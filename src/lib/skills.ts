@@ -58,6 +58,8 @@ import {
   uuidList,
   type PerfViewer,
 } from '@/lib/performance-scope';
+// Pure, no runtime imports of its own, so this costs the module nothing at load time.
+import { protectedAttributeConcern } from '@/lib/person-assertions';
 
 const MOD = 'skills';
 const WRITE_FAILED = 'We could not save that just now. Nothing was changed.';
@@ -196,6 +198,21 @@ export async function createSkill(input: {
 }): Promise<SkillWriteResult> {
   const name = clean(input?.name, 120);
   if (!name) return { ok: false, error: 'Give the skill a name.' };
+  // A SKILL NAMED AFTER A PROTECTED ATTRIBUTE IS A DECISION VARIABLE WEARING A SKILL'S CLOTHES.
+  //
+  // The catalogue is the front door: everything downstream keys on hr_skills.id, so a row called
+  // "Gender" or "Caste" here becomes something a person can be recorded as HOLDING, something a job
+  // can REQUIRE, and something the skill graph hangs edges off. src/lib/person-assertions.ts said
+  // this was checked before a skill enters the catalogue and src/lib/skill-ontology.ts said no seam
+  // existed; nothing was actually checking, and the day such a row appears is the day the graph
+  // becomes a machine for inferring somebody's origin.
+  //
+  // Only an EXACT match of the whole name refuses — protectedAttributeConcern() answers 'review',
+  // not 'refuse', for a longer phrase — so "Mental health first aid" and "Accessibility
+  // engineering" go in untouched. A filter that silently refused real skills would only teach
+  // people to word around it, and nobody would ever see what was reworded.
+  const nameConcern = protectedAttributeConcern(name);
+  if (nameConcern.level === 'refuse') return { ok: false, error: nameConcern.sentence };
   const category = clean(input?.category, 60) || 'general';
   const description = clean(input?.description, 1000) || null;
   const actor = isUuid(input?.actorUserId) ? String(input.actorUserId) : null;

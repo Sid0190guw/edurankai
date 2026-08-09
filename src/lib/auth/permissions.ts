@@ -521,6 +521,82 @@ export type Permission =
   | 'learning.rules.manage'
 
   // =============================================================================================
+  // WHAT A COURSE COSTS, AND WHO IS EXCUSED FROM PAYING IT. Two keys, and they are deliberately
+  // NOT the authoring keys.
+  //
+  // Creating and publishing a course is `lessons.author` / `lessons.publish`, held by
+  // INTERNAL_ROLE_KEYS — every non-applicant role, which is the population the four course editors
+  // already admit. SETTING A PRICE IS NOT THAT. It decides what a learner is charged, and the same
+  // population that may fix a typo in a lesson must not silently be the population that may put a
+  // number on it. So pricing is its own key, granted to the same desk that already holds the
+  // learning administration keys above (super_admin + hr).
+  //
+  // Set the price of a course and choose its fee model — free to everyone, free to employees and
+  // paid for the public, paid for everyone, or closed. SENSITIVE: a wrong number here is money
+  // taken from a learner, and the absurd-price guard in the checkout is a floor, not a review.
+  | 'courses.pricing.manage'
+  // Grant somebody free or reduced access to a course they would otherwise pay for — in full, or as
+  // a percentage — and decline a request with a reason the person can read.
+  //
+  // SENSITIVE, and this is the key the phase brief calls out by name: granting free access to a
+  // paid thing is giving away revenue, one named learner at a time. It is a STANDING AUTHORITY over
+  // a domain (`fee_waiver` in src/lib/workflow.ts), not a relationship — a fee-waiver requester is
+  // usually a member of the public with no manager, no department and no employee record, so there
+  // is no edge in the Organization Graph to walk and no per-row routing that could answer this.
+  // That is exactly why it is a capability rather than a route, and exactly why it is sensitive.
+  //
+  // IT DOES NOT LET ANYBODY WAIVE THEIR OWN FEE. src/lib/course-waiver.ts refuses a decision by the
+  // requester before it asks this key anything at all; holding it is not a way around that.
+  | 'learning.waiver.grant'
+  // Move an enrolment between the states in src/lib/course-access.ts - pause it, cancel it, reinstate
+  // it, extend or shorten somebody's access window.
+  //
+  // SENSITIVE, and for a reason that is not obvious: none of these transitions deletes anything. A
+  // suspension leaves the completions, the certificate and the progress exactly where they are, and
+  // an expiry is a fact about the clock rather than a punishment. What the key really confers is the
+  // power to CLOSE A DOOR on a named learner, one at a time, and every use of it is written to
+  // training_enrolment_transitions with a written reason - including the attempts that are refused.
+  //
+  // IT CONFERS NO APPROVAL AUTHORITY. An enrolment waiting on a decision points at a workflow
+  // instance in src/lib/workflow.ts, and only the person that engine routed to may decide it.
+  // Holding this key lets somebody APPLY the transition that decision implies; it is not a way to
+  // make the decision, and there is no approve button anywhere in course-access.ts.
+  //
+  // IT IS NOT A CONTENT KEY EITHER. Opening a course you are not enrolled on is `lessons.author` /
+  // `lessons.publish` (an author reading their own draft) or `learning.progress.view` (the learning
+  // desk). This key is about the enrolment record, not about the lessons.
+  | 'learning.enrolment.manage'
+
+  // SCHOLARSHIPS. TWO KEYS, AND THEY ARE NOT THE WAIVER KEY.
+  //
+  // A waiver is a decision about ONE person's circumstances, requested and reviewed through the
+  // `fee_waiver` domain. A SCHOLARSHIP is a PROGRAMME that exists before anybody asks: eligibility,
+  // a deadline, a number of places, and a BUDGET. Defining one commits money the company has not
+  // spent yet; awarding one spends it, by name. Those are two different acts and they are two keys,
+  // for the reason `courses.pricing.manage` is not `lessons.author`: the population that may decide
+  // how big a fund is must not be, by accident, the population that may hand it out.
+  //
+  //   scholarships.manage  create a scholarship, set its budget, its places, its deadline and its
+  //                        eligibility rules, and open or close it. It gives nothing to anybody.
+  //   scholarships.award   award one to a named learner, and withdraw an award with a reason.
+  //
+  // BOTH SENSITIVE. Every award is revenue given away, and src/lib/scholarships.ts writes the audit
+  // row STRICTLY: if the row naming who awarded what to whom cannot be written, the award is undone
+  // and the caller is told — the same rule registry.ts applies to a sensitive permission grant.
+  //
+  // NEITHER LETS ITS HOLDER AWARD TO THEMSELVES. awardScholarship() refuses that before it reads the
+  // programme, whatever the actor holds — a scholarship applicant is usually a member of the public
+  // with no manager and no employee record, so there is no edge in the Organization Graph to route
+  // the decision by, which is exactly why the refusal is written out rather than assumed.
+  //
+  // NO PRIOR POPULATION TO PRESERVE — there was no scholarships table and no scholarship module
+  // anywhere in this codebase before this commit. So these follow the precedent of
+  // `courses.pricing.manage` and `learning.waiver.grant`: the narrowest defensible holders,
+  // super_admin and hr, which is the same desk that already prices a course, already sees every
+  // payment and already sends money back.
+  | 'scholarships.manage' | 'scholarships.award'
+
+  // =============================================================================================
   // PROJECTS. TWO KEYS, AND NEITHER OF THEM MAKES ANYBODY A PROJECT MANAGER.
   //
   // READ THIS BEFORE GRANTING EITHER. "Runs this project" is an ORGANISATIONAL RELATIONSHIP — the
@@ -1077,6 +1153,23 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // row naming the granter can be written.
     'learning.progress.view', 'learning.completion.override',
     'learning.certificate.manage', 'learning.rules.manage',
+    // COURSE PRICE AND FEE WAIVERS. Same population and the same derivation as the four keys above:
+    // super_admin and `hr` are the only accounts that reach the course catalogue or the finance
+    // console today, and `payments.refund` — money moving the other way — is already theirs. Both
+    // keys are SENSITIVE in the registry, so granting either to a custom role fails unless the audit
+    // row naming the granter can be written. Neither makes anybody an approver of anything else, and
+    // neither lets its holder waive a fee for themselves.
+    'courses.pricing.manage', 'learning.waiver.grant',
+    // ENROLMENT STATE. Same population and the same derivation once more: super_admin and `hr` are
+    // the only accounts that reach the learning desk, and pausing or reinstating somebody's place on
+    // a course belongs to whoever already holds `learning.completion.override`. It approves nothing
+    // and deletes nothing — an enrolment waiting on a decision is decided in src/lib/workflow.ts by
+    // whoever that engine routed to, and a suspension leaves every completion where it is.
+    'learning.enrolment.manage',
+    // SCHOLARSHIPS. The fund and the award. Same derivation again: the desk that prices a course and
+    // decides a waiver is the desk that runs a scholarship. Holding both does NOT let the founder
+    // award one to themselves — src/lib/scholarships.ts refuses that before it reads the programme.
+    'scholarships.manage', 'scholarships.award',
     // PROJECTS. The portfolio read and the project register. NEITHER makes the founder the manager
     // of any project — that is a `project_manager` edge in the Organization Graph, scoped to one
     // project, and /admin/projects resolves it per row exactly like every other surface here.
@@ -1162,6 +1255,20 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // product could do before, in any role, on any screen.
     'learning.progress.view', 'learning.completion.override',
     'learning.certificate.manage', 'learning.rules.manage',
+    // COURSE PRICE AND FEE WAIVERS. `hr` already holds `payments.view` and `payments.refund` on the
+    // line further up — it is the desk that already sees every payment and sends money back — and it
+    // already holds the training section and the learning desk. Pricing a course and deciding a fee
+    // waiver is the same desk; it is named here rather than spelled as a role test on the page.
+    'courses.pricing.manage', 'learning.waiver.grant',
+    // ENROLMENT STATE. The same desk again. `hr` already holds `learning.completion.override`, which
+    // changes what somebody's record SAYS; this changes only whether the course still opens for them,
+    // and it can no more delete a completion than the expiry of a library card deletes a book read.
+    'learning.enrolment.manage',
+    // SCHOLARSHIPS. The same desk again, and no wider reach than the line above already gives it: a
+    // scholarship is a fee decision made in advance, out of a budget, instead of one at a time on
+    // request. `hr` may define one and award one; it may not award one to itself, and no grant on
+    // this line can change that.
+    'scholarships.manage', 'scholarships.award',
     // PROJECTS. `hr` already holds the org-wide reads that a portfolio is made of — every employee
     // record (employee.manage), the whole claim queue (expenses.review), the purchasing record
     // (procurement.view) and aggregate reporting (analytics.view) — so a register of what the

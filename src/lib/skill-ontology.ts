@@ -112,6 +112,8 @@ import { logAudit } from '@/lib/audit';
 import { ensurePerformanceSchema } from '@/lib/performance-schema';
 import { createSkill } from '@/lib/skills';
 import { clean, isUuid, logFail, rowsOf } from '@/lib/performance-scope';
+// Pure — no runtime imports of its own, so this adds nothing to load time.
+import { protectedAttributeConcern } from '@/lib/person-assertions';
 
 const MOD = 'skill-ontology';
 const WRITE_FAILED = 'We could not save that just now. Nothing was changed.';
@@ -731,6 +733,24 @@ export async function assertRelation(input: {
        WHERE id = ${canonical.from}::uuid OR id = ${canonical.to}::uuid`));
     if (both.length < 2) return { ok: false, error: 'One of those skills is not in the catalogue.' };
 
+    // THE HEADER SAYS NO SEAM EXISTS FOR A PROTECTED ATTRIBUTE TO BECOME A NODE. It says so about
+    // this module's own tables, and this is where that stops being a sentence. createSkill() now
+    // refuses such a name at the front door, but rows predating that guard are already in
+    // hr_skills, and an edge is what would make one of them REACHABLE: broaderThan() would walk to
+    // it, impliedBy() would suggest it, and requirementResolution() would answer whether somebody
+    // holds it. No edge is built onto a node named after a protected attribute.
+    for (const s of both) {
+      const concern = protectedAttributeConcern(String(s.name || ''));
+      if (concern.level === 'refuse') {
+        return {
+          ok: false,
+          error: 'The catalogue skill "' + String(s.name || '') + '" names a protected or sensitive '
+            + 'attribute, so no relation is recorded onto it and it stays unreachable through this '
+            + 'graph. Retire that catalogue row; it is not a skill.',
+        };
+      }
+    }
+
     if (canonical.relation === 'parent' && await wouldCycle(canonical.from, canonical.to)) {
       return {
         ok: false,
@@ -824,11 +844,25 @@ export async function addAlias(input: {
   const kind: AliasKind = isAliasKind(input?.kind) ? input.kind : 'synonym';
   const actor = isUuid(input?.actorUserId) ? String(input.actorUserId) : null;
   const source = input?.source === 'seed' ? 'seed' : 'admin';
+  // An alias is a NAME somebody types that resolves to a node. "Gender" recorded as another name for
+  // anything would let a protected attribute arrive through resolveSkillNode() from any of the six
+  // free-text vocabularies, which is the same seam by the other door.
+  const aliasConcern = protectedAttributeConcern(alias);
+  if (aliasConcern.level === 'refuse') return { ok: false, error: aliasConcern.sentence };
   try {
     await ensureSkillOntologySchema();
     const target = rowsOf(await db.execute(sql`
       SELECT id::text AS id, name FROM hr_skills WHERE id = ${skillId}::uuid LIMIT 1`));
     if (!target.length) return { ok: false, error: 'That skill is not in the catalogue.' };
+    const targetConcern = protectedAttributeConcern(String(target[0].name || ''));
+    if (targetConcern.level === 'refuse') {
+      return {
+        ok: false,
+        error: 'The catalogue skill "' + String(target[0].name || '') + '" names a protected or '
+          + 'sensitive attribute, so no other name is recorded for it and it stays unreachable '
+          + 'through this graph. Retire that catalogue row; it is not a skill.',
+      };
+    }
 
     const clash = rowsOf(await db.execute(sql`
       SELECT s.id::text AS id, s.name FROM hr_skills s
@@ -950,10 +984,18 @@ export function edgeSentence(
   }
 }
 
-/** Every direct edge touching one node, written from that node's point of view. */
-export async function edgesFor(skillId: string): Promise<SkillEdge[]> {
+/**
+ * Every direct edge touching one node, written from that node's point of view.
+ *
+ * THE STRICT VARIANT THROWS. A caller that is about to say something about a PERSON — whether a
+ * requirement is answered — must be able to tell "the graph records nothing" from "the graph could
+ * not be read", because those two render as the same empty list and only one of them is a finding.
+ * requirementResolution() calls this one; screens that are only drawing the graph call the tolerant
+ * export below, where an empty list is an honest picture of an unreadable graph.
+ */
+async function edgesForStrict(skillId: string): Promise<SkillEdge[]> {
   if (!isUuid(skillId)) return [];
-  try {
+  {
     await ensureSkillOntologySchema();
     const self = rowsOf(await db.execute(sql`
       SELECT name FROM hr_skills WHERE id = ${skillId}::uuid LIMIT 1`));
@@ -995,16 +1037,24 @@ export async function edgesFor(skillId: string): Promise<SkillEdge[]> {
         ),
       };
     });
+  }
+}
+
+/** The tolerant form, for a screen drawing the graph. An unreadable graph draws as no edges. */
+export async function edgesFor(skillId: string): Promise<SkillEdge[]> {
+  try {
+    return await edgesForStrict(skillId);
   } catch (e: any) {
     logFail(MOD, 'edgesFor', e);
     return [];
   }
 }
 
-async function walk(skillId: string, up: boolean, maxDepth: number): Promise<OntologyPathNode[]> {
+/** THROWS on an unreadable graph, for the same reason edgesForStrict() does. */
+async function walkStrict(skillId: string, up: boolean, maxDepth: number): Promise<OntologyPathNode[]> {
   if (!isUuid(skillId)) return [];
   const depth = Math.min(Math.max(1, Math.round(Number(maxDepth) || MAX_WALK_DEPTH)), MAX_WALK_DEPTH);
-  try {
+  {
     await ensureSkillOntologySchema();
     const rows = up
       ? rowsOf(await db.execute(sql`
@@ -1044,6 +1094,12 @@ async function walk(skillId: string, up: boolean, maxDepth: number): Promise<Ont
       depth: Number(r.depth) || 1,
       path: Array.isArray(r.path) ? r.path.map((x: any) => String(x)) : [],
     }));
+  }
+}
+
+async function walk(skillId: string, up: boolean, maxDepth: number): Promise<OntologyPathNode[]> {
+  try {
+    return await walkStrict(skillId, up, maxDepth);
   } catch (e: any) {
     logFail(MOD, up ? 'broaderThan' : 'narrowerThan', e);
     return [];
@@ -1083,13 +1139,18 @@ export async function impliedBy(skillId: string, maxDepth = MAX_WALK_DEPTH): Pro
   }));
 }
 
-export async function skillNode(skillId: string): Promise<SkillNode | null> {
+/** THROWS on an unreadable catalogue, so "not in the catalogue" is never said about a failed read. */
+async function skillNodeStrict(skillId: string): Promise<SkillNode | null> {
   if (!isUuid(skillId)) return null;
+  await ensurePerformanceSchema();
+  const r = rowsOf(await db.execute(sql`
+    SELECT id, name, category, is_active FROM hr_skills WHERE id = ${skillId}::uuid LIMIT 1`));
+  return r.length ? mapNode(r[0]) : null;
+}
+
+export async function skillNode(skillId: string): Promise<SkillNode | null> {
   try {
-    await ensurePerformanceSchema();
-    const r = rowsOf(await db.execute(sql`
-      SELECT id, name, category, is_active FROM hr_skills WHERE id = ${skillId}::uuid LIMIT 1`));
-    return r.length ? mapNode(r[0]) : null;
+    return await skillNodeStrict(skillId);
   } catch (e: any) {
     logFail(MOD, 'skillNode', e);
     return null;
@@ -1109,7 +1170,17 @@ export interface RequirementResolution {
   /** The held skill that produced the match, when one did. */
   viaSkillId: string | null;
   viaSkillName: string | null;
-  /** True only for 'exact'. Everything else needs a person to look at it. */
+  /**
+   * True only for 'exact', and it is a statement about the ROUTE, never about the evidence.
+   *
+   * It means "no judgement is needed about whether this is the same skill", because it is the same
+   * node. It does NOT mean the person has shown anything: the held set handed to this function is
+   * just a list of skill ids, and a skill somebody typed on a CV reaches this branch exactly as a
+   * demonstrated one does. WHAT THEY CAN SHOW FOR IT IS THE EVIDENCE GRAPH'S QUESTION — see
+   * requirementCoverage() in src/lib/evidence-graph.ts, which takes this route and then reads the
+   * claim's evidence level before calling anything evidenced. A caller that renders this field as
+   * "requirement met" without that second read has turned a keyword into a competence.
+   */
   countsWithoutJudgement: boolean;
   sentence: string;
 }
@@ -1137,7 +1208,26 @@ export async function requirementResolution(
   heldSkillIds: readonly string[],
 ): Promise<RequirementResolution> {
   const held = (heldSkillIds || []).filter(isUuid);
-  const node = await skillNode(requiredSkillId);
+  const unreadableBase: RequirementResolution = {
+    requiredSkillId: String(requiredSkillId || ''),
+    requiredSkillName: 'that skill',
+    match: 'unreadable',
+    viaSkillId: null,
+    viaSkillName: null,
+    countsWithoutJudgement: false,
+    sentence: 'We could not read the skill catalogue, so we cannot say whether this requirement is answered.',
+  };
+  // The lookup is guarded SEPARATELY from the walks below, because its two failures say opposite
+  // things: a null node means the requirement names no catalogue skill, and a throw means nobody
+  // can say what it names. Reporting the second as the first is a statement about a job description
+  // that nobody made.
+  let node: SkillNode | null;
+  try {
+    node = await skillNodeStrict(requiredSkillId);
+  } catch (e: any) {
+    logFail(MOD, 'requirementResolution:node', e);
+    return unreadableBase;
+  }
   const requiredName = node ? node.name : 'that skill';
   const base: RequirementResolution = {
     requiredSkillId: String(requiredSkillId || ''),
@@ -1160,10 +1250,14 @@ export async function requirementResolution(
     };
   }
   try {
+    // THE STRICT VARIANTS, DELIBERATELY. The tolerant ones return an empty list when the database
+    // cannot be read, and an empty list here would come back as "Nothing on record answers X" — a
+    // confident negative about a person, manufactured out of a failed read, on a screen where
+    // somebody is deciding. An unreadable graph must reach the catch below and say so.
     const [down, up, edges] = await Promise.all([
-      narrowerThan(requiredSkillId),
-      broaderThan(requiredSkillId),
-      edgesFor(requiredSkillId),
+      walkStrict(requiredSkillId, false, MAX_WALK_DEPTH),
+      walkStrict(requiredSkillId, true, MAX_WALK_DEPTH),
+      edgesForStrict(requiredSkillId),
     ]);
     const narrower = down.find((n) => held.includes(n.skillId));
     if (narrower) {
@@ -1208,6 +1302,142 @@ export async function requirementResolution(
       ...base,
       match: 'unreadable',
       sentence: 'We could not read the skill graph, so we cannot say whether ' + requiredName + ' is answered.',
+    };
+  }
+}
+
+// =================================================================================================
+// ONE NODE, ASSEMBLED FOR A SCREEN — WITH THE THREE STATES KEPT APART
+// =================================================================================================
+
+/**
+ * The state of a read, as four words that a screen must never collapse into one.
+ *
+ * The same shape person-spine.ts uses. It is restated here rather than imported because this module
+ * is already imported by evidence-graph.ts and by every match surface, and a screen-shaped helper is
+ * not worth pulling another module into all of them.
+ */
+export type OntologyReadState = 'ok' | 'not_configured' | 'empty' | 'unreadable';
+
+export interface OntologyAlias {
+  id: string;
+  alias: string;
+  kind: string;
+  source: string;
+}
+
+export interface SkillGraphView {
+  state: OntologyReadState;
+  /** The sentence the screen prints. Never invented at the call site. */
+  sentence: string;
+  node: SkillNode | null;
+  edges: SkillEdge[];
+  aliases: OntologyAlias[];
+  broader: OntologyPathNode[];
+  narrower: OntologyPathNode[];
+  /** Always stamped inferred, with the chain that produced each row. */
+  implied: ImpliedSkill[];
+  error?: string;
+}
+
+/**
+ * EVERYTHING RECORDED ABOUT ONE NODE, IN ONE READ, WITHOUT THE TOLERANT SHORTCUT.
+ *
+ * edgesFor() and broaderThan() swallow and return an empty list on purpose — a screen that is only
+ * DRAWING the graph draws nothing when it cannot be read. A screen an administrator EDITS the graph
+ * from cannot use those: "this skill has no relations" and "we could not read the relations" are the
+ * difference between adding the edge that was missing and adding a duplicate of one that is already
+ * there, and only one of them is a finding. So this uses the strict internals and reports which of
+ * the four states it is actually in — including not_configured, asked of information_schema rather
+ * than assumed from ensureSkillOntologySchema() returning, which it does even when the DDL failed.
+ */
+export async function skillGraphView(skillId: string): Promise<SkillGraphView> {
+  const base: SkillGraphView = {
+    state: 'unreadable',
+    sentence: '',
+    node: null,
+    edges: [],
+    aliases: [],
+    broader: [],
+    narrower: [],
+    implied: [],
+  };
+  if (!isUuid(skillId)) {
+    return { ...base, state: 'empty', sentence: 'No skill was chosen, so there is nothing to show.' };
+  }
+  try {
+    await ensureSkillOntologySchema();
+    // ASKED, NEVER ASSUMED. ensureOnce ends in p.catch(() => {}) and this module's own guard rethrows
+    // into it, so a returned ensure proves that a promise settled and nothing else.
+    const tables = rowsOf(await db.execute(sql`
+      SELECT table_name FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_name IN ('skill_relations', 'skill_aliases')`));
+    const have = new Set(tables.map((r: any) => String(r.table_name)));
+    const node = await skillNodeStrict(skillId);
+    if (!have.has('skill_relations') || !have.has('skill_aliases')) {
+      const missing = ['skill_relations', 'skill_aliases'].filter((t) => !have.has(t));
+      return {
+        ...base,
+        state: 'not_configured',
+        node,
+        sentence: 'The skill graph has not been set up in this database yet — ' + missing.join(' and ')
+          + ' ' + (missing.length === 1 ? 'is' : 'are') + ' not there. That is not a statement that '
+          + 'nothing is related to this skill; nothing has been able to be recorded at all.',
+      };
+    }
+    if (!node) {
+      return {
+        ...base,
+        state: 'empty',
+        sentence: 'That skill is not in the catalogue, so there is no node to show relations for.',
+      };
+    }
+    const [edges, aliasRows, broader, narrower] = await Promise.all([
+      edgesForStrict(skillId),
+      db.execute(sql`
+        SELECT id::text AS id, alias, kind, source FROM skill_aliases
+         WHERE skill_id = ${skillId}::uuid ORDER BY alias ASC LIMIT 200`),
+      walkStrict(skillId, true, MAX_WALK_DEPTH),
+      walkStrict(skillId, false, MAX_WALK_DEPTH),
+    ]);
+    const aliases: OntologyAlias[] = rowsOf(aliasRows).map((r: any) => ({
+      id: String(r.id),
+      alias: String(r.alias || ''),
+      kind: String(r.kind || 'synonym'),
+      source: String(r.source || 'admin'),
+    }));
+    // Built from the walk that was already read rather than by calling impliedBy(), which would walk
+    // the same edges a third time. The wording is the one impliedBy() prints, kept identical here on
+    // purpose: two screens must not describe the same inference in two ways.
+    const implied: ImpliedSkill[] = broader.map((n) => ({
+      ...n,
+      assertion: 'inferred' as const,
+      sentence: 'Holding ' + node.name + ' suggests some ' + n.name + ', because the graph records '
+        + n.name + ' as the broader area it sits inside. That is an inference, not a demonstration.',
+    }));
+    const empty = edges.length === 0 && aliases.length === 0;
+    return {
+      state: empty ? 'empty' : 'ok',
+      sentence: empty
+        ? 'Nothing is recorded about ' + node.name + ' in the graph: no relation to any other skill '
+          + 'and no other name. The graph is curated by hand, so an absent edge means nobody has '
+          + 'written it down yet — not that there is none.'
+        : '',
+      node,
+      edges,
+      aliases,
+      broader,
+      narrower,
+      implied,
+    };
+  } catch (e: any) {
+    logFail(MOD, 'skillGraphView', e);
+    return {
+      ...base,
+      state: 'unreadable',
+      sentence: 'We could not read the skill graph just now, so this shows nothing rather than '
+        + 'guessing. It is not a statement that nothing is recorded.',
+      error: e?.cause?.message || e?.message || 'unreadable',
     };
   }
 }

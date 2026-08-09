@@ -95,7 +95,12 @@ import {
   type OrgPerson,
 } from '@/lib/org-graph';
 import { skillsForEmployee, SKILL_LEVEL_LABELS, type EmployeeSkill } from '@/lib/skills';
-import { getProfile, type ProfileEntry } from '@/lib/profile';
+// NOT getProfile(). See PROFILE_COLUMNS_BY_ASPECT below: getProfile() selects date of birth,
+// nationality, home address, photograph, bank account and tax identifiers, all of which
+// NEVER_COMPOSED says are absent from this model for every viewer. ensureProfileSchema() is kept
+// because the table may not exist yet on a database where nobody has opened a profile, and
+// normaliseLink() is kept because the writer normalised through it and the reader must agree.
+import { ensureProfileSchema, normaliseLink, type ProfileEntry } from '@/lib/profile';
 import { getCertificatesForUser } from '@/lib/certificates';
 import { learningPathFor, type LearningItem } from '@/lib/performance-learning';
 import { reviewHistory, type PerformanceReview } from '@/lib/performance';
@@ -347,6 +352,20 @@ export interface PersonRoot {
   sentence: string;
   /** A read failed. The twin is INCOMPLETE, and that is not the same as EMPTY. */
   readFailed: boolean;
+  /**
+   * Has anything DESCRIPTIVE been read about this person — their name, their employee code, the
+   * state of their application?
+   *
+   * resolvePerson() answers false. It reads the id graph and nothing else, because the id graph is
+   * what the authorization question is asked ABOUT and there is no way to ask "may this viewer see
+   * this person" without first knowing which rows are this person. describePerson() answers true,
+   * and it is called only after `identity` has been granted.
+   *
+   * A screen reading `described: false` must not print a name, because there is no name on the
+   * object — not because it was blanked, but because the SELECT that would have carried it was
+   * never issued.
+   */
+  described: boolean;
 }
 
 const NO_PERSON: PersonRoot = {
@@ -361,14 +380,37 @@ const NO_PERSON: PersonRoot = {
   fullyLinked: false,
   sentence: 'No person could be resolved from what was asked for.',
   readFailed: false,
+  described: false,
 };
 
 /**
- * RESOLVE ONE PERSON FROM ANY ONE OF THEIR IDS.
+ * RESOLVE ONE PERSON FROM ANY ONE OF THEIR IDS — THE ID GRAPH, AND STRICTLY NOTHING ELSE.
  *
  * Reads only the pointers that are already on the record: hr_employees.user_id,
  * hr_employees.application_id, applications.applicant_user_id. Nothing is joined on a name or an
  * address, and nothing is created.
+ *
+ * =================================================================================================
+ * WHY THERE IS NO NAME, NO EMPLOYEE CODE AND NO APPLICATION STATUS IN ANY SELECT BELOW
+ * =================================================================================================
+ *
+ * This function RUNS BEFORE twinAccess(), because the authorization question — is this me, does the
+ * Organization Graph make me responsible for them, does my capability reach them — cannot be asked
+ * until we know which rows are this person. So everything read here is read by a viewer whose
+ * grants are not yet known, and the only defensible thing to read in that position is the id graph
+ * the question is asked about.
+ *
+ * IT USED TO READ MORE. full_name, employee_code, employment_status, applications.status,
+ * applications.first_name, applications.last_name and users.name were all selected here and written
+ * onto PersonRoot, which buildDigitalTwin() returns to EVERY caller whatever their grants — so a
+ * viewer granted nothing at all still received the person's name, their employee code inside a
+ * state label, and the fact that one of their applications had been rejected. The withheld list
+ * said the identity aspect was withheld while the name sat on the object beside it. That is
+ * fetch-then-hide, and this module's own header refuses it in as many words.
+ *
+ * The descriptive values now live in describePerson(), which runs AFTER the grant and only under
+ * it. An ungranted viewer does not get a blanked name; the SELECT that would have carried one is
+ * never issued.
  */
 export async function resolvePerson(input: {
   userId?: string | null;
@@ -383,12 +425,13 @@ export async function resolvePerson(input: {
   let readFailed = false;
   let employee: any = null;
   let applications: any[] = [];
-  let account: any = null;
 
   // ---- THE EMPLOYEE RECORD -----------------------------------------------------------------------
+  // is_active is a pointer question, not a disclosure: it decides WHICH employee row is this person
+  // when somebody has been engaged twice. It is not put on the object here.
   try {
     const r = rowsOf(await db.execute(sql`
-      SELECT id, user_id, application_id, full_name, employee_code, is_active, employment_status
+      SELECT id, user_id, application_id, is_active
         FROM hr_employees
        WHERE (${wantEmployee}::uuid IS NOT NULL AND id = ${wantEmployee}::uuid)
           OR (${wantUser}::uuid IS NOT NULL AND user_id = ${wantUser}::uuid)
@@ -407,7 +450,7 @@ export async function resolvePerson(input: {
   try {
     const appId = wantApplication || (employee?.application_id ? String(employee.application_id) : null);
     const rows = rowsOf(await db.execute(sql`
-      SELECT id, applicant_user_id, first_name, last_name, status, created_at
+      SELECT id, applicant_user_id
         FROM applications
        WHERE (${appId}::uuid IS NOT NULL AND id = ${appId}::uuid)
           OR (${userId}::uuid IS NOT NULL AND applicant_user_id = ${userId}::uuid)
@@ -419,70 +462,18 @@ export async function resolvePerson(input: {
     readFailed = true;
   }
 
-  // ---- THE LOGIN ---------------------------------------------------------------------------------
-  if (userId) {
-    try {
-      const r = rowsOf(await db.execute(sql`
-        SELECT id, name, is_active FROM users WHERE id = ${userId}::uuid LIMIT 1`));
-      account = r.length ? r[0] : null;
-    } catch (e: any) {
-      logFail(MOD, 'resolvePerson:user', e);
-      readFailed = true;
-    }
-  }
+  // ---- THE LOGIN, DELIBERATELY NOT READ ----------------------------------------------------------
+  // There was a `SELECT id, name, is_active FROM users` here. Nothing in the id graph needs it:
+  // userId is already known from the input or from hr_employees.user_id. It existed to put a NAME on
+  // the object, and a name is a description, so it moved into describePerson() behind the grant.
 
   const employeeId = employee?.id ? String(employee.id) : null;
   const applicationIds = applications.map((a: any) => String(a.id)).filter(isUuid);
 
+  // STATES ARE DESCRIPTIONS. "On the employee register as ERA-0142", "Applied for a role (rejected)"
+  // — each of those is a sentence about a person, and each was being handed to viewers who had been
+  // granted nothing. describePerson() builds them.
   const states: PersonState[] = [];
-  if (account) {
-    states.push({
-      kind: 'account',
-      id: String(account.id),
-      label: 'Has a sign-in on this platform',
-      current: account.is_active !== false,
-      provenance: {
-        assertion: 'factual', source: 'users', recordedAt: null, assertedByUserId: null, evidenceUrl: null,
-        basis: 'A row exists in users for this id.',
-      },
-    });
-    states.push({
-      kind: 'learner',
-      id: String(account.id),
-      label: 'Learner record, keyed on the same sign-in',
-      current: true,
-      provenance: {
-        assertion: 'factual', source: 'users (the learning engine is keyed on users.id)', recordedAt: null,
-        assertedByUserId: null, evidenceUrl: null,
-        basis: 'Enrolments, completions and certificates on this platform are keyed on users.id.',
-      },
-    });
-  }
-  for (const a of applications) {
-    states.push({
-      kind: 'candidate',
-      id: String(a.id),
-      label: 'Applied for a role' + (a.status ? ' (' + String(a.status) + ')' : ''),
-      current: String(a.status || '') !== 'rejected',
-      provenance: {
-        assertion: 'factual', source: 'applications', recordedAt: a.created_at ? new Date(a.created_at).toISOString() : null,
-        assertedByUserId: a.applicant_user_id ? String(a.applicant_user_id) : null, evidenceUrl: null,
-        basis: 'An application row exists.',
-      },
-    });
-  }
-  if (employee) {
-    states.push({
-      kind: 'employee',
-      id: String(employee.id),
-      label: 'On the employee register' + (employee.employee_code ? ' as ' + String(employee.employee_code) : ''),
-      current: employee.is_active !== false,
-      provenance: {
-        assertion: 'factual', source: 'hr_employees', recordedAt: null, assertedByUserId: null, evidenceUrl: null,
-        basis: 'An employee row exists.',
-      },
-    });
-  }
 
   const edges: LinkEdge[] = [];
   if (employeeId) {
@@ -511,18 +502,154 @@ export async function resolvePerson(input: {
     });
   }
 
+  // The same-address comparison that used to run here is in describePerson(). It is an inference
+  // ABOUT WHO SOMEBODY IS, which makes it identity, which makes it something to read after the grant
+  // rather than before it.
+  const unconfirmed: UnconfirmedLink[] = [];
+
+  const key = employeeId ? 'employee:' + employeeId
+    : userId ? 'user:' + userId
+      : applicationIds.length ? 'application:' + applicationIds[0]
+        : '';
+
+  const missing = edges.filter((e) => e.status === 'absent');
+  const recordCount = (employeeId ? 1 : 0) + (userId ? 1 : 0) + applicationIds.length;
+
+  const sentence = readFailed
+    ? 'One of the records that make up this person could not be read just now, so this is incomplete. That is not a statement that the record does not exist.'
+    : missing.length === 0 && recordCount > 0
+      ? 'Every record this person has is linked to every other, so this twin is composed from all of them.'
+      : missing.length
+        ? 'This person is on ' + recordCount + ' records and ' + missing.length + ' of the links between them is not on file. '
+          + 'What is missing is named above; nothing was guessed to fill it.'
+        : 'This person is on one record only.';
+
+  return {
+    key,
+    userId,
+    employeeId,
+    applicationIds,
+    displayName: null,
+    states,
+    edges,
+    unconfirmed,
+    fullyLinked: !readFailed && missing.length === 0,
+    sentence,
+    readFailed,
+    described: false,
+  };
+}
+
+/**
+ * THE NAMES, THE CODES AND THE STATUSES — READ ONLY ONCE `identity` HAS BEEN GRANTED.
+ *
+ * Everything in here is a description of a human: what they are called, what their employee code
+ * is, whether an application of theirs was rejected, whether an account somewhere shares one of
+ * their addresses. None of it is needed to decide whether the viewer may look, so none of it is
+ * read until that has been decided.
+ *
+ * `emp` is the employee row buildDigitalTwin() has already read under the same grant, using the
+ * screened per-aspect column list. It is passed in rather than re-queried so that the identity
+ * columns are named in exactly one SELECT in this module.
+ *
+ * A failure here marks the root readFailed and leaves the descriptions off. It never invents one,
+ * and it never returns a person who looks complete.
+ */
+async function describePerson(person: PersonRoot, emp: any): Promise<PersonRoot> {
+  const states: PersonState[] = [];
+  const unconfirmed: UnconfirmedLink[] = [];
+  let readFailed = person.readFailed;
+
+  // ---- THE LOGIN ---------------------------------------------------------------------------------
+  let account: any = null;
+  if (person.userId) {
+    try {
+      const r = rowsOf(await db.execute(sql`
+        SELECT id, name, is_active FROM users WHERE id = ${person.userId}::uuid LIMIT 1`));
+      account = r.length ? r[0] : null;
+    } catch (e: any) {
+      logFail(MOD, 'describePerson:user', e);
+      readFailed = true;
+    }
+  }
+
+  // ---- THE APPLICATIONS --------------------------------------------------------------------------
+  let apps: any[] = [];
+  if (person.applicationIds.length) {
+    try {
+      apps = rowsOf(await db.execute(sql`
+        SELECT id, applicant_user_id, first_name, last_name, status, created_at
+          FROM applications
+         WHERE id IN (${sql.join(person.applicationIds.map((id) => sql`${id}::uuid`), sql`, `)})
+         ORDER BY created_at DESC`));
+    } catch (e: any) {
+      logFail(MOD, 'describePerson:applications', e);
+      readFailed = true;
+    }
+  }
+
+  if (account) {
+    states.push({
+      kind: 'account',
+      id: String(account.id),
+      label: 'Has a sign-in on this platform',
+      current: account.is_active !== false,
+      provenance: {
+        assertion: 'factual', source: 'users', recordedAt: null, assertedByUserId: null, evidenceUrl: null,
+        basis: 'A row exists in users for this id.',
+      },
+    });
+    states.push({
+      kind: 'learner',
+      id: String(account.id),
+      label: 'Learner record, keyed on the same sign-in',
+      current: true,
+      provenance: {
+        assertion: 'factual', source: 'users (the learning engine is keyed on users.id)', recordedAt: null,
+        assertedByUserId: null, evidenceUrl: null,
+        basis: 'Enrolments, completions and certificates on this platform are keyed on users.id.',
+      },
+    });
+  }
+  for (const a of apps) {
+    states.push({
+      kind: 'candidate',
+      id: String(a.id),
+      label: 'Applied for a role' + (a.status ? ' (' + String(a.status) + ')' : ''),
+      current: String(a.status || '') !== 'rejected',
+      provenance: {
+        assertion: 'factual', source: 'applications',
+        recordedAt: a.created_at ? new Date(a.created_at).toISOString() : null,
+        assertedByUserId: a.applicant_user_id ? String(a.applicant_user_id) : null, evidenceUrl: null,
+        basis: 'An application row exists.',
+      },
+    });
+  }
+  if (person.employeeId) {
+    states.push({
+      kind: 'employee',
+      id: person.employeeId,
+      label: 'On the employee register' + (emp?.employee_code ? ' as ' + String(emp.employee_code) : ''),
+      current: emp ? emp.is_active !== false : true,
+      provenance: {
+        assertion: 'factual', source: 'hr_employees', recordedAt: null, assertedByUserId: null, evidenceUrl: null,
+        basis: 'An employee row exists.',
+      },
+    });
+  }
+
   // ---- WHAT WE DID NOT USE ----------------------------------------------------------------------
   // Address matching is how hire-transfer.ts resolves identity at WRITE time, once, with a human
   // present and a refusal path. Doing it on a read would convert an inference into a fact on every
   // page load, so a possible link is recorded and left for a person to confirm.
-  const unconfirmed: UnconfirmedLink[] = [];
-  if (employeeId && !employee?.user_id) {
+  const employeeHasNoAccount = !!person.employeeId && !person.userId;
+  if (employeeHasNoAccount) {
     try {
       const r = rowsOf(await db.execute(sql`
         SELECT u.id
           FROM hr_employees e
           JOIN users u ON lower(u.email) IN (lower(COALESCE(e.email, '')), lower(COALESCE(e.personal_email, '')), lower(COALESCE(e.work_email, '')))
-         WHERE e.id = ${employeeId}::uuid
+         WHERE e.id = ${person.employeeId}::uuid
          LIMIT 3`));
       for (const row of r) {
         unconfirmed.push({
@@ -538,42 +665,46 @@ export async function resolvePerson(input: {
         });
       }
     } catch (e: any) {
-      logFail(MOD, 'resolvePerson:unconfirmed', e);
+      logFail(MOD, 'describePerson:unconfirmed', e);
     }
   }
 
-  const key = employeeId ? 'employee:' + employeeId
-    : userId ? 'user:' + userId
-      : applicationIds.length ? 'application:' + applicationIds[0]
-        : '';
-
-  const missing = edges.filter((e) => e.status === 'absent');
-  const displayName = employee?.full_name ? String(employee.full_name)
+  const displayName = emp?.full_name ? String(emp.full_name)
     : account?.name ? String(account.name)
-      : applications.length ? [applications[0].first_name, applications[0].last_name].filter(Boolean).join(' ') || null
+      : apps.length ? ([apps[0].first_name, apps[0].last_name].filter(Boolean).join(' ') || null)
         : null;
 
-  const sentence = readFailed
-    ? 'One of the records that make up this person could not be read just now, so this is incomplete. That is not a statement that the record does not exist.'
-    : missing.length === 0 && states.length > 0
-      ? 'Every record this person has is linked to every other, so this twin is composed from all of them.'
-      : missing.length
-        ? 'This person is on ' + states.length + ' records and ' + missing.length + ' of the links between them is not on file. '
-          + 'What is missing is named above; nothing was guessed to fill it.'
-        : 'This person is on one record only.';
-
   return {
-    key,
-    userId,
-    employeeId,
-    applicationIds,
+    ...person,
     displayName,
     states,
-    edges,
     unconfirmed,
-    fullyLinked: !readFailed && missing.length === 0,
-    sentence,
     readFailed,
+    described: true,
+    sentence: readFailed
+      ? 'One of the records that make up this person could not be read just now, so this is incomplete. That is not a statement that the record does not exist.'
+      : person.sentence,
+  };
+}
+
+/**
+ * The person root for a viewer who was NOT granted `identity`.
+ *
+ * The ids stay, because the caller passed one in and pretending otherwise would be theatre. Every
+ * DESCRIPTION is absent — and absent is the right word: no query carrying a name, a code or an
+ * application status was issued for this viewer.
+ */
+function undescribedPerson(person: PersonRoot): PersonRoot {
+  return {
+    ...person,
+    displayName: null,
+    states: [],
+    edges: [],
+    unconfirmed: [],
+    described: false,
+    sentence: 'Who this person is — their name, which records are them, and how those records were '
+      + 'connected — was not read for you. It is not hidden on this page; the query that would have '
+      + 'carried it was never issued.',
   };
 }
 
@@ -850,13 +981,92 @@ const dayOf = (v: any): string | null => {
  */
 const EMPLOYEE_COLUMNS_BY_ASPECT: Record<string, readonly string[]> = {
   base: ['id', 'user_id', 'application_id'],
-  identity: ['full_name', 'employee_code', 'work_email'],
+  // is_active is here as well as under employment because describePerson() needs it to say whether
+  // the employee state is the CURRENT one, and describePerson() runs under `identity`.
+  identity: ['full_name', 'employee_code', 'work_email', 'is_active'],
   employment: [
     'designation', 'department_id', 'employment_type', 'work_mode', 'employment_status',
     'onboarding_status', 'joining_date', 'confirmation_date', 'probation_end_date', 'exit_date', 'is_active',
   ],
   trajectory: ['joining_date', 'confirmation_date', 'exit_date', 'exit_type'],
 };
+
+/**
+ * The per-aspect column lists for `applications`.
+ *
+ * ONE SELECT USED TO CARRY ALL OF THEM. It was issued whenever any one of education, experience,
+ * claimed_capabilities, projects or trajectory was granted, so a recruiter granted only `projects`
+ * pulled the applicant's education, their institution and their self-described experience into
+ * memory and the composer then dropped them on the floor. Fetched-then-hidden is the shape this
+ * module's header refuses; the list is now built from the grants, exactly as the employee one is.
+ *
+ * `trajectory` is absent on purpose: it reads application_stage_events and takes no column from
+ * this table at all.
+ */
+const APPLICATION_COLUMNS_BY_ASPECT: Record<string, readonly string[]> = {
+  base: ['id', 'created_at'],
+  education: ['education', 'field_of_study', 'institution'],
+  experience: ['experience_band', 'experience_description'],
+  claimed_capabilities: ['tech_skills'],
+  projects: ['ps_selected', 'ps_solution_link'],
+};
+
+/**
+ * The per-aspect column lists for `hr_employee_profile`.
+ *
+ * THIS USED TO BE getProfile(), AND THAT WAS THE WORST FETCH-THEN-HIDE IN THE FILE. getProfile()
+ * selects date_of_birth, nationality, address, city, photo_url, bank_name, bank_holder,
+ * bank_account_number, bank_ifsc, pan_number, uan_number, pf_number and esic_number off
+ * hr_employees, and this module's comment cheerfully said the bank and tax blocks "are dropped
+ * here". Dropped after being read. A viewer granted nothing but `education` caused a protected
+ * attribute and a bank account number to be selected out of the database — the NEVER_COMPOSED list
+ * two hundred lines above says those are absent for every viewer, and they were not.
+ *
+ * The four list columns this module actually composes live on hr_employee_profile and nowhere near
+ * hr_employees, so they are read directly and hr_employees is not touched for them at all.
+ */
+const PROFILE_COLUMNS_BY_ASPECT: Record<string, readonly string[]> = {
+  base: ['updated_at'],
+  education: ['education'],
+  experience: ['experience'],
+  claimed_capabilities: ['skills'],
+  achievements: ['achievements'],
+};
+
+/** The profile aspects, named once so the read condition and the column build cannot disagree. */
+const PROFILE_ASPECTS: readonly TwinAspect[] = ['education', 'experience', 'claimed_capabilities', 'achievements'];
+
+const MAX_PROFILE_ENTRIES = 40;
+const MAX_ENTRY_TEXT = 2000;
+
+/**
+ * One JSON list column off hr_employee_profile, parsed into entries.
+ *
+ * The same shape profile.ts stores, read without profile.ts's SELECT. `label` is required — a row
+ * with no label is not a half-filled entry, it is noise — and the link goes through the same
+ * normaliser the writer used, so nothing here can render a javascript: URL somebody stored.
+ */
+function profileEntries(v: any): ProfileEntry[] {
+  let list: any = v;
+  if (typeof list === 'string') {
+    try { list = JSON.parse(list); } catch { list = []; }
+  }
+  if (!Array.isArray(list)) return [];
+  const out: ProfileEntry[] = [];
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue;
+    const label = clean((item as any).label, 200);
+    if (!label) continue;
+    out.push({
+      label,
+      detail: clean((item as any).detail, MAX_ENTRY_TEXT) || null,
+      period: clean((item as any).period, 80) || null,
+      url: normaliseLink((item as any).url),
+    });
+    if (out.length >= MAX_PROFILE_ENTRIES) break;
+  }
+  return out;
+}
 
 /**
  * BUILD THE TWIN, PER VIEWER.
@@ -881,17 +1091,9 @@ export async function buildDigitalTwin(
     });
   };
 
-  const twin: DigitalTwin = {
-    person,
-    viewer: { userId: viewer.userId, employeeId: viewer.employeeId, scope: viewer.kind },
-    access,
-    aspects: [],
-    withheld: access.withheld,
-    neverComposed: NEVER_COMPOSED,
-    unreadable,
-  };
-
   // ---- ONE EMPLOYEE READ, WITH THE COLUMNS THE GRANTS ALLOW --------------------------------------
+  // This runs BEFORE the twin object is built, because describePerson() reads it and describePerson()
+  // decides what `twin.person` is allowed to say.
   let emp: any = null;
   if (person.employeeId && (has('identity') || has('employment') || has('trajectory'))) {
     const wanted = new Set<string>(EMPLOYEE_COLUMNS_BY_ASPECT.base);
@@ -912,12 +1114,25 @@ export async function buildDigitalTwin(
     }
   }
 
+  // ---- WHO THIS IS, READ ONLY NOW, AND ONLY IF THE GRANT SAYS SO ---------------------------------
+  const described = has('identity') ? await describePerson(person, emp) : undescribedPerson(person);
+
+  const twin: DigitalTwin = {
+    person: described,
+    viewer: { userId: viewer.userId, employeeId: viewer.employeeId, scope: viewer.kind },
+    access,
+    aspects: [],
+    withheld: access.withheld,
+    neverComposed: NEVER_COMPOSED,
+    unreadable,
+  };
+
   // ---- IDENTITY ----------------------------------------------------------------------------------
   if (has('identity')) {
     twin.aspects.push('identity');
     twin.identity = {
-      name: person.displayName
-        ? asserted(person.displayName, 'provided', emp ? 'hr_employees.full_name' : 'applications / users',
+      name: described.displayName
+        ? asserted(described.displayName, 'provided', emp ? 'hr_employees.full_name' : 'applications / users',
           'A name somebody entered on the record. Nothing verifies it.')
         : null,
       employeeCode: emp?.employee_code
@@ -1403,7 +1618,11 @@ export async function buildDigitalTwin(
         dueAt: i.dueAt ?? null,
         complete: i.complete === true,
         provenance: {
-          assertion: i.complete === true ? 'verified' : 'factual',
+          // 'factual' EITHER WAY. A completion is this platform recording something that happened
+          // here — nobody checked it against anything, and 'verified' in this vocabulary is the
+          // word for a check. The two rows differ in their BASIS, which is where the difference
+          // actually lives, not in a stronger word for the same machine act.
+          assertion: 'factual',
           source: 'performance-learning + learning-progress (the single definition of completion)',
           basis: i.complete === true
             ? 'Completion as learning-progress.ts defines it: lessons recorded against the learner account that owns them.'
@@ -1428,7 +1647,11 @@ export async function buildDigitalTwin(
         courseTitle: c.course_title ? String(c.course_title) : null,
         issuedAt: c.issued_at ? new Date(c.issued_at).toISOString() : null,
         provenance: {
-          assertion: 'verified',
+          // A certificate THIS PLATFORM ISSUED is our own record of our own act, however strongly
+          // it is signed. A signature proves the row was not altered; it does not mean anybody
+          // outside checked what it says. src/lib/evidence-graph.ts makes the same call in the same
+          // words: a platform certificate supports 'demonstrated', never 'externally_verified'.
+          assertion: 'factual',
           source: 'certificates (course_certificates, hash-chained and signed)',
           basis: 'A signed entry in the certificate ledger, checkable by anybody at the verification link. '
             + 'It records what was completed on this platform. EduRankAI is the technology platform; accredited partners award credentials.',
@@ -1508,9 +1731,16 @@ export async function buildDigitalTwin(
 // vocabulary is created anywhere in this file.
 // -------------------------------------------------------------------------------------------------
 
+/**
+ * 'factual', NOT 'verified'. A course-sourced or assessment-sourced row was confirmed by this
+ * platform reading its own table at write time. No named human checked anything, gave a reason or
+ * can be asked why in six months, and 'verified' is the word this system reserves for exactly that
+ * act — see src/lib/provenance.ts, which will not produce one without an actor, a reason and a
+ * method. src/lib/person-assertions.ts maps the same column the same way.
+ */
 export function skillAssertionOf(storedSource: string): AssertionType {
   const s = String(storedSource || 'self');
-  if (s === 'course' || s === 'assessment') return 'verified';
+  if (s === 'course' || s === 'assessment') return 'factual';
   return 'provided';
 }
 

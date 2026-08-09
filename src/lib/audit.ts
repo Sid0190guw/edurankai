@@ -47,7 +47,13 @@ export async function logAudit(args: {
   ipAddress?: string;
 }) {
   try {
-    await db.insert(auditLog).values({
+    // Through the SAME lazy resolver ensureAuditIndexes() uses. The lazy-db pass converted the
+    // statements above it and left this one referring to a bare `db` that this module no longer
+    // imports, so the file did not compile — and every surface that writes an audit entry went down
+    // with it. Resolved here rather than by re-adding a module-scope import, because that import is
+    // precisely what the lazy resolver exists to avoid.
+    const dbi = await database();
+    await dbi.insert(auditLog).values({
       userId: args.userId,
       action: args.action,
       entity: args.entity,

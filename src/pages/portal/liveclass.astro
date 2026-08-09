@@ -4,6 +4,11 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { can } from '@/lib/auth/permissions';
 import { ensureOnce } from '@/lib/ensure-once';
+// THIS BOARD LISTS EVERY CLASS IN THE DATABASE, and course sessions now live in the same table.
+// Without the filter below, a paid course's timetable — and, on the Live tab, the address of its
+// classroom — would be printed to everyone signed in. entitledCourseIds() answers, in one query, which
+// courses this reader is actually entitled to, using the same rule the join endpoint enforces.
+import { entitledCourseIds } from '@/lib/course-sessions';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
@@ -239,6 +244,43 @@ try {
   classesError = String(e?.cause?.message || e?.message || 'unknown database error');
   console.error('[portal/liveclass] past read failed -', classesError);
 }
+
+// COURSE SESSIONS ARE FILTERED TO THE READER, AND THE FILTER FAILS CLOSED.
+//
+// A row with a course_id belongs to a course; a row without one is a general class, exactly as this
+// board has always shown. If the entitlement read throws we drop EVERY course-bound row rather than
+// show them: an outage must not open a paid classroom. The tab says what happened, because a list
+// silently missing the class somebody is enrolled on is its own kind of lie.
+let allowedCourses = new Set<string>();
+let courseFilterOk = true;
+try {
+  allowedCourses = await entitledCourseIds(user);
+} catch (e: any) {
+  courseFilterOk = false;
+  console.error('[portal/liveclass] entitlement read failed -', e?.cause?.message || e?.message);
+}
+const visible = (c: any): boolean => {
+  if (!c?.course_id) return true;
+  return courseFilterOk && allowedCourses.has(String(c.course_id));
+};
+const hiddenCount =
+  upcoming.filter((c: any) => !visible(c)).length +
+  liveNow.filter((c: any) => !visible(c)).length +
+  past.filter((c: any) => !visible(c)).length;
+upcoming = upcoming.filter(visible);
+liveNow = liveNow.filter(visible);
+past = past.filter(visible);
+
+/**
+ * Where the Join button points.
+ *
+ * A COURSE SESSION NEVER PUTS ITS ADDRESS IN THIS PAGE. It points at the join endpoint, which
+ * re-resolves entitlement on that request and redirects — so the address is not in the HTML even for
+ * somebody who is entitled to it, and a link copied out of the page cannot outlive the enrolment.
+ * A general class keeps the behaviour it had.
+ */
+const joinHref = (c: any): string =>
+  c?.course_id ? '/api/portal/course-sessions/' + c.id + '/join' : String(c?.meet_url || '');
 
 function timeUntil(d: any): string {
   if (!d) return '';

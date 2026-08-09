@@ -507,6 +507,36 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     group: 'People',
     description: 'Choose, per course, whether completion means the lessons were viewed, an assessment was passed, or a mark reached a threshold. It changes nobody\'s record on its own — it changes how the next recomputation reads the evidence.',
   },
+  'courses.pricing.manage': {
+    label: 'Price a course',
+    group: 'Finance',
+    description: 'Set what a course costs and choose its fee model: free to everyone, free to employees and paid for the public, paid for everyone, or closed to employees and not for sale. A price is a field on a course, never a claim about the platform. Whoever holds this decides what a learner is charged, so a mistyped figure here is money taken from somebody.',
+    sensitive: true,
+  },
+  'learning.waiver.grant': {
+    label: 'Grant or decline a course fee waiver',
+    group: 'Finance',
+    description: 'Decide a learner\'s request to have a course fee waived: grant it in full, grant a percentage and leave the balance payable through the ordinary checkout, or decline it with a reason the requester reads. Every decision records who decided, when and why. Nobody may decide their own request, whatever they hold.',
+    sensitive: true,
+  },
+  'scholarships.manage': {
+    label: 'Define a scholarship',
+    group: 'Finance',
+    description: 'Create a scholarship programme and set what it is worth, how many places it has, how much money it may spend in total, when it opens and closes, and who is eligible. It gives nothing to anybody on its own — awarding is a separate permission. A programme with neither a budget nor a number of places cannot be created without deliberately recording that it is unlimited.',
+    sensitive: true,
+  },
+  'scholarships.award': {
+    label: 'Award a scholarship',
+    group: 'Finance',
+    description: 'Award a scholarship to a named learner, and withdraw an award with a reason. Every award spends a finite budget, is refused outright when it would exceed that budget or the number of places, and is recorded against the name of whoever made it — if that record cannot be written, the award is undone. Nobody may award one to themselves.',
+    sensitive: true,
+  },
+  'learning.enrolment.manage': {
+    label: 'Pause, cancel or reinstate an enrolment',
+    group: 'People',
+    description: 'Move somebody\'s place on a course between its states — pause it, cancel it, reinstate it, or extend and shorten the window their access runs for. None of it deletes anything: a paused or expired enrolment keeps every lesson completion, the progress figure and any certificate already issued, and the person is told which of those they still hold. Every change is written down with a reason, and so is every change that was refused as impossible.',
+    sensitive: true,
+  },
   'settings.view': { label: 'View settings', group: 'System', description: 'See platform configuration.' },
   'settings.edit': {
     label: 'Edit settings',

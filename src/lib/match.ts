@@ -338,13 +338,37 @@ export async function verifyMatchSchema(): Promise<SchemaReport> {
  * skill-graph.addRelation(), behind `skills.administer`, and there is deliberately no second door
  * to it in this file.
  */
+export interface EdgeRead {
+  edges: SkillEdge[];
+  /**
+   * null when the graph was READ. A sentence when the read FAILED.
+   *
+   * THIS FIELD EXISTS BECAUSE THE OLD SHAPE TOLD A LIE. relationsInto() caught its error and returned
+   * an empty array, and an empty array is what a person with no related skill also produces. Downstream
+   * that became the gap sentence "no related skill the graph connects to it in a direction that counts"
+   * — a confident negative about a named person, manufactured out of a failed query, printed on a screen
+   * where somebody is deciding whether to call them to interview. A failure and an absence are not the
+   * same finding and must not arrive in the same shape.
+   */
+  unreadable: string | null;
+}
+
+/** The tolerant read, for a screen that is only drawing the graph. A failure reads as no edges. */
 export async function relationsInto(
   requirementSkillIds: readonly string[],
   heldSkillIds: readonly string[],
 ): Promise<SkillEdge[]> {
+  return (await relationsIntoRead(requirementSkillIds, heldSkillIds)).edges;
+}
+
+/** The honest read. Anything that COMPARES A PERSON uses this one and carries `unreadable` through. */
+export async function relationsIntoRead(
+  requirementSkillIds: readonly string[],
+  heldSkillIds: readonly string[],
+): Promise<EdgeRead> {
   const reqs = Array.from(new Set(requirementSkillIds.filter(isUuid)));
   const held = Array.from(new Set(heldSkillIds.filter(isUuid)));
-  if (!reqs.length || !held.length) return []; // never emit IN ()
+  if (!reqs.length || !held.length) return { edges: [], unreadable: null }; // never emit IN ()
   const reqList = sql.join(reqs.map((i) => sql`${i}::uuid`), sql`, `);
   const heldList = sql.join(held.map((i) => sql`${i}::uuid`), sql`, `);
   try {
@@ -388,10 +412,16 @@ export async function relationsInto(
         supportsRequirement: pointsAtRequirement || relation === 'equivalent',
       });
     }
-    return out;
+    return { edges: out, unreadable: null };
   } catch (e: any) {
-    logFail(MOD, 'relationsInto', e);
-    return [];
+    // NOT AN EMPTY LIST. See EdgeRead.unreadable above: silence here reads as "nothing related exists".
+    logFail(MOD, 'relationsIntoRead', e);
+    return {
+      edges: [],
+      unreadable: 'The curated relations between skills could not be read just now ('
+        + (e?.cause?.message || e?.message || 'unknown') + '), so no requirement below could be checked '
+        + 'for a related skill. Nothing here says a person holds no related skill; it says we could not look.',
+    };
   }
 }
 
@@ -763,6 +793,11 @@ export function rateRequirement(
   claimed: readonly ClaimedCapability[],
   edges: readonly SkillEdge[],
   skillsVisible: boolean,
+  /**
+   * EdgeRead.unreadable, carried down. Optional so every existing caller is unchanged, and null on
+   * the ordinary path. When it is set the gap branch below refuses to call anything a gap.
+   */
+  graphUnreadable: string | null = null,
 ): RequirementResult {
   const base = {
     requirementId: req.id,
@@ -791,7 +826,10 @@ export function rateRequirement(
       recordedAt: direct.provenance.recordedAt,
       url: direct.provenance.evidenceUrl,
     }];
-    const checked = direct.provenance.assertion === 'verified';
+    // 'factual' is what skillAssertionOf() returns for a course or assessment attachment: this
+    // platform's own record of its own act. It is NOT 'verified' — no human checked it — and this
+    // comparison follows that word rather than reintroducing the stronger one.
+    const checked = direct.provenance.assertion === 'factual';
     const byOther = direct.storedSource === 'manager';
     const meets = direct.level >= req.minLevel;
 
@@ -837,7 +875,7 @@ export function rateRequirement(
       if (edge.relation !== rel || !edge.supportsRequirement) continue;
       const via = held.find((h) => h.skillId === edge.heldSkillId);
       if (!via) continue;
-      const viaChecked = via.provenance.assertion === 'verified' || via.storedSource === 'manager';
+      const viaChecked = via.provenance.assertion === 'factual' || via.storedSource === 'manager';
       const phrase = via.skillName + ' ' + RELATION_PHRASE[rel] + ' ' + req.skillName;
       const evidence: EvidenceRef[] = [{
         what: via.skillName + ' at ' + via.levelLabel + ', where ' + phrase,

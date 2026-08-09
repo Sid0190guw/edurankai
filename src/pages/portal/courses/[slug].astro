@@ -13,12 +13,31 @@ import { sql } from 'drizzle-orm';
 //
 // Both players now go through src/lib/learning-progress.ts. Existing training_progress rows are
 // still counted — nothing was dropped and nobody's finished work disappears.
+// A LESSON'S VIDEO LINK IS RESOLVED, NEVER TRUSTED.
+//
+// This page used to put the stored string straight into three places: an iframe src (type
+// 'simulation'), a <video src> (anything it did not recognise) and an href (type 'link'). Astro
+// escapes an attribute for HTML but says nothing about the SCHEME, so a stored `javascript:` or
+// `data:text/html` survived all three - script execution in the session of every signed-in employee
+// and paying learner who opened the lesson - and an arbitrary https origin was framed with
+// allowfullscreen inside the portal.
+//
+// src/lib/video-embed.ts now parses the address, requires https, matches it against an allowlist of
+// known shapes and BUILDS the player address itself from an id whose character set it constrains.
+// The iframe below is fed only that constructed string, under a sandbox that withholds top-level
+// navigation and popups, and a referrer policy that never hands a third party the lesson URL.
+import { lessonVideo } from '@/lib/lesson-video';
 import {
   completedLessonIds as countedLessonIds,
   completionEvidence,
   ensureEnrolment,
   recordLessonComplete,
 } from '@/lib/learning-progress';
+// LIVE SESSIONS. Reads only; the module hands out no addresses (see the block above the panel).
+import {
+  listCourseSessions, courseEntitlement, sessionState, stateLabel, formatInZone,
+  countdownLabel, JOIN_OPENS_MINUTES, MEETING_LINK_LABEL,
+} from '@/lib/course-sessions';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
@@ -56,29 +75,56 @@ try {
 
 if (!course) return Astro.redirect('/portal/courses');
 
-const isEmployee = user.role !== 'applicant';
-const accessOk = course.access_type === 'public' || course.access_type === 'both' ||
-  (course.access_type === 'employees' && isEmployee) ||
-  (course.access_type === 'applicants' && !isEmployee);
-if (!accessOk) return Astro.redirect('/portal/courses');
+// =================================================================================================
+// WHO MAY OPEN THIS, AND WHETHER THEY HAVE PAID FOR IT
+// =================================================================================================
+//
+// The audience test was four lines of access_type comparison copied into five files, and it was
+// followed by an UNCONDITIONAL auto-enrolment: opening this page enrolled the reader, whatever the
+// course cost and whether or not they had paid a paisa. That made the paid path unsellable and
+// ungated at the same time - the checkout existed, and navigating straight to this address walked
+// round it.
+//
+// Both questions are now asked of ONE function. payableForCourse() resolves the audience through
+// access_type (unchanged - it is still the answer to WHO MAY ENROL), the price through the course's
+// own pricing columns, and any granted fee waiver - full or partial - against this person.
+const payable = await payableForCourse({ id: String(user.id), role: user.role }, String(course.id));
+if (!payable || !payable.allowed) return Astro.redirect('/portal/courses');
 
-// AUTO-ENROLMENT, THROUGH THE ONE ENROLMENT WRITER.
-//
-// Opening a course enrols the reader. That was a SELECT, then a comparison in JavaScript, then an
-// unconditional INSERT and an unconditional `enrolled_count + 1`: two loads arriving together — a
-// double tap on a phone, a prefetch — both read "no enrolment", both inserted, and the counter was
-// bumped twice. The test and the write are now ONE statement inside ensureEnrolment(), which is the
-// same call HR's assignCourse() makes, so an employee ASKED to do a course and an employee who just
-// opened it end up in exactly one place.
-//
-// HONEST LIMIT, unchanged: training_enrollments still has no unique key on (course_id, user_id), so
-// this narrows the window rather than closing it. Adding that constraint is a migration for the
-// founder to run against live data (it fails if duplicates already exist), so it is not
-// bootstrapped from a page load. NOT VERIFIED at runtime.
+// ALREADY ENROLLED IS A FACT, READ ONCE, ABOVE THE BRANCH THAT USES IT.
+// A read that FAILED is not "not enrolled": on a paid course the reader goes to the enrolment page,
+// which re-checks ownership on its own request and refuses to charge anybody twice.
+let alreadyEnrolled = false;
+let enrolmentReadOk = false;
 try {
-  const enrol = await ensureEnrolment(String(user.id), String(course.id));
-  if (!enrol.ok) logFail('enrollment', new Error(enrol.error || 'enrolment did not complete'));
-} catch(e) { logFail('enrollment', e); }
+  const er = await db.execute(sql`SELECT 1 AS ok FROM training_enrollments WHERE course_id = ${course.id} AND user_id = ${user.id} LIMIT 1`);
+  alreadyEnrolled = (Array.isArray(er) ? er : (er?.rows || [])).length > 0;
+  enrolmentReadOk = true;
+} catch(e) { logFail('enrolment lookup', e); }
+
+if (!alreadyEnrolled) {
+  if (payable.free) {
+    // NOTHING TO PAY - a free course, a course that is part of working here, or a waiver that covers
+    // the whole fee. Auto-enrolment is correct HERE AND ONLY HERE, and it goes through the one
+    // enrolment writer, which is the same call HR's assignCourse() makes.
+    //
+    // HONEST LIMIT, unchanged: training_enrollments still has no unique key on (course_id, user_id),
+    // so ensureEnrolment() narrows the window rather than closing it. Adding that constraint is a
+    // migration for the founder to run against live data (it fails if duplicates already exist), so
+    // it is not bootstrapped from a page load. NOT VERIFIED at runtime.
+    try {
+      const enrol = await ensureEnrolment(String(user.id), String(course.id));
+      if (!enrol.ok) logFail('enrollment', new Error(enrol.error || 'enrolment did not complete'));
+    } catch(e) { logFail('enrollment', e); }
+  } else {
+    // A BALANCE IS OWED, so the course does not open and nobody is enrolled. The enrolment page
+    // carries the price, any granted waiver, the checkout, and the form for asking that the fee be
+    // waived. Enrolment follows a verified payment and nothing else.
+    return Astro.redirect('/portal/courses/' + slug + '/enrol');
+  }
+} else if (!enrolmentReadOk && !payable.free) {
+  return Astro.redirect('/portal/courses/' + slug + '/enrol');
+}
 
 try {
   const r = await db.execute(sql`SELECT * FROM training_modules WHERE course_id = ${course.id} ORDER BY sort_order`);
@@ -136,6 +182,9 @@ if (Astro.request.method === 'POST') {
 const urlP = new URL(Astro.request.url).searchParams;
 const activeLessonId = urlP.get('lesson') || lessons[0]?.id || '';
 const justDone = urlP.get('done') === '1';
+// THE SESSION MESSAGE COMES BACK FROM THE JOIN ENDPOINT, which redirects here when it refuses so the
+// learner reads a sentence instead of a bare 403 page. It is printed as text and never as markup.
+const sessionMsg = (urlP.get('sessionmsg') || '').slice(0, 300);
 // One code, from this page's own redirect, never anything variable off the request.
 const saveFailed = urlP.get('err') === 'save';
 const activeLesson = (lessons as any[]).find((l: any) => l.id === activeLessonId) || lessons[0] || null;
@@ -151,16 +200,35 @@ const prevLesson = currentIdx > 0 ? lessons[currentIdx-1] : null;
 const nextLesson = currentIdx < lessons.length-1 ? lessons[currentIdx+1] : null;
 const activeLessonDone = activeLesson ? completedLessonIds.includes(activeLesson.id) : false;
 
-function getYoutubeId(url: string) {
-  if (!url) return null;
-  const m = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/);
-  return m ? m[1] : null;
-}
-function getVimeoId(url: string) {
-  if (!url) return null;
-  const m = url.match(/vimeo\.com\/(\d+)/);
-  return m ? m[1] : null;
-}
+// Resolved ONCE for the lesson on screen, above every reader below - `const` is not hoisted.
+// The pasted address is re-resolved on each render rather than trusted from a column, so a change
+// to how we build a player address reaches every lesson ever saved without asking an author to
+// re-enter anything.
+const activeVideo = lessonVideo(activeLesson);
+const videoFramed  = !!activeVideo && activeVideo.ok && (activeVideo.kind === 'embed' || activeVideo.kind === 'internal');
+const videoFile    = !!activeVideo && activeVideo.ok && activeVideo.kind === 'file';
+const videoLinkOut = !!activeVideo && activeVideo.ok && activeVideo.kind === 'link';
+// A link that no longer matches a known shape is a sentence, not an empty black rectangle.
+const videoProblem = activeVideo && !activeVideo.ok
+  ? 'This lesson has a video link we are not able to play here. Nothing is missing from your side - please tell whoever runs the course.'
+  : '';
+
+// LIVE SESSIONS ON THIS COURSE.
+//
+// listCourseSessions() returns NO url — not the meeting address, not the board id, not the recording.
+// The Join control below points at /api/portal/course-sessions/<id>/join, which resolves entitlement
+// against the database on that request and then redirects. So the address is never in this HTML, and
+// it cannot be read out of the page by anything, whatever the reader's entitlement.
+//
+// Entitlement is ALSO resolved here, but only to decide what to SHOW. The two are not redundant: this
+// one keeps a learner from being offered a button that will refuse them, and the endpoint's one is
+// the actual lock. If they ever disagree, the endpoint wins and nothing leaks.
+const sessionList = await listCourseSessions(String(course.id));
+const sessionEntitlement = await courseEntitlement(user, String(course.id));
+const sessionNow = Date.now();
+const sessionsSorted = sessionList.sessions.slice().sort((a, b) => Date.parse(a.startIso) - Date.parse(b.startIso));
+const upcomingSessions = sessionsSorted.filter((s) => sessionState({ startIso: s.startIso, durationMinutes: s.durationMinutes, status: s.status }, sessionNow) !== 'ended');
+const pastSessions = sessionsSorted.filter((s) => sessionState({ startIso: s.startIso, durationMinutes: s.durationMinutes, status: s.status }, sessionNow) === 'ended').reverse();
 
 // Virtual lab configs by category
 // Our OWN virtual labs (no third-party embeds) keyed by course category, plus a
@@ -350,36 +418,117 @@ const typeColors: Record<string,string> = {video:'#ef4444',text:'#60a5fa',quiz:'
           </div>
         </div>
       ))}
-      <div class="lab-card" style="margin-bottom:8px;" onclick="openLab('https://www.desmos.com/calculator','Desmos Calculator')">
+      {/* TWO OUTSIDE COMPANIES USED TO BE FRAMED HERE, AND NAMED ON THE PAGE.
+          These two cards passed third-party addresses into openLab(), which sets labFrame.src - an
+          arbitrary outside origin inside the authenticated portal - and printed both company names
+          in learner-facing copy. Both now point at labs this platform owns, which are the same labs
+          every other card on this panel opens. */}
+      <div class="lab-card" style="margin-bottom:8px;" onclick="openLab('/aquintutor/labs/plot','Graphing &amp; Plotting')">
         <div style="display:flex;align-items:center;gap:8px;">
           <div style="width:32px;height:32px;background:rgba(96,165,250,0.15);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#60a5fa;flex-shrink:0;">Calc</div>
-          <div><p style="font-size:12px;font-weight:600;color:#1A1612;margin:0;">Desmos Calculator</p><p style="font-size:10px;color:#8B8175;margin:0;">Graphing & scientific</p></div>
+          <div><p style="font-size:12px;font-weight:600;color:#1A1612;margin:0;">Graphing &amp; Plotting</p><p style="font-size:10px;color:#8B8175;margin:0;">Plot and explore functions</p></div>
         </div>
       </div>
-      <div class="lab-card" onclick="openLab('https://replit.com/@replit/Python?lite=1','Code Sandbox')">
+      <div class="lab-card" onclick="openLab('/aquintutor/labs/dsa-bench','Code &amp; Data Structures')">
         <div style="display:flex;align-items:center;gap:8px;">
           <div style="width:32px;height:32px;background:rgba(167,139,250,0.15);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#a78bfa;flex-shrink:0;">Code</div>
-          <div><p style="font-size:12px;font-weight:600;color:#1A1612;margin:0;">Code Sandbox</p><p style="font-size:10px;color:#8B8175;margin:0;">Python / JS playground</p></div>
+          <div><p style="font-size:12px;font-weight:600;color:#1A1612;margin:0;">Code &amp; Data Structures</p><p style="font-size:10px;color:#8B8175;margin:0;">Step through algorithms</p></div>
         </div>
       </div>
     </div>
 
-    <!-- Live panel -->
+    {/* LIVE SESSIONS.
+        What used to be here: two buttons that built a room name in the browser
+        (`edurankai-<slug>-<today>`) and opened it on a third-party public meeting host. Anyone who
+        knew a course slug was in that room — no enrolment, no payment, no host, no record that it had
+        happened — and the copy named the tool. Both buttons and both helpers are gone. The schedule
+        below is the replacement: real sessions, with a link resolved server-side per request.
+
+        No address appears anywhere in this markup. Each Join control points at the join endpoint. */}
     <div id="panel-live" style="display:none;padding:12px;">
-      <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#8B8175;margin:0 0 10px;">Live Classes</p>
-      <div style="background:#FBF8F1;border:1px solid rgba(16,185,129,0.2);border-radius:10px;padding:14px;margin-bottom:8px;">
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-          <div class="live-badge">LIVE</div>
-          <p style="font-size:12px;font-weight:600;color:#1A1612;margin:0;">Join Live Class</p>
+      <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#8B8175;margin:0 0 10px;">Live sessions</p>
+
+      {sessionMsg && (
+        <p style="background:#FBF8F1;border:1px solid rgba(185,28,28,0.3);border-left:3px solid #B91C1C;border-radius:8px;padding:10px 12px;font-size:12px;color:#1A1612;margin:0 0 10px;line-height:1.5;">{sessionMsg}</p>
+      )}
+
+      {!sessionList.ok ? (
+        <p style="background:#FBF8F1;border:1px dashed rgba(185,28,28,0.35);border-radius:10px;padding:14px;font-size:12px;color:#5C544A;margin:0;line-height:1.55;">
+          The session schedule could not be read just now. That is not the same as this course having
+          no sessions - reload in a moment.
+        </p>
+      ) : sessionsSorted.length === 0 ? (
+        <p style="background:#FBF8F1;border:1px dashed var(--ac-border);border-radius:10px;padding:16px;font-size:12px;color:#5C544A;margin:0;line-height:1.55;">
+          This course has no live sessions. Everything in it is yours to work through whenever you
+          like - nothing is missing from this panel.
+        </p>
+      ) : (
+        <div>
+          {upcomingSessions.map((s) => {
+            const st = sessionState({ startIso: s.startIso, durationMinutes: s.durationMinutes, status: s.status }, sessionNow);
+            const joinable = st === 'open' || st === 'live';
+            return (
+              <div style="background:#FBF8F1;border:1px solid var(--ac-border);border-radius:10px;padding:14px;margin-bottom:8px;">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">
+                  {st === 'live' && <div class="live-badge">LIVE</div>}
+                  <span style="font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#8B8175;">{stateLabel(st)}</span>
+                </div>
+                <p style="font-size:13px;font-weight:600;color:#1A1612;margin:0 0 4px;line-height:1.35;">{s.title}</p>
+                <p style="font-size:11px;color:#5C544A;margin:0 0 2px;">{formatInZone(s.startIso, s.timeZone)}</p>
+                <p class="cs-when-line" style="font-size:11px;color:#8B8175;margin:0 0 8px;" data-session-start={s.startIso}>
+                  <span class="cs-count">{countdownLabel(s.startIso, sessionNow)}</span>
+                </p>
+                <p style="font-size:11px;color:#8B8175;margin:0 0 10px;">
+                  {s.durationMinutes} min &middot; {s.mode === 'in_house' ? 'on the live board here' : 'on a ' + MEETING_LINK_LABEL}
+                  {s.isRecorded ? ' - recorded' : ''}
+                </p>
+
+                {!sessionEntitlement.ok ? (
+                  <p style="font-size:11px;color:#8B8175;margin:0;line-height:1.5;">{sessionEntitlement.reason}</p>
+                ) : !s.hasLink ? (
+                  <p style="font-size:11px;color:#8B8175;margin:0;line-height:1.5;">No joining details have been set for this session yet.</p>
+                ) : joinable ? (
+                  <a
+                    href={'/api/portal/course-sessions/' + s.id + '/join?back=' + encodeURIComponent(String(course.slug || ''))}
+                    rel="noopener"
+                    style="display:flex;align-items:center;justify-content:center;min-height:44px;width:100%;background:#10b981;color:#1A1612;font-size:13px;font-weight:600;padding:10px;border-radius:8px;text-decoration:none;"
+                  >Join the session</a>
+                ) : (
+                  <p style="font-size:11px;color:#8B8175;margin:0;line-height:1.5;">
+                    The joining details open {JOIN_OPENS_MINUTES} minutes before the start, on this page.
+                  </p>
+                )}
+              </div>
+            );
+          })}
+
+          {pastSessions.length > 0 && (
+            <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#8B8175;margin:14px 0 8px;">Finished</p>
+          )}
+          {pastSessions.map((s) => (
+            <div style="background:#FBF8F1;border:1px solid var(--ac-border);border-radius:10px;padding:14px;margin-bottom:8px;">
+              <p style="font-size:13px;font-weight:600;color:#1A1612;margin:0 0 4px;line-height:1.35;">{s.title}</p>
+              <p style="font-size:11px;color:#8B8175;margin:0 0 8px;">{formatInZone(s.startIso, s.timeZone)}</p>
+              {!sessionEntitlement.ok ? (
+                <p style="font-size:11px;color:#8B8175;margin:0;">{sessionEntitlement.reason}</p>
+              ) : s.recording ? (
+                <a
+                  href={'/api/portal/course-sessions/' + s.id + '/join?what=recording'}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style="display:flex;align-items:center;justify-content:center;min-height:44px;width:100%;background:#EFE9DC;border:1px solid var(--ac-border);color:#1A1612;font-size:13px;font-weight:600;padding:10px;border-radius:8px;text-decoration:none;"
+                >Watch the recording</a>
+              ) : (
+                <p style="font-size:11px;color:#8B8175;margin:0;line-height:1.5;">
+                  {s.isRecorded
+                    ? 'This session was recorded. The recording appears here once it has been added.'
+                    : 'This session was not recorded.'}
+                </p>
+              )}
+            </div>
+          ))}
         </div>
-        <p style="font-size:11px;color:#8B8175;margin:0 0 10px;">Join the video call with your instructor and classmates.</p>
-        <button onclick={`openLiveClass('${course.slug}')`} style="width:100%;background:#10b981;border:none;color:#1A1612;font-size:13px;font-weight:600;padding:10px;border-radius:8px;cursor:pointer;">Join Class Room</button>
-      </div>
-      <div style="background:#FBF8F1;border:1px solid var(--ac-border);border-radius:10px;padding:14px;">
-        <p style="font-size:12px;font-weight:600;color:#1A1612;margin:0 0-6px;">Start Your Own Room</p>
-        <p style="font-size:11px;color:#8B8175;margin:4px 0 10px;">Create a study group or practice session.</p>
-        <button onclick="openStudyRoom()" style="width:100%;background:#EFE9DC;border:1px solid var(--ac-border);color:#5C544A;font-size:13px;font-weight:600;padding:10px;border-radius:8px;cursor:pointer;">Create Study Room</button>
-      </div>
+      )}
     </div>
   </aside>
 
@@ -401,16 +550,43 @@ const typeColors: Record<string,string> = {video:'#ef4444',text:'#60a5fa',quiz:'
     )}
     {activeLesson && (
       <div>
-        {/* Video player at top for video lessons */}
-        {activeLesson.type === 'video' && activeLesson.video_url && (
+        {/* THE PLAYER. Only `activeVideo.embedUrl` - a string this codebase built - reaches a src. */}
+        {activeLesson.type === 'video' && videoFramed && (
           <div class="vid-wrap">
-            {getYoutubeId(activeLesson.video_url) ? (
-              <iframe src={`https://www.youtube.com/embed/${getYoutubeId(activeLesson.video_url)}?rel=0&modestbranding=1`} allowfullscreen allow="accelerometer;autoplay;clipboard-write;encrypted-media;gyroscope;picture-in-picture"></iframe>
-            ) : getVimeoId(activeLesson.video_url) ? (
-              <iframe src={`https://player.vimeo.com/video/${getVimeoId(activeLesson.video_url)}`} allowfullscreen></iframe>
-            ) : (
-              <video controls src={activeLesson.video_url} style="width:100%;height:100%;background:#000;"></video>
-            )}
+            <iframe
+              src={(activeVideo as any).embedUrl}
+              title={activeLesson.title + ' - lesson video'}
+              loading="lazy"
+              sandbox={(activeVideo as any).sandbox}
+              allow={(activeVideo as any).allow}
+              referrerpolicy={(activeVideo as any).referrerPolicy}
+              allowfullscreen></iframe>
+          </div>
+        )}
+        {activeLesson.type === 'video' && videoFile && (
+          <div class="vid-wrap">
+            <video controls preload="metadata" src={(activeVideo as any).embedUrl} style="width:100%;height:100%;background:#000;"></video>
+          </div>
+        )}
+        {/* An honest button, not a broken frame, for anything meant to open elsewhere. */}
+        {activeLesson.type === 'video' && videoLinkOut && (
+          <div style="margin:14px 16px 0;background:#FBF8F1;border:1px solid var(--ac-border);border-radius:12px;padding:16px;">
+            <p style="font-size:13px;color:#5C544A;margin:0 0 10px;line-height:1.6;">This lesson's video is hosted somewhere we cannot play inside the page. The button opens it in a new tab.</p>
+            <a href={(activeVideo as any).embedUrl} target="_blank" rel="noopener noreferrer" style="display:inline-flex;align-items:center;gap:8px;min-height:44px;background:#B8512E;color:#1A1612;text-decoration:none;font-size:13px;font-weight:600;padding:11px 20px;border-radius:8px;">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+              Open the video in a new tab
+            </a>
+          </div>
+        )}
+        {/* Words, in both directions: a link we will not play, and a video lesson with no link at all. */}
+        {activeLesson.type === 'video' && videoProblem && (
+          <div style="margin:14px 16px 0;background:rgba(250,204,21,0.14);border:1px solid rgba(250,204,21,0.35);border-radius:10px;padding:12px 14px;">
+            <p style="font-size:13px;color:#92400e;margin:0;line-height:1.6;">{videoProblem}</p>
+          </div>
+        )}
+        {activeLesson.type === 'video' && !activeVideo && (
+          <div style="margin:14px 16px 0;background:#FBF8F1;border:1px solid var(--ac-border);border-radius:10px;padding:12px 14px;">
+            <p style="font-size:13px;color:#5C544A;margin:0;line-height:1.6;">No video has been added to this lesson yet. The notes below are the lesson for now.</p>
           </div>
         )}
 
@@ -421,10 +597,24 @@ const typeColors: Record<string,string> = {video:'#ef4444',text:'#60a5fa',quiz:'
           </div>
         )}
 
-        {/* Simulation/Lab */}
-        {activeLesson.type === 'simulation' && activeLesson.video_url && (
+        {/* Simulation / lab. Same resolver, same rule: an allowlisted shape or a sentence. This is
+            the frame that used to take the stored string verbatim from any origin. */}
+        {activeLesson.type === 'simulation' && videoFramed && (
           <div class="vid-wrap" style="aspect-ratio:16/9;">
-            <iframe src={activeLesson.video_url} style="width:100%;height:100%;border:none;" allowfullscreen></iframe>
+            <iframe
+              src={(activeVideo as any).embedUrl}
+              title={activeLesson.title + ' - simulation'}
+              loading="lazy"
+              sandbox={(activeVideo as any).sandbox}
+              allow={(activeVideo as any).allow}
+              referrerpolicy={(activeVideo as any).referrerPolicy}
+              style="width:100%;height:100%;border:none;"
+              allowfullscreen></iframe>
+          </div>
+        )}
+        {activeLesson.type === 'simulation' && !videoFramed && (
+          <div style="margin:14px 16px 0;background:rgba(250,204,21,0.14);border:1px solid rgba(250,204,21,0.35);border-radius:10px;padding:12px 14px;">
+            <p style="font-size:13px;color:#92400e;margin:0;line-height:1.6;">{videoProblem || 'This simulation has no address we can open here yet. Please tell whoever runs the course.'}</p>
           </div>
         )}
 
@@ -468,9 +658,20 @@ const typeColors: Record<string,string> = {video:'#ef4444',text:'#60a5fa',quiz:'
           <!-- Notes tab -->
           <div id="tab-notes">
             {activeLesson.content && <div style="font-size:14px;color:#5C544A;line-height:1.8;white-space:pre-wrap;background:#FBF8F1;border:1px solid var(--ac-border);border-radius:10px;padding:16px;">{activeLesson.content}</div>}
-            {activeLesson.type === 'link' && activeLesson.video_url && (
-              <div style="text-align:center;padding:32px;background:#FBF8F1;border:1px solid var(--ac-border);border-radius:12px;">
-                <a href={activeLesson.video_url} target="_blank" rel="noopener" style="background:#60a5fa;color:#1A1612;text-decoration:none;font-size:13px;font-weight:600;padding:10px 20px;border-radius:8px;display:inline-block;">Open Resource</a>
+            {/* An external resource. The href is the NORMALISED https address the resolver returned -
+                a `javascript:` value stored in this column used to be one click from running. */}
+            {activeLesson.type === 'link' && activeVideo && activeVideo.ok && (
+              <div style="text-align:center;padding:24px 16px;background:#FBF8F1;border:1px solid var(--ac-border);border-radius:12px;">
+                <p style="font-size:12.5px;color:#8B8175;margin:0 0 12px;line-height:1.6;">This resource lives outside the course and opens in a new tab.</p>
+                <a href={(activeVideo as any).embedUrl} target="_blank" rel="noopener noreferrer" style="display:inline-flex;align-items:center;gap:8px;min-height:44px;background:#60a5fa;color:#1A1612;text-decoration:none;font-size:13px;font-weight:600;padding:11px 20px;border-radius:8px;">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                  Open the resource in a new tab
+                </a>
+              </div>
+            )}
+            {activeLesson.type === 'link' && (!activeVideo || !activeVideo.ok) && (
+              <div style="padding:16px;background:rgba(250,204,21,0.14);border:1px solid rgba(250,204,21,0.35);border-radius:12px;">
+                <p style="font-size:13px;color:#92400e;margin:0;line-height:1.6;">{videoProblem || 'This lesson does not have a resource link on it yet.'}</p>
               </div>
             )}
           </div>
@@ -503,9 +704,16 @@ const typeColors: Record<string,string> = {video:'#ef4444',text:'#60a5fa',quiz:'
                   <span style="font-size:13px;color:#5C544A;">{lab.name}</span>
                 </button>
               ))}
-              <button onclick={`openLiveClass('${course.slug}')`} style="background:#EFE9DC;border:1px solid rgba(16,185,129,0.3);border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:10px;cursor:pointer;">
+              {/* The second door into the old guessable third-party room. It now opens this course's
+                  real schedule in the side panel, where each session's link is resolved against
+                  enrolment on the request instead of being assembled in the browser. */}
+              <button onclick="switchSidebar('live', null)" style="background:#EFE9DC;border:1px solid rgba(16,185,129,0.3);border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:10px;cursor:pointer;">
                 <span style="font-size:12px;font-weight:600;color:#10b981;">[Live]</span>
-                <span style="font-size:13px;color:#5C544A;">Join Class Room</span>
+                <span style="font-size:13px;color:#5C544A;">
+                  {sessionList.ok && upcomingSessions.length > 0
+                    ? 'Live sessions: ' + upcomingSessions.length + ' scheduled'
+                    : 'Live sessions'}
+                </span>
               </button>
             </div>
           </div>
@@ -629,20 +837,71 @@ function showContentTab(tab, btn) {
 }
 
 function openLab(url, name) {
+  // SAME-ORIGIN ONLY. Every lab this page offers is a page on this platform, so the modal refuses
+  // anything else outright rather than trusting that its callers stayed honest. A single leading
+  // slash - "//host" is another site entirely.
+  if (typeof url !== 'string' || url.charAt(0) !== '/' || url.charAt(1) === '/') return;
   document.getElementById('labTitle').textContent = name;
   document.getElementById('labFrame').src = url;
   document.getElementById('labModal').style.display = 'flex';
 }
 
-function openLiveClass(slug) {
-  var roomName = 'edurankai-' + slug + '-' + new Date().toISOString().split('T')[0];
-  window.open('https://meet.jit.si/' + roomName, '_blank');
-}
+// openLiveClass() and openStudyRoom() ARE GONE, DELIBERATELY.
+//
+// They built a room name in the browser — 'edurankai-<course slug>-<today>' and
+// 'edurankai-study-<six random characters>' — and opened it on a public third-party meeting host. The
+// first name is guessable by anyone who can read a course URL, which is anyone at all: the course
+// slug is in the address bar and on the public catalogue. So the "class room" for any course, paid or
+// free, was open to the whole internet, with no enrolment test, no host, no record that a class had
+// happened, and no way to close it. It also named the tool in the button beside it.
+//
+// The replacement is the Live sessions panel: sessions somebody actually scheduled, whose join
+// address is resolved by /api/portal/course-sessions/<id>/join against this reader's enrolment on the
+// request that asks for it. Nothing is assembled client-side, because a room a browser can name is a
+// room a stranger can name.
 
-function openStudyRoom() {
-  var roomName = 'edurankai-study-' + Math.random().toString(36).substring(2,8);
-  window.open('https://meet.jit.si/' + roomName, '_blank');
-}
+// THE LOCAL TIME AND THE COUNTDOWN.
+//
+// The session's own zone is rendered by the server and is the authoritative line. This adds the
+// reader's local time beside it — the one thing a server cannot know — and keeps the countdown
+// honest as the minutes pass, so a page left open does not go on claiming "in 20 min" an hour later.
+(function () {
+  var lines = document.querySelectorAll('[data-session-start]');
+  if (!lines.length) return;
+  function label(ms) {
+    if (ms <= 0) return 'starting now';
+    var m = Math.floor(ms / 60000);
+    if (m < 60) return 'in ' + m + ' min';
+    var h = Math.floor(m / 60);
+    if (h < 24) return 'in ' + h + 'h ' + (m % 60) + 'm';
+    var d = Math.floor(h / 24);
+    return 'in ' + d + (d === 1 ? ' day' : ' days');
+  }
+  function tick() {
+    for (var i = 0; i < lines.length; i++) {
+      var el = lines[i];
+      var start = Date.parse(el.getAttribute('data-session-start') || '');
+      if (!isFinite(start)) continue;
+      var count = el.querySelector('.cs-count');
+      if (count) count.textContent = label(start - Date.now());
+      if (!el.getAttribute('data-local-done')) {
+        try {
+          var d = new Date(start);
+          var zone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+          var local = d.toLocaleString(undefined, {
+            day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+          });
+          var span = document.createElement('span');
+          span.textContent = 'Your time: ' + local + (zone ? ' (' + zone + ')' : '') + ' · ';
+          el.insertBefore(span, el.firstChild);
+          el.setAttribute('data-local-done', '1');
+        } catch (e) { /* an engine without a time zone database keeps the server's line, which is complete on its own */ }
+      }
+    }
+  }
+  tick();
+  setInterval(tick, 30000);
+})();
 
 // Mobile toggle
 document.querySelectorAll('.l-item').forEach(function(el) {

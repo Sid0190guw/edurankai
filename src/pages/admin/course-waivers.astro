@@ -1,0 +1,214 @@
+---
+// /admin/course-waivers — THE DESK THAT DECIDES A COURSE FEE WAIVER.
+//
+// WHAT GATES THIS PAGE. `learning.waiver.grant` — a capability that exists in BOTH
+// src/lib/auth/permissions.ts (the union and PERMS_BY_ROLE) and src/lib/auth/registry.ts
+// (BUILTIN_PERMISSIONS, marked sensitive). A key outside the union is a permanent 403 for every role
+// including super_admin, which is how a whole console became unreachable on this project once.
+//
+// It is NOT gated on a role name and NOT on canAccessSection: there is no section key for waivers in
+// src/middleware.ts PATH_SECTION, which is exactly why /admin/fee-waivers is reachable today by
+// every admin-capable role — recruiter, reviewer, marketing, editor and any custom role holding
+// admin.access. That is an existing policy gap on the OTHER page; it is reported rather than quietly
+// changed here, and this page starts closed.
+//
+// mayDecideWaivers() also admits somebody the Organization Graph routed a live step to, so recording
+// a fee-waiver approval owner does not hand them a queue they cannot open. It grants nothing: the
+// write still goes through workflow.mayAct().
+//
+// THE DECISION IS NOT TAKEN HERE. It is taken by src/lib/workflow.ts, through
+// decideCourseWaiver() -> decideInstance() -> settleCourseWaiverFromWorkflow(). This page collects a
+// percentage and a reason and reports what the engine answered.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import {
+  decideCourseWaiver,
+  listCourseWaivers,
+  mayDecideWaivers,
+  type CourseWaiver,
+} from '@/lib/course-waiver';
+import { formatPrice, netAfterWaiver } from '@/lib/course-pricing';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+const mayDecide = await mayDecideWaivers(user as any);
+if (!mayDecide) {
+  return new Response(
+    'This console decides who gets a course fee waived, so it is limited to the people who hold that authority. If that should be you, ask for the "Grant or decline a course fee waiver" permission.',
+    { status: 403, headers: { 'content-type': 'text/plain; charset=utf-8' } },
+  );
+}
+
+// Declared ABOVE the POST handler that fills them — `const` is not hoisted, and on this project a
+// const under its handler threw on the first line while the page reported success.
+let okMsg = '';
+let errMsg = '';
+let warnMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '').trim();
+  const id = String(fd.get('id') || '').trim();
+  const note = String(fd.get('note') || '').trim();
+  const pctRaw = String(fd.get('grant_pct') || '100').trim();
+
+  if (action !== 'approve' && action !== 'decline') {
+    errMsg = 'That is not a decision we record.';
+  } else {
+    const decided = await decideCourseWaiver({
+      waiverId: id,
+      actor: user as any,
+      decision: action === 'approve' ? 'approve' : 'decline',
+      grantPct: action === 'approve' ? parseInt(pctRaw, 10) : null,
+      note,
+    });
+    if (!decided.ok) {
+      errMsg = decided.error || 'Nothing was changed.';
+    } else if (decided.status === 'approved') {
+      okMsg = 'Waiver granted. The learner has been told, and any balance is payable through the ordinary checkout.';
+    } else {
+      okMsg = 'Declined, and the reason has been sent to the person who asked.';
+    }
+    if (decided.warning) warnMsg = decided.warning;
+  }
+}
+
+const listed = await listCourseWaivers('all', 150);
+const waivers: CourseWaiver[] = listed.waivers;
+const pending = waivers.filter((w) => w.status === 'pending');
+const decidedList = waivers.filter((w) => w.status !== 'pending');
+
+function fmtDate(d: string | null): string {
+  if (!d) return '';
+  try {
+    return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+  } catch { return ''; }
+}
+
+// The choices a decision offers. Declared as data so the markup carries no logic.
+const PCT_CHOICES = [100, 75, 50, 25];
+---
+
+<AdminLayout title="Course fee waivers">
+  <div style="padding:16px;max-width:960px;margin:0 auto;">
+
+    <h1 style="font-size:19px;font-weight:700;color:#fff;margin:0 0 4px;">Course fee waivers</h1>
+    <p style="font-size:12.5px;color:#9aa6b6;margin:0 0 14px;line-height:1.6;">
+      Somebody has asked for help with a course fee. Grant it in full, grant part of it and leave the
+      balance payable, or decline with a reason they can read. Every decision records who decided,
+      when and why. You cannot decide your own request.
+    </p>
+
+    {okMsg && <p style="background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.35);color:#6ee7b7;font-size:12.5px;padding:10px 12px;border-radius:8px;margin:0 0 10px;line-height:1.6;">{okMsg}</p>}
+    {errMsg && <p style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;font-size:12.5px;padding:10px 12px;border-radius:8px;margin:0 0 10px;line-height:1.6;">{errMsg}</p>}
+    {warnMsg && <p style="background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.35);color:#fbbf24;font-size:12.5px;padding:10px 12px;border-radius:8px;margin:0 0 10px;line-height:1.6;">{warnMsg}</p>}
+
+    {!listed.ok && (
+      <p style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;font-size:12.5px;padding:10px 12px;border-radius:8px;margin:0 0 10px;line-height:1.6;">
+        The queue could not be read, so this list is not "nobody is waiting" - it is "we could not
+        look". The reason is in the server log. Reload in a moment.
+      </p>
+    )}
+
+    <h2 style="font-size:13px;font-weight:700;color:#fff;margin:18px 0 8px;text-transform:uppercase;letter-spacing:0.08em;">
+      Waiting on a decision ({pending.length})
+    </h2>
+
+    {listed.ok && pending.length === 0 && (
+      <p style="font-size:12.5px;color:#6e6e78;margin:0 0 10px;">Nobody is waiting. Requests appear here the moment they are made.</p>
+    )}
+
+    <div style="display:flex;flex-direction:column;gap:12px;">
+      {pending.map((w) => (
+        <div style="background:#0f0f14;border:1px solid #1f1f26;border-radius:12px;padding:14px;">
+          <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+            <div style="min-width:0;">
+              <p style="font-size:14px;font-weight:700;color:#fff;margin:0 0 2px;">{w.courseTitle || 'A course'}</p>
+              <p style="font-size:11.5px;color:#9aa6b6;margin:0;word-break:break-word;">
+                {w.requesterName || 'A learner'}{w.requesterEmail ? ' - ' + w.requesterEmail : ''}
+              </p>
+            </div>
+            <div style="text-align:right;">
+              <p style="font-size:13px;font-weight:700;color:#fff;margin:0;font-family:'Geist Mono',monospace;">{formatPrice(w.listPriceMinor, w.listPriceCurrency)}</p>
+              <p style="font-size:10.5px;color:#6e6e78;margin:2px 0 0;">asked {fmtDate(w.createdAt)}</p>
+            </div>
+          </div>
+
+          <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#6e6e78;margin:8px 0 3px;">Why they are asking</p>
+          <p style="font-size:12.5px;color:#d8d8de;margin:0;white-space:pre-wrap;line-height:1.7;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">{w.reason}</p>
+
+          {w.evidenceUrl && (
+            <p style="font-size:11.5px;color:#6e6e78;margin:8px 0 0;">
+              Link they gave: <a href={w.evidenceUrl} target="_blank" rel="noopener noreferrer" style="color:#60a5fa;text-decoration:none;word-break:break-all;font-family:'Geist Mono',monospace;">{w.evidenceUrl}</a>
+            </p>
+          )}
+
+          <form method="POST" style="margin:12px 0 0;display:flex;flex-direction:column;gap:8px;">
+            <input type="hidden" name="id" value={w.id} />
+
+            <label style="font-size:11px;color:#9aa6b6;display:block;">
+              How much of the fee is covered
+              <select name="grant_pct" style="display:block;width:100%;min-height:44px;background:#15151a;border:1px solid #2a2a2f;color:#fff;font-size:13px;padding:10px;border-radius:8px;margin-top:4px;">
+                {PCT_CHOICES.map((p) => (
+                  <option value={p}>
+                    {p === 100
+                      ? 'All of it - nothing left to pay'
+                      : p + ' per cent - ' + formatPrice(netAfterWaiver(w.listPriceMinor, p), w.listPriceCurrency) + ' left to pay'}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label style="font-size:11px;color:#9aa6b6;display:block;">
+              Reason - required to decline, and the person reads it
+              <textarea name="note" rows="3" maxlength="2000" placeholder="A sentence they can read." style="display:block;width:100%;background:#15151a;border:1px solid #2a2a2f;color:#fff;font-size:13px;padding:10px;border-radius:8px;margin-top:4px;font-family:inherit;resize:vertical;"></textarea>
+            </label>
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button type="submit" name="_action" value="approve" style="flex:1 1 160px;min-height:44px;background:#10b981;border:none;color:#04231a;font-size:13px;font-weight:700;padding:10px 16px;border-radius:8px;cursor:pointer;">Grant this waiver</button>
+              <button type="submit" name="_action" value="decline" style="flex:1 1 160px;min-height:44px;background:#15151a;border:1px solid rgba(239,68,68,0.45);color:#fca5a5;font-size:13px;font-weight:700;padding:10px 16px;border-radius:8px;cursor:pointer;">Decline with this reason</button>
+            </div>
+            <p style="font-size:10.5px;color:#6e6e78;margin:0;line-height:1.6;">
+              A partial waiver leaves a balance, and that balance goes through the same verified
+              checkout as a full price. Nothing is enrolled until it is paid.
+            </p>
+          </form>
+        </div>
+      ))}
+    </div>
+
+    <h2 style="font-size:13px;font-weight:700;color:#fff;margin:24px 0 8px;text-transform:uppercase;letter-spacing:0.08em;">
+      Already decided ({decidedList.length})
+    </h2>
+
+    {decidedList.length === 0 && (
+      <p style="font-size:12.5px;color:#6e6e78;margin:0;">Nothing decided yet.</p>
+    )}
+
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      {decidedList.map((w) => (
+        <div style="background:#0f0f14;border:1px solid #1f1f26;border-radius:10px;padding:12px;">
+          <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+            <p style="font-size:13px;font-weight:600;color:#fff;margin:0;">{w.courseTitle || 'A course'}</p>
+            <span style={'font-size:10px;font-weight:700;padding:3px 9px;border-radius:100px;text-transform:uppercase;background:' + (w.status === 'approved' ? 'rgba(16,185,129,0.15)' : 'rgba(239,68,68,0.15)') + ';color:' + (w.status === 'approved' ? '#6ee7b7' : '#fca5a5') + ';'}>
+              {w.status === 'approved' ? (w.grantPct === 100 ? 'granted in full' : 'granted ' + w.grantPct + ' per cent') : 'declined'}
+            </span>
+          </div>
+          <p style="font-size:11.5px;color:#9aa6b6;margin:4px 0 0;">
+            {w.requesterName || 'A learner'} - decided {fmtDate(w.reviewedAt)}
+            {w.consumedAt ? ' - used ' + fmtDate(w.consumedAt) : ''}
+          </p>
+          {w.status === 'rejected' && w.rejectReason && (
+            <p style="font-size:12px;color:#fca5a5;margin:6px 0 0;white-space:pre-wrap;line-height:1.6;">Reason given: {w.rejectReason}</p>
+          )}
+          {w.status === 'approved' && (
+            <p style="font-size:12px;color:#9aa6b6;margin:6px 0 0;">
+              Covered {formatPrice(w.listPriceMinor - netAfterWaiver(w.listPriceMinor, w.grantPct), w.listPriceCurrency)} of {formatPrice(w.listPriceMinor, w.listPriceCurrency)}.
+            </p>
+          )}
+        </div>
+      ))}
+    </div>
+
+  </div>
+</AdminLayout>

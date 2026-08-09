@@ -508,7 +508,9 @@ export async function mergePreview(loserId: string, winnerId: string): Promise<M
         replaces,
         outcome: replaces
           ? name + ' holds both. The row on ' + loserInfo.name + ' is the stronger record ('
-            + (lAssert === 'verified' ? 'it was checked' : 'a higher level, and neither was checked')
+            + (lAssert === 'factual'
+              ? 'it rests on a completion or a passed assessment this platform recorded'
+              : 'a higher level, and neither rests on anything this platform recorded')
             + '), so it will replace the row on ' + winnerInfo.name + '. The replaced values are kept in the audit log.'
           : name + ' holds both. The row on ' + winnerInfo.name + ' is kept as it is, and their row on '
             + loserInfo.name + ' is LEFT WHERE IT IS on the retired skill rather than deleted, so nothing they '

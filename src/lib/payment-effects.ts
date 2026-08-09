@@ -509,6 +509,30 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
     return;
   }
 
+  // COURSE ENROLMENT -> give the payer the course they just bought.
+  //
+  // THIS BRANCH DID NOT EXIST, AND THAT WAS A HOLE WITH MONEY IN IT. Course confirmation lived only
+  // in /api/aquintutor/confirm-payment, which runs in the payer's browser. A tab closed between the
+  // gateway and the return trip meant a captured payment, a 'paid' row, and no enrolment — and
+  // NEITHER the webhook NOR reconcileOrder() could finish it, because neither had a branch to match.
+  // Every other priced thing in this product had one.
+  //
+  // completeCoursePurchase() is the same function the browser route calls, so all three doors write
+  // the same enrolment, spend the same waiver once, and move the seat counter once.
+  if (pay.purpose === 'course_enrollment' || pay.reference_type === 'training_course') {
+    await runEffect(orderId, 'enrol the payer on the course they bought',
+      'A learner paid for a course and was NOT enrolled on it, so they have nothing for their money.',
+      async () => {
+        const { completeCoursePurchase } = await import('@/lib/course-purchase');
+        const done = await completeCoursePurchase(orderId, paymentId);
+        // A refunded order is terminal and refusing it is the CORRECT outcome, not a failure.
+        if (!done.applied && !done.refunded && !done.notACourse) {
+          throw new Error('the payment row does not name both a course and a learner, so nobody could be enrolled');
+        }
+      });
+    return;
+  }
+
   // Wallet recharge -> add the paid amount to the user's account credit.
   // Idempotent on the order id so webhook + verify + reconcile never double-credit.
   if (pay.purpose === 'wallet_recharge' || pay.reference_type === 'wallet') {
