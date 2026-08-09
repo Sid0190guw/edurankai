@@ -670,6 +670,22 @@ const fail = (error: string): RegistryResult<never> => ({ ok: false, error });
 // exists — turning one bad row into a total outage of this module. Duplicates are handled in code
 // instead (resolvePermissions unions, assignments are checked before insert).
 const DDL: string[] = [
+  // The strict audit sink. recordStrict() INSERTs here and deliberately THROWS on failure so a
+  // sensitive grant cannot outlive a failed audit write. Nothing in the codebase created this table,
+  // which meant every sensitive grant failed closed against a fresh database. Created here, beside
+  // its only writer, in the shape that writer uses.
+  `CREATE TABLE IF NOT EXISTS audit_log (
+     id BIGSERIAL PRIMARY KEY,
+     user_id UUID,
+     action TEXT NOT NULL,
+     entity TEXT NOT NULL,
+     entity_id TEXT,
+     diff JSONB NOT NULL DEFAULT '{}'::jsonb,
+     ip_address TEXT,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+   )`,
+  `CREATE INDEX IF NOT EXISTS audit_log_entity_idx ON audit_log (entity, entity_id)`,
+  `CREATE INDEX IF NOT EXISTS audit_log_created_idx ON audit_log (created_at DESC)`,
   `CREATE TABLE IF NOT EXISTS team_roles (
      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
      name VARCHAR(80) NOT NULL UNIQUE,
@@ -796,7 +812,7 @@ export function seedCatalogueRows(): (PermissionMeta & { key: string; isBuiltin:
  * remember it.
  */
 export function ensureRegistrySchema(): Promise<void> {
-  return ensureOnce('auth_registry_v1', async () => {
+  return ensureOnce('auth_registry_v2', async () => {
     for (const stmt of DDL) await db.execute(sql.raw(stmt));
 
     const all = seedCatalogueRows();
