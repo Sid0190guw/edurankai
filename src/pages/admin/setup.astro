@@ -47,6 +47,52 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 // CONSTANTS FIRST. `const` is not hoisted; a binding declared under its first reader has taken pages
 // down on this project.
 // -------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------
+// CREATE THE MODULE TABLES, from a button rather than a console command.
+//
+// This platform has no migration runner: each module creates its own tables the first time somebody
+// opens it, so /api/health reports "degraded — N module table(s) not yet created" until a human
+// happens to visit every surface. The API endpoint that does them all deliberately needs an admin
+// session, which meant pasting fetch() into DevTools — a step that failed twice on a laptop whose
+// F12 is bound to a vendor utility. A setup action a person cannot reach is not a setup action.
+//
+// Declared here, above the handler, because const is not hoisted.
+const BOOTSTRAP_MODULES: Array<{ name: string; run: () => Promise<unknown> }> = [
+  { name: 'auth-registry', run: async () => (await import('@/lib/auth/registry')).ensureRegistrySchema() },
+  { name: 'rbac', run: async () => (await import('@/lib/rbac/store')).ensureRbacSchema() },
+  { name: 'observability-health', run: async () => (await import('@/lib/observability-health')).ensureObservabilitySchema() },
+  { name: 'feature-flags', run: async () => (await import('@/lib/observability')).ensureFlagSchema() },
+  { name: 'knowledge-sync', run: async () => (await import('@/lib/knowledge-sync')).ensureSyncSchema() },
+  { name: 'mail', run: async () => (await import('@/lib/mail')).ensureMailSchema() },
+  { name: 'error-log', run: async () => (await import('@/lib/logger')).recentErrors(1) },
+  { name: 'job-queue', run: async () => (await import('@/lib/job-queue')).claimBatch(0) },
+];
+
+let bootstrapOk = '';
+let bootstrapFailed: string[] = [];
+
+if (Astro.request.method === 'POST') {
+  const form = await Astro.request.formData().catch(() => null);
+  if (form && String(form.get('action') || '') === 'bootstrap') {
+    const { can } = await import('@/lib/auth/permissions');
+    if (!can(user as any, 'settings.edit')) {
+      bootstrapFailed = ['You do not have permission to change platform configuration.'];
+    } else {
+      let done = 0;
+      for (const m of BOOTSTRAP_MODULES) {
+        try { await m.run(); done++; }
+        catch (e: any) {
+          // The real Postgres reason is on e.cause; e.message is only the failed SQL. Never swallowed.
+          const why = e?.cause?.message || e?.message || 'unknown error';
+          console.error('[setup/bootstrap] ' + m.name + ' failed:', why);
+          bootstrapFailed.push(m.name + ': ' + why);
+        }
+      }
+      bootstrapOk = done + ' of ' + BOOTSTRAP_MODULES.length + ' module(s) ready.';
+    }
+  }
+}
+
 const CARD = 'background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:16px 18px;';
 const HD = "font-size:10.5px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.12em;font-weight:700;margin:0 0 10px;";
 
@@ -130,6 +176,32 @@ function stepCountWords(s: SetupStatus): string {
         zero it cannot stand behind.
       </p>
     </div>
+
+    {/* THE MODULE TABLES. A button, because the alternative was a fetch() pasted into a browser
+        console — a step that is not reachable on every keyboard and is not a thing to ask an
+        operator to do. Idempotent: pressing it again is harmless. */}
+    <form method="POST" class="setup-boot">
+      <input type="hidden" name="action" value="bootstrap" />
+      <div>
+        <p class="setup-boot-h">Module tables</p>
+        <p class="setup-boot-p">
+          Each module creates its own tables the first time it is opened, so an untouched module has
+          none and its first real user is the one who finds that out. This creates them all now.
+          Nothing is deleted or changed, and pressing it twice does nothing the second time.
+        </p>
+      </div>
+      <button type="submit">Create module tables</button>
+    </form>
+
+    {bootstrapOk !== '' && bootstrapFailed.length === 0 && (
+      <div class="setup-alert setup-alert-ok"><p>{bootstrapOk}</p></div>
+    )}
+    {bootstrapFailed.length > 0 && (
+      <div class="setup-alert setup-alert-bad">
+        <p>{bootstrapOk === '' ? 'This did not run.' : bootstrapOk + ' The rest did not:'}</p>
+        <ul>{bootstrapFailed.map((f) => (<li>{clip(f, 240)}</li>))}</ul>
+      </div>
+    )}
 
     {unknown.length > 0 && (
       <div class="setup-alert setup-alert-bad">

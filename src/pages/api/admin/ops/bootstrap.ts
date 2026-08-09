@@ -49,6 +49,35 @@ export const POST: APIRoute = async ({ locals }) => {
     }
   }
 
+  // VERIFY, do not trust the return. ensureOnce() ends in `p.catch(() => {})`, so a DDL statement
+  // that threw still resolves and every ensure above reports success. The first run of this endpoint
+  // answered ok:true, ran:8, failed:0 while /api/health went on reporting all ten tables missing.
+  // A green result from a call is not evidence the call did anything; the only evidence is the
+  // database itself, so ask it.
+  const EXPECTED = ['audit_log', 'edu_cron_runs', 'edu_error_log', 'edu_feature_flags', 'edu_job_log',
+    'edu_jobs', 'edu_releases', 'edu_sync_queue', 'mail_config', 'rbac_audit'];
+  let present: string[] = [];
+  let verifyError = '';
+  try {
+    const { db } = await import('@/lib/db');
+    const { sql } = await import('drizzle-orm');
+    const r: any = await db.execute(sql`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name = ANY(${EXPECTED})`);
+    const rows = Array.isArray(r) ? r : (r?.rows || []);
+    present = rows.map((x: any) => String(x.table_name));
+  } catch (e: any) {
+    verifyError = e?.cause?.message || e?.message || 'unknown error';
+  }
+  const missing = EXPECTED.filter((t) => !present.includes(t));
+
   const failed = results.filter((r) => !r.ok);
-  return j({ ok: failed.length === 0, ran: results.length, failed: failed.length, results });
+  return j({
+    ok: failed.length === 0 && missing.length === 0 && verifyError === '',
+    ran: results.length,
+    failed: failed.length,
+    results,
+    verified: verifyError === '' ? { present: present.length, missing } : null,
+    verifyError: verifyError || undefined,
+  });
 };
