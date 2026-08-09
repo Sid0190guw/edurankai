@@ -26,6 +26,9 @@ import { pendingLeaveForApprover, decideLeave, describeUnits } from '@/lib/hr-le
 import { pendingWithdrawalsForApprover, decideWithdrawal } from '@/lib/hr-wallet';
 // EVERY OTHER ROUTED APPROVAL. See the ROUTED WORKFLOW STEPS note below.
 import { pendingForApprover, decideStep, domainLabel, type PendingApproval } from '@/lib/workflow';
+// A WEEKLY SCHEDULE CARRIES A CHECK THAT decideStep() DOES NOT KNOW ABOUT. See the note in the POST
+// handler: this queue hands one to its own module, which calls decideStep() itself.
+import { decideSchedule } from '@/lib/eims-schedule';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/approvals'));
@@ -91,12 +94,40 @@ if (Astro.request.method === 'POST') {
     errorMsg = 'Declining needs a reason. Nothing has been recorded yet — add a short note saying why, and the person will see it with the decision.';
   } else {
     try {
+      // A WEEKLY SCHEDULE IS NEVER DECIDED BY decideStep() ALONE, WHICHEVER SCREEN DECIDES IT.
+      //
+      // An intern's week carries a ceiling, and the ceiling is re-checked at the MOMENT of approval
+      // rather than at the moment the plan was proposed — between the two, a make-up can have been
+      // approved into the same week, or the person's recorded weekly hours can have changed. That
+      // check lives in decideSchedule(), which then calls decideStep() itself.
+      //
+      // This queue is generic: it lists every routed step whatever its domain, so a reporting manager
+      // clears schedules here without ever opening the schedule screen. Calling decideStep() directly
+      // for one would be a SECOND DOOR into the same decision with the check missing behind it, and
+      // that door is exactly how outstanding hours get cleared by a week that goes over the ceiling —
+      // the one thing the specification says must never be possible.
+      //
+      // THE DOMAIN IS READ FROM THE ENGINE, NOT FROM THE FORM. A posted field naming its own domain
+      // would let a crafted request pick which checks apply to it. pendingForApprover() answers what
+      // is routed or delegated to THIS reader right now; a step it does not name falls through to
+      // decideStep(), which refuses it at mayAct() exactly as before.
+      let scheduleRecordId = '';
+      if (kind === 'step') {
+        const routed = await pendingForApprover(String(user.id));
+        const match = routed.find((p) => String(p.step.id) === id);
+        if (match && String(match.instance.domain) === 'schedule') {
+          scheduleRecordId = String(match.instance.recordId || '');
+        }
+      }
+
       // The engine re-checks authority. A posted id for someone else's report is refused here, not
       // by the fact that this page did not draw a button for it.
       const res = kind === 'leave'
         ? await decideLeave(id, user, decision as any, note)
         : kind === 'step'
-          ? await decideStep(id, user as any, decision as any, note)
+          ? (scheduleRecordId
+            ? await decideSchedule(scheduleRecordId, user as any, decision as any, note)
+            : await decideStep(id, user as any, decision as any, note))
           : await decideWithdrawal(id, user, decision as any, note);
       if (res.ok) {
         okMsg = decision === 'approved' ? 'Approved.' : 'Declined.';

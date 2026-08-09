@@ -1,0 +1,373 @@
+---
+// /portal/employee/schedule/approvals — WEEKLY SCHEDULES WAITING ON THIS PERSON.
+//
+// =================================================================================================
+// WHY THIS IS IN THE PORTAL AND NOT IN /admin
+// =================================================================================================
+//
+// A proposed week routes to the intern's REPORTING MANAGER, resolved per row from the Organization
+// Graph. Most reporting managers have no admin access at all, so a queue behind /admin would mean the
+// one person the request was addressed to could not open it, and the week would begin before anybody
+// had agreed to it. So it lives where the people it is addressed to already are, beside the credit
+// queue they already use.
+//
+// =================================================================================================
+// THE LIST IS NOT THE PERMISSION, AND THE LIST IS NOT WHAT DECIDES
+// =================================================================================================
+//
+// pendingForApprover() answers "what is routed to you, or delegated to you, right now". decideSchedule()
+// then goes through decideStep(), which re-asks the whole question at the moment of the write: the
+// instance must still be pending, the step must be the current rung, and mayAct() must say this
+// signed-in user is the routed approver or their in-force delegate. A posted schedule id from
+// somebody else's queue is refused by the engine, not by the absence of a button here.
+//
+// =================================================================================================
+// THREE ANSWERS, AND THE THIRD IS NOT A SOFTER SECOND
+// =================================================================================================
+//
+//   APPROVE           this becomes the official plan for that week. A reason is welcome, not required.
+//   ASK FOR CHANGES   the intern re-plans and proposes again. Say what needs to change.
+//   REFUSE            no. Say why; somebody built their week around this.
+//
+// THE CEILING IS RE-CHECKED WHEN YOU PRESS APPROVE, not when the page was drawn. A make-up can have
+// been approved into the same week in the meantime, and approving on the strength of a stale figure
+// is how an intern ends up with a week nobody intended to agree to. Outstanding hours are never
+// cleared by going over the ceiling, and the refusal says so in those words.
+//
+// MOBILE FIRST. This is a queue people clear on a phone between two other things.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import { pendingForApprover, escalateStep, STATE_LABELS, type PendingApproval } from '@/lib/workflow';
+import {
+  decideSchedule, scheduleForRecord, outstandingHours, capacityForWeek,
+  hoursText, MIN_DECISION_REASON,
+  type ScheduleRow, type CapacityRead,
+} from '@/lib/eims-schedule';
+
+const PATH = '/portal/employee/schedule/approvals';
+const SCHEDULE_DOMAIN = 'schedule';
+const DECISIONS = ['approved', 'changes-requested', 'rejected'];
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+const workspace = gate.ok ? gate.workspace : null;
+
+let flash = '';
+let flashError = '';
+let flashNote = '';
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || 'decide');
+
+    if (action === 'escalate') {
+      const res = await escalateStep(String(form.get('step_id') || ''), user as any);
+      if (res.ok) flash = 'Sent to the next person above them in the organization graph.';
+      else flashError = res.error || 'That could not be escalated.';
+    } else {
+      const scheduleId = String(form.get('schedule_id') || '');
+      const decision = String(form.get('decision') || '');
+      const reason = String(form.get('reason') || '').trim().slice(0, 500);
+
+      if (!scheduleId || DECISIONS.indexOf(decision) === -1) {
+        flashError = 'That decision could not be read. Nothing was changed.';
+      } else {
+        const res = await decideSchedule(scheduleId, user as any, decision as any, reason);
+        if (res.ok) {
+          if (decision === 'approved') flash = 'Approved. That is the official plan for the week now.';
+          else if (decision === 'changes-requested') flash = 'Sent back for changes, with your note.';
+          else flash = 'Refused, with your reason recorded against the plan.';
+          if (res.warning) flashNote = res.warning;
+        } else {
+          // NEVER SWALLOWED. The engine's sentence is shown exactly as it came back, including the
+          // ceiling arithmetic when that is what stopped it.
+          flashError = res.error || 'That decision could not be recorded.';
+        }
+      }
+    }
+  } catch (e: any) {
+    flashError = 'That decision could not be recorded: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    console.error('[portal/schedule/approvals] decide', e?.cause?.message || e?.message);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+interface QueueItem {
+  approval: PendingApproval;
+  schedule: ScheduleRow | null;
+  capacity: CapacityRead | null;
+  owedText: string;
+  ceilingText: string;
+  wouldTotalText: string;
+  overCeiling: boolean;
+}
+
+const queue: QueueItem[] = [];
+let queueError = '';
+
+if (gate.ok) {
+  try {
+    const all = await pendingForApprover(String(user.id));
+    const mine = all.filter((p) => String(p.instance.domain) === SCHEDULE_DOMAIN);
+    for (const approval of mine) {
+      // The workflow record id IS the schedule's id, so the plan being decided is one read away. A
+      // queue that showed only "a weekly schedule" would be asking somebody to decide blind.
+      const schedule = await scheduleForRecord(String(approval.instance.recordId));
+      let capacity: CapacityRead | null = null;
+      let owedText = '';
+      let wouldTotalText = '';
+      let overCeiling = false;
+
+      if (schedule) {
+        capacity = await capacityForWeek(schedule.employeeId, schedule.weekStart, {
+          replacingOfficialRegular: schedule.kind === 'regular',
+          excludeScheduleId: schedule.id,
+        });
+        if (capacity.ok && capacity.ceilingHours !== null) {
+          const would = Math.round((capacity.committedHours + schedule.totalHours) * 100) / 100;
+          wouldTotalText = hoursText(would);
+          overCeiling = would > capacity.ceilingHours + 0.011;
+        }
+        if (schedule.kind === 'makeup') {
+          const owed = await outstandingHours(schedule.employeeId);
+          owedText = owed.ok
+            ? hoursText(owed.remainingHours) + ' still outstanding'
+            : 'What is outstanding could not be read just now';
+        }
+      }
+
+      queue.push({
+        approval,
+        schedule,
+        capacity,
+        owedText,
+        ceilingText: capacity && capacity.ceilingHours !== null ? hoursText(capacity.ceilingHours) : 'not recorded',
+        wouldTotalText,
+        overCeiling,
+      });
+    }
+  } catch (e: any) {
+    // An empty queue and a queue that could not be read are different facts, and only one of them
+    // means nobody is waiting on you.
+    queueError = 'Your queue could not be read just now: '
+      + (e?.cause?.message || e?.message || 'unknown reason')
+      + '. This is not a statement that nothing is waiting on you.';
+    console.error('[portal/schedule/approvals] read', e?.cause?.message || e?.message);
+  }
+}
+
+const when = (iso: string | null) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+};
+---
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="robots" content="noindex,nofollow"/>
+  <title>Weekly schedules waiting on you - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    html,body{overflow-x:hidden;}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;-webkit-text-size-adjust:100%;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-0.01em;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;padding:10px 16px 2px;margin:0;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:36px;padding:7px 12px;border:1px solid #DFDCD8;
+      border-radius:999px;background:#FDFDFC;color:#564E43;font-size:0.8125rem;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    .card{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h2{margin:0 0 6px;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .card p + p{margin-top:8px;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CBE3D2;border-radius:10px;background:#F1F8F3;font-size:0.8125rem;line-height:1.55;color:#1F5132;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .notice{margin:12px 0 0;padding:10px 12px;border:1px solid #EADECD;border-radius:10px;background:#FBF7F1;font-size:0.8125rem;line-height:1.55;color:#6D470D;}
+    .item{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .item h3{margin:0;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .item .sub{margin:3px 0 0;font-size:0.75rem;color:#70685C;line-height:1.5;overflow-wrap:anywhere;}
+    .kv{display:grid;grid-template-columns:1fr auto;gap:4px 10px;margin:10px 0 0;font-size:0.8125rem;}
+    .kv dt{color:#70685C;}
+    .kv dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;font-weight:650;}
+    .list{list-style:none;margin:10px 0 0;padding:0;}
+    .list li{padding:8px 10px;border:1px solid #EFEDEA;border-radius:8px;background:#FCFBFA;margin-bottom:6px;font-size:0.8125rem;line-height:1.5;overflow-wrap:anywhere;}
+    .lab{display:block;margin:12px 0 3px;font-size:0.75rem;font-weight:650;color:#564E43;}
+    .field{width:100%;min-width:0;min-height:44px;padding:10px 12px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#1B1813;font:inherit;font-size:0.875rem;}
+    .row{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 0;}
+    .go{flex:1 1 160px;min-height:48px;padding:12px 14px;border:1px solid #1B1813;border-radius:10px;background:#1B1813;color:#fff;font:inherit;font-size:0.9375rem;font-weight:650;cursor:pointer;}
+    .thin{flex:1 1 160px;min-height:48px;padding:12px 14px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;color:#564E43;font:inherit;font-size:0.875rem;font-weight:650;cursor:pointer;}
+    .foot{margin:16px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;line-height:1.6;color:#70685C;}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Weekly schedules waiting on you</h1>
+    <p>{workspace ? workspace.fullName : 'Your queue'}</p>
+  </header>
+
+  <nav class="tabs" aria-label="Schedules">
+    <a class="tab" href="/portal/employee/schedule">My schedule</a>
+    <a class="tab" href={PATH} aria-current="page">Waiting on me</a>
+    <a class="tab" href="/portal/employee/credits/approvals">Weekly credits</a>
+    <a class="tab" href="/portal/approvals">All approvals</a>
+  </nav>
+
+  <main class="wrap">
+    {flash && <div class="ok">{flash}</div>}
+    {flashError && <div class="bad">{flashError}</div>}
+    {flashNote && <div class="notice">{flashNote}</div>}
+
+    {!gate.ok && (
+      <section class="card">
+        <h2>{gate.title || 'This screen is not available'}</h2>
+        <p>{gate.reason || 'Your employee record is what this screen is built from.'}</p>
+      </section>
+    )}
+
+    {gate.ok && (
+      <section class="card">
+        <h2>What you are being asked</h2>
+        <p>An intern has planned a week for themselves: which activities, on which days, for how many
+        hours. They are university students, so any days and any distribution are legitimate. What you
+        are agreeing to is the WORK, not a presence pattern.</p>
+        <p>The weekly ceiling covers everything recognised, well-being included, and it is checked
+        again the moment you press approve. If the week has filled up since this was proposed, the
+        approval is refused with the arithmetic printed, and asking for a smaller plan is the answer.
+        Outstanding hours are never cleared by going over the ceiling.</p>
+      </section>
+    )}
+
+    {gate.ok && queueError && <div class="bad">{queueError}</div>}
+
+    {gate.ok && !queueError && queue.length === 0 && (
+      <section class="card">
+        <h2>Nothing is waiting on you</h2>
+        <p>Plans appear here only when they are routed to you or delegated to you.</p>
+      </section>
+    )}
+
+    {gate.ok && queue.map((q) => (
+      <article class="item">
+        <h3>{q.approval.instance.subjectName || 'An intern'}</h3>
+        <p class="sub">
+          {q.schedule ? q.schedule.kindLabel + ' · ' + q.schedule.label : (q.approval.instance.summary || 'A week')}
+          {q.approval.step.dueAt ? ' · due ' + when(q.approval.step.dueAt) : ''}
+          {' · ' + (STATE_LABELS[q.approval.instance.state as keyof typeof STATE_LABELS] || q.approval.instance.state)}
+        </p>
+
+        {!q.schedule && (
+          <p class="sub" style="margin-top:8px;">
+            The plan behind this request could not be read, so its days and hours are not shown. Do not
+            decide it blind - reload the page first. Nothing about the request itself is lost.
+          </p>
+        )}
+
+        {q.schedule && (
+          <>
+            <dl class="kv">
+              <dt>Hours in this plan</dt><dd>{hoursText(q.schedule.totalHours)}</dd>
+              <dt>Already approved into that week</dt>
+              <dd>{q.capacity && q.capacity.ok ? hoursText(q.capacity.committedHours) : 'could not be read'}</dd>
+              <dt>Weekly ceiling</dt><dd>{q.ceilingText}</dd>
+              <dt>The week would come to</dt><dd>{q.wouldTotalText || 'could not be worked out'}</dd>
+              {q.schedule.kind === 'makeup' && (<dt>Outstanding hours</dt>)}
+              {q.schedule.kind === 'makeup' && (<dd>{q.owedText}</dd>)}
+            </dl>
+
+            <ul class="list">
+              {q.schedule.days.map((d) => (
+                <li><strong>{d.date}</strong> - {d.activity} - {hoursText(d.hours)}</li>
+              ))}
+            </ul>
+
+            {q.schedule.note && (
+              <p class="sub" style="margin-top:8px;">They wrote: {q.schedule.note}</p>
+            )}
+
+            {q.schedule.supersedesId && (
+              <p class="sub" style="margin-top:8px;">
+                This replaces an earlier approved plan for the same week. The earlier one is kept
+                exactly as it was agreed; approving this makes it the version that stands from now on.
+              </p>
+            )}
+
+            {q.overCeiling && (
+              <div class="bad">
+                <strong>This would take the week past its ceiling.</strong>
+                <span> {q.wouldTotalText} against a ceiling of {q.ceilingText}. Approving it will be
+                refused at the write. Ask for a smaller plan, or for the extra hours to be moved into
+                a week with room.</span>
+              </div>
+            )}
+
+            {q.capacity && !q.capacity.ok && (
+              <div class="notice">
+                <span>{q.capacity.error || 'The hours already approved into that week could not be read.'}
+                {' '}Approving is still checked at the write, so nothing unsafe can get through - but
+                reload before you decide.</span>
+              </div>
+            )}
+
+            <form method="POST">
+              <input type="hidden" name="action" value="decide" />
+              <input type="hidden" name="schedule_id" value={q.schedule.id} />
+              <label class="lab" for={'reason-' + q.schedule.id}>
+                Your reason (required if you refuse or ask for changes)
+              </label>
+              {/* NO `minlength` HERE, DELIBERATELY. One textarea serves all three buttons, and a
+                  reason is required for two of them and not for the third. The attribute applies to
+                  whichever button submits the form, so it would let a manager approve with an EMPTY
+                  box — a blank optional field passes constraint validation — while stopping them
+                  approving with the word "fine" in it, refused by a browser tooltip for a rule that
+                  does not exist. The requirement is enforced in decideSchedule(), which knows which
+                  decision was pressed and answers in a sentence. An attribute is not a rule. */}
+              <textarea class="field" id={'reason-' + q.schedule.id} name="reason" rows="3"
+                placeholder={'What needs to change, or why this cannot stand (at least '
+                  + MIN_DECISION_REASON + ' characters).'}></textarea>
+              <div class="row">
+                <button class="go" type="submit" name="decision" value="approved">Approve this plan</button>
+                <button class="thin" type="submit" name="decision" value="changes-requested">Ask for changes</button>
+                <button class="thin" type="submit" name="decision" value="rejected">Refuse</button>
+              </div>
+            </form>
+          </>
+        )}
+
+        <form method="POST">
+          <input type="hidden" name="action" value="escalate" />
+          <input type="hidden" name="step_id" value={q.approval.step.id} />
+          <div class="row">
+            <button class="thin" type="submit">Not mine to decide - send it above me</button>
+          </div>
+        </form>
+      </article>
+    ))}
+
+    {gate.ok && (
+      <p class="foot">
+        This list is what is routed or delegated to you, and it is not the permission - the engine
+        re-checks who you are at the moment you press a button. A plan you send above you goes to the
+        next person up the reporting line in the organization graph; where the graph names nobody it
+        says so rather than picking somebody. Approving a plan agrees to the work in it. It records no
+        presence, no location and no session time, because none of those are what an internship is
+        measured by here.
+      </p>
+    )}
+  </main>
+</body>
+</html>

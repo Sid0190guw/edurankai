@@ -1,0 +1,420 @@
+---
+// /portal/employee/evidence — FILE THE EVIDENCE FOR WHAT YOU ACTUALLY DID.
+//
+// =================================================================================================
+// WHAT THIS SCREEN IS FOR
+// =================================================================================================
+//
+// This is the intern's end of the evidence graph, and it is what makes the mentor's queue exist. You
+// say what you did, how long it took, and link the work. A named mentor then verifies it, and the
+// hours that are recognised are the hours they verified.
+//
+// NOTHING HERE MEASURES YOU. There is no clock on this page, no timer, no webcam, no screenshot and
+// no keystroke record — the system is answering "what did this person do", not "were they logged
+// in". A day you worked without touching a clock is a day you can still be credited for, because the
+// evidence is what counts.
+//
+// =================================================================================================
+// YOUR REPORTED HOURS ARE KEPT AS YOU REPORTED THEM
+// =================================================================================================
+//
+// If you report six hours on a four-hour piece of work, six is what the record says. Nothing here
+// trims it and nothing here questions it. Your mentor sees the over-run as a sentence to look at,
+// and they decide what to verify. Recognition is capped at your weekly ceiling; what you reported
+// never is. Those are two different numbers and this screen shows both.
+//
+// =================================================================================================
+// EVIDENCE IS A LINK. IT IS NEVER AN UPLOAD.
+// =================================================================================================
+//
+// The file stays in your own account and is shared by link — a Drive document, a commit, a pull
+// request, a notebook, a published page. There is no upload on this page and there is nowhere for
+// one to be added. Where a Drive link is asked for, share it as "Anyone with the link" first: your
+// own link always opens for you, so you cannot tell from your side whether anybody else can open it.
+//
+// MOBILE FIRST: 360px, every control at least 44px, nothing scrolls sideways.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  submitEvidence,
+  listEvidenceForEmployee,
+  evidenceTypesForRole,
+  verifierFor,
+  verifiedHoursForWeek,
+  ACTIVITY_KINDS,
+  ACTIVITY_KIND_LABELS,
+  EVIDENCE_STATUS_LABELS,
+  ROLE_KEYS,
+  ROLE_LABELS,
+  SHARING_REQUIREMENT,
+  isRoleKey,
+  type EvidenceRow,
+  type EvidenceType,
+  type WeekHours,
+} from '@/lib/eims-evidence';
+import { listMyTasks } from '@/lib/employee-tasks';
+import { weekStartOf, isoDate } from '@/lib/credit-week';
+
+const PATH = '/portal/employee/evidence';
+
+// Every const declared BEFORE the POST handler that reads it. const is not hoisted.
+const TODAY = isoDate(new Date());
+const KIND_OPTIONS = ACTIVITY_KINDS.map((k) => ({ value: String(k), label: String(ACTIVITY_KIND_LABELS[k]) }));
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+const workspace = gate.ok ? gate.workspace : null;
+const employeeId = workspace ? workspace.employeeId : '';
+
+const askedRole = String(Astro.url.searchParams.get('role') || '');
+const roleKey = isRoleKey(askedRole) ? askedRole : 'general';
+
+let flash = '';
+let flashError = '';
+let flashNotes: string[] = [];
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+
+    // Two activity slots: one required, one optional. The second exists because one link is often
+    // evidence for two things at once — the task it finished and the learning it demonstrated — and
+    // filing it twice would put the same URL on the record with two separate fates.
+    const activities: { kind: any; id: string | null; label: string | null; hoursClaimed: number }[] = [];
+    for (const slot of ['a', 'b']) {
+      const kind = String(form.get('kind_' + slot) || '');
+      const hours = Number(String(form.get('hours_' + slot) || '0'));
+      if (!kind) continue;
+      if (!Number.isFinite(hours) || hours <= 0) continue;
+      const taskId = String(form.get('task_' + slot) || '');
+      activities.push({
+        kind,
+        id: kind === 'task' && taskId ? taskId : null,
+        label: String(form.get('label_' + slot) || '') || null,
+        hoursClaimed: hours,
+      });
+    }
+
+    const res = await submitEvidence({
+      employeeId,
+      userId: String(user.id),
+      roleKey,
+      typeKey: String(form.get('type_key') || ''),
+      title: String(form.get('title') || ''),
+      url: String(form.get('url') || ''),
+      note: String(form.get('note') || ''),
+      occurredOn: String(form.get('occurred_on') || ''),
+      sharingAck: String(form.get('sharing_ack') || '') === 'yes',
+      activities: activities as any,
+    });
+
+    if (res.ok) {
+      flash = 'Filed. Your mentor can see it now, and nothing is recognised until they verify it.';
+      flashNotes = [res.warning, ...res.notes].filter((x) => !!x);
+    } else {
+      // NEVER SWALLOWED. The engine's sentence is shown exactly as it came back.
+      flashError = res.error;
+    }
+  } catch (e: any) {
+    flashError = 'That could not be filed: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    console.error('[portal/evidence] submit', e?.cause?.message || e?.message);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+let types: EvidenceType[] = [];
+let filed: EvidenceRow[] = [];
+let week: WeekHours | null = null;
+let verifierSentence = '';
+let tasks: { id: string; title: string }[] = [];
+
+if (employeeId) {
+  types = await evidenceTypesForRole(roleKey);
+  filed = await listEvidenceForEmployee(employeeId, { limit: 60 });
+  week = await verifiedHoursForWeek(employeeId, weekStartOf(TODAY));
+  verifierSentence = (await verifierFor(employeeId)).sentence;
+  try {
+    const mine = await listMyTasks(employeeId, 40);
+    tasks = mine.map((t) => ({ id: t.id, title: t.title }));
+  } catch (e: any) {
+    console.error('[portal/evidence] tasks', e?.cause?.message || e?.message);
+  }
+}
+
+// -----------------------------------------------------------------------------------------------
+// VIEW MODELS. Every label resolved to a plain string here rather than by indexing a typed map from
+// inside the markup, which is one of the two things that reliably breaks the .astro compiler on this
+// project — and it blames a line nowhere near the real one.
+// -----------------------------------------------------------------------------------------------
+const roleChips = ROLE_KEYS.map((r) => ({
+  key: String(r),
+  label: String(ROLE_LABELS[r]),
+  href: PATH + '?role=' + String(r),
+  current: r === roleKey,
+}));
+
+const typeOptions = types.map((t) => ({
+  value: t.typeKey,
+  label: t.label + (t.referenceKind === 'drive' ? ' (Drive link)' : ''),
+  help: t.description,
+}));
+
+const filedView = filed.map((e) => ({
+  id: e.id,
+  title: e.title,
+  url: e.url,
+  typeLabel: e.typeLabel || e.typeKey,
+  occurredOn: e.occurredOn,
+  statusLabel: String((EVIDENCE_STATUS_LABELS as Record<string, string>)[String(e.status)] || 'Filed'),
+  claimed: e.hoursClaimed,
+  verified: e.hoursVerified,
+  reason: e.reviewReason || '',
+  outcome: e.outcome || '',
+  reviewer: e.reviewedByName || '',
+  activities: e.links.map((l) => l.activityLabel || 'Activity').join(', '),
+}));
+
+const hasTypes = typeOptions.length > 0;
+const hasFiled = filedView.length > 0;
+const hasTasks = tasks.length > 0;
+const hasFlashNotes = flashNotes.length > 0;
+const weekSentence = week ? week.sentence : '';
+---
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="robots" content="noindex,nofollow"/>
+  <title>Evidence - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    html,body{overflow-x:hidden;}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+      -webkit-text-size-adjust:100%;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-0.01em;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;padding:10px 16px 2px;margin:0;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:36px;padding:7px 12px;border:1px solid #DFDCD8;
+      border-radius:999px;background:#FDFDFC;color:#564E43;font-size:0.8125rem;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    h2.sec{margin:22px 0 0;font-size:0.6875rem;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#70685C;}
+    .card{margin:10px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h3{margin:0 0 6px;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .card p + p{margin-top:8px;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CFE3D2;border-radius:10px;background:#F3F9F4;font-size:0.8125rem;line-height:1.55;color:#245C33;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .notice{margin:10px 0 0;padding:10px 12px;border:1px solid #EADECD;border-radius:10px;background:#FBF7F1;font-size:0.8125rem;line-height:1.55;color:#6D470D;}
+    label.fld{display:block;margin:12px 0 0;font-size:0.75rem;font-weight:700;color:#564E43;}
+    label.fld span{display:block;margin:2px 0 5px;font-size:0.75rem;font-weight:400;line-height:1.5;color:#70685C;}
+    input[type="text"],input[type="url"],input[type="date"],input[type="number"],select,textarea{
+      width:100%;min-height:44px;padding:10px 11px;border:1px solid #DFDCD8;border-radius:9px;
+      background:#FFFFFF;color:#1B1813;font:inherit;font-size:0.875rem;}
+    textarea{min-height:78px;line-height:1.5;resize:vertical;}
+    .ack{display:flex;align-items:flex-start;gap:10px;margin:12px 0 0;padding:11px 12px;border:1px solid #DFDCD8;
+      border-radius:10px;background:#FCFBFA;font-size:0.8125rem;line-height:1.5;color:#564E43;}
+    .ack input{width:22px;height:22px;min-height:22px;margin:1px 0 0;flex:none;}
+    button.go{width:100%;min-height:48px;margin:14px 0 0;padding:13px;border-radius:10px;border:1px solid #1B1813;
+      background:#1B1813;color:#FFFFFF;font:inherit;font-size:0.875rem;font-weight:700;cursor:pointer;}
+    .pair{display:grid;grid-template-columns:1fr;gap:0;}
+    .kv{display:grid;grid-template-columns:1fr auto;gap:4px 10px;margin:10px 0 0;font-size:0.8125rem;}
+    .kv dt{color:#70685C;}
+    .kv dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;font-weight:650;}
+    .item{margin:10px 0 0;padding:12px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .item h3{margin:0;font-size:0.875rem;font-weight:680;line-height:1.35;overflow-wrap:anywhere;}
+    .item .meta{margin:5px 0 0;font-size:0.75rem;line-height:1.5;color:#70685C;overflow-wrap:anywhere;}
+    .chip{display:inline-flex;align-items:center;padding:3px 9px;border-radius:999px;border:1px solid #DFDCD8;
+      background:#F6F4F1;font-size:0.6875rem;font-weight:700;color:#564E43;white-space:nowrap;margin:8px 6px 0 0;}
+    .evlink{display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:9px 12px;margin:8px 0 0;
+      border:1px solid #DFDCD8;border-radius:10px;background:#F6F4F1;color:#1B1813;text-decoration:none;
+      font-size:0.8125rem;font-weight:650;max-width:100%;overflow-wrap:anywhere;}
+    .ico{flex:none;width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;}
+    .foot{margin:22px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;line-height:1.6;color:#70685C;}
+    @media (min-width:520px){ .pair{grid-template-columns:repeat(2,minmax(0,1fr));gap:0 12px;} }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Evidence</h1>
+    <p>{workspace ? workspace.fullName : 'Your work'}</p>
+  </header>
+
+  <nav class="tabs" aria-label="Your record">
+    <a class="tab" href="/portal/employee/reports">Daily reports</a>
+    <a class="tab" href="/portal/employee/evidence" aria-current="page">Evidence</a>
+    <a class="tab" href="/portal/employee/credits">Weekly credits</a>
+    <a class="tab" href="/portal/employee/learning">Learning</a>
+  </nav>
+
+  <main class="wrap">
+    {flash ? <div class="ok">{flash}</div> : null}
+    {hasFlashNotes ? (
+      <div class="notice">{flashNotes.map((n) => <p>{n}</p>)}</div>
+    ) : null}
+    {flashError ? <div class="bad">{flashError}</div> : null}
+
+    <section class="card">
+      <h3>This week</h3>
+      <p>{weekSentence}</p>
+      <p>{verifierSentence}</p>
+    </section>
+
+    <h2 class="sec">File evidence</h2>
+
+    <nav class="tabs" aria-label="Kind of internship">
+      {roleChips.map((r) => (
+        <a class="tab" href={r.href} aria-current={r.current ? 'page' : undefined}>{r.label}</a>
+      ))}
+    </nav>
+
+    <section class="card">
+      {!hasTypes ? (
+        <p>No evidence types are configured yet, so there is nothing to choose from. Tell HR — nothing
+          you have already filed is affected.</p>
+      ) : (
+        <form method="POST">
+          <label class="fld">
+            What kind of evidence is this
+            <span>Pick the one that matches the work. The type decides how the link is checked.</span>
+            <select name="type_key" required>
+              {typeOptions.map((t) => (
+                <option value={t.value}>{t.label}</option>
+              ))}
+            </select>
+          </label>
+
+          <label class="fld">
+            Name it
+            <span>What your mentor will see before they open it.</span>
+            <input type="text" name="title" maxlength="200" required/>
+          </label>
+
+          <label class="fld">
+            The link
+            <span>{SHARING_REQUIREMENT}</span>
+            <input type="url" name="url" inputmode="url" placeholder="https://" required/>
+          </label>
+
+          <label class="fld">
+            The day the work happened
+            <span>Not the day you are filing it. The week is worked out from this.</span>
+            <input type="date" name="occurred_on" value={TODAY} max={TODAY} required/>
+          </label>
+
+          <div class="pair">
+            <label class="fld">
+              What is this evidence of
+              <select name="kind_a" required>
+                {KIND_OPTIONS.map((k) => (
+                  <option value={k.value}>{k.label}</option>
+                ))}
+              </select>
+            </label>
+            <label class="fld">
+              Hours you spent on it
+              <span>Report what it actually took, even if that is more than was planned.</span>
+              <input type="number" name="hours_a" min="0" max="24" step="0.25" inputmode="decimal" required/>
+            </label>
+          </div>
+
+          {hasTasks ? (
+            <label class="fld">
+              Which piece of work (if it was project work)
+              <select name="task_a">
+                <option value="">Not one of my listed tasks</option>
+                {tasks.map((t) => (
+                  <option value={t.id}>{t.title}</option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+
+          <label class="fld">
+            Or describe it
+            <span>Used when it is not one of your listed tasks.</span>
+            <input type="text" name="label_a" maxlength="200"/>
+          </label>
+
+          <div class="pair">
+            <label class="fld">
+              Also evidence of (optional)
+              <span>One link is often evidence for two things at once.</span>
+              <select name="kind_b">
+                <option value="">Nothing else</option>
+                {KIND_OPTIONS.map((k) => (
+                  <option value={k.value}>{k.label}</option>
+                ))}
+              </select>
+            </label>
+            <label class="fld">
+              Hours on that
+              <input type="number" name="hours_b" min="0" max="24" step="0.25" inputmode="decimal"/>
+            </label>
+          </div>
+
+          <label class="fld">
+            Anything your mentor should know
+            <span>Optional. What you were trying to do, what went wrong, what you would do next.</span>
+            <textarea name="note" maxlength="2000"></textarea>
+          </label>
+
+          <label class="ack">
+            <input type="checkbox" name="sharing_ack" value="yes"/>
+            <span>I have shared this as "Anyone with the link", so my mentor can open it without asking
+              me for access.</span>
+          </label>
+
+          <button class="go" type="submit">File this evidence</button>
+        </form>
+      )}
+    </section>
+
+    <h2 class="sec">What you have filed</h2>
+
+    {!hasFiled ? (
+      <div class="card">
+        <h3>Nothing filed yet</h3>
+        <p>Hours are recognised from evidence somebody verified, so this is where your week comes
+          from. Nothing here is measured from a clock.</p>
+      </div>
+    ) : null}
+
+    {filedView.map((e) => (
+      <article class="item">
+        <h3>{e.title}</h3>
+        <p class="meta">{e.typeLabel} - {e.occurredOn} - {e.activities}</p>
+        <span class="chip">{e.statusLabel}</span>
+        <span class="chip">{e.claimed}h reported</span>
+        <span class="chip">{e.verified}h verified</span>
+        <a class="evlink" href={e.url} target="_blank" rel="noopener noreferrer">
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>
+          Open it
+        </a>
+        {e.reason ? <p class="meta">{e.reviewer || 'Your mentor'} wrote: {e.reason}</p> : null}
+        {e.outcome ? <p class="meta">Outcome recorded: {e.outcome}</p> : null}
+      </article>
+    ))}
+
+    <div class="foot">
+      <p>Nothing on this page watches you. There is no webcam, no screenshot and no keystroke record
+        anywhere in this system, and evidence is always a link to work that stays where it lives.</p>
+      <p>What you report is kept as you reported it, including an over-run. What is recognised is what
+        a mentor verified, capped at your weekly ceiling - holistic time included, never added on top.
+        Hours above the ceiling stay on your record as recorded and not recognised.</p>
+      <p>EduRankAI is the technology platform. Verified hours are a record of work done on this
+        platform; accredited partners award credentials.</p>
+    </div>
+  </main>
+</body>
+</html>

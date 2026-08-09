@@ -10,10 +10,18 @@ import { roleCanReceive } from '@/lib/notify-audience';
 import { metaFor, vibrationFor, isHighPriority, type NotifPriority } from '@/lib/notification-catalog';
 import { ensureNotificationsSchema } from '@/lib/notifications-schema';
 
-// Configure web-push with VAPID keys
-const VAPID_PUBLIC = import.meta.env.VAPID_PUBLIC_KEY || process.env.VAPID_PUBLIC_KEY || '';
-const VAPID_PRIVATE = import.meta.env.VAPID_PRIVATE_KEY || process.env.VAPID_PRIVATE_KEY || '';
-const VAPID_SUBJECT = import.meta.env.VAPID_SUBJECT || process.env.VAPID_SUBJECT || 'mailto:siddharth@edurankai.in';
+// Configure web-push with VAPID keys.
+//
+// import.meta.env is UNDEFINED outside a Vite context, so reading a property off it throws rather
+// than yielding undefined, and the || fallback to process.env is never reached. That crashed any
+// script or test that imported this module even indirectly. Read it defensively.
+const viteEnv: Record<string, string | undefined> =
+  (typeof import.meta !== 'undefined' && (import.meta as any).env) || {};
+const envVar = (name: string): string => viteEnv[name] || process.env[name] || '';
+
+const VAPID_PUBLIC = envVar('VAPID_PUBLIC_KEY');
+const VAPID_PRIVATE = envVar('VAPID_PRIVATE_KEY');
+const VAPID_SUBJECT = envVar('VAPID_SUBJECT') || 'mailto:connect@edurankai.in';
 
 if (VAPID_PUBLIC && VAPID_PRIVATE) {
   webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);

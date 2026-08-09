@@ -1,0 +1,564 @@
+---
+// /portal/mentor — WHAT IS WAITING ON THIS MENTOR, AND WHO NEEDS THEM FIRST.
+//
+// =================================================================================================
+// THE QUEUE IS THE PRODUCT
+// =================================================================================================
+//
+// A dashboard nobody can act from is a report, and a report about somebody's hours that nobody acts
+// on is worse than nothing because it looks like oversight. So the first thing on this page is the
+// work waiting on this person, with the verdict buttons on the item itself. The intern cards come
+// second, ordered by who needs attention rather than alphabetically, and every position on that list
+// is accompanied by the sentences that produced it — nobody is shown a rank without its reasons.
+//
+// =================================================================================================
+// WHY THIS IS IN THE PORTAL AND NOT IN /admin
+// =================================================================================================
+//
+// A mentor is very often an ordinary employee with no admin access at all. A queue behind /admin
+// would mean the one person the evidence was addressed to could not open it, and an intern's work
+// would sit unverified until somebody noticed. So it lives where the people it is addressed to
+// already are.
+//
+// =================================================================================================
+// THE LIST IS NOT THE PERMISSION
+// =================================================================================================
+//
+// mentorDashboard() shows what the Organization Graph says is this person's, resolved per row from
+// the recorded mentor, reporting and reviewer edges — never from users.role. recordVerdict() then
+// asks the whole question again at the write: an evidence id posted from somebody else's queue is
+// refused by the engine, not by the absence of a button here.
+//
+// =================================================================================================
+// WHAT THIS SCREEN DELIBERATELY CANNOT DO
+// =================================================================================================
+//
+// It cannot see a webcam, a screenshot, or a keystroke. It cannot mark anybody as dishonest: there
+// is no control on this page that does that and no wording for it. The advisory sentences say
+// "potential discrepancy, mentor review required" and nothing stronger, and they change no number.
+// A human reads them and a human decides.
+//
+// It cannot verify more hours than the intern reported: the engine refuses, and the input carries
+// the reported figure as its maximum. And it never silently trims an over-run — hours above the
+// weekly ceiling stay RECORDED and are shown as not recognised.
+//
+// MOBILE FIRST: 360px, every control at least 44px, nothing scrolls sideways.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  mentorDashboard,
+  recordVerdict,
+  VERDICT_LABELS,
+  VERDICT_SENTENCES,
+  ACTIVITY_KIND_LABELS,
+  MIN_REASON,
+  type MentorDashboard,
+  type Verdict,
+} from '@/lib/eims-evidence';
+// THE ADVISORY LAYER. It is READ HERE AND NOWHERE ELSE, which is the point of it: the sentence it
+// produces is addressed to the one person the Organization Graph names as this intern's mentor, and
+// there is no admin console, no HR screen and no notification that carries it anywhere else. A
+// "potential discrepancy" that reached a desk the student has never met would be an accusation with
+// no relationship behind it and nobody accountable for reading it fairly.
+import {
+  reviewForMany,
+  MENTOR_SENTENCE,
+  NOT_A_FINDING_SENTENCE,
+  ADVISORY_SENTENCE,
+  type AnomalyReview,
+} from '@/lib/eims-anomaly';
+
+const PATH = '/portal/mentor';
+
+// Every const declared BEFORE the POST handler that reads it. const is not hoisted.
+const ACCEPT: Verdict = 'accepted';
+const VERDICT_ORDER: Verdict[] = ['accepted', 'revision_required', 'rejected', 'flagged'];
+const VERDICT_HELP: Record<string, string> = {
+  accepted: 'Writes the verified hours. This is the only verdict that does.',
+  revision_required: 'The work is not in question; the evidence does not show it yet. Say what is missing.',
+  rejected: 'This evidence does not support these hours. The reported hours stay recorded, unrecognised.',
+  flagged: 'Ask for a second look before deciding. Not a finding about the intern.',
+};
+const HOURS_PREFIX = 'hours_';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+const workspace = gate.ok ? gate.workspace : null;
+
+let flash = '';
+let flashError = '';
+let flashNotes: string[] = [];
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+    const evidenceId = String(form.get('evidence_id') || '');
+    const verdict = String(form.get('verdict') || '');
+    const reason = String(form.get('reason') || '').trim().slice(0, 1000);
+    const outcome = String(form.get('outcome') || '').trim().slice(0, 500);
+
+    const hours: { linkId: string; hours: number }[] = [];
+    for (const [key, value] of form.entries()) {
+      if (key.indexOf(HOURS_PREFIX) !== 0) continue;
+      const linkId = key.slice(HOURS_PREFIX.length);
+      const n = Number(String(value || '0'));
+      hours.push({ linkId, hours: Number.isFinite(n) ? n : 0 });
+    }
+
+    const res = await recordVerdict({
+      evidenceId,
+      userId: String(user.id),
+      verdict: verdict as Verdict,
+      reason,
+      outcome,
+      hours,
+    });
+
+    if (res.ok) {
+      flash = verdict === ACCEPT
+        ? res.hoursVerified + ' hours verified, recorded against this evidence with your name on it.'
+        : VERDICT_SENTENCES[verdict as Verdict] + ' The intern can read your reason.';
+      flashNotes = res.advisories;
+    } else {
+      // NEVER SWALLOWED. The engine's sentence is shown exactly as it came back.
+      flashError = res.error;
+    }
+  } catch (e: any) {
+    flashError = 'That verdict could not be recorded: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    console.error('[portal/mentor] verdict', e?.cause?.message || e?.message);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+let data: MentorDashboard | null = null;
+if (gate.ok) {
+  data = await mentorDashboard(String(user.id));
+}
+
+const queue = data ? data.queue : [];
+const interns = data ? data.interns : [];
+const weekLine = data ? data.weekStart + ' to ' + data.weekEnd : '';
+const graphReady = data ? data.graphReady : false;
+const rosterSentence = data ? data.sentence : '';
+const readError = data ? data.error : '';
+const atRisk = interns.filter((i) => i.risks.length > 0).length;
+
+// ------------------------------------------------------------------------------------------------
+// THE ADVISORY REVIEW, FOR THE PEOPLE ALREADY ON THIS MENTOR'S LIST.
+//
+// The ids come from the roster the graph produced above; nothing widens the set. reviewForMany() is
+// capped and sequential by design, and it reports what it skipped rather than trimming silently, so
+// a mentor with a long list is told their advisory pass was partial instead of being shown a shorter
+// one that looks complete.
+//
+// A FAILURE HERE IS SILENT ON PURPOSE, and it is the one place in this file where that is right: the
+// advisory layer decides nothing, so if it cannot run, the queue and the verdict buttons must still
+// work. What it must never do is report "no signals" when it failed to look, so the reviews map is
+// simply absent for anybody it could not examine, and the card says the pass did not run rather than
+// showing an all-clear.
+// ------------------------------------------------------------------------------------------------
+const rosterIds: string[] = [];
+for (const card of interns) {
+  const id = card.person && card.person.employeeId ? String(card.person.employeeId) : '';
+  if (id) rosterIds.push(id);
+}
+
+let reviews = new Map<string, AnomalyReview>();
+let advisoryExamined = 0;
+let advisorySkipped = 0;
+let advisoryRan = false;
+if (rosterIds.length) {
+  try {
+    const res = await reviewForMany(rosterIds, { max: 25 });
+    reviews = res.reviews;
+    advisoryExamined = res.examined;
+    advisorySkipped = res.skipped;
+    advisoryRan = true;
+  } catch (e: any) {
+    console.error('[portal/mentor] advisory', e?.cause?.message || e?.message);
+  }
+}
+
+// -----------------------------------------------------------------------------------------------
+// VIEW MODELS, BUILT HERE AND NOT IN THE MARKUP.
+//
+// Every label is resolved to a plain string in the frontmatter. Indexing a typed map from inside
+// JSX is one of the two things that reliably breaks the .astro compiler on this project, and the
+// error it produces names a completely unrelated line, so the fix is to never do it.
+// -----------------------------------------------------------------------------------------------
+const kindLabel = (kind: string): string =>
+  (ACTIVITY_KIND_LABELS as Record<string, string>)[kind] || 'Activity';
+
+const verdictButtons = VERDICT_ORDER.map((v) => ({
+  value: String(v),
+  label: String(VERDICT_LABELS[v]),
+  help: String(VERDICT_HELP[v] || ''),
+  primary: v === ACCEPT,
+}));
+
+const queueView = queue.map((item) => ({
+  id: item.evidence.id,
+  internName: item.internName,
+  title: item.evidence.title,
+  url: item.evidence.url,
+  host: item.evidence.host || '',
+  note: item.evidence.note || '',
+  typeLabel: item.evidence.typeLabel,
+  occurredOn: item.evidence.occurredOn,
+  waitingLine: item.waitingDays === 1 ? 'filed 1 day ago' : 'filed ' + item.waitingDays + ' days ago',
+  advisories: item.advisories,
+  links: item.evidence.links.map((l) => ({
+    id: l.id,
+    label: l.activityLabel || kindLabel(String(l.activityKind)),
+    claimed: l.hoursClaimed,
+  })),
+}));
+
+const VIA_WORDS: Record<string, string> = {
+  mentor: 'your mentee',
+  reporting_manager: 'a direct report',
+  reviewer: 'someone you review',
+};
+
+// THE ONE SENTENCE, RESOLVED HERE. It is MENTOR_SENTENCE verbatim or it is nothing: there is no
+// branch below that produces a stronger wording, no count at which it escalates, and no place a
+// signal count is shown as a score about a person. The observations are listed underneath it with
+// their ordinary explanations attached, because a mentor reading "large hours, little evidence"
+// alongside "evidence is often filed in a batch at the end of a sprint" is the entire safeguard.
+const internView = interns.map((card) => {
+  const employeeId = card.person && card.person.employeeId ? String(card.person.employeeId) : '';
+  const review = employeeId ? reviews.get(employeeId) : undefined;
+  const signals = review ? review.signals : [];
+  return {
+  advisorySentence: review && review.sentence ? MENTOR_SENTENCE : '',
+  advisorySignals: signals.map((s) => ({
+    key: String(s.key),
+    label: s.label,
+    observation: s.observation,
+    ordinaryExplanation: s.ordinaryExplanation,
+    lookAt: s.lookAt,
+  })),
+  advisoryWindow: review ? review.fromIso + ' to ' + review.toIso : '',
+  advisoryIncomplete: review ? review.incompleteSentence : '',
+  // NOT the same as "nothing fired". Absent means the pass did not run for this person, and saying
+  // so is the difference between silence and an all-clear.
+  advisoryRanFor: !!review,
+  name: card.person.fullName || 'Unnamed',
+  designation: card.person.designation || 'No designation recorded',
+  viaWord: VIA_WORDS[String(card.person.via)] || 'on your list',
+  risks: card.risks,
+  requiredText: card.hours.required === null ? 'Not set' : String(card.hours.required),
+  allocatedText: card.hours.allocated === null ? 'Not recorded' : String(card.hours.allocated),
+  claimed: card.hours.claimed,
+  verified: card.hours.verified,
+  recognised: card.hours.recognised,
+  outstandingText: card.hours.outstanding === null ? 'Unknown' : String(card.hours.outstanding),
+  aboveCeiling: card.hours.aboveCeiling,
+  work: card.work,
+  ev: card.evidence,
+  learningHours: card.learningHours,
+  holisticHours: card.holisticHours,
+  requiredBasis: card.hours.requiredBasis,
+  allocatedNote: card.hours.allocatedNote,
+  };
+});
+
+// Precomputed so no comparison operator has to appear inside a JSX expression.
+const hasQueue = queueView.length > 0;
+const hasInterns = internView.length > 0;
+const hasFlashNotes = flashNotes.length > 0;
+const advisoryPartial = advisoryRan && advisorySkipped > 0;
+const advisoryFailed = rosterIds.length > 0 && !advisoryRan;
+const riskLine = atRisk ? ' - ' + atRisk + ' need attention' : '';
+const reasonHelp = 'Required unless you are verifying. The intern reads this, and it is the only '
+  + 'thing that tells them what to do next. At least ' + MIN_REASON + ' characters.';
+---
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="robots" content="noindex,nofollow"/>
+  <title>Mentor - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    html,body{overflow-x:hidden;}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+      -webkit-text-size-adjust:100%;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-0.01em;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    h2.sec{margin:22px 0 0;font-size:0.6875rem;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#70685C;}
+    .card{margin:10px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h3{margin:0 0 6px;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .card p + p{margin-top:8px;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CFE3D2;border-radius:10px;background:#F3F9F4;font-size:0.8125rem;line-height:1.55;color:#245C33;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .notice{margin:10px 0 0;padding:10px 12px;border:1px solid #EADECD;border-radius:10px;background:#FBF7F1;font-size:0.8125rem;line-height:1.55;color:#6D470D;}
+    /* THE ADVISORY BLOCK IS DELIBERATELY QUIET. No red, no warning triangle, no alarm colour: it is
+       a note asking somebody to look, and styling it as an alert would make the interface itself
+       accuse a student before a human has read a word of it. */
+    .advisory{margin:10px 0 0;padding:11px 12px;border:1px solid #DFDCD8;border-left:3px solid #A8A093;
+      border-radius:10px;background:#FBFAF8;}
+    .advisory-line{margin:0;font-size:0.8125rem;font-weight:680;line-height:1.5;color:#3E382F;}
+    .advisory-meta{margin:7px 0 0;font-size:0.6875rem;line-height:1.55;color:#70685C;}
+    .advisory-item{margin:9px 0 0;padding:9px 0 0;border-top:1px solid #EDEAE5;}
+    .advisory-item b{display:block;font-size:0.75rem;font-weight:700;color:#3E382F;}
+    .advisory-item p{margin:4px 0 0;font-size:0.75rem;line-height:1.55;color:#564E43;}
+    .advisory-item p.ordinary{color:#70685C;}
+    .chip{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;border:1px solid #DFDCD8;background:#F6F4F1;font-size:0.6875rem;font-weight:700;color:#564E43;white-space:nowrap;}
+    .chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0;}
+    .meta{margin:6px 0 0;font-size:0.75rem;line-height:1.5;color:#70685C;overflow-wrap:anywhere;}
+    .evlink{display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:9px 12px;margin:8px 0 0;
+      border:1px solid #DFDCD8;border-radius:10px;background:#F6F4F1;color:#1B1813;text-decoration:none;
+      font-size:0.8125rem;font-weight:650;max-width:100%;overflow-wrap:anywhere;}
+    .kv{display:grid;grid-template-columns:1fr auto;gap:4px 10px;margin:10px 0 0;font-size:0.8125rem;}
+    .kv dt{color:#70685C;}
+    .kv dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;font-weight:650;}
+    .tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:10px 0 0;}
+    .tile{padding:11px 12px;border:1px solid #DFDCD8;border-radius:10px;background:#FCFBFA;}
+    .tile b{display:block;font-size:1.125rem;font-weight:700;line-height:1.2;font-variant-numeric:tabular-nums;}
+    .tile span{display:block;margin-top:3px;font-size:0.6875rem;line-height:1.4;color:#70685C;text-transform:uppercase;letter-spacing:0.04em;}
+    ul.plain{list-style:none;margin:8px 0 0;padding:0;}
+    ul.plain li{padding:8px 10px;border:1px solid #EFEDEA;border-radius:8px;background:#FCFBFA;margin-bottom:6px;font-size:0.8125rem;line-height:1.5;overflow-wrap:anywhere;}
+    details.verify{margin:10px 0 0;border:1px solid #DFDCD8;border-radius:10px;background:#FCFBFA;overflow:hidden;}
+    details.verify > summary{list-style:none;cursor:pointer;min-height:44px;display:flex;align-items:center;
+      padding:12px;font-size:0.8125rem;font-weight:700;}
+    details.verify > summary::-webkit-details-marker{display:none;}
+    .vbody{padding:0 12px 12px;border-top:1px solid #EFEDEA;}
+    label.fld{display:block;margin:10px 0 0;font-size:0.75rem;font-weight:700;color:#564E43;}
+    label.fld span{display:block;margin:2px 0 5px;font-size:0.75rem;font-weight:400;line-height:1.5;color:#70685C;}
+    input[type="number"],input[type="text"],textarea{width:100%;min-height:44px;padding:10px 11px;border:1px solid #DFDCD8;
+      border-radius:9px;background:#FFFFFF;color:#1B1813;font:inherit;font-size:0.875rem;}
+    textarea{min-height:88px;line-height:1.5;resize:vertical;}
+    .verdicts{display:grid;grid-template-columns:1fr;gap:8px;margin:12px 0 0;}
+    button.v{min-height:44px;padding:11px 12px;border-radius:10px;border:1px solid #DFDCD8;background:#FDFDFC;
+      color:#1B1813;font:inherit;font-size:0.8125rem;font-weight:700;text-align:left;cursor:pointer;}
+    button.v small{display:block;margin-top:3px;font-size:0.6875rem;font-weight:400;line-height:1.45;color:#70685C;}
+    button.v.primary{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    button.v.primary small{color:#D8D3CC;}
+    .foot{margin:22px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;line-height:1.6;color:#70685C;}
+    .ico{flex:none;width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;}
+    @media (min-width:520px){ .verdicts{grid-template-columns:repeat(2,minmax(0,1fr));} }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Mentor</h1>
+    <p>{workspace ? workspace.fullName : 'Your interns'}{weekLine ? ' - week of ' + weekLine : ''}</p>
+  </header>
+
+  <main class="wrap">
+    {flash ? <div class="ok">{flash}</div> : null}
+    {hasFlashNotes ? (
+      <div class="notice">
+        {flashNotes.map((n) => <p>{n}</p>)}
+      </div>
+    ) : null}
+    {flashError ? <div class="bad">{flashError}</div> : null}
+    {readError ? <div class="bad">{readError}</div> : null}
+
+    {!graphReady ? (
+      <div class="card">
+        <h3>Nothing is guessed from a job title</h3>
+        <p>{rosterSentence}</p>
+      </div>
+    ) : null}
+
+    <!-- =========================================================================================
+         THE QUEUE. First, because it is the only part of this page that changes anything.
+         ========================================================================================= -->
+    <h2 class="sec">Waiting on you</h2>
+
+    {!hasQueue ? (
+      <div class="card">
+        <h3>Nothing is waiting on you</h3>
+        <p>Every piece of evidence your interns have filed has a verdict against it. When one arrives
+          it appears here, oldest first, with the link and the reported hours.</p>
+      </div>
+    ) : null}
+
+    {queueView.map((item) => (
+      <article class="card">
+        <h3>{item.internName}: {item.title}</h3>
+        <p class="meta">{item.typeLabel} - work done {item.occurredOn} - {item.waitingLine}</p>
+
+        <a class="evlink" href={item.url} target="_blank" rel="noopener noreferrer">
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>
+          Open the evidence
+        </a>
+        <p class="meta">{item.host}</p>
+
+        <div class="chips">
+          {item.links.map((l) => (
+            <span class="chip">{l.label}: {l.claimed}h reported</span>
+          ))}
+        </div>
+
+        {item.note ? <p style="margin-top:8px;">{item.note}</p> : null}
+
+        {item.advisories.map((a) => (
+          <div class="notice">{a}</div>
+        ))}
+
+        <details class="verify">
+          <summary>Give a verdict</summary>
+          <div class="vbody">
+            <form method="POST">
+              <input type="hidden" name="evidence_id" value={item.id}/>
+
+              {item.links.map((l) => (
+                <label class="fld">
+                  Hours to verify for {l.label}
+                  <span>Reported: {l.claimed}. You may verify fewer. You cannot verify more, and the
+                    reported figure stays on the record either way.</span>
+                  <input type="number" name={'hours_' + l.id} value={l.claimed}
+                    min="0" max={l.claimed} step="0.25" inputmode="decimal"/>
+                </label>
+              ))}
+
+              <label class="fld">
+                Reason
+                <span>{reasonHelp}</span>
+                <textarea name="reason" maxlength="1000"></textarea>
+              </label>
+
+              <label class="fld">
+                Outcome (optional)
+                <span>What this work establishes - the skill shown, the deliverable finished. Kept with
+                  your verdict, so the record can say what the hours were for.</span>
+                <input type="text" name="outcome" maxlength="500"/>
+              </label>
+
+              <div class="verdicts">
+                {verdictButtons.map((b) => (
+                  <button class={b.primary ? 'v primary' : 'v'} type="submit" name="verdict" value={b.value}>
+                    {b.label}
+                    <small>{b.help}</small>
+                  </button>
+                ))}
+              </div>
+            </form>
+          </div>
+        </details>
+      </article>
+    ))}
+
+    <!-- =========================================================================================
+         THE INTERNS. At risk first, and every position carries the sentences that produced it.
+         ========================================================================================= -->
+    <h2 class="sec">Your interns{riskLine}</h2>
+
+    {advisoryPartial ? (
+      <div class="notice">The advisory pass looked at {advisoryExamined} of your interns and did not
+        reach {advisorySkipped}. Nothing is being reported about the ones it did not examine, so a
+        card with no note may simply not have been looked at.</div>
+    ) : null}
+
+    {advisoryFailed ? (
+      <div class="notice">The advisory pass could not run. That is not an all-clear about anybody: it
+        means nothing was checked. Your queue and your verdicts are unaffected.</div>
+    ) : null}
+
+    {!hasInterns ? (
+      <div class="card">
+        <h3>No interns are recorded as yours</h3>
+        <p>{rosterSentence}</p>
+      </div>
+    ) : null}
+
+    {internView.map((card) => (
+      <article class="card">
+        <h3>{card.name}</h3>
+        <p class="meta">{card.designation} - on your list as {card.viaWord}</p>
+
+        {card.risks.map((r) => (
+          <div class="notice">{r}</div>
+        ))}
+
+        {card.advisorySentence ? (
+          <div class="advisory">
+            <p class="advisory-line">{card.advisorySentence}</p>
+            <p class="advisory-meta">{ADVISORY_SENTENCE}</p>
+            <p class="advisory-meta">{NOT_A_FINDING_SENTENCE}</p>
+            {card.advisorySignals.map((s) => (
+              <div class="advisory-item">
+                <b>{s.label}</b>
+                <p>{s.observation}</p>
+                <p class="ordinary">{s.ordinaryExplanation}</p>
+                <p class="ordinary">{s.lookAt}</p>
+              </div>
+            ))}
+            <p class="advisory-meta">Looked at the period {card.advisoryWindow}.</p>
+            {card.advisoryIncomplete ? (
+              <p class="advisory-meta">{card.advisoryIncomplete}</p>
+            ) : null}
+          </div>
+        ) : null}
+
+        {!card.advisoryRanFor ? (
+          <p class="meta">The advisory pass did not run for this person, so nothing here is an
+            all-clear. It is silence, not a result.</p>
+        ) : null}
+
+        <div class="tiles">
+          <div class="tile"><b>{card.requiredText}</b><span>Required this week</span></div>
+          <div class="tile"><b>{card.allocatedText}</b><span>Allocated</span></div>
+          <div class="tile"><b>{card.claimed}</b><span>Reported</span></div>
+          <div class="tile"><b>{card.verified}</b><span>Verified</span></div>
+          <div class="tile"><b>{card.recognised}</b><span>Recognised</span></div>
+          <div class="tile"><b>{card.outstandingText}</b><span>Outstanding</span></div>
+        </div>
+
+        {card.aboveCeiling ? (
+          <div class="notice">{card.aboveCeiling} verified hours are above the ceiling for this week.
+            They stay recorded and are not recognised. Nothing has been deleted.</div>
+        ) : null}
+
+        <dl class="kv">
+          <dt>Work assigned and open</dt><dd>{card.work.assigned}</dd>
+          <dt>In progress</dt><dd>{card.work.inProgress}</dd>
+          <dt>Completed</dt><dd>{card.work.completed}</dd>
+          <dt>Past its date</dt><dd>{card.work.overdue}</dd>
+          <dt>Evidence filed this week</dt><dd>{card.ev.submitted}</dd>
+          <dt>Waiting on you</dt><dd>{card.ev.pending}</dd>
+          <dt>Verified</dt><dd>{card.ev.accepted}</dd>
+          <dt>Revision requested</dt><dd>{card.ev.revisionRequired}</dd>
+          <dt>Not accepted</dt><dd>{card.ev.rejected}</dd>
+          <dt>Flagged</dt><dd>{card.ev.flagged}</dd>
+          <dt>Days this week with no evidence</dt><dd>{card.ev.daysWithout}</dd>
+          <dt>Learning hours verified</dt><dd>{card.learningHours}</dd>
+          <dt>Holistic hours verified</dt><dd>{card.holisticHours}</dd>
+        </dl>
+
+        <p class="meta">{card.requiredBasis}</p>
+        <p class="meta">{card.allocatedNote}</p>
+      </article>
+    ))}
+
+    <div class="foot">
+      <p>Hours are recognised from evidence a named person verified, never from time logged in. There
+        is no webcam here, no screenshot and no keystroke record, and nothing on this page can create
+        one.</p>
+      <p>Reported hours are kept exactly as the intern reported them, including when they exceed what
+        was allocated. Verification decides what is recognised; it never rewrites what was reported.
+        The weekly ceiling is a ceiling on what may be recognised - holistic fitness included, never
+        added on top of it.</p>
+      <p>Advisory sentences point at things worth a look. They decide nothing, they change no number,
+        and they never say a person did anything wrong. You decide.</p>
+      <p>EduRankAI is the technology platform. Verified hours recorded here are a record of work done
+        on this platform; accredited partners award credentials.</p>
+    </div>
+  </main>
+</body>
+</html>

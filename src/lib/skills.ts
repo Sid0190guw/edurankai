@@ -380,6 +380,12 @@ export async function setEmployeeSkill(
   const ref = refKind === 'course' || refKind === 'assessment'
     ? { kind: refKind, id: String(input?.evidenceRef?.id || '') }
     : null;
+  // What a SkillVerified event would be allowed to carry, filled in ONLY by a confirmation below.
+  // Declared here rather than inside the block because the emit happens after the write — and
+  // because a binding declared after the code that reads it is not hoisted, which has broken two
+  // handlers on this project.
+  let confirmedEvidence: { kind: string; ref: string; label: string; url: string | null } | null = null;
+  let confirmedLearnerUserId: string | null = null;
   if (ref) {
     if (!isUuid(ref.id)) return { ok: false, error: 'Choose the completion or assessment this level rests on.' };
     const learnerUserId = await resolveLearnerUserId(employeeId);
@@ -405,6 +411,8 @@ export async function setEmployeeSkill(
       source = 'course';
       evidence = ev.evidence;
       evidenceUrl = ev.evidenceUrl || null;
+      confirmedLearnerUserId = String(learnerUserId);
+      confirmedEvidence = { kind: 'course', ref: ref.id, label: ev.evidence, url: ev.evidenceUrl || null };
     } else {
       const ev = await verifyAssessmentEvidence(String(learnerUserId), ref.id);
       if (!ev) {
@@ -416,6 +424,8 @@ export async function setEmployeeSkill(
       source = 'assessment';
       evidence = ev.label;
       evidenceUrl = ev.url || null;
+      confirmedLearnerUserId = String(learnerUserId);
+      confirmedEvidence = { kind: 'assessment', ref: ref.id, label: ev.label, url: ev.url || null };
     }
   }
 
@@ -443,6 +453,34 @@ export async function setEmployeeSkill(
       entityId: String(rows[0].id),
       diff: { employeeId, skillId, level, source },
     });
+
+    // ---- THE SPINE IS TOLD, AND ONLY WHEN IT IS TRUE -------------------------------------------
+    // SkillVerified is the only event that may call a level verified, and it is emitted ONLY when
+    // this function confirmed the evidence against the learner's own record above. A self-claim and
+    // a manager's assessment are real rows and stay real rows — they are simply not verification,
+    // and no event says they are.
+    //
+    // The emit runs after the write and cannot undo it: emitSkillVerified() never throws, and its
+    // failure is reported here rather than swallowed. A skill row that exists with no event is a
+    // gap in a timeline; a skill row lost to a logging failure would be a gap in a person's record.
+    if (confirmedEvidence) {
+      const { emitSkillVerified } = await import('@/lib/hr-events');
+      const emitted = await emitSkillVerified({
+        employeeId,
+        learnerUserId: confirmedLearnerUserId,
+        skillId,
+        level,
+        levelLabel: SKILL_LEVEL_LABELS[level] || null,
+        verifiedByUserId: String(viewer.userId || ''),
+        evidence: confirmedEvidence,
+        sourceModule: 'lib/skills.setEmployeeSkill',
+        correlationId: 'skill:' + String(rows[0].id),
+      });
+      if (!emitted.ok) {
+        logFail(MOD, 'setEmployeeSkill:emit', new Error(emitted.error || 'SkillVerified was not appended'));
+      }
+    }
+
     return { ok: true, id: String(rows[0].id) };
   } catch (e: any) {
     logFail(MOD, 'setEmployeeSkill', e);

@@ -2,7 +2,14 @@
 // employment, LOR, and admin-issued custom credentials. Coexists with the older
 // course-only system in src/lib/certificates.ts (course_certificates table) so
 // the existing AquinTutor course flow keeps working.
-import { db } from '@/lib/db';
+// Resolved LAZILY. A top-level db import makes src/lib/db throw DATABASE_URL is not set the moment
+// any importer loads, which puts every pure function in this module — and in anything that imports
+// it — out of reach of a test that needs no database at all.
+let _db: any = null;
+async function database(): Promise<any> {
+  if (!_db) _db = (await import('@/lib/db')).db;
+  return _db;
+}
 import { sql } from 'drizzle-orm';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
@@ -12,7 +19,7 @@ export function ensureUniversalCertSchema(): Promise<void> {
   if (ready) return ready;
   ready = (async () => {
     try {
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS universal_certificates (
+      await (await database()).execute(sql`CREATE TABLE IF NOT EXISTS universal_certificates (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         serial VARCHAR(40) NOT NULL UNIQUE,
         kind VARCHAR(40) NOT NULL,
@@ -46,9 +53,9 @@ export function ensureUniversalCertSchema(): Promise<void> {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
-      await db.execute(sql`CREATE INDEX IF NOT EXISTS ucert_serial_idx ON universal_certificates(serial)`);
-      await db.execute(sql`CREATE INDEX IF NOT EXISTS ucert_recipient_idx ON universal_certificates(recipient_email, kind)`);
-      await db.execute(sql`CREATE INDEX IF NOT EXISTS ucert_kind_idx ON universal_certificates(kind, signed_at DESC)`);
+      await (await database()).execute(sql`CREATE INDEX IF NOT EXISTS ucert_serial_idx ON universal_certificates(serial)`);
+      await (await database()).execute(sql`CREATE INDEX IF NOT EXISTS ucert_recipient_idx ON universal_certificates(recipient_email, kind)`);
+      await (await database()).execute(sql`CREATE INDEX IF NOT EXISTS ucert_kind_idx ON universal_certificates(kind, signed_at DESC)`);
     } catch (_) {}
   })();
   return ready;
@@ -90,7 +97,7 @@ export interface IssueUniversalOpts {
 export async function issueUniversalCertificate(opts: IssueUniversalOpts) {
   await ensureUniversalCertSchema();
   if (opts.kind === 'test' && opts.refAttemptId) {
-    const existing = rows(await db.execute(sql`
+    const existing = rows(await (await database()).execute(sql`
       SELECT * FROM universal_certificates WHERE kind = 'test' AND ref_attempt_id = ${opts.refAttemptId} AND revoked = false LIMIT 1
     `));
     if (existing[0]) return { ok: true, existing: true, id: existing[0].id, serial: existing[0].serial };
@@ -98,14 +105,14 @@ export async function issueUniversalCertificate(opts: IssueUniversalOpts) {
 
   let serial = generateSerial(opts.kind);
   for (let i = 0; i < 5; i++) {
-    const dup = rows(await db.execute(sql`SELECT 1 FROM universal_certificates WHERE serial = ${serial} LIMIT 1`));
+    const dup = rows(await (await database()).execute(sql`SELECT 1 FROM universal_certificates WHERE serial = ${serial} LIMIT 1`));
     if (dup.length === 0) break;
     serial = generateSerial(opts.kind);
   }
 
   const metaJson = JSON.stringify(opts.metadata || {});
 
-  const r = rows(await db.execute(sql`
+  const r = rows(await (await database()).execute(sql`
     INSERT INTO universal_certificates (serial, kind, recipient_name, recipient_email, recipient_user_id, recipient_employee_id,
       title, body, achievement,
       ref_course_id, ref_test_id, ref_attempt_id, ref_event_id,
@@ -126,10 +133,10 @@ export async function issueUniversalCertificate(opts: IssueUniversalOpts) {
 
 export async function getUniversalBySerial(serial: string) {
   await ensureUniversalCertSchema();
-  const r = rows(await db.execute(sql`SELECT * FROM universal_certificates WHERE serial = ${serial} LIMIT 1`));
+  const r = rows(await (await database()).execute(sql`SELECT * FROM universal_certificates WHERE serial = ${serial} LIMIT 1`));
   if (r[0]) {
     try {
-      await db.execute(sql`UPDATE universal_certificates SET verify_count = verify_count + 1, last_verified_at = NOW() WHERE id = ${r[0].id}`);
+      await (await database()).execute(sql`UPDATE universal_certificates SET verify_count = verify_count + 1, last_verified_at = NOW() WHERE id = ${r[0].id}`);
     } catch (_) {}
   }
   return r[0] || null;
@@ -141,14 +148,14 @@ export async function listUniversal(opts: { kind?: string; limit?: number; q?: s
   const q = (opts.q || '').trim();
   if (q) {
     const like = '%' + q + '%';
-    return rows(await db.execute(sql`
+    return rows(await (await database()).execute(sql`
       SELECT * FROM universal_certificates
       WHERE (recipient_name ILIKE ${like} OR recipient_email ILIKE ${like} OR serial ILIKE ${like} OR title ILIKE ${like})
         ${opts.kind ? sql`AND kind = ${opts.kind}` : sql``}
       ORDER BY signed_at DESC, created_at DESC LIMIT ${limit}
     `));
   }
-  return rows(await db.execute(sql`
+  return rows(await (await database()).execute(sql`
     SELECT * FROM universal_certificates
     ${opts.kind ? sql`WHERE kind = ${opts.kind}` : sql``}
     ORDER BY signed_at DESC, created_at DESC LIMIT ${limit}
@@ -170,14 +177,14 @@ export async function listUniversal(opts: { kind?: string; limit?: number; q?: s
  */
 export async function revokeUniversal(serial: string, byUserId: string, reason: string): Promise<{ revoked: boolean; alreadyRevoked: boolean }> {
   await ensureUniversalCertSchema();
-  const done = rows(await db.execute(sql`
+  const done = rows(await (await database()).execute(sql`
     UPDATE universal_certificates SET revoked = true, revoked_at = NOW(), revoked_by_user_id = ${byUserId},
       revocation_reason = ${reason.slice(0, 1000)}, updated_at = NOW()
     WHERE serial = ${serial} AND revoked = false
     RETURNING serial
   `));
   if (done.length > 0) return { revoked: true, alreadyRevoked: false };
-  const existing = rows(await db.execute(sql`SELECT revoked FROM universal_certificates WHERE serial = ${serial} LIMIT 1`));
+  const existing = rows(await (await database()).execute(sql`SELECT revoked FROM universal_certificates WHERE serial = ${serial} LIMIT 1`));
   return { revoked: false, alreadyRevoked: existing.length > 0 && !!existing[0].revoked };
 }
 

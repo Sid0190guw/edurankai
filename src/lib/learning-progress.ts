@@ -549,6 +549,42 @@ export async function recordLessonComplete(input: {
           certNumber: certificate?.certNumber || null,
         },
       });
+
+      // THE SPINE IS TOLD, ONCE, ON THE FACT THAT MATTERS — and never on a lesson.
+      //
+      // It runs after the completion is written and cannot undo it: emitHrEvent() does not throw,
+      // and a failure is logged here rather than swallowed. A learner who finished a course and lost
+      // the timeline row is a reporting gap; a learner who finished a course and lost the COMPLETION
+      // to a logging failure would be the real damage, and that cannot happen from here.
+      //
+      // `assertion: 'factual'` is the honest word: this platform watched the lessons complete. The
+      // certificate number is the signed ledger's, so anything reading this event cites the same
+      // certificate /verify/[cert] verifies.
+      try {
+        const { emitHrEvent } = await import('@/lib/hr-events');
+        const emitted = await emitHrEvent({
+          type: 'CourseCompleted',
+          subject: { userId },
+          actorUserId: userId,
+          actorKind: 'human',
+          sourceModule: 'lib/learning-progress.recordLessonComplete',
+          recordRef: after.enrollmentIds[0] || courseId,
+          assertion: 'factual',
+          payload: {
+            courseId,
+            source: input.source,
+            lessonsCompleted: after.completedLessons,
+            totalLessons: after.totalLessons,
+            certNumber: certificate?.certNumber || null,
+            verificationUrl: certificate?.verificationUrl || null,
+          },
+        });
+        if (!emitted.ok) {
+          logFail('recordLessonComplete:emit', new Error(emitted.error || 'CourseCompleted was not appended'));
+        }
+      } catch (e: any) {
+        logFail('recordLessonComplete:emit', e);
+      }
     }
 
     return { ok: true, completedNow, courseCompletedNow, progress: after, certificate };

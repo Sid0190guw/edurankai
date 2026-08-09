@@ -1,0 +1,584 @@
+---
+// /portal/employee/schedule — THE WEEK AN INTERN PLANS FOR THEMSELVES, AND THE HOURS LEAVE LEFT OWED.
+//
+// =================================================================================================
+// WHAT THIS SCREEN IS FOR
+// =================================================================================================
+//
+// An intern says what they intend to do next week: which activities, on which days, for how many
+// hours. Any days, any distribution - they are university students and their week is built around
+// classes, not around a shift pattern. The total is checked against the weekly ceiling, and the plan
+// goes to their reporting manager through the one approval engine.
+//
+// FIVE STATES ARE NAMED SEPARATELY ON THIS PAGE, because collapsing any two of them is how somebody
+// ends up waiting on something that is not happening:
+//
+//   NOT YET PROPOSED    no row exists for that week. Said in those words, never drawn as an empty
+//                       table, which reads as a week somebody planned to do nothing in.
+//   AWAITING APPROVAL   sent, and a named person owes an answer.
+//   APPROVED            the official plan for that week. Frozen - a change is a NEW proposal.
+//   REJECTED / CHANGES  a person answered, with their reason printed verbatim.
+//   COULD NOT BE READ   a read failed. Every figure would render as zero, which looks exactly like a
+//                       person who did nothing, so the page says so instead of showing the zeros.
+//
+// APPROVED LEAVE DOES NOT WAIVE HOURS. It takes the day out of the approved plan and leaves those
+// hours OUTSTANDING; the intern proposes a make-up for them, and that make-up is subject to the
+// ceiling of the week it lands in. There is no button on this page that clears outstanding hours by
+// going over a ceiling, and the engine refuses it again at the write.
+//
+// NOTHING HERE WATCHES ANYBODY. This screen stores a plan and a decision. No camera, no screenshot,
+// no keystroke, no session time - and no seam where one could be switched on.
+//
+// MOBILE FIRST: 360px, 44px targets, one column, nothing scrolls sideways.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  proposeSchedule, withdrawSchedule, resendForApproval, syncScheduleDecisions,
+  listSchedules, outstandingHours, ceilingFor, plannableWeeks,
+  hoursText, scheduleStateLabel, scheduleStateTone,
+  type ScheduleRow, type OutstandingRead, type CeilingRead, type SchedulesRead,
+} from '@/lib/eims-schedule';
+import { isoDate, parseIso, weekLabel, weekStartOf } from '@/lib/credit-week';
+
+const PATH = '/portal/employee/schedule';
+const DAY_MS = 86400000;
+const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+const workspace = gate.ok ? gate.workspace : null;
+const employeeId = workspace ? workspace.employeeId : '';
+
+const today = isoDate(new Date());
+const weeks = plannableWeeks(today, 5);
+
+let flash = '';
+let flashError = '';
+let flashNote = '';
+
+// Posted values, kept so a refusal does not throw away what somebody typed on a phone.
+let keptKind = 'regular';
+let keptWeek = weeks.length ? weeks[0] : weekStartOf(today);
+const keptActivity = ['', '', '', '', '', '', ''];
+const keptHours = ['', '', '', '', '', '', ''];
+let keptNote = '';
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST' && employeeId) {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || 'propose');
+
+    if (action === 'withdraw') {
+      const res = await withdrawSchedule(String(form.get('schedule_id') || ''), employeeId, user as any);
+      if (res.ok) {
+        flash = 'That plan is withdrawn. Nobody is waiting on it now.';
+        if (res.warning) flashNote = res.warning;
+      } else {
+        flashError = res.error || 'That plan could not be withdrawn.';
+      }
+    } else if (action === 'resend') {
+      const res = await resendForApproval(String(form.get('schedule_id') || ''), employeeId, String(user.id));
+      if (res.ok) {
+        flash = res.haltReason
+          ? 'Sent, but it has not reached anybody yet.'
+          : 'Sent to your reporting manager.';
+        if (res.haltReason) flashNote = res.haltReason;
+      } else {
+        flashError = res.error || 'That plan could not be sent.';
+      }
+    } else {
+      keptKind = String(form.get('kind') || 'regular');
+      keptWeek = String(form.get('week_start') || keptWeek);
+      keptNote = String(form.get('note') || '').slice(0, 500);
+
+      const start = parseIso(weekStartOf(keptWeek));
+      const entries = [];
+      for (let i = 0; i < 7; i++) {
+        const activity = String(form.get('activity_' + i) || '').trim();
+        const hours = String(form.get('hours_' + i) || '').trim();
+        keptActivity[i] = activity;
+        keptHours[i] = hours;
+        if (!activity && !hours) continue;
+        const date = start ? isoDate(new Date(start.getTime() + i * DAY_MS)) : '';
+        entries.push({ date, activity, hours: Number(hours) });
+      }
+
+      const res = await proposeSchedule({
+        employeeId,
+        userId: String(user.id),
+        weekStart: keptWeek,
+        kind: keptKind === 'makeup' ? 'makeup' : 'regular',
+        entries,
+        note: keptNote || null,
+      });
+
+      if (res.ok) {
+        flash = keptKind === 'makeup'
+          ? 'Make-up plan sent to your reporting manager.'
+          : 'Plan for ' + weekLabel(weekStartOf(keptWeek)) + ' sent to your reporting manager.';
+        // A halt is not a failure and not an approval. It is said in the engine's own words.
+        if (res.haltReason) flashNote = res.haltReason;
+        else if (res.warning) flashNote = res.warning;
+        for (let i = 0; i < 7; i++) { keptActivity[i] = ''; keptHours[i] = ''; }
+        keptNote = '';
+      } else {
+        // NEVER SWALLOWED. The engine's sentence is shown exactly as it came back.
+        flashError = res.error || 'That plan could not be saved.';
+      }
+    }
+  } catch (e: any) {
+    flashError = 'That could not be saved: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    console.error('[portal/schedule] write', e?.cause?.message || e?.message);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+let ceiling: CeilingRead | null = null;
+let owed: OutstandingRead | null = null;
+let read: SchedulesRead | null = null;
+
+if (employeeId) {
+  // Decisions taken on the generic approvals queue first, so a plan settled there is not still
+  // drawn as waiting on somebody.
+  await syncScheduleDecisions(employeeId);
+  ceiling = await ceilingFor(employeeId);
+  owed = await outstandingHours(employeeId);
+  read = await listSchedules(employeeId);
+}
+
+const all: ScheduleRow[] = read && read.ok ? read.schedules : [];
+const canMakeUp = !!owed && owed.ok && owed.remainingHours > 0;
+const ceilingKnown = !!ceiling && ceiling.ok && ceiling.applicable && ceiling.hours !== null;
+const ceilingText = ceiling && ceiling.hours !== null ? hoursText(ceiling.hours) : '';
+const ceilingBasis = ceiling ? ceiling.basis : '';
+
+// Every week is grouped ONCE, here, so the markup below only renders. A block-bodied arrow inside
+// JSX is exactly the shape that produces an .astro parse error blamed on a Fragment elsewhere.
+const weekViews = weeks.map((ws, idx) => {
+  const mine = all.filter((s) => s.weekStart === ws);
+  const official = mine.find((s) => s.official && s.kind === 'regular') || null;
+  const makeups = mine.filter((s) => s.official && s.kind === 'makeup');
+  const awaiting = mine.filter((s) => s.state === 'proposed');
+  let committed = official ? official.totalHours : 0;
+  for (const m of makeups) committed += m.totalHours;
+  committed = Math.round(committed * 100) / 100;
+
+  const state = official ? 'approved' : (awaiting.length > 0 ? 'proposed' : 'none');
+  const tone = state === 'none'
+    ? { bg: '#F4F3F1', fg: '#564E43', bd: '#DFDCD8' }
+    : scheduleStateTone(state);
+  const line = (committed > 0
+    ? hoursText(committed) + ' approved into this week'
+    : 'Nothing approved into this week yet')
+    + (ceilingKnown ? ' of ' + ceilingText : '')
+    + (awaiting.length > 0 ? ' · ' + awaiting.length + ' waiting on a decision' : '');
+
+  return {
+    weekStart: ws,
+    label: weekLabel(ws),
+    first: idx === 0,
+    official, makeups, awaiting, state, tone, line,
+    stateText: state === 'none' ? 'Not yet proposed' : scheduleStateLabel(state),
+  };
+});
+
+const history = all
+  .filter((s) => s.state !== 'proposed' && weeks.indexOf(s.weekStart) === -1)
+  .slice(0, 20);
+
+/** Kept out of the markup: a bare less-than inside a JSX expression is read as an opening tag. */
+const partOfDay = (fraction: number) => (fraction === 1 ? '' : ' (part of the day)');
+---
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="robots" content="noindex,nofollow"/>
+  <title>My weekly schedule - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    html,body{overflow-x:hidden;}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+      -webkit-text-size-adjust:100%;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-0.01em;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;padding:10px 16px 2px;margin:0;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:36px;padding:7px 12px;border:1px solid #DFDCD8;
+      border-radius:999px;background:#FDFDFC;color:#564E43;font-size:0.8125rem;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    .card{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h2{margin:0 0 6px;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .card p + p{margin-top:8px;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CBE3D2;border-radius:10px;background:#F1F8F3;font-size:0.8125rem;line-height:1.55;color:#1F5132;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .notice{margin:12px 0 0;padding:10px 12px;border:1px solid #EADECD;border-radius:10px;background:#FBF7F1;font-size:0.8125rem;line-height:1.55;color:#6D470D;}
+    .tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:12px 0 0;}
+    .tile{padding:11px 12px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;}
+    .tile b{display:block;font-size:1.25rem;font-weight:700;line-height:1.2;font-variant-numeric:tabular-nums;}
+    .tile span{display:block;margin-top:3px;font-size:0.6875rem;line-height:1.4;color:#70685C;text-transform:uppercase;letter-spacing:0.04em;}
+    .week{margin:10px 0 0;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;overflow:hidden;}
+    .week > summary{list-style:none;cursor:pointer;padding:12px;min-height:44px;}
+    .week > summary::-webkit-details-marker{display:none;}
+    .whead{display:flex;flex-wrap:wrap;align-items:center;gap:8px;}
+    .whead b{font-size:0.875rem;font-weight:680;}
+    .chip{display:inline-flex;align-items:center;padding:3px 9px;border-radius:999px;border:1px solid;font-size:0.6875rem;font-weight:700;white-space:nowrap;}
+    .wline{margin:6px 0 0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .wbody{padding:0 12px 12px;border-top:1px solid #EFEDEA;}
+    .list{list-style:none;margin:10px 0 0;padding:0;}
+    .list li{padding:8px 10px;border:1px solid #EFEDEA;border-radius:8px;background:#FCFBFA;margin-bottom:6px;font-size:0.8125rem;line-height:1.5;overflow-wrap:anywhere;}
+    .kv{display:grid;grid-template-columns:1fr auto;gap:4px 10px;margin:10px 0 0;font-size:0.8125rem;}
+    .kv dt{color:#70685C;}
+    .kv dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;font-weight:650;}
+    .lab{display:block;margin:12px 0 3px;font-size:0.75rem;font-weight:650;color:#564E43;}
+    .field{width:100%;min-width:0;min-height:44px;padding:10px 12px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#1B1813;font:inherit;font-size:0.875rem;}
+    .dayrow{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:8px;margin-top:8px;align-items:end;}
+    .daylab{font-size:0.75rem;font-weight:650;color:#564E43;display:block;margin-bottom:3px;}
+    .row{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0;}
+    .go{flex:1 1 180px;min-height:48px;padding:12px 14px;border:1px solid #1B1813;border-radius:10px;background:#1B1813;color:#fff;font:inherit;font-size:0.9375rem;font-weight:650;cursor:pointer;}
+    .thin{flex:1 1 160px;min-height:48px;padding:12px 14px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;color:#564E43;font:inherit;font-size:0.875rem;font-weight:650;cursor:pointer;}
+    .foot{margin:16px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;line-height:1.6;color:#70685C;}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>My weekly schedule</h1>
+    <p>{workspace ? workspace.fullName : 'Your weeks'}</p>
+  </header>
+
+  <nav class="tabs" aria-label="Time">
+    <a class="tab" href={PATH} aria-current="page">Schedule</a>
+    <a class="tab" href="/portal/employee/schedule/approvals">Waiting on me</a>
+    <a class="tab" href="/portal/employee/leave">Leave</a>
+    <a class="tab" href="/portal/employee/credits">Credits</a>
+    <a class="tab" href="/portal/employee/attendance">Attendance</a>
+  </nav>
+
+  <main class="wrap">
+    {flash && <div class="ok">{flash}</div>}
+    {flashError && <div class="bad">{flashError}</div>}
+    {flashNote && <div class="notice">{flashNote}</div>}
+
+    {!gate.ok && (
+      <section class="card">
+        <h2>{gate.title || 'This screen is not available'}</h2>
+        <p>{gate.reason || 'Your employee record is what this screen is built from.'}</p>
+      </section>
+    )}
+
+    {gate.ok && ceiling && !ceiling.ok && (
+      <div class="bad">
+        <strong>Your engagement terms could not be read.</strong>
+        <span> {ceiling.error || 'Something went wrong reading them.'} Nothing you have already
+        proposed is lost, and nothing has been decided on the strength of this. A plan cannot be
+        checked against a ceiling nobody can read, so proposing is closed until it loads.</span>
+      </div>
+    )}
+
+    {gate.ok && ceiling && ceiling.ok && !ceiling.applicable && (
+      <section class="card">
+        <h2>Weekly schedules are not proposed on this engagement</h2>
+        <p>{ceiling.basis}</p>
+        <p>This screen is for engagements where hours are the certified deliverable. Your own work
+        record is at /portal/employee.</p>
+      </section>
+    )}
+
+    {gate.ok && ceiling && ceiling.ok && ceiling.applicable && ceiling.hours === null && (
+      <div class="bad">
+        <strong>No weekly hours are recorded on your engagement.</strong>
+        <span> That figure is the ceiling every plan is checked against, and it is deliberately not
+        assumed to be forty. Ask HR to record your weekly hours on your employee record; you can
+        propose a week the moment they have. Nothing about your work so far is affected.</span>
+      </div>
+    )}
+
+    {gate.ok && ceilingKnown && (
+      <section class="card">
+        <h2>{ceilingText} a week, and that is a ceiling</h2>
+        <p>{ceilingBasis}</p>
+        <p>Everything recognised sits inside that figure, well-being included. It is never that figure
+        plus something. Plan any days of the week you like and split the hours however your classes
+        allow; what the plan may not do is take a week past its ceiling.</p>
+      </section>
+    )}
+
+    {gate.ok && owed && !owed.ok && (
+      <div class="bad">
+        <strong>Outstanding hours could not be worked out.</strong>
+        <span> {owed.error || 'Your approved leave could not be read.'} This is not a statement that
+        you owe nothing. Try again in a moment before proposing a make-up.</span>
+      </div>
+    )}
+
+    {gate.ok && owed && owed.ok && (
+      <>
+        <div class="tiles">
+          <div class="tile">
+            <b>{owed.grossHours}</b>
+            <span>Hours leave took out of an approved plan</span>
+          </div>
+          <div class="tile">
+            <b>{owed.madeUpHours}</b>
+            <span>Made up and approved</span>
+          </div>
+          <div class="tile">
+            <b>{owed.awaitingHours}</b>
+            <span>Make-up awaiting a decision</span>
+          </div>
+          <div class="tile">
+            <b>{owed.remainingHours}</b>
+            <span>Still outstanding</span>
+          </div>
+        </div>
+
+        <section class="card">
+          <h2>Approved leave does not cancel the hours</h2>
+          <p>When leave is approved, the days it covers come out of your approved plan and those hours
+          stay owed. You pay them back by proposing a make-up schedule, and that make-up is checked
+          against the ceiling of whichever week you put it in. Outstanding hours are never cleared by
+          going over a ceiling.</p>
+          {owed.items.length === 0 && (
+            <p>Nothing is outstanding at the moment.</p>
+          )}
+        </section>
+
+        {owed.items.length > 0 && (
+          <details class="week">
+            <summary>
+              <div class="whead">
+                <b>What is outstanding, day by day</b>
+                <span class="chip" style="background:#FBF7F1;color:#6D470D;border-color:#EADECD;">
+                  {owed.items.length} day(s)
+                </span>
+              </div>
+              <p class="wline">{hoursText(owed.remainingHours)} still to be made up.</p>
+            </summary>
+            <div class="wbody">
+              <ul class="list">
+                {owed.items.map((it) => (
+                  <li>
+                    <strong>{it.date}</strong> - {hoursText(it.outstandingHours)} owed of
+                    {' ' + hoursText(it.scheduledHours)} planned
+                    {partOfDay(it.fraction)}
+                    {it.activities.length > 0 ? '. Planned: ' + it.activities.join('; ') : ''}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </details>
+        )}
+
+        {owed.unscheduledLeaveDates.length > 0 && (
+          <div class="notice">
+            <strong>Leave on days you had no approved plan for: {owed.unscheduledLeaveDates.join(', ')}.</strong>
+            <span> Nothing is counted as outstanding for those days here, because nothing had been
+            allocated to them. Your week still has its hours requirement; it is the weekly credit
+            record that shows how that week came out.</span>
+          </div>
+        )}
+      </>
+    )}
+
+    {gate.ok && read && !read.ok && (
+      <div class="bad">
+        <strong>Your schedules could not be read.</strong>
+        <span> {read.error || 'Something went wrong reading them.'} This page is showing nothing
+        because it could not read, which is not the same as you having proposed nothing. Nothing you
+        have proposed is lost.</span>
+      </div>
+    )}
+
+    {gate.ok && read && read.ok && weekViews.map((w) => (
+        <details class="week" open={w.first}>
+          <summary>
+            <div class="whead">
+              <b>{w.label}</b>
+              <span class="chip" style={'background:' + w.tone.bg + ';color:' + w.tone.fg + ';border-color:' + w.tone.bd + ';'}>
+                {w.stateText}
+              </span>
+            </div>
+            <p class="wline">{w.line}</p>
+          </summary>
+
+          <div class="wbody">
+            {w.state === 'none' && (
+              <p class="wline">You have not proposed anything for this week. That is a real state and
+              not an empty plan: nothing is expected of you for it and nothing has been agreed. Use
+              the form below to propose it.</p>
+            )}
+
+            {w.official && (
+              <>
+                <p class="wline" style="margin-top:12px;font-weight:650;color:#1B1813;">
+                  Approved plan, version {w.official.version}
+                  {w.official.decidedByName ? ', by ' + w.official.decidedByName : ''}
+                  {w.official.decidedAt ? ' on ' + String(w.official.decidedAt).slice(0, 10) : ''}
+                </p>
+                <ul class="list">
+                  {w.official.days.map((d) => (
+                    <li><strong>{d.date}</strong> - {d.activity} - {hoursText(d.hours)}</li>
+                  ))}
+                </ul>
+                {w.official.decisionReason && (
+                  <p class="wline">Your manager wrote: {w.official.decisionReason}</p>
+                )}
+                {w.official.ceilingNote && (
+                  <div class="notice" style="margin-top:10px;"><span>{w.official.ceilingNote}</span></div>
+                )}
+                <p class="wline">This record is history now. If your week has changed, propose the week
+                again below - the new plan replaces this one only when it is approved, and this one is
+                kept exactly as it was agreed.</p>
+              </>
+            )}
+
+            {w.makeups.map((m) => (
+              <>
+                <p class="wline" style="margin-top:12px;font-weight:650;color:#1B1813;">
+                  Approved make-up, {hoursText(m.totalHours)}
+                </p>
+                <ul class="list">
+                  {m.days.map((d) => (
+                    <li><strong>{d.date}</strong> - {d.activity} - {hoursText(d.hours)}</li>
+                  ))}
+                </ul>
+              </>
+            ))}
+
+            {w.awaiting.map((p) => (
+              <>
+                <p class="wline" style="margin-top:12px;font-weight:650;color:#1B1813;">
+                  {p.kindLabel} awaiting approval - {hoursText(p.totalHours)}
+                </p>
+                <ul class="list">
+                  {p.days.map((d) => (
+                    <li><strong>{d.date}</strong> - {d.activity} - {hoursText(d.hours)}</li>
+                  ))}
+                </ul>
+                {p.haltReason && (
+                  <div class="bad" style="margin-top:10px;">
+                    <strong>This plan is waiting on nobody.</strong>
+                    <span> {p.haltReason} It has not been refused and it is not lost. Tell HR, and it
+                    resumes from where it stopped.</span>
+                  </div>
+                )}
+                <div class="row">
+                  <form method="POST" style="flex:1 1 160px;">
+                    <input type="hidden" name="action" value="withdraw" />
+                    <input type="hidden" name="schedule_id" value={p.id} />
+                    <button class="thin" type="submit" style="width:100%;">Withdraw this plan</button>
+                  </form>
+                  {p.haltReason && (
+                    <form method="POST" style="flex:1 1 160px;">
+                      <input type="hidden" name="action" value="resend" />
+                      <input type="hidden" name="schedule_id" value={p.id} />
+                      <button class="thin" type="submit" style="width:100%;">Send it again</button>
+                    </form>
+                  )}
+                </div>
+              </>
+            ))}
+          </div>
+        </details>
+    ))}
+
+    {gate.ok && ceilingKnown && (
+      <section class="card">
+        <h2>Propose a week</h2>
+        <p>Say what you will be doing and for how long. Leave a day blank if you are not working on it
+        - there is no expectation that you work every day, and no expectation about which days.</p>
+
+        <form method="POST">
+          <input type="hidden" name="action" value="propose" />
+
+          <label class="lab" for="kind">What kind of plan</label>
+          <select class="field" id="kind" name="kind">
+            <option value="regular" selected={keptKind !== 'makeup'}>An ordinary week</option>
+            {canMakeUp && (
+              <option value="makeup" selected={keptKind === 'makeup'}>
+                A make-up for outstanding hours
+              </option>
+            )}
+          </select>
+          {!canMakeUp && (
+            <p style="margin:6px 0 0;font-size:0.75rem;line-height:1.5;color:#70685C;">
+              A make-up plan appears here only when approved leave has left hours outstanding.
+            </p>
+          )}
+
+          <label class="lab" for="week_start">Which week</label>
+          <select class="field" id="week_start" name="week_start">
+            {weeks.map((ws) => (
+              <option value={ws} selected={ws === keptWeek}>{weekLabel(ws)}</option>
+            ))}
+          </select>
+
+          {DAY_NAMES.map((name, i) => (
+            <div class="dayrow">
+              <div>
+                <label class="daylab" for={'activity_' + i}>{name}</label>
+                <input class="field" type="text" id={'activity_' + i} name={'activity_' + i}
+                  maxlength="160" value={keptActivity[i]} placeholder="What you will be doing" />
+              </div>
+              <div>
+                <label class="daylab" for={'hours_' + i}>Hours</label>
+                <input class="field" type="number" id={'hours_' + i} name={'hours_' + i}
+                  min="0" max="9" step="0.25" inputmode="decimal" value={keptHours[i]} />
+              </div>
+            </div>
+          ))}
+
+          <label class="lab" for="note">Anything your manager should know (optional)</label>
+          <textarea class="field" id="note" name="note" rows="2" maxlength="500">{keptNote}</textarea>
+
+          <div class="row">
+            <button class="go" type="submit">Send to my reporting manager</button>
+          </div>
+        </form>
+      </section>
+    )}
+
+    {gate.ok && history.length > 0 && (
+      <details class="week">
+        <summary>
+          <div class="whead"><b>Earlier plans and decisions</b></div>
+          <p class="wline">{history.length} record(s). Nothing here is ever rewritten.</p>
+        </summary>
+        <div class="wbody">
+          <ul class="list">
+            {history.map((s) => (
+              <li>
+                <strong>{s.label}</strong> - {s.kindLabel} - {hoursText(s.totalHours)} -
+                {' ' + s.stateLabel}
+                {s.decidedByName ? ' by ' + s.decidedByName : ''}
+                {s.decisionReason ? '. ' + s.decisionReason : ''}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </details>
+    )}
+
+    {gate.ok && (
+      <p class="foot">
+        A plan you send goes to your reporting manager, resolved from the organization graph rather
+        than from anybody's job title. They can approve it, ask you to change it, or refuse it, and
+        whichever they do they write a reason that is kept beside the plan. An approved plan is never
+        edited: a change is a new proposal that replaces it once it is approved, and the old one stays
+        readable exactly as it was agreed.
+      </p>
+    )}
+  </main>
+</body>
+</html>
