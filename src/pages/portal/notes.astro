@@ -98,50 +98,106 @@ if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = String(fd.get('action') || '');
   try {
+    // ===========================================================================================
+    // EVERY WRITE BELOW IS SCOPED TO A NOTE THIS ACCOUNT OWNS, IN THE STATEMENT, AND REPORTS WHAT
+    // THE DATABASE ACTUALLY DID.
+    //
+    // WHAT WAS WRONG, AND IT WAS NOT SMALL.
+    //
+    // `add_collab` took a note id straight from the form and inserted a note_collaborators row for
+    // it with permission 'edit'. There was NO test that the caller owned that note - or had ever
+    // seen it. The list query below returns every note where `n.id IN (SELECT note_id FROM
+    // note_collaborators WHERE user_id = me)`, and the JSON save handler above grants edit on the
+    // same basis. So any signed-in account could post one form - the id of somebody else's note and
+    // its own e-mail address - and be reading and rewriting that note on the next page load. A
+    // private notebook was one request away from anybody who knew a uuid.
+    //
+    // `delete_note` had the ownership test on the notes DELETE and then ran
+    // `DELETE FROM note_collaborators WHERE note_id = <whatever was posted>` with no scope at all,
+    // so the same one request stripped every collaborator off any note in the product.
+    //
+    // Both are now single statements whose WHERE contains the ownership test, so there is no gap
+    // between checking and acting and no second statement running on an unchecked id. Zero rows
+    // back is the refusal, and it is said out loud instead of "Deleted." over nothing.
+    // ===========================================================================================
     if (action === 'create_note') {
       const title = String(fd.get('title') || 'Untitled note').trim().slice(0, 240) || 'Untitled note';
-      await db.execute(sql`
+      const made = rows(await db.execute(sql`
         INSERT INTO notes (owner_user_id, title, body)
         VALUES (${user.id}, ${title}, ${''})
-      `);
-      flashMsg = 'Note created.';
+        RETURNING id
+      `));
+      flashMsg = made.length ? 'Note created.' : 'That note was not created. Try again in a moment.';
     } else if (action === 'delete_note') {
       const id = String(fd.get('id') || '');
-      if (id) {
-        await db.execute(sql`DELETE FROM notes WHERE id = ${id}::uuid AND owner_user_id = ${user.id}`);
-        await db.execute(sql`DELETE FROM note_collaborators WHERE note_id = ${id}::uuid`);
-        flashMsg = 'Deleted.';
+      if (!id || !/^[0-9a-fA-F-]{36}$/.test(id)) {
+        flashMsg = 'No note was named, so nothing was deleted.';
+      } else {
+        const gone = rows(await db.execute(sql`
+          DELETE FROM notes WHERE id = ${id}::uuid AND owner_user_id = ${user.id} RETURNING id
+        `));
+        if (gone.length) {
+          // Only the collaborators of the note that was actually deleted, and only because it was.
+          await db.execute(sql`DELETE FROM note_collaborators WHERE note_id = ${id}::uuid`);
+          flashMsg = 'Deleted.';
+        } else {
+          flashMsg = 'That is not a note you own, so nothing was deleted.';
+        }
       }
     } else if (action === 'share_note') {
       const id = String(fd.get('id') || '');
-      if (id) {
+      if (!id || !/^[0-9a-fA-F-]{36}$/.test(id)) {
+        flashMsg = 'No note was named, so no share link was made.';
+      } else {
         // generate share token
         const token = 'nt_' + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
-        await db.execute(sql`
+        const shared = rows(await db.execute(sql`
           UPDATE notes SET share_token = ${token}, visibility = 'shared', updated_at = NOW()
           WHERE id = ${id}::uuid AND owner_user_id = ${user.id}
-        `);
-        flashMsg = 'Share link ready.';
+          RETURNING id
+        `));
+        flashMsg = shared.length
+          ? 'Share link ready.'
+          : 'That is not a note you own, so no share link was made.';
       }
     } else if (action === 'add_collab') {
       const id = String(fd.get('id') || '');
       const email = String(fd.get('email') || '').trim().toLowerCase();
-      if (id && email) {
+      if (!id || !/^[0-9a-fA-F-]{36}$/.test(id) || !email) {
+        flashMsg = 'A note and an email address are both needed.';
+      } else {
         const u = rows(await db.execute(sql`SELECT id FROM users WHERE LOWER(email) = ${email} LIMIT 1`));
-        if (u.length) {
-          await db.execute(sql`
-            INSERT INTO note_collaborators (note_id, user_id, permission)
-            VALUES (${id}::uuid, ${u[0].id}::uuid, 'edit')
-            ON CONFLICT (note_id, user_id) DO NOTHING
-          `);
-          flashMsg = 'Collaborator added.';
-        } else {
+        if (!u.length) {
           flashMsg = 'No registered user with that email.';
+        } else {
+          // The ownership test is the SELECT this INSERT draws from, so a note the caller does not
+          // own contributes no row and the insert writes nothing. It cannot be raced past either:
+          // there is no separate check to win.
+          const granted = rows(await db.execute(sql`
+            INSERT INTO note_collaborators (note_id, user_id, permission)
+            SELECT n.id, ${u[0].id}::uuid, 'edit'
+              FROM notes n
+             WHERE n.id = ${id}::uuid AND n.owner_user_id = ${user.id}
+            ON CONFLICT (note_id, user_id) DO NOTHING
+            RETURNING note_id
+          `));
+          if (granted.length) {
+            flashMsg = 'Collaborator added.';
+          } else {
+            // Two different refusals, and the wording must not tell a stranger which one it was:
+            // "you do not own that note" over a guessed uuid confirms the note exists.
+            flashMsg = 'No change: either that is not a note you own, or they already have access to it.';
+          }
         }
       }
+    } else {
+      flashMsg = 'That action is not one this page performs. Nothing was changed.';
     }
   } catch (e: any) {
-    flashMsg = 'Error: ' + (e?.message || 'failed');
+    // e.message is only the SQL that failed; the real Postgres reason is on e.cause, and it belongs
+    // in the log rather than on the reader's screen.
+    console.error('[portal/notes]', action, 'failed -', e?.cause?.message || e?.message);
+    flashMsg = 'That did not go through. Nothing was changed - try again in a moment.';
   }
 }
 

@@ -36,6 +36,42 @@ const errText = (e: any, fallback: string): string =>
 interface LeaveWindow { start: string; end: string; noticeGivenAt: string | null; }
 
 /**
+ * DOES hr_attendance CARRY break_minutes ON THIS DATABASE?
+ *
+ * clock_in and clock_out are in db/hr-schema.sql and are always there. break_minutes is added at
+ * runtime by ensureWorkingTimeSchema() in src/lib/attendance-schema.ts, so on an environment where
+ * no attendance surface has been opened yet it may not exist — and naming a missing column in the
+ * SELECT would throw and take the whole ledger read with it, which on this page reads as an intern
+ * who attended nothing.
+ *
+ * Asked ONCE per process against information_schema, which is a cheap read and never a DDL. A
+ * failure is NOT cached: the promise is dropped so the next call retries rather than leaving the
+ * whole process netting no breaks because a pooler blinked. When the answer is genuinely no, the
+ * fragment selects a literal 0 and the hours are gross of breaks — stated here rather than silently
+ * assumed, because it makes a measured week slightly generous.
+ */
+let breakColumnProbe: Promise<boolean> | null = null;
+function hasBreakMinutes(): Promise<boolean> {
+  if (!breakColumnProbe) {
+    breakColumnProbe = db
+      .execute(sql`SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'hr_attendance' AND column_name = 'break_minutes' LIMIT 1`)
+      .then((r: any) => rows(r).length > 0)
+      .catch((e: any) => {
+        logFail('hasBreakMinutes', e);
+        breakColumnProbe = null;   // never cache a failure
+        return false;
+      });
+  }
+  return breakColumnProbe;
+}
+
+/** The break-minutes column, or a literal 0 where the column does not exist. */
+async function breakSelect() {
+  return (await hasBreakMinutes()) ? sql`, a.break_minutes` : sql`, 0 AS break_minutes`;
+}
+
+/**
  * Approved leave windows for one employee.
  *
  * THIS MUST NOT SWALLOW, AND FOR ONCE AN EMPTY RESULT IS ACTIVELY DANGEROUS RATHER THAN MERELY
@@ -114,16 +150,60 @@ export interface LedgerResult {
  * Stored attendance rows -> credit-bearing days. Shared by the single and bulk readers so the
  * notice rule cannot be applied one way on a person's own page and another way on a console.
  */
+/**
+ * HOURS MEASURED FROM THE CLOCK, net of recorded breaks — or null when there is no pair to measure.
+ *
+ * This is the figure the founder's correction is about. work_hours is a NUMBER SOMEBODY ENTERED; a
+ * clock-in and a clock-out are a MEASUREMENT. Where both exist the clock wins, and where only a
+ * clock-in exists the day is INCOMPLETE and yields nothing at all — not the entered figure, not the
+ * expected day, not zero.
+ *
+ * Declared above toDays(), which calls it: const is not hoisted, and a const under its first use
+ * has taken pages down on this project.
+ */
+function clockHoursOf(r: any): number | null {
+  const inAt = r?.clock_in ? new Date(r.clock_in).getTime() : NaN;
+  const outAt = r?.clock_out ? new Date(r.clock_out).getTime() : NaN;
+  if (!Number.isFinite(inAt) || !Number.isFinite(outAt) || outAt <= inAt) return null;
+  const breakMins = Number(r?.break_minutes);
+  const net = (outAt - inAt) / 3600000 - (Number.isFinite(breakMins) && breakMins > 0 ? breakMins / 60 : 0);
+  if (!(net > 0)) return null;
+  // A single day longer than the statutory ceiling is a clock somebody forgot to stop, not a shift.
+  // It is still passed through — summarise() caps it against the agreed day, and capping it twice
+  // in two places is how two screens end up disagreeing.
+  return Math.round((net + Number.EPSILON) * 100) / 100;
+}
+
+/** A day was started and never finished: there is a clock-in, no clock-out, and no entered figure. */
+function isIncompleteDay(r: any, entered: number | null): boolean {
+  return !!r?.clock_in && !r?.clock_out && entered === null;
+}
+
+/**
+ * Stored attendance rows -> credit-bearing days. Shared by the single and bulk readers so the
+ * notice rule cannot be applied one way on a person's own page and another way on a console.
+ *
+ * EACH DAY NOW SAYS WHERE ITS HOURS CAME FROM. 'clock' is a measurement, 'recorded' is an
+ * assertion by a person, 'incomplete' is a day nobody clocked out of and whose hours are UNKNOWN.
+ * summarise() credits the first two and nothing for the rest, and src/lib/credit-week.ts refuses to
+ * grant a week automatically while an incomplete day sits in it.
+ */
 function toDays(attRows: any[], leave: LeaveWindow[]): AttendanceDay[] {
   return attRows.map((r: any) => {
     const { status, noticeGivenAt } = statusFor(r, leave);
-    const h = r.work_hours == null ? undefined : Number(r.work_hours);
+    const raw = r.work_hours == null ? NaN : Number(r.work_hours);
+    // Only count hours on days actually worked; a stored 0 on a leave day would otherwise read as
+    // "worked zero hours" rather than "did not work".
+    const worked = status === 'present' || status === 'half-day';
+    const entered = worked && Number.isFinite(raw) && raw > 0 ? raw : null;
+    const clocked = worked ? clockHoursOf(r) : null;
+    const incomplete = worked && isIncompleteDay(r, entered);
+
     return {
       date: iso(r.date),
       status,
-      // Only pass hours for days actually worked; a stored 0 on a leave day would otherwise read
-      // as "worked zero hours" rather than "did not work".
-      hours: (status === 'present' && Number.isFinite(h) && (h as number) > 0) ? h : undefined,
+      hours: incomplete ? undefined : (clocked ?? entered ?? undefined),
+      hoursSource: incomplete ? 'incomplete' : (clocked != null ? 'clock' : (entered != null ? 'recorded' : 'none')),
       noticeGivenAt,
     };
   });
@@ -142,10 +222,11 @@ export async function ledgerFor(employeeId: string, terms: EngagementTerms): Pro
   if (!employeeId) return empty(true, null);
   try {
     const leave = await approvedLeave(employeeId);
+    const brk = await breakSelect();
     const att = rows(await db.execute(sql`
-      SELECT date, status, work_hours
-      FROM hr_attendance WHERE employee_id = ${employeeId}
-      ORDER BY date ASC LIMIT 2000`));
+      SELECT a.date, a.status, a.work_hours, a.clock_in, a.clock_out ${brk}
+      FROM hr_attendance a WHERE a.employee_id = ${employeeId}
+      ORDER BY a.date ASC LIMIT 2000`));
 
     const days = toDays(att, leave);
     const summary = summarise(days, terms);
@@ -212,12 +293,13 @@ export async function ledgerForMany(
       leaveBy.set(key, list);
     }
 
+    const brk = await breakSelect();
     const attBy = new Map<string, any[]>();
     for (const r of rows(await db.execute(sql`
-      SELECT employee_id, date, status, work_hours
-      FROM hr_attendance
-      WHERE employee_id::text = ANY(${ids})
-      ORDER BY employee_id ASC, date ASC`))) {
+      SELECT a.employee_id, a.date, a.status, a.work_hours, a.clock_in, a.clock_out ${brk}
+      FROM hr_attendance a
+      WHERE a.employee_id::text = ANY(${ids})
+      ORDER BY a.employee_id ASC, a.date ASC`))) {
       const key = String(r.employee_id);
       const list = attBy.get(key) || [];
       list.push(r);
@@ -271,12 +353,26 @@ export async function ensureTermColumns(): Promise<void> {
  */
 export function termsFromRow(r: any): EngagementTerms {
   const kind = r?.engagement_kind === 'part-time' ? 'part-time' : 'full-time';
+  const stated = r?.weekly_hours == null ? null : Number(r.weekly_hours);
   return {
     kind,
-    // Left undefined rather than defaulted for part-time: weeklyHoursFor() resolves an unstated
-    // part-time load to 0 on purpose, so a missing contract shows as missing instead of being
-    // quietly invented.
-    weeklyHours: r?.weekly_hours == null ? (kind === 'full-time' ? 40 : undefined) : Number(r.weekly_hours),
+    // THE 40 IS GONE. This read `r.weekly_hours == null ? (kind === 'full-time' ? 40 : undefined)`,
+    // and because engagement_kind itself DEFAULTS TO 'full-time' in hr_employees, every employee
+    // whose weekly hours had never been entered was handed a full-time contract by a null. That
+    // number then became the denominator of the attendance percentage on a completion letter and
+    // the basis of a credit-hours figure a person shows a university. A flag saying "assumed" was
+    // not enough: nothing read it, and the 40 was still the number that printed.
+    //
+    // Unset is now UNDEFINED for both kinds, weeklyHoursFor() resolves that to 0, and
+    // CreditSummary.expectationKnown goes false so a screen says "not recorded" instead of a
+    // percentage. Where the figure legitimately comes from a POLICY rather than a contract — an
+    // internship is 40 because the published internship policy says so — it is resolved in
+    // src/lib/credit-week.ts from src/lib/engagement-policy.ts, per engagement type, and is never
+    // conjured by a null here.
+    weeklyHours: stated != null && Number.isFinite(stated) && stated > 0 ? stated : undefined,
+    // Kept: a screen may still want to distinguish "no figure recorded" from "a figure of zero
+    // recorded", and this says which. Nothing in the arithmetic reads it.
+    weeklyHoursRecorded: r?.weekly_hours != null,
     workingDaysPerWeek: r?.working_days_per_week == null ? 5 : Number(r.working_days_per_week),
     requiredCreditHours: r?.required_credit_hours == null ? undefined : Number(r.required_credit_hours),
   };
@@ -301,10 +397,11 @@ export async function termsFor(employeeId: string): Promise<EngagementTerms> {
     if (!r) return fallback;
     return termsFromRow(r);
   } catch (e: any) {
-    // The fallback claims full-time, 40 hours. That is a CONTRACT being invented by a failed read,
-    // and on a part-timer it inflates the denominator of every attendance percentage on the
-    // completion letter. It stays (there is no shape to return instead), but it is no longer
-    // silent — this was a bare `catch { return fallback }`.
+    // The fallback used to claim full-time, 40 hours — a CONTRACT invented by a failed read, which
+    // on a part-timer inflated the denominator of every attendance percentage on the completion
+    // letter. It now carries NO weekly hours at all, so weeklyHoursFor() answers 0,
+    // expectationKnown answers false, and the screen says the terms could not be read instead of
+    // printing a percentage against a week nobody agreed to. Still logged, never swallowed.
     logFail('termsFor', e);
     return fallback;
   }

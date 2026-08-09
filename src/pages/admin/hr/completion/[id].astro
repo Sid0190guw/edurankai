@@ -13,6 +13,23 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ledgerFor, reviewsForDetailed, termsFor, setTermsFor } from '@/lib/credit-ledger';
 import { completionFigures, remainingWeeks, weeklyHoursFor } from '@/lib/credit-hours';
+// THE CREDIT UNIT THE FOUNDER CORRECTED. One credit is one COMPLETED WEEK, not an hour, and it is
+// earned only when the hours were actually measured and the week's reports and tasks were done. The
+// letter below used to print a single credit-hours figure with nothing behind it - a figure that
+// included eight hours for every day somebody merely ticked in an attendance grid. It now prints
+// credits EARNED with what each one rests on, and states the PENDING ones separately, because a
+// completion letter that overstates credits to an accredited partner is the worst possible place
+// for this to be wrong.
+import {
+  reconcileCreditWeeks,
+  syncCreditDecisions,
+  type ReconcileResult,
+} from '@/lib/credit-week-ledger';
+import { positionFrom, weekLabel } from '@/lib/credit-week';
+import {
+  creditsLabel, hoursLabel as creditHoursLabel,
+  CREDIT_UNIT_SENTENCE, INTERN_WEEK_SENTENCE, CREDIT_SCOPE_SENTENCE,
+} from '@/lib/credit-week-copy';
 // The date this engagement ENDED is a claim printed on a certificate, not a formatting choice, and
 // this process runs in UTC — five and a half hours behind the people whose record it is. Between
 // 00:00 and 05:29 IST `new Date().toISOString().slice(0,10)` named YESTERDAY as the last day of
@@ -128,6 +145,23 @@ const weeksLeft = remainingWeeks(summary, terms);
 const contractedWeekly = weeklyHoursFor(terms);
 const termsMissing = terms.kind === 'part-time' && contractedWeekly === 0;
 
+// THE WEEKLY CREDIT REGISTER. Reading it is also what grants the weeks that earned themselves -
+// idempotently, and only when every read behind them succeeded. A week a person already decided is
+// never re-measured, so the evidence printed here is the evidence the approver saw.
+await syncCreditDecisions(id);
+const credit: ReconcileResult = await reconcileCreditWeeks(id, { maxWeeks: 104 });
+const creditPosition = positionFrom(credit.weeks);
+const creditsTotal = creditPosition.credits;
+const creditedWeeks = credit.weeks.filter((w) => w.state === 'earned-automatically' || w.state === 'approved');
+const pendingWeeks = credit.weeks.filter((w) => w.state === 'pending');
+const unmeasurableWeeks = credit.weeks.filter(
+  (w) => !!w.evidence && Array.isArray(w.evidence.incompleteDates) && w.evidence.incompleteDates.length > 0,
+);
+// The letter states credits only when the register could actually be read AND this engagement is on
+// the credit model at all. A salaried engagement is not measured by an intern's week, and printing
+// "0 credits" for one would be a claim about somebody rather than an absence of a measurement.
+const creditsPrintable = credit.ok && credit.applicable;
+
 const card = 'border:1px solid #2a2a30;border-radius:12px;background:#0f0f14;padding:14px;';
 const stat = (label: string, value: string, tone = '#e8e8ee') =>
   `<div style="${card}"><p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">${label}</p><p style="font-size:20px;font-weight:700;color:${tone};margin:0;font-family:'Geist Mono',monospace;">${value}</p></div>`;
@@ -157,8 +191,38 @@ const stat = (label: string, value: string, tone = '#e8e8ee') =>
       </div>
     )}
 
+    {/* THREE DIFFERENT FACTS, NEVER ONE NUMBER. Credits earned, credits waiting on a person, and
+        weeks that could not be measured at all. They used to render as a single credit-hours
+        figure that quietly included eight hours for every ticked day. */}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:10px;">
+      <Fragment set:html={stat('Credits earned', creditsPrintable ? String(creditsTotal) : 'not measured', creditsPrintable ? '#6ee7b7' : '#b4b4be')} />
+      <Fragment set:html={stat('Granted automatically', creditsPrintable ? String(creditPosition.earnedAutomatically) : '—')} />
+      <Fragment set:html={stat('Credits waiting', creditsPrintable ? String(creditPosition.pending) : '—', creditPosition.pending ? '#fbbf24' : '#e8e8ee')} />
+      <Fragment set:html={stat('Weeks not measurable', creditsPrintable ? String(unmeasurableWeeks.length) : '—', unmeasurableWeeks.length ? '#f87171' : '#e8e8ee')} />
+    </div>
+
+    <p style="font-size:12px;color:#8a8a94;margin:0 0 16px;line-height:1.6;">
+      {CREDIT_UNIT_SENTENCE} {INTERN_WEEK_SENTENCE}
+      {' '}<a href={'/admin/hr/credits/' + id} style="color:#e8e8ee;">Open the week-by-week record</a>.
+    </p>
+
+    {!credit.ok && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;font-size:13px;line-height:1.55;">
+        <strong>The weekly credit record could not be read, so no credit figure is stated.</strong>
+        <span> {credit.error} A zero here would look exactly like somebody who earned nothing, and the
+        letter will not print a credit count it could not measure.</span>
+      </div>
+    )}
+
+    {credit.ok && !credit.applicable && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid #2a2a30;background:#0f0f14;font-size:13px;line-height:1.55;color:#8a8a94;">
+        <strong>This engagement is not on the weekly credit model.</strong>
+        <span> {credit.notApplicableReason} The letter states hours and attendance for it, and no credit count.</span>
+      </div>
+    )}
+
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:18px;">
-      <Fragment set:html={stat('Credit-hours earned', String(summary.creditHours))} />
+      <Fragment set:html={stat('Credit-hours recorded', String(summary.creditHours))} />
       <Fragment set:html={stat('Attendance', summary.attendancePct + '%', summary.attendancePct >= 85 ? '#4ade80' : summary.attendancePct >= 70 ? '#fbbf24' : '#f87171')} />
       <Fragment set:html={stat('Required', summary.requiredCreditHours ? String(summary.requiredCreditHours) : 'not set')} />
       <Fragment set:html={stat('Weeks remaining', weeksLeft == null ? '—' : String(weeksLeft))} />
@@ -170,6 +234,75 @@ const stat = (label: string, value: string, tone = '#e8e8ee') =>
       <Fragment set:html={stat('Unauthorised', String(summary.unauthorisedLeaveDays), summary.unauthorisedLeaveDays ? '#f87171' : '#e8e8ee')} />
       <Fragment set:html={stat('Notice breaches', String(summary.noticeBreaches), summary.noticeBreaches ? '#fbbf24' : '#e8e8ee')} />
     </div>
+
+    {summary.unmeasuredDays > 0 && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid #b45309;background:rgba(180,83,9,0.14);font-size:13px;line-height:1.55;">
+        <strong>{summary.unmeasuredDays} day(s) were marked present with no hours recorded against them.</strong>
+        <span> They credit NOTHING. Until recently each of them was credited the expected daily
+        figure - eight hours for a full-time engagement - so ticking a box in the attendance grid
+        produced credit-hours on this letter that nobody had worked. The dates are
+        {' ' + summary.unmeasuredDates.slice(0, 12).join(', ')}
+        {summary.unmeasuredDates.length > 12 ? ' and ' + (summary.unmeasuredDates.length - 12) + ' more' : ''}.</span>
+      </div>
+    )}
+
+    {/* WHAT THE CREDITS REST ON. Printed, not summarised: a number with no evidence behind it is
+        exactly what this page used to hand somebody to show a university. */}
+    {creditsPrintable && (
+      <details style={card + 'margin-bottom:16px;'} open={pendingWeeks.length > 0}>
+        <summary style="cursor:pointer;font-size:13px;font-weight:600;">
+          Weekly credits: {creditsTotal} earned, {creditPosition.pending} waiting, {unmeasurableWeeks.length} not measurable
+        </summary>
+
+        {creditedWeeks.length === 0 && (
+          <p style="font-size:12.5px;color:#8a8a94;margin:10px 0 0;line-height:1.6;">No week has been
+          credited yet. That is a statement about the register, not about the person.</p>
+        )}
+
+        {creditedWeeks.map((w) => (
+          <div style="border-top:1px solid #1a1a22;padding:9px 0;">
+            <p style="font-size:12.5px;color:#e8e8ee;margin:0;font-weight:650;">
+              {w.label || weekLabel(w.weekStart)} · {w.state === 'earned-automatically' ? 'granted automatically' : 'credited by decision'}
+            </p>
+            <p style="font-size:12px;color:#8a8a94;margin:3px 0 0;line-height:1.6;">
+              {creditHoursLabel(w.hoursMeasured)} measured of {creditHoursLabel(w.hoursRequired)} required
+              {' · reports ' + w.reportsFiled + '/' + w.reportsExpected}
+              {' · tasks ' + w.tasksCompleted + '/' + w.tasksAssigned}
+              {w.decidedByName ? ' · decided by ' + w.decidedByName : ''}
+            </p>
+            {w.decisionReason && w.state === 'approved' && (
+              <p style="font-size:12px;color:#c8c8d0;margin:3px 0 0;line-height:1.6;">Reason: {w.decisionReason}</p>
+            )}
+          </div>
+        ))}
+
+        {pendingWeeks.length > 0 && (
+          <>
+            <p style="font-size:12.5px;font-weight:650;margin:14px 0 0;color:#fbbf24;">Waiting on a decision, and NOT counted above</p>
+            {pendingWeeks.map((w) => (
+              <div style="border-top:1px solid #1a1a22;padding:9px 0;">
+                <p style="font-size:12.5px;color:#e8e8ee;margin:0;">{w.label || weekLabel(w.weekStart)}</p>
+                <p style="font-size:12px;color:#8a8a94;margin:3px 0 0;line-height:1.55;">
+                  {creditHoursLabel(w.hoursMeasured)} measured of {creditHoursLabel(w.hoursRequired)} required
+                  {' · reports ' + w.reportsFiled + '/' + w.reportsExpected}
+                  {' · tasks ' + w.tasksCompleted + '/' + w.tasksAssigned}
+                </p>
+                {w.haltReason && (
+                  <p style="font-size:12px;color:#fca5a5;margin:3px 0 0;line-height:1.55;">{w.haltReason}</p>
+                )}
+              </div>
+            ))}
+          </>
+        )}
+
+        {unmeasurableWeeks.length > 0 && (
+          <p style="font-size:12px;color:#f87171;margin:12px 0 0;line-height:1.6;">
+            {unmeasurableWeeks.length} week(s) contain a day that was checked in and never checked out.
+            Those hours are unknown, not zero, which is why those weeks are neither credited nor refused.
+          </p>
+        )}
+      </details>
+    )}
 
     {/* Terms */}
     <details style={card + 'margin-bottom:16px;'}>
@@ -245,13 +378,41 @@ const stat = (label: string, value: string, tone = '#e8e8ee') =>
         <strong> {letterEndDate}</strong>.
       </p>
       <p style="font-size:15px;line-height:1.75;margin:0 0 12px;">
-        Over this engagement they completed <strong>{figures.creditHours} credit-hours</strong> of
-        verified work at an attendance of <strong>{figures.attendancePct}%</strong>
+        Over this engagement they recorded <strong>{figures.creditHours} credit-hours</strong> of
+        measured work at an attendance of <strong>{figures.attendancePct}%</strong>
         {terms.kind === 'part-time' ? ' on an agreed part-time load of ' + contractedWeekly + ' hours per week' : ''}.
         {figures.reviewCount > 0 && figures.averageRating != null
           ? ` Across ${figures.reviewCount} recorded reviews their average rating was ${figures.averageRating} out of 5.`
           : ''}
       </p>
+
+      {/* CREDITS, WITH THEIR PROVENANCE, AND THE PENDING ONES STATED SEPARATELY. Never one number.
+          A completion letter that overstates credits to an accredited partner is the worst possible
+          place for this to be wrong, so a week nobody has decided is named as undecided rather than
+          rolled into the total or quietly dropped. */}
+      {creditsPrintable ? (
+        <p style="font-size:15px;line-height:1.75;margin:0 0 12px;">
+          They completed <strong>{creditsLabel(creditsTotal)}</strong>, where one credit is one
+          completed week: the hours that week required, measured from recorded check-in and check-out
+          net of breaks, with the daily reports filed and the work due that week done. Approved leave
+          and holidays reduced the hours required for the weeks they fell in.
+          {creditPosition.approvedByPerson > 0
+            ? ' ' + creditPosition.approvedByPerson + ' of those weeks were credited by a named person with a written reason, recorded against the week.'
+            : ''}
+          {creditPosition.pending > 0
+            ? ' A further ' + creditPosition.pending + ' week(s) are waiting on a decision and are NOT included in that figure.'
+            : ''}
+          {unmeasurableWeeks.length > 0
+            ? ' ' + unmeasurableWeeks.length + ' week(s) contain a day that was clocked in and never clocked out, so those hours are unknown rather than zero.'
+            : ''}
+        </p>
+      ) : (
+        <p style="font-size:15px;line-height:1.75;margin:0 0 12px;">
+          {credit.applicable
+            ? 'No weekly credit figure is stated: the weekly credit record could not be read for this engagement, and a count that was not measured will not be printed.'
+            : 'No weekly credit figure is stated. ' + (credit.notApplicableReason || '')}
+        </p>
+      )}
       {figures.achievements.length > 0 && (
         <>
           <p style="font-size:13px;font-weight:700;margin:16px 0 6px;">Key achievements</p>
@@ -262,7 +423,9 @@ const stat = (label: string, value: string, tone = '#e8e8ee') =>
       )}
       <p style="font-size:12.5px;color:#555;line-height:1.6;margin:16px 0 0;border-top:1px solid #eee;padding-top:12px;">
         {figures.reason} Figures are computed from recorded attendance, approved leave and logged
-        reviews. One credit-hour represents one hour of verified engagement; a full-time week is 40.
+        reviews. A day marked present with no hours recorded against it contributes nothing, because
+        an attendance mark is not a measurement of time worked. One credit is one completed week.
+        {' ' + CREDIT_SCOPE_SENTENCE}
       </p>
     </div>
     )}

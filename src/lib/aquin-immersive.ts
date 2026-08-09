@@ -10,6 +10,16 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+
+// WHAT WAS WRONG. addSession() was the only INSERT into aquin_immersive_sessions and nothing called
+// it, so /aquintutor/clinical-campus — which reads sessionsByKind() — could only ever render a
+// catalogue with nothing in it, under copy describing a library of recorded theatre and ward
+// sessions. The mount is /admin/aquintutor/curriculum, where a session is registered against a
+// partner recording. The reads are discriminated so an unreadable catalogue is not printed as an
+// empty one.
+
+export type ImmersiveRead<T> = { ok: true; value: T } | { ok: false; reason: string };
 
 // Session kinds with the founder's estimated observation-contribution (spec §3 table).
 export interface SessionKind { key: string; label: string; contribution: string; }
@@ -59,7 +69,11 @@ export function ensureImmersiveSchema(): Promise<void> {
         created_by UUID,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS aquin_immersive_kind_idx ON aquin_immersive_sessions (kind, created_at DESC)`);
-    } catch (_) { _ready = null; }
+    } catch (e: any) {
+      console.error('[aquin-immersive] schema ensure failed:', reasonOf(e));
+      _ready = null; // the next request retries rather than caching a failed bootstrap
+      throw e;
+    }
   })();
   return _ready;
 }
@@ -78,15 +92,26 @@ function toSession(r: any): ImmersiveSession {
   };
 }
 
-export async function listSessions(publishedOnly = true): Promise<ImmersiveSession[]> {
-  await ensureImmersiveSchema();
-  const where = publishedOnly ? sql`WHERE is_published = true` : sql``;
-  return rows(await db.execute(sql`SELECT * FROM aquin_immersive_sessions ${where} ORDER BY created_at DESC`)).map(toSession);
+export async function listSessions(publishedOnly = true): Promise<ImmersiveRead<ImmersiveSession[]>> {
+  try {
+    await ensureImmersiveSchema();
+    const where = publishedOnly ? sql`WHERE is_published = true` : sql``;
+    const r = rows(await db.execute(sql`SELECT * FROM aquin_immersive_sessions ${where} ORDER BY created_at DESC`));
+    return { ok: true, value: r.map(toSession) };
+  } catch (e: any) {
+    const reason = reasonOf(e);
+    console.error('[aquin-immersive] listSessions:', reason);
+    return { ok: false, reason };
+  }
 }
 
-export async function sessionsByKind(publishedOnly = true): Promise<{ kind: SessionKind; sessions: ImmersiveSession[] }[]> {
+export async function sessionsByKind(publishedOnly = true): Promise<ImmersiveRead<{ kind: SessionKind; sessions: ImmersiveSession[] }[]>> {
   const all = await listSessions(publishedOnly);
-  return SESSION_KINDS.map((kind) => ({ kind, sessions: all.filter((s) => s.kind === kind.key) })).filter((g) => g.sessions.length > 0);
+  if (!all.ok) return all;
+  return {
+    ok: true,
+    value: SESSION_KINDS.map((kind) => ({ kind, sessions: all.value.filter((s) => s.kind === kind.key) })).filter((g) => g.sessions.length > 0),
+  };
 }
 
 export async function addSession(s: {
@@ -97,9 +122,22 @@ export async function addSession(s: {
   if (!title) return { ok: false, error: 'Session title is required.' };
   const kind = SESSION_KINDS.some((k) => k.key === s.kind) ? s.kind : 'skills_demo';
   const overlays = (s.aiOverlays || []).filter((o) => AI_OVERLAYS.some((a) => a.key === o));
-  await ensureImmersiveSchema();
-  await db.execute(sql`INSERT INTO aquin_immersive_sessions (title, kind, discipline, source_url, is_360, ai_overlays, status, created_by)
-    VALUES (${title.slice(0, 200)}, ${kind}, ${String(s.discipline || '').slice(0, 100)}, ${String(s.sourceUrl || '').slice(0, 500)},
-      ${!!s.is360}, ${JSON.stringify(overlays)}::jsonb, ${['scheduled', 'live', 'recorded'].includes(s.status || '') ? s.status : 'recorded'}, ${s.createdBy || null})`);
-  return { ok: true };
+  const url = String(s.sourceUrl || '').trim();
+  // Recordings are LINKED, never uploaded — the same rule the rest of this product follows for
+  // documents. A link that is not a link would render as a dead player with no explanation.
+  if (url && !/^https?:\/\//i.test(url)) {
+    return { ok: false, error: 'The recording address must start with http:// or https://.' };
+  }
+  try {
+    await ensureImmersiveSchema();
+    await db.execute(sql`INSERT INTO aquin_immersive_sessions (title, kind, discipline, source_url, is_360, ai_overlays, status, created_by)
+      VALUES (${title.slice(0, 200)}, ${kind}, ${String(s.discipline || '').slice(0, 100)}, ${url.slice(0, 500)},
+        ${!!s.is360}, ${JSON.stringify(overlays)}::jsonb, ${['scheduled', 'live', 'recorded'].includes(s.status || '') ? s.status : 'recorded'}, ${s.createdBy || null})`);
+    return { ok: true };
+  } catch (e: any) {
+    // A write path never swallows: the operator is told the catalogue is unchanged.
+    const reason = reasonOf(e);
+    console.error('[aquin-immersive] addSession:', reason);
+    return { ok: false, error: 'That session was not registered. The catalogue is unchanged. (' + reason + ')' };
+  }
 }

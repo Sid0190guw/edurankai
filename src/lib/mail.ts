@@ -2,6 +2,15 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
+// THE BINDING THAT NEVER RAN. Five statements in this file matched a column against a JS array with
+// `= ANY(${jsArray}::uuid[])` / `::text[]`. postgres-js serialises a JS array as a RECORD literal, so
+// Postgres answers "cannot cast type record to uuid[]" and the statement never executes — the exact
+// fault src/lib/pg-array.ts was written about and fixed in four other modules. Two of the five sat
+// in getThreadMessages() with NO catch around them, so opening ANY mail conversation threw before a
+// single message was rendered and MailClient drew the "could not be opened" state instead of the
+// thread. `IN ${uuidIn(ids)}` is the repaired idiom already used by /admin/mail/analytics,
+// /admin/applications, /admin/users and /admin/tests/attempts; it keeps the column's index usable.
+import { uuidIn, textIn } from '@/lib/pg-array';
 
 export const MAIL_DOMAIN = process.env.MAIL_DOMAIN || 'edurankai.in';
 
@@ -431,7 +440,7 @@ export async function getDeliveryStatuses(
     const r = await db.execute(sql`
       SELECT message_id::text AS mid, status, provider, error, created_at
       FROM email_logs
-      WHERE message_id::text = ANY(${ids}::text[])
+      WHERE message_id::text IN ${textIn(ids)}
       ORDER BY created_at DESC
     `);
     logRows = rows(r);
@@ -774,7 +783,7 @@ export async function listFolder(userId: string, opts: ListFolderOptions): Promi
       const p = await db.execute(sql`
         SELECT b.thread_id, string_agg(DISTINCT coalesce(nullif(m.from_name,''), m.from_email), ', ') AS names
         FROM mail_box b JOIN mail_messages m ON m.id = b.message_id
-        WHERE b.user_id = ${userId} AND b.thread_id = ANY(${ids}::uuid[])
+        WHERE b.user_id = ${userId} AND b.thread_id IN ${uuidIn(ids)}
         GROUP BY b.thread_id
       `);
       const byThread: Record<string, string> = {};
@@ -841,7 +850,7 @@ export async function getThreadMessages(userId: string, threadId: string): Promi
   for (const m of msgs) { m.recipients = []; m.attachments = []; m.reads = []; m.delivery = null; byId[m.id] = m; }
 
   const rec = await db.execute(sql`
-    SELECT message_id, kind, email, name, user_id FROM mail_recipients WHERE message_id = ANY(${ids}::uuid[])
+    SELECT message_id, kind, email, name, user_id FROM mail_recipients WHERE message_id IN ${uuidIn(ids)}
   `);
   const externalCounts: Record<string, number> = {};
   for (const x of rows(rec)) {
@@ -850,7 +859,7 @@ export async function getThreadMessages(userId: string, threadId: string): Promi
   }
 
   const at = await db.execute(sql`
-    SELECT message_id, filename, url, mime, size_bytes FROM mail_attachments WHERE message_id = ANY(${ids}::uuid[])
+    SELECT message_id, filename, url, mime, size_bytes FROM mail_attachments WHERE message_id IN ${uuidIn(ids)}
   `);
   for (const x of rows(at)) {
     byId[String(x.message_id)]?.attachments.push({ filename: x.filename, url: x.url, mime: x.mime, size_bytes: x.size_bytes });
@@ -862,7 +871,7 @@ export async function getThreadMessages(userId: string, threadId: string): Promi
     try {
       const rr = await db.execute(sql`
         SELECT message_id, kind, country, region, city, ip_address, read_at, user_id
-        FROM mail_reads WHERE message_id = ANY(${mine}::uuid[]) ORDER BY read_at DESC
+        FROM mail_reads WHERE message_id IN ${uuidIn(mine)} ORDER BY read_at DESC
       `);
       for (const x of rows(rr)) byId[String(x.message_id)]?.reads.push(x);
     } catch (e: any) {
@@ -945,6 +954,118 @@ export async function findThreadForInbound(p: {
 
 export function normalizeSubject(s: string): string {
   return String(s || '').replace(/^((re|fw|fwd)\s*:\s*)+/i, '').trim().toLowerCase();
+}
+
+// =================================================================================================
+// ONE DOOR FOR ARRIVING MAIL
+// =================================================================================================
+//
+// WHAT WAS WRONG. Mail reaches this product two ways — the webhook at src/pages/api/mail/inbound.ts
+// (a Cloudflare Email Worker or any MTA pipe) and the IMAP pull in src/lib/mail-imap.ts — and each
+// carried its OWN hand-written copy of the delivery. The two copies had drifted, in the way two
+// copies always do, and every difference was invisible from any screen:
+//
+//   * BOTH re-implemented "which thread does this belong to?" as a single lookup of In-Reply-To
+//     against rfc_message_id. findThreadForInbound() — written for exactly this, sitting in this
+//     file, carrying the subject/counterpart/30-day fallback for the very common case of a client
+//     that dropped the header — was imported by NOTHING. So a reply that lost its reference started
+//     a brand new thread and the conversation scattered down the list.
+//   * THE RULES NEVER RAN AT ARRIVAL. An administrator could build a full set of filters on
+//     /admin/mail/rules, watch them save, list back and (since the backfill was added) run over old
+//     mail — and no message has ever been filed by one as it landed. applyRulesToMessage() existed
+//     and this path did not call it.
+//   * ONLY THE WEBHOOK TOLD THE RECIPIENT. mail arriving over IMAP was inserted into mail_box and
+//     announced to nobody, so whether you were notified about your own mail depended on which
+//     transport the company happened to be using that week.
+//
+// This is the one engine both doors now go through. Every step after the message row is best-effort
+// and REPORTED, never swallowed: the mail is already delivered and must stay delivered even if the
+// filing or the notification fails, but "the rules did not run" is a fact worth having in the log
+// rather than a silence.
+//
+// DE-DUPLICATION IS THE CALLER'S JOB and stays there — the IMAP puller has its own UID watermark
+// plus an rfc-id check, and the webhook is fired once per message by its sender.
+export interface InboundDelivery {
+  /** The recipient in THIS product, already resolved from the envelope address. */
+  userId: string;
+  /** The address the mail was sent to, as stored on the recipient row. */
+  email: string;
+  name: string | null;
+  fromEmail: string;
+  fromName: string;
+  subject: string;
+  bodyText: string;
+  bodyHtml: string;
+  /** The RFC Message-Id. The caller mints a synthetic one when the sender omitted it. */
+  rfcMessageId: string;
+  inReplyTo: string | null;
+}
+
+export interface InboundResult {
+  messageId: string;
+  threadId: string;
+  /** What the filing rules changed, if any ran. Empty is a real answer, not a failure. */
+  ruleActions: string[];
+}
+
+/** Deliver one arriving message to one recipient: thread it, store it, file it, announce it. */
+export async function deliverInbound(d: InboundDelivery): Promise<InboundResult> {
+  // THE ENGINE, NOT A SECOND COPY OF ITS FIRST LINE. In-Reply-To is still tried first inside
+  // findThreadForInbound(); what is new here is that a reply which lost the header now rejoins its
+  // conversation instead of starting a fresh one.
+  const threadId = (await findThreadForInbound({
+    userId: d.userId,
+    inReplyTo: d.inReplyTo,
+    subject: d.subject,
+    fromEmail: d.fromEmail,
+  })) || randomUUID();
+
+  const ins = rows(await db.execute(sql`
+    INSERT INTO mail_messages (thread_id, subject, from_user_id, from_email, from_name, body_html, body_text, snippet, direction, rfc_message_id, in_reply_to)
+    VALUES (${threadId}, ${d.subject}, NULL, ${d.fromEmail}, ${d.fromName}, ${d.bodyHtml || null}, ${d.bodyText || null}, ${makeSnippet(d.bodyText, d.bodyHtml)}, 'inbound', ${d.rfcMessageId}, ${d.inReplyTo})
+    RETURNING id`));
+  const messageId = String(ins[0].id);
+
+  await db.execute(sql`
+    INSERT INTO mail_recipients (message_id, kind, user_id, email, name)
+    VALUES (${messageId}, 'to', ${d.userId}, ${d.email}, ${d.name})`);
+  await db.execute(sql`
+    INSERT INTO mail_box (user_id, message_id, thread_id, folder, is_read)
+    VALUES (${d.userId}, ${messageId}, ${threadId}, 'inbox', false)
+    ON CONFLICT (user_id, message_id) DO NOTHING`);
+
+  // ---- THE FILTERS RUN, AT LAST, ON THE MESSAGE THAT JUST LANDED ---------------------------------
+  //
+  // Dynamically imported so the advanced-mail schema is only ever bootstrapped on a path that
+  // actually needs it, and so this core module keeps no static edge to the layer built on top of it.
+  // The message is already in the inbox; a filing failure leaves it in the inbox, which is the safe
+  // direction, and says so in the log.
+  let ruleActions: string[] = [];
+  try {
+    const { ensureMailAdvancedSchema, applyRulesToMessage } = await import('@/lib/mail-advanced');
+    await ensureMailAdvancedSchema();
+    const res = await applyRulesToMessage(
+      d.userId,
+      { message_id: messageId, folder: 'inbox', is_read: false, is_starred: false, labels: [] },
+      { from: d.fromEmail, to: d.email, subject: d.subject, body: d.bodyText },
+    );
+    ruleActions = res.actions;
+  } catch (e: any) {
+    console.error('[mail] arrival filters did NOT run for message', messageId, '-', e?.cause?.message || e?.message);
+  }
+
+  // ---- AND THE PERSON IS TOLD, WHICHEVER TRANSPORT BROUGHT IT ------------------------------------
+  //
+  // A rule may have marked it read or filed it out of the inbox; the recipient is still told, because
+  // the alternative is a mailbox that changes underneath somebody with no signal at all.
+  try {
+    const { pushNotify } = await import('@/lib/push');
+    await pushNotify.inboundMail(d.userId, d.fromName || d.fromEmail || 'someone', d.subject);
+  } catch (e: any) {
+    console.error('[mail] recipient NOT told about message', messageId, '-', e?.cause?.message || e?.message);
+  }
+
+  return { messageId, threadId, ruleActions };
 }
 
 export async function markThreadRead(userId: string, threadId: string) {

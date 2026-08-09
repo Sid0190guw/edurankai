@@ -46,3 +46,29 @@ export function textArray(xs: readonly unknown[] | null | undefined, nullWhenEmp
 export function textIn(xs: readonly string[]) {
   return sql`(SELECT jsonb_array_elements_text(${JSON.stringify([...xs])}::jsonb))`;
 }
+
+/**
+ * The same membership test for a UUID column.
+ *
+ * `WHERE id = ANY(${jsArray}::uuid[])` IS THE SAME BUG THIS FILE WAS WRITTEN ABOUT, and it was
+ * still live in five places long after the text[] half was fixed. postgres-js serialises the array
+ * as a record literal, so Postgres answers "cannot cast type record to uuid[]" and the statement
+ * never runs. Every one of those five sat behind either a swallowing catch or a generic error
+ * banner, so the controls simply did not work:
+ *
+ *   /admin/tests/attempts     the proctoring event counts for every attempt on the board
+ *   /admin/users              bulk-approve of a SELECTED set of accounts (approve-all worked,
+ *                             because that branch has no array)
+ *   /admin/applications       the deleted_at half of bulk delete/archive — the write that actually
+ *                             puts a row in Trash, run after the archive flag had already been set
+ *   /admin/mail/analytics     recipient counts and delivery status
+ *   /portal/index             pruning abandoned application intents, inside catch (_) {}
+ *
+ * Written as `IN (SELECT ...::uuid)` rather than `::text` comparison so the column's own index is
+ * still usable.
+ *
+ * Callers must guard the empty case themselves, exactly as with textIn().
+ */
+export function uuidIn(xs: readonly string[]) {
+  return sql`(SELECT t.x::uuid FROM jsonb_array_elements_text(${JSON.stringify([...xs])}::jsonb) AS t(x))`;
+}

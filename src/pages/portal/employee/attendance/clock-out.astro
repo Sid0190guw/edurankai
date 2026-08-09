@@ -1,0 +1,805 @@
+---
+// /portal/employee/attendance/clock-out — THE GATE. Record what you did, confirm who you are, go home.
+//
+// =================================================================================================
+// WHY THE CLOCK-OUT MOVED OFF THE MAIN SCREEN
+// =================================================================================================
+//
+// A clock-out is now two things: a record of the work, and a re-confirmation of identity. Neither
+// fits beside a one-tap button, and a one-tap button that quietly required both would be a button
+// that lies. So the clock-out control on /portal/employee/attendance is a LINK to this page, the
+// punch API refuses kind=clock_out and says where to go, and this is the only place a clock-out is
+// written.
+//
+// =================================================================================================
+// IT POSTS NATIVELY. JAVASCRIPT IS AN ENHANCEMENT AND NOTHING MORE.
+// =================================================================================================
+//
+// Clock-out was JavaScript-only on this project once already: it silently did nothing on a slow
+// phone and the person believed they had clocked out. So this is an ordinary <form method="POST">
+// to this same URL, with a real submit button, and every field is a real field. With JavaScript off,
+// with the camera broken, with the model server unreachable, the page still clocks somebody out.
+//
+// The one thing script adds is the face capture: it reads a descriptor from the live camera, puts it
+// in a hidden input, and lets the SAME form submit natively. There is no second write path, no
+// fetch() that could half-succeed, and no state that exists only in the browser.
+//
+// =================================================================================================
+// IT CANNOT STRAND ANYBODY
+// =================================================================================================
+//
+// If the second factor cannot be completed - camera refused, phone lost, an enrolment that is
+// genuinely broken - the "I cannot complete this check" box clocks the person out anyway, records
+// that the check did not pass, keeps their own words about why, and flags it for a human. Automated
+// detection here is ADVISORY: a person decides. A gate that can leave somebody clocked in overnight
+// is worse than the fraud it prevents.
+//
+// WHAT IS INSISTED ON, and it is not the same thing: you must either offer a factor or say you
+// cannot. Blank is refused, because a blank that sails through would make the gate decorative. That
+// refusal is one tap away from being satisfied, so it strands nobody.
+//
+// =================================================================================================
+// const BEFORE THE HANDLER
+// =================================================================================================
+//
+// Every const this file's POST handler reads is declared ABOVE it. const is not hoisted, and a const
+// declared under the handler throws on the handler's first line - the failure that took down apply
+// step 5 and the /admin/roles/diagnose Repair button on this project, both of which reported success
+// while failing every time.
+//
+// NOTHING IS SWALLOWED. If the clock-out does not write, the page says so in the database's own
+// words and every box keeps what was typed in it.
+//
+// MOBILE FIRST. 360px is the design width, every control clears 44px, and the page never scrolls
+// sideways.
+import WorkspaceNav from '@/components/workforce/WorkspaceNav.astro';
+import EmptyState from '@/components/workforce/EmptyState.astro';
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import { composeWorkspace } from '@/lib/workforce/composer';
+import {
+  punchesOn,
+  computeDay,
+  allowedPunches,
+  formatMinutes,
+  today as attendanceToday,
+  type DayTotals,
+} from '@/lib/attendance';
+import { isVerifyOutcome } from '@/lib/attendance-verify';
+import { SHARING_WARNING } from '@/lib/daily-report';
+import {
+  completeClockOut,
+  clockOutFactors,
+  identityLine,
+  identityBadge,
+  latestClockOutCheck,
+  STANDALONE_MIN_CHARS,
+  type IdentityAttempt,
+} from '@/lib/attendance-verify-clockout';
+
+const PATH = '/portal/employee/attendance/clock-out';
+const BACK = '/portal/employee/attendance';
+const FORM_LINK_API = '/api/portal/attendance/check-form-link';
+const DRIVE_LINK_API = '/api/portal/reports/check-link';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+// ------------------------------------------------------------------------------------------------
+// CONSTANTS AND HELPERS - ALL OF THEM ABOVE THE POST HANDLER.
+// ------------------------------------------------------------------------------------------------
+
+const clockTime = (iso: string | null) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  return String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+};
+
+/** A field value that survives a failed submit. Never a Record indexed inside JSX. */
+const fieldValue = (form: FormData | null, name: string): string => {
+  if (!form) return '';
+  const v = form.get(name);
+  return typeof v === 'string' ? v : '';
+};
+
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+
+const workspace = gate.ok ? gate.workspace : null;
+const employeeId = workspace ? workspace.employeeId : '';
+
+let flashError = '';
+let posted: FormData | null = null;
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE. One action, and the engine re-checks every rule this page drew its controls from.
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST' && employeeId) {
+  try {
+    const form = await Astro.request.formData();
+    posted = form;
+
+    const typed = String(form.get('typed') || '');
+    const finished = String(form.get('finished') || '');
+    const blocked = String(form.get('blocked') || '');
+    const hours = String(form.get('hours') || '');
+    const driveUrl = String(form.get('drive') || '').trim();
+    const formUrl = String(form.get('formlink') || '').trim();
+    const sharingAck = String(form.get('ack') || '') === '1';
+    const cannot = String(form.get('cannot') || '') === '1';
+    const reason = String(form.get('reason') || '');
+    const code = String(form.get('code') || '').trim();
+    const descriptorRaw = String(form.get('descriptor') || '').trim();
+
+    // WHICH FACTOR WAS OFFERED. A descriptor beats a code only because a person who used the camera
+    // has already had it on their face; both are compared on the server and neither is trusted from
+    // the browser. "I cannot" always wins, because it is the escape hatch.
+    let attempt: IdentityAttempt | null = null;
+    if (cannot) {
+      attempt = { method: 'none', reason };
+    } else if (descriptorRaw) {
+      let parsed: unknown = null;
+      try {
+        parsed = JSON.parse(descriptorRaw);
+      } catch {
+        parsed = null;
+      }
+      // A descriptor we cannot read is NOT a failed face check - it is no capture at all, and the
+      // person is asked again rather than labelled.
+      attempt = parsed ? { method: 'face', descriptor: parsed } : { method: 'code', code };
+    } else if (code) {
+      attempt = { method: 'code', code };
+    }
+
+    if (!attempt) {
+      // Refused HERE, on the screen, and not in the engine: a programmatic caller must never be able
+      // to strand somebody, so completeClockOut() still accepts an empty attempt and records it
+      // honestly as "no check given". On this page we ask once more, because a blank that sailed
+      // through would make the whole gate decorative. Ticking the box below is one tap.
+      flashError = 'Confirm who you are before you clock out: enter your authenticator or recovery '
+        + 'code, or use the face check. If you cannot do either right now, tick the box below - you '
+        + 'will still be clocked out and a person will look at it.';
+    } else {
+      const res = await completeClockOut({
+        employeeId,
+        userId: String(user.id),
+        submission: { typed, finished, blocked, hours, driveUrl, formUrl, sharingAck },
+        attempt,
+        lat: form.get('lat') ? Number(form.get('lat')) : null,
+        lon: form.get('lon') ? Number(form.get('lon')) : null,
+        accuracy: form.get('acc') ? Number(form.get('acc')) : null,
+        qrCode: String(form.get('qr') || '').trim() || null,
+        workMode: String(form.get('mode') || 'remote'),
+        ipAddress: Astro.request.headers.get('x-forwarded-for'),
+        deviceInfo: Astro.request.headers.get('user-agent'),
+      });
+
+      if (res.ok) {
+        // POST then REDIRECT then GET, so a reload cannot clock somebody out twice. Only the outcome
+        // word travels in the address - never anybody's report text.
+        return Astro.redirect(PATH + '?done=' + encodeURIComponent(res.outcome || 'no_capture'));
+      }
+      // NEVER SWALLOWED. The engine's sentence, including the database's own reason, is shown as it
+      // is, and every box below keeps what was typed in it.
+      flashError = res.error || 'That could not be recorded.';
+    }
+  } catch (e: any) {
+    flashError = 'We could not record that: ' + (e?.cause?.message || e?.message || 'unknown reason')
+      + ' Nothing you typed is lost - press the button again.';
+    console.error('[portal/attendance/clock-out] post', e?.cause?.message || e?.message);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+const doneParam = String(Astro.url.searchParams.get('done') || '');
+const isDone = doneParam !== '' && isVerifyOutcome(doneParam);
+const doneLine = isDone ? identityLine(doneParam) : '';
+const doneBadge = isDone ? identityBadge(doneParam) : '';
+
+const now = await attendanceToday();
+
+let totals: DayTotals | null = null;
+let canClockOut = false;
+let factors = { face: false, code: false, recovery: false, any: false };
+let lastCheck: any = null;
+
+if (employeeId && now) {
+  totals = computeDay(await punchesOn(employeeId, now));
+  canClockOut = allowedPunches(totals).includes('clock_out');
+  factors = await clockOutFactors(String(user.id));
+  if (isDone) lastCheck = await latestClockOutCheck(employeeId, now);
+}
+
+// The floor is read from the engine rather than typed into the sentence twice, so the hint and the
+// rule cannot drift apart.
+const standaloneHint = 'With no link, this is the whole record of your day, so it needs at least '
+  + STANDALONE_MIN_CHARS + ' characters and enough detail to be read on its own.';
+
+// Below the handler on purpose and safely: nothing in the handler reads it, and a successful write
+// redirects before this line. A nav that cannot be built renders no nav - a clock-out taken down by
+// its own menu is the worse failure.
+let composed: any = null;
+try {
+  composed = await composeWorkspace(user as any, { locals: Astro.locals, next: PATH });
+} catch (e: any) {
+  console.error('[portal/attendance/clock-out] compose', e?.cause?.message || e?.message);
+}
+---
+
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>Clock out - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+      -webkit-text-size-adjust:100%;}
+    html,body{overflow-x:hidden;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;
+      padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-0.01em;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    .card{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h2{margin:0 0 6px;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .card h3{margin:14px 0 4px;font-size:0.8125rem;font-weight:680;line-height:1.35;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CBE3D2;border-radius:10px;
+      background:#F1F8F3;font-size:0.8125rem;line-height:1.55;color:#1F5132;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;
+      background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .notice{margin:12px 0 0;padding:10px 12px;border:1px solid #EADECD;border-radius:10px;
+      background:#FBF7F1;font-size:0.8125rem;line-height:1.55;color:#6D470D;}
+    .privacy{margin:8px 0 0;padding:10px 12px;border:1px solid #D6D2EC;border-radius:10px;
+      background:#F5F3FD;font-size:0.8125rem;line-height:1.55;color:#312A5B;}
+    .privacy b{font-weight:680;}
+    .stats{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0;}
+    .stat{flex:1 1 140px;padding:10px 12px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;}
+    .stat b{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+      font-size:1.125rem;line-height:1.2;}
+    .stat span{display:block;margin-top:2px;font-size:0.6875rem;letter-spacing:0.06em;
+      text-transform:uppercase;color:#70685C;}
+    .lab{display:block;margin:12px 0 4px;font-size:0.75rem;font-weight:650;color:#564E43;}
+    .field{width:100%;min-width:0;min-height:44px;padding:10px 12px;border:1px solid #DFDCD8;
+      border-radius:8px;background:#FDFDFC;color:#1B1813;font:inherit;font-size:0.875rem;}
+    textarea.field{min-height:132px;line-height:1.5;resize:vertical;}
+    .hint{margin:6px 0 0;font-size:0.75rem;line-height:1.55;color:#70685C;overflow-wrap:anywhere;}
+    .check{display:flex;gap:10px;align-items:flex-start;margin:10px 0 0;padding:10px 12px;
+      border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;}
+    .check input{width:22px;height:22px;margin:0;flex:none;}
+    .check span{font-size:0.8125rem;line-height:1.5;color:#564E43;}
+    .submit{width:100%;min-height:52px;margin:14px 0 0;padding:14px;border:1px solid #1B1813;
+      border-radius:10px;background:#1B1813;color:#FFFFFF;font:inherit;font-size:1rem;
+      font-weight:680;cursor:pointer;}
+    .submit:focus-visible{outline:2px solid #6F52E5;outline-offset:2px;}
+    .softbtn{width:100%;min-height:48px;margin:10px 0 0;padding:12px 14px;border:1px solid #DFDCD8;
+      border-radius:10px;background:#FDFDFC;color:#1B1813;font:inherit;font-size:0.9375rem;
+      font-weight:650;cursor:pointer;}
+    .softbtn:focus-visible{outline:2px solid #6F52E5;outline-offset:2px;}
+    .links{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0;}
+    .links a{flex:1 1 160px;display:inline-flex;align-items:center;justify-content:center;min-height:44px;
+      padding:10px 12px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#1B1813;
+      font-size:0.8125rem;font-weight:600;text-decoration:none;}
+    .viewer{position:relative;width:100%;max-width:280px;margin:10px auto 0;aspect-ratio:3/4;
+      border-radius:12px;overflow:hidden;background:#1B1813;}
+    .viewer video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:block;}
+    .badge{display:inline-flex;align-items:center;gap:5px;margin-top:6px;padding:4px 9px;
+      border:1px solid #DFDCD8;border-radius:999px;background:#F4F3F0;
+      font-size:0.6875rem;font-weight:650;color:#564E43;}
+    .badge svg{width:12px;height:12px;flex:none;}
+    .foot{margin:16px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;
+      line-height:1.6;color:#70685C;}
+    @media (min-width:640px){ .card{padding:16px;} }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Clock out</h1>
+    <p>{workspace ? workspace.fullName : 'Finish your working day'}</p>
+  </header>
+
+  <main class="wrap">
+    {!gate.ok && (
+      <EmptyState
+        title={gate.title || 'This screen is not available'}
+        body={gate.reason || 'Your employee record is what this screen is built from.'}
+        illustration="note"
+        actionLabel="Back to your workspace"
+        actionHref="/portal/employee"
+      />
+    )}
+
+    {gate.ok && !now && (
+      <p class="bad">
+        We could not read today's date from the database, so we will not guess which day a clock-out
+        belongs to. Nothing you have logged is lost. Try again in a moment, and tell HR if it keeps
+        happening.
+      </p>
+    )}
+
+    {isDone && (
+      <section class="card">
+        <h2>You are clocked out</h2>
+        <p>{doneLine}</p>
+        <span class="badge">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path>
+            {doneParam === 'match' && <path d="M9 12l2 2 4-4"></path>}
+            {doneParam === 'code_match' && <path d="M9 12l2 2 4-4"></path>}
+            {doneParam !== 'match' && doneParam !== 'code_match' && <path d="M12 9v3.5"></path>}
+            {doneParam !== 'match' && doneParam !== 'code_match' && <path d="M12 16h.01"></path>}
+          </svg>
+          {doneBadge}
+        </span>
+        {lastCheck && lastCheck.needsLook && (
+          <p class="notice">
+            This clock-out is marked for a person to look at. That is a look, not a finding: nothing
+            is deducted, your hours are unchanged, and no decision is made about you by a machine.
+          </p>
+        )}
+        <p class="hint">
+          Your work record for today is filed. It is what your reporting manager reads, and it is
+          what a completed week is measured against.
+        </p>
+        <div class="links">
+          <a href={BACK}>Back to attendance</a>
+          <a href="/portal/employee/reports">Your daily reports</a>
+        </div>
+      </section>
+    )}
+
+    {gate.ok && now && !isDone && !canClockOut && (
+      <section class="card">
+        <h2>There is nothing to clock out of</h2>
+        <p>
+          {totals && totals.clockOut
+            ? 'You are already clocked out for today, at ' + clockTime(totals.clockOut) + '.'
+            : 'You are not clocked in, so there is no open day to close.'}
+        </p>
+        <div class="links">
+          <a href={BACK}>Back to attendance</a>
+        </div>
+      </section>
+    )}
+
+    {flashError && <p class="bad">{flashError}</p>}
+
+    {gate.ok && now && !isDone && canClockOut && totals && (
+      <section class="card">
+        <h2>Today so far</h2>
+        <p>
+          {totals.clockIn ? 'Checked in at ' + clockTime(totals.clockIn) + '.' : ''}
+          {totals.onBreak ? ' You are on a break, and clocking out ends it.' : ''}
+        </p>
+        <div class="stats">
+          <div class="stat"><b>{formatMinutes(totals.workedMinutes) || '0m'}</b><span>worked today</span></div>
+          <div class="stat"><b>{formatMinutes(totals.breakMinutes) || '0m'}</b><span>on break</span></div>
+        </div>
+        <p class="hint">
+          These are the hours your punches show, net of breaks. Nothing on this page changes them.
+        </p>
+      </section>
+    )}
+
+    {gate.ok && now && !isDone && canClockOut && (
+      <form method="POST" action={PATH} id="out-form">
+        <input type="hidden" name="lat" id="geo-lat" value="" />
+        <input type="hidden" name="lon" id="geo-lon" value="" />
+        <input type="hidden" name="acc" id="geo-acc" value="" />
+        {/* Filled by the face capture and by nothing else. It carries 128 numbers, never a picture,
+            and there is no field here that could assert a result - the server would not read one. */}
+        <input type="hidden" name="descriptor" id="descriptor" value="" />
+
+        <section class="card">
+          <h2>What you did today</h2>
+          <p>
+            Three ways of giving the same thing, because people work in different tools. At least one
+            must be here. A link on its own is only accepted with a line typed here, so the week can
+            be read without opening twelve tabs.
+          </p>
+
+          <label class="lab" for="typed">Type it here</label>
+          <textarea class="field" id="typed" name="typed" maxlength="8000"
+            placeholder="What you worked on today.">{fieldValue(posted, 'typed')}</textarea>
+          <p class="hint">{standaloneHint}</p>
+
+          <label class="lab" for="finished">What is finished</label>
+          <input class="field" id="finished" name="finished" type="text" maxlength="2000"
+            value={fieldValue(posted, 'finished')} autocomplete="off" />
+
+          <label class="lab" for="blocked">What is blocked</label>
+          <input class="field" id="blocked" name="blocked" type="text" maxlength="2000"
+            value={fieldValue(posted, 'blocked')} autocomplete="off" />
+          <p class="hint">
+            Say so plainly. A blocker recorded on the day it happened is the one thing that makes a
+            week readable later, and nobody is marked down for one.
+          </p>
+
+          <label class="lab" for="hours">Hours against tasks</label>
+          <input class="field" id="hours" name="hours" type="text" maxlength="2000"
+            value={fieldValue(posted, 'hours')} autocomplete="off"
+            placeholder="For example: 3h on the import screen, 2h on review" />
+
+          <h3>A Google Drive link, if your work is in a doc or sheet</h3>
+          <label class="lab" for="drive">Drive link</label>
+          {/* type="text", NOT type="url", deliberately. A browser's own URL validation refuses
+              "drive.google.com/file/d/..." pasted from an address bar, which checkDriveLink()
+              repairs by adding the scheme - so the browser would refuse, in a tooltip nobody can
+              read out, something the server would have accepted and explained. One rule decides
+              this, and it is the server's. */}
+          <input class="field" id="drive" name="drive" type="text" maxlength="2048"
+            value={fieldValue(posted, 'drive')} autocomplete="off" inputmode="url"
+            data-api={DRIVE_LINK_API} placeholder="https://docs.google.com/..." />
+          <p class="hint" id="drive-state"></p>
+          <p class="privacy">{SHARING_WARNING}</p>
+          <label class="check">
+            <input type="checkbox" name="ack" value="1" checked={fieldValue(posted, 'ack') === '1'} />
+            <span>I have set this link to "Anyone with the link".</span>
+          </label>
+
+          <h3>A form response, if you file one</h3>
+          <label class="lab" for="formlink">Google Form or Zoho Form response link</label>
+          <input class="field" id="formlink" name="formlink" type="text" maxlength="2048"
+            value={fieldValue(posted, 'formlink')} autocomplete="off" inputmode="url"
+            data-api={FORM_LINK_API} placeholder="Paste the link from your submitted response" />
+          <p class="hint" id="form-state">
+            We check that this looks like a form response and say which service we recognised. A link
+            we cannot place is refused rather than quietly stored as one.
+          </p>
+        </section>
+
+        <section class="card">
+          <h2>Confirm it is you</h2>
+          <p>
+            A second check before the clock-out is written, on top of being signed in. Use your
+            authenticator or a recovery code, or the face check. If you cannot do either right now,
+            tick the box at the bottom - you will still be clocked out.
+          </p>
+
+          {!factors.any && (
+            <p class="notice">
+              There is no authenticator and no face enrolled on your account, so there is nothing to
+              check against yet. Tick the box below and clock out; nothing is marked against you. You
+              can <a href="/portal/employee/security">set one up</a> whenever you like.
+            </p>
+          )}
+
+          {factors.code && (
+            <div>
+              <label class="lab" for="code">Authenticator code, or a recovery code</label>
+              <input class="field" id="code" name="code" type="text" maxlength="64"
+                autocomplete="one-time-code" inputmode="text" spellcheck="false"
+                placeholder="6-digit code, or one recovery code" />
+              <p class="hint">
+                A recovery code works here exactly as an authenticator code does, which is why a lost
+                phone is not a locked door. It is compared on our server and can be used once.
+              </p>
+            </div>
+          )}
+
+          {factors.face && (
+            <div id="face-panel" hidden>
+              <h3>Or use the face check</h3>
+              <p class="privacy">
+                <b>No photo is taken and none is kept.</b> The camera preview stays on this phone.
+                What is checked is a mathematical signature of your face - 128 numbers - compared on
+                our server against the one you enrolled, and then discarded. Nothing is uploaded,
+                saved to your record or shown to anybody.
+              </p>
+              <div class="viewer" id="face-viewer" hidden>
+                <video id="face-video" playsinline autoplay muted></video>
+              </div>
+              <button type="button" class="softbtn" id="face-btn">Check my face</button>
+              <button type="button" class="softbtn" id="face-cancel" hidden>Cancel and turn the camera off</button>
+              <p class="hint" id="face-state"></p>
+            </div>
+          )}
+
+          <label class="check">
+            <input type="checkbox" name="cannot" value="1" checked={fieldValue(posted, 'cannot') === '1'} />
+            <span>
+              I cannot complete the identity check right now. Clock me out anyway and record that the
+              check did not pass.
+            </span>
+          </label>
+          <label class="lab" for="reason">If you ticked that, what happened</label>
+          <input class="field" id="reason" name="reason" type="text" maxlength="2000"
+            value={fieldValue(posted, 'reason')} autocomplete="off"
+            placeholder="Camera would not open, phone lost, and so on" />
+          <p class="hint">
+            Your words are kept with the clock-out and read by a person. Nothing here is deducted,
+            nothing is decided automatically, and a check that did not pass is never treated as proof
+            of anything on its own.
+          </p>
+          <p class="hint">
+            A code and a face signature are each used once. If something above has to be corrected
+            and the page comes back with what you typed, enter a fresh code or run the face check
+            again before you submit.
+          </p>
+        </section>
+
+        <section class="card">
+          <h2>Where you worked from</h2>
+          <label class="lab" for="mode">Work mode</label>
+          <select class="field" id="mode" name="mode">
+            <option value="remote">Remote</option>
+            <option value="onsite">On site</option>
+            <option value="hybrid">Hybrid</option>
+          </select>
+          <label class="lab" for="qr">Station code, if you scanned one</label>
+          <input class="field" id="qr" name="qr" type="text" maxlength="120"
+            value={fieldValue(posted, 'qr')} autocomplete="off"
+            placeholder="Leave empty if you did not scan" />
+          <button class="softbtn" type="button" id="geo-btn" hidden>Attach my location to this clock-out</button>
+          <p class="hint" id="geo-state"></p>
+
+          <button class="submit" type="submit">Submit and clock out</button>
+          <p class="hint">
+            This is an ordinary form. It works with the camera off, with JavaScript off and on a slow
+            connection, and if it does not save you will be told why on this page rather than left
+            believing you clocked out.
+          </p>
+        </section>
+      </form>
+    )}
+
+    <p class="foot">
+      What you write here is your daily report for today. It is stored once, in the same record your
+      reporting manager already reads, and a completed week is measured against it: the hours your
+      punches show, and the reports and tasks that go with them. A credit is a record of work done
+      here. It is never a qualification, and it is never awarded by this platform.
+    </p>
+
+    <p class="foot">
+      The identity check never stores a photograph. Your camera stays on your own device, the frame is
+      discarded the moment a signature is read from it, and only that signature is sent to be compared
+      against the one you enrolled. A check that does not pass never refuses your clock-out, never
+      reduces your hours and never decides anything on its own; it is marked for a person to look at,
+      because cameras, phones and enrolments fail far more often than people do.
+    </p>
+  </main>
+
+  {composed && <WorkspaceNav composed={composed} />}
+
+  <script is:inline>
+    // Location. Progressive enhancement, un-hides its own button, and cannot refuse anything.
+    (function () {
+      var btn = document.getElementById('geo-btn');
+      var state = document.getElementById('geo-state');
+      if (!btn || !state || !navigator.geolocation) return;
+      btn.hidden = false;
+      btn.addEventListener('click', function () {
+        state.textContent = 'Asking your browser for a location...';
+        navigator.geolocation.getCurrentPosition(
+          function (pos) {
+            document.getElementById('geo-lat').value = String(pos.coords.latitude);
+            document.getElementById('geo-lon').value = String(pos.coords.longitude);
+            document.getElementById('geo-acc').value = String(pos.coords.accuracy || '');
+            state.textContent = 'A location will be attached to this clock-out. It is a note, not a check.';
+          },
+          function () {
+            state.textContent = 'Your browser did not share a location. Your clock-out works exactly the same.';
+          },
+          { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
+        );
+      });
+    })();
+  </script>
+
+  <script is:inline>
+    // The live link hints. The SAME pure functions the write path uses, reached over two small
+    // endpoints, so the hint under the field and the check at submit cannot drift apart. Neither
+    // call can block a submit: a network failure leaves the hint empty and the server decides.
+    (function () {
+      var drive = document.getElementById('drive');
+      var driveState = document.getElementById('drive-state');
+      var form = document.getElementById('formlink');
+      var formState = document.getElementById('form-state');
+      if (!window.fetch) return;
+
+      function ask(api, value, out, fallback) {
+        if (!api) return;
+        if (!value) { out.textContent = fallback; return; }
+        fetch(api, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ url: value })
+        }).then(function (r) { return r.json(); }).then(function (d) {
+          if (!d) return;
+          if (d.ok) {
+            var say = d.serviceName ? 'Recognised: ' + d.serviceName + '.' : 'This looks like a Drive link.';
+            if (d.notes && d.notes.length) say = say + ' ' + d.notes.join(' ');
+            out.textContent = say;
+          } else {
+            out.textContent = d.problem || 'We could not read that link.';
+          }
+        }).catch(function () { /* the server decides at submit; an empty hint is honest */ });
+      }
+
+      // THE ENDPOINT ADDRESSES COME FROM data-* ATTRIBUTES ON THE FIELDS THEMSELVES. define:vars
+      // cannot be combined with is:inline on this project, and a URL typed twice is a URL that will
+      // eventually be typed differently.
+      if (drive && driveState) {
+        drive.addEventListener('change', function () {
+          ask(drive.getAttribute('data-api'), drive.value.trim(), driveState, '');
+        });
+      }
+      if (form && formState) {
+        form.addEventListener('change', function () {
+          ask(form.getAttribute('data-api'), form.value.trim(), formState,
+            'We check that this looks like a form response and say which service we recognised.');
+        });
+      }
+    })();
+  </script>
+
+  <script is:inline>
+    // ============================================================================================
+    // THE FACE CHECK, AS AN ENHANCEMENT TO A FORM THAT ALREADY WORKS WITHOUT IT.
+    //
+    // It reads a descriptor from the LIVE video element, puts those 128 numbers into a hidden input,
+    // and lets the ordinary form submit carry them. There is no fetch here, no second write path and
+    // no state that exists only in the browser: if this script never runs, the code box and the
+    // "I cannot" box still clock the person out.
+    //
+    // WHAT IS SENT: 128 numbers. No frame is drawn to a canvas, no data URI is built, nothing is
+    // uploaded. shutCamera() stops every track before the descriptor is used, on every exit path.
+    // WHAT IS NOT SENT: a distance, a score, a verdict. The comparison happens on the server.
+    // ============================================================================================
+    (function () {
+      var panel = document.getElementById('face-panel');
+      var outForm = document.getElementById('out-form');
+      if (!panel || !outForm) return;
+
+      var video = document.getElementById('face-video');
+      var viewer = document.getElementById('face-viewer');
+      var state = document.getElementById('face-state');
+      var btn = document.getElementById('face-btn');
+      var cancelBtn = document.getElementById('face-cancel');
+      var descriptorField = document.getElementById('descriptor');
+      var hasCam = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+      if (!hasCam) return;
+
+      // The same two URLs as enrolment, character for character: a descriptor is only comparable to
+      // one produced by the same pipeline, and a different build would drift the distance for
+      // reasons that have nothing to do with whose face it is.
+      var LIB = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.min.js';
+      var MODELS = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
+
+      var stream = null;
+      var busy = false;
+      var libP = null;
+
+      panel.hidden = false;
+
+      function say(t) { if (state) state.textContent = t; }
+
+      function shutCamera() {
+        try { if (stream) { stream.getTracks().forEach(function (t) { try { t.stop(); } catch (_) {} }); } } catch (_) {}
+        stream = null;
+        try { video.pause(); } catch (_) {}
+        try { video.srcObject = null; } catch (_) {}
+        viewer.hidden = true;
+        cancelBtn.hidden = true;
+      }
+
+      function loadLib() {
+        if (libP) return libP;
+        libP = new Promise(function (res, rej) {
+          if (window.faceapi) { res(); return; }
+          var s = document.createElement('script');
+          s.src = LIB;
+          s.async = true;
+          s.onload = function () { res(); };
+          s.onerror = function () { rej(new Error('face-model-script')); };
+          document.head.appendChild(s);
+        }).then(function () {
+          var f = window.faceapi;
+          if (!f) throw new Error('face-model-script');
+          var back = Promise.resolve();
+          if (f.tf) {
+            back = Promise.resolve()
+              .then(function () { return f.tf.setBackend('webgl'); })
+              .catch(function () { return f.tf.setBackend('wasm'); })
+              .catch(function () {})
+              .then(function () { return f.tf.ready ? f.tf.ready() : null; })
+              .catch(function () {});
+          }
+          return back.then(function () {
+            return Promise.all([
+              f.nets.tinyFaceDetector.loadFromUri(MODELS),
+              f.nets.faceLandmark68TinyNet.loadFromUri(MODELS),
+              f.nets.faceRecognitionNet.loadFromUri(MODELS)
+            ]);
+          });
+        }).catch(function (e) { libP = null; throw e; });
+        return libP;
+      }
+
+      function grab() {
+        var f = window.faceapi;
+        var opts = new f.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+        var deadline = Date.now() + 12000;
+        function tick() {
+          return f.detectSingleFace(video, opts).withFaceLandmarks(true).withFaceDescriptor()
+            .then(function (d) {
+              if (d && d.descriptor) return Array.prototype.slice.call(d.descriptor);
+              if (Date.now() > deadline) return null;
+              return new Promise(function (r) { setTimeout(r, 250); }).then(tick);
+            });
+        }
+        return tick();
+      }
+
+      cancelBtn.addEventListener('click', function () {
+        shutCamera();
+        busy = false;
+        say('Camera off. Nothing was captured or sent. You can still clock out with a code, or by ticking the box below.');
+      });
+
+      window.addEventListener('pagehide', shutCamera);
+
+      btn.addEventListener('click', function () {
+        if (busy) return;
+        busy = true;
+        cancelBtn.hidden = false;
+        say('Starting the camera. No photo is taken and nothing is uploaded.');
+
+        var camP;
+        try {
+          camP = navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'user', width: { ideal: 480 } },
+            audio: false
+          });
+        } catch (e) { camP = Promise.reject(e); }
+
+        camP.then(function (s) {
+          stream = s;
+          video.setAttribute('playsinline', '');
+          video.muted = true;
+          video.srcObject = s;
+          viewer.hidden = false;
+          var p = video.play();
+          if (p && p.catch) { p.catch(function () {}); }
+          say('Look at the camera. The picture stays on this phone and only a signature is checked.');
+          return loadLib();
+        }).then(function () {
+          say('Reading a signature. No photo is being taken.');
+          return grab();
+        }).then(function (descriptor) {
+          shutCamera();
+          busy = false;
+          if (!descriptor) {
+            say('We could not find a face clearly enough in the time we allowed. Use your code instead, or tick the box below - you will still be clocked out.');
+            return;
+          }
+          descriptorField.value = JSON.stringify(descriptor);
+          say('Ready. Press "Submit and clock out" and your face will be compared on our server. Nothing has been sent yet.');
+        }).catch(function (e) {
+          shutCamera();
+          busy = false;
+          var name = (e && (e.name || e.message)) + '';
+          var why = /NotAllowed|Security|denied|permission/i.test(name)
+            ? 'The camera was not allowed.'
+            : /NotFound|DevicesNotFound/i.test(name)
+            ? 'No camera was found on this device.'
+            : /NotReadable|TrackStart/i.test(name)
+            ? 'The camera is being used by another app.'
+            : /face-model-script/i.test(name)
+            ? 'The face model could not be downloaded.'
+            : 'The face check could not run.';
+          say(why + ' Use your code instead, or tick the box below - you will still be clocked out, and nothing is marked against you.');
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

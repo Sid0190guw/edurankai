@@ -1,0 +1,368 @@
+---
+// /admin/aquintutor/curriculum — where the competency framework and the immersive catalogue are
+// actually filled in.
+//
+// WHY THIS PAGE EXISTS. Two modules were complete and mounted nowhere.
+//
+//   src/lib/aquin-competencies.ts — addCompetency() was the only INSERT into aquin_competencies and
+//   setProgress() the only writer of aquin_competency_progress. Neither was called by any page. So
+//   /aquintutor/competencies described a progression ("not started, in progress, demonstrated,
+//   verified") that no learner could ever be in, over a set of competencies nobody could define.
+//
+//   src/lib/aquin-immersive.ts — addSession() was the only INSERT into aquin_immersive_sessions and
+//   was called by nothing, while /aquintutor/clinical-campus READ that table. The clinical campus
+//   could only ever be an empty catalogue under copy describing a library of recorded sessions.
+//
+// Both are now written from here, and both learner-facing pages read what is written.
+//
+// A COMPETENCY IS NOT A PERMISSION. Recording somebody as having demonstrated a competency changes
+// nothing about what they may do in this system; capabilities come from src/lib/auth/permissions.ts
+// and are not derived from anything on this page.
+//
+// RECORDINGS ARE LINKED, NEVER UPLOADED — the same rule this product applies to documents. The
+// address is validated in the engine, so a broken link is refused rather than stored and rendered
+// later as a dead player.
+export const prerender = false;
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { listProgramsResult } from '@/lib/aquin-programs';
+import {
+  DIMENSIONS, ASSESSMENT_MODES, PROGRESS_STATES, dimensionLabel,
+  listCompetencies, addCompetency, setProgress, programsWithCompetencies,
+  type ProgressState,
+} from '@/lib/aquin-competencies';
+import {
+  SESSION_KINDS, AI_OVERLAYS, listSessions, addSession, kindLabel,
+} from '@/lib/aquin-immersive';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user as any, 'admin.access')) return Astro.redirect('/portal');
+// Defining what a learner must demonstrate, and recording that they have, is authoring authority.
+const mayEdit = can(user as any, 'lessons.author');
+
+const PAGE = '/admin/aquintutor/curriculum';
+const STATE_LABEL: Record<string, string> = {
+  not_started: 'Not started',
+  in_progress: 'In progress',
+  demonstrated: 'Demonstrated',
+  verified: 'Verified',
+};
+
+let okMsg = '';
+let errMsg = '';
+
+if (Astro.request.method === 'POST') {
+  if (!mayEdit) {
+    errMsg = 'Authoring the curriculum needs the lessons.author capability. Your account can read this page but not change it.';
+  } else {
+    try {
+      const fd = await Astro.request.formData();
+      const intent = String(fd.get('intent') || '');
+
+      if (intent === 'add_competency') {
+        const res = await addCompetency({
+          programSlug: String(fd.get('program_slug') || ''),
+          code: String(fd.get('code') || ''),
+          name: String(fd.get('name') || ''),
+          dimension: String(fd.get('dimension') || ''),
+          assessmentMode: String(fd.get('assessment_mode') || ''),
+          description: String(fd.get('description') || ''),
+          sortOrder: Number(fd.get('sort_order') || 0),
+        });
+        if (res.ok) return Astro.redirect(PAGE + '?program=' + encodeURIComponent(String(fd.get('program_slug') || '')) + '&added=competency');
+        errMsg = res.error || 'That competency was not saved.';
+      } else if (intent === 'set_progress') {
+        const res = await setProgress(
+          String(fd.get('learner_id') || ''),
+          String(fd.get('competency_id') || ''),
+          String(fd.get('status') || 'not_started') as ProgressState,
+          user.id,
+        );
+        if (res.ok) return Astro.redirect(PAGE + '?program=' + encodeURIComponent(String(fd.get('program_slug') || '')) + '&recorded=1');
+        errMsg = res.error || 'That was not recorded.';
+      } else if (intent === 'add_session') {
+        const overlays = fd.getAll('overlays').map((o) => String(o));
+        const res = await addSession({
+          title: String(fd.get('title') || ''),
+          kind: String(fd.get('kind') || ''),
+          discipline: String(fd.get('discipline') || ''),
+          sourceUrl: String(fd.get('source_url') || ''),
+          is360: String(fd.get('is_360') || '') === '1',
+          aiOverlays: overlays,
+          status: String(fd.get('status') || 'recorded'),
+          createdBy: user.id,
+        });
+        if (res.ok) return Astro.redirect(PAGE + '?added=session');
+        errMsg = res.error || 'That session was not registered.';
+      }
+    } catch (e: any) {
+      // Never swallowed: these are write paths.
+      console.error('[admin/aquintutor/curriculum]', e?.cause?.message || e?.message);
+      errMsg = 'That did not save. Nothing has been changed.';
+    }
+  }
+}
+
+const addedCompetency = Astro.url.searchParams.get('added') === 'competency';
+const addedSession = Astro.url.searchParams.get('added') === 'session';
+const recorded = Astro.url.searchParams.get('recorded') === '1';
+
+// --- reads ---------------------------------------------------------------------------------------
+const programsRes = await listProgramsResult();
+const programs = programsRes.ok ? programsRes.programs : [];
+const definedRes = await programsWithCompetencies();
+const definedCounts = new Map((definedRes.ok ? definedRes.value : []).map((d) => [d.programSlug, d.count]));
+
+const selectedSlug = String(Astro.url.searchParams.get('program') || (programs[0]?.slug || '')).trim();
+const compRes = selectedSlug ? await listCompetencies(selectedSlug) : null;
+const competencies = compRes && compRes.ok ? compRes.value : [];
+
+const sessionsRes = await listSessions(false);
+const sessions = sessionsRes.ok ? sessionsRes.value : [];
+
+// Learners, so recording a state picks a real person instead of a typed id.
+let learners: { id: string; label: string }[] = [];
+let learnersFailed = false;
+try {
+  const r = await db.execute(sql`
+    SELECT id::text AS id, COALESCE(name, email) AS label FROM users
+    WHERE is_active = true ORDER BY COALESCE(name, email) ASC LIMIT 500`);
+  const arr = Array.isArray(r) ? r : ((r as any)?.rows || []);
+  learners = arr.map((x: any) => ({ id: String(x.id), label: String(x.label || 'Account ' + String(x.id).slice(0, 8)) }));
+} catch (e: any) {
+  console.error('[admin/aquintutor/curriculum] learners:', e?.cause?.message || e?.message);
+  learnersFailed = true;
+}
+
+const CARD = 'background:#fff;border:1px solid rgba(14,11,8,0.10);border-radius:14px;padding:20px;margin-bottom:20px;';
+const LABEL = 'display:block;font-size:12px;color:#6b6455;margin:0 0 4px;';
+const INPUT = 'width:100%;box-sizing:border-box;padding:9px 11px;border:1px solid rgba(14,11,8,0.18);border-radius:8px;font-size:14px;font-family:inherit;background:#fff;';
+const BTN = 'background:#FF4F00;color:#fff;border:none;padding:10px 20px;border-radius:8px;font-weight:700;cursor:pointer;font-family:ui-monospace,monospace;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;';
+const H2 = 'font-size:20px;font-weight:700;margin:0 0 4px;';
+const NOTE = 'font-size:13px;color:#6b6455;margin:0 0 16px;line-height:1.6;max-width:78ch;';
+const FAILBOX = 'border:1px solid #FF4F00;border-radius:10px;padding:16px;margin-bottom:16px;';
+---
+<AdminLayout title="Curriculum" activeNav="aquintutor">
+  <div style="max-width:1080px;margin:0 auto;padding:26px 20px 80px;">
+    <p style="font-family:ui-monospace,monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#FF4F00;font-weight:700;margin:0 0 6px;">AquinTutor</p>
+    <h1 style="font-size:28px;font-weight:700;margin:0 0 6px;">Curriculum</h1>
+    <p style={NOTE}>
+      What a learner has to demonstrate, and the recorded sessions they observe. Both public pages
+      &mdash; the competency framework and the clinical campus &mdash; read exactly what is entered
+      here, and both showed an empty catalogue until this screen existed.
+    </p>
+
+    {okMsg && <div style="background:#EBF5EF;border:1px solid #1A6B35;border-radius:10px;padding:12px 16px;margin-bottom:18px;font-size:14px;">{okMsg}</div>}
+    {errMsg && <div style="background:#FFF3EE;border:1px solid #FF4F00;border-radius:10px;padding:12px 16px;margin-bottom:18px;font-size:14px;">{errMsg}</div>}
+    {addedCompetency && <div style="background:#EBF5EF;border:1px solid #1A6B35;border-radius:10px;padding:12px 16px;margin-bottom:18px;font-size:14px;">Competency added. It is now on the programme and can be recorded against a learner.</div>}
+    {addedSession && <div style="background:#EBF5EF;border:1px solid #1A6B35;border-radius:10px;padding:12px 16px;margin-bottom:18px;font-size:14px;">Session registered. It appears on the clinical campus if it is published.</div>}
+    {recorded && <div style="background:#EBF5EF;border:1px solid #1A6B35;border-radius:10px;padding:12px 16px;margin-bottom:18px;font-size:14px;">Recorded against that learner, with your account named as the verifier.</div>}
+    {!mayEdit && <div style="background:#F3EFE8;border:1px solid rgba(14,11,8,0.12);border-radius:10px;padding:12px 16px;margin-bottom:18px;font-size:14px;">Read-only: authoring needs the lessons.author capability.</div>}
+
+    <!-- ======================= COMPETENCIES ======================= -->
+    <section style={CARD}>
+      <h2 style={H2}>Competencies</h2>
+      <p style={NOTE}>
+        Each programme defines its own, against the six dimensions. A competency here is a thing a
+        learner must be able to do; it grants no permission and it is never compared to a role.
+      </p>
+
+      {!programsRes.ok ? (
+        <div style={FAILBOX}>
+          <p style="font-size:15px;font-weight:700;margin:0 0 6px;">The programme list could not be read.</p>
+          <p style="font-size:13.5px;color:#2E2520;line-height:1.6;margin:0;">Nothing can be attached to a programme until this reads, and adding one now would attach it to whatever slug happened to be in the URL.</p>
+          <p style="font-family:ui-monospace,monospace;font-size:12px;color:#7A6F68;margin:10px 0 0;">Reason recorded: {programsRes.ok ? '' : programsRes.reason}</p>
+        </div>
+      ) : programs.length === 0 ? (
+        <p style="font-size:14px;color:#6b6455;margin:0 0 16px;">No programme is published, so there is nothing to define competencies against yet.</p>
+      ) : (
+        <div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
+            {programs.map((p) => (
+              <a
+                href={PAGE + '?program=' + encodeURIComponent(p.slug)}
+                style={'font-size:12px;padding:6px 14px;border-radius:100px;text-decoration:none;border:1px solid rgba(14,11,8,0.15);' + (p.slug === selectedSlug ? 'background:#0E0B08;color:#fff;' : 'color:#2E2520;')}
+              >{p.name} ({definedCounts.get(p.slug) || 0})</a>
+            ))}
+          </div>
+
+          {compRes && !compRes.ok ? (
+            <div style={FAILBOX}>
+              <p style="font-size:15px;font-weight:700;margin:0 0 6px;">The competencies for this programme could not be read.</p>
+              <p style="font-size:13.5px;color:#2E2520;line-height:1.6;margin:0;">This is not telling you there are none. Adding one now could duplicate something already defined.</p>
+              <p style="font-family:ui-monospace,monospace;font-size:12px;color:#7A6F68;margin:10px 0 0;">Reason recorded: {compRes.ok ? '' : compRes.reason}</p>
+            </div>
+          ) : competencies.length === 0 ? (
+            <p style="font-size:14px;color:#6b6455;margin:0 0 16px;">
+              This programme has no competencies defined. Until it does, a learner on it has nothing
+              to progress through and the public framework page has nothing of theirs to show.
+            </p>
+          ) : (
+            <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:18px;">
+              {competencies.map((c) => (
+                <div style="border:1px solid rgba(14,11,8,0.08);border-radius:10px;padding:12px 14px;">
+                  <p style="font-size:15px;font-weight:600;margin:0;">
+                    {c.code && <span style="font-family:ui-monospace,monospace;font-size:12px;color:#6b6455;font-weight:400;">{c.code} &middot; </span>}
+                    {c.name}
+                  </p>
+                  <p style="font-size:12.5px;color:#7A6F68;margin:2px 0 0;">{dimensionLabel(c.dimension)} &middot; assessed {c.assessmentMode}</p>
+                  {c.description && <p style="font-size:13px;color:#2E2520;margin:6px 0 0;line-height:1.6;">{c.description}</p>}
+
+                  {mayEdit && !learnersFailed && learners.length > 0 && (
+                    <form method="POST" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:10px;">
+                      <input type="hidden" name="intent" value="set_progress" />
+                      <input type="hidden" name="competency_id" value={c.id} />
+                      <input type="hidden" name="program_slug" value={selectedSlug} />
+                      <select name="learner_id" required style={INPUT + 'width:auto;min-width:200px;'}>
+                        <option value="">Which learner</option>
+                        {learners.map((l) => <option value={l.id}>{l.label}</option>)}
+                      </select>
+                      <select name="status" style={INPUT + 'width:auto;'}>
+                        {PROGRESS_STATES.map((s) => <option value={s}>{STATE_LABEL[s] || s}</option>)}
+                      </select>
+                      <button type="submit" style={BTN}>Record</button>
+                    </form>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {learnersFailed && (
+            <p style="font-size:13px;color:#6b6455;margin:0 0 14px;">
+              The account list could not be read, so a learner's state cannot be recorded on this
+              load. The competencies above are unaffected.
+            </p>
+          )}
+
+          {mayEdit && (
+            <form method="POST" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;align-items:end;border-top:1px solid rgba(14,11,8,0.08);padding-top:16px;">
+              <input type="hidden" name="intent" value="add_competency" />
+              <input type="hidden" name="program_slug" value={selectedSlug} />
+              <div>
+                <label style={LABEL} for="c-name">Competency</label>
+                <input style={INPUT} type="text" id="c-name" name="name" required maxlength="200" />
+              </div>
+              <div>
+                <label style={LABEL} for="c-code">Code</label>
+                <input style={INPUT} type="text" id="c-code" name="code" maxlength="40" />
+              </div>
+              <div>
+                <label style={LABEL} for="c-dim">Dimension</label>
+                <select style={INPUT} id="c-dim" name="dimension">
+                  {DIMENSIONS.map((d) => <option value={d.key}>{d.label}</option>)}
+                </select>
+              </div>
+              <div>
+                <label style={LABEL} for="c-mode">Assessed</label>
+                <select style={INPUT} id="c-mode" name="assessment_mode">
+                  {ASSESSMENT_MODES.map((m) => <option value={m.key}>{m.label}</option>)}
+                </select>
+              </div>
+              <div>
+                <label style={LABEL} for="c-order">Order</label>
+                <input style={INPUT} type="number" id="c-order" name="sort_order" value="0" min="0" max="999" />
+              </div>
+              <div style="grid-column:1/-1;">
+                <label style={LABEL} for="c-desc">What has to be demonstrated</label>
+                <input style={INPUT} type="text" id="c-desc" name="description" maxlength="600" />
+              </div>
+              <div><button type="submit" style={BTN}>Add competency</button></div>
+            </form>
+          )}
+        </div>
+      )}
+    </section>
+
+    <!-- ==================== IMMERSIVE SESSIONS ==================== -->
+    <section style={CARD}>
+      <h2 style={H2}>Immersive and observation sessions</h2>
+      <p style={NOTE}>
+        The catalogue behind the clinical campus. Recordings are linked from where they already live
+        &mdash; nothing is uploaded here. Observation never replaces supervised practice at a partner,
+        and the public page says so.
+      </p>
+
+      {!sessionsRes.ok ? (
+        <div style={FAILBOX}>
+          <p style="font-size:15px;font-weight:700;margin:0 0 6px;">The session catalogue could not be read.</p>
+          <p style="font-family:ui-monospace,monospace;font-size:12px;color:#7A6F68;margin:8px 0 0;">Reason recorded: {sessionsRes.ok ? '' : sessionsRes.reason}</p>
+        </div>
+      ) : sessions.length === 0 ? (
+        <p style="font-size:14px;color:#6b6455;margin:0 0 16px;">
+          No session has been registered. The clinical campus page is empty for that reason and no
+          other.
+        </p>
+      ) : (
+        <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:18px;">
+          {sessions.map((s) => (
+            <div style="border:1px solid rgba(14,11,8,0.08);border-radius:10px;padding:12px 14px;">
+              <p style="font-size:15px;font-weight:600;margin:0;">{s.title}</p>
+              <p style="font-size:12.5px;color:#7A6F68;margin:2px 0 0;">
+                {kindLabel(s.kind)}{s.discipline ? ' · ' + s.discipline : ''}
+                {s.is360 ? ' · 360 capture' : ''} &middot; {s.status}
+                {s.aiOverlays.length > 0 ? ' · overlays: ' + s.aiOverlays.join(', ') : ''}
+              </p>
+              {s.sourceUrl
+                ? <p style="font-size:12.5px;margin:6px 0 0;"><a href={s.sourceUrl} target="_blank" rel="noopener" style="color:#FF4F00;">Open the recording</a></p>
+                : <p style="font-size:12.5px;color:#6b6455;margin:6px 0 0;">No recording address on this entry, so there is nothing for a learner to open.</p>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {mayEdit && (
+        <form method="POST" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;align-items:end;border-top:1px solid rgba(14,11,8,0.08);padding-top:16px;">
+          <input type="hidden" name="intent" value="add_session" />
+          <div>
+            <label style={LABEL} for="s-title">Title</label>
+            <input style={INPUT} type="text" id="s-title" name="title" required maxlength="200" />
+          </div>
+          <div>
+            <label style={LABEL} for="s-kind">Kind</label>
+            <select style={INPUT} id="s-kind" name="kind">
+              {SESSION_KINDS.map((k) => <option value={k.key}>{k.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={LABEL} for="s-disc">Discipline</label>
+            <input style={INPUT} type="text" id="s-disc" name="discipline" maxlength="100" />
+          </div>
+          <div>
+            <label style={LABEL} for="s-url">Recording address</label>
+            <input style={INPUT} type="url" id="s-url" name="source_url" maxlength="500" placeholder="https://" />
+          </div>
+          <div>
+            <label style={LABEL} for="s-status">Status</label>
+            <select style={INPUT} id="s-status" name="status">
+              <option value="recorded">Recorded</option>
+              <option value="scheduled">Scheduled</option>
+              <option value="live">Live</option>
+            </select>
+          </div>
+          <div>
+            <label style={LABEL} for="s-360">Capture</label>
+            <select style={INPUT} id="s-360" name="is_360">
+              <option value="0">Standard</option>
+              <option value="1">360 degree</option>
+            </select>
+          </div>
+          <div style="grid-column:1/-1;">
+            <p style={LABEL}>AI overlays on this recording</p>
+            <div style="display:flex;gap:12px;flex-wrap:wrap;">
+              {AI_OVERLAYS.map((o) => (
+                <label style="font-size:13px;display:inline-flex;gap:6px;align-items:center;">
+                  <input type="checkbox" name="overlays" value={o.key} /> {o.label}
+                </label>
+              ))}
+            </div>
+          </div>
+          <div><button type="submit" style={BTN}>Register session</button></div>
+        </form>
+      )}
+    </section>
+  </div>
+</AdminLayout>

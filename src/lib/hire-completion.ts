@@ -411,14 +411,21 @@ export async function completeHire(input: CompleteHireInput): Promise<HireComple
   if (applicationId) {
     try {
       const { advanceStage } = await import('@/lib/application-stages');
-      await advanceStage({
+      // ITS ANSWER IS READ. advanceStage() returns a result rather than throwing when it refuses a
+      // move, so `await` on its own would have recorded this step as done against a tracker that had
+      // not moved — the exact shape this module exists to remove.
+      const moved = await advanceStage({
         applicationId,
         toStage: 'onboarded',
         actorUserId: actor,
         actorName: source === 'candidate_signature' ? (candidateName || 'Candidate') : 'People desk',
         note: source === 'candidate_signature' ? 'Offer signed by the candidate.' : 'Hire completed.',
       });
-      step('application_stage', true, 'Their application tracker now reads 06 · Onboarded.');
+      if (moved.ok) {
+        step('application_stage', true, 'Their application tracker now reads 06 · Onboarded.');
+      } else {
+        step('application_stage', false, 'Their application tracker still shows the previous step: ' + (moved.error || 'unknown reason'));
+      }
     } catch (e: any) {
       logFail('completeHire.application_stage', e);
       step('application_stage', false, 'Their application tracker still shows the previous step: ' + reasonOf(e));

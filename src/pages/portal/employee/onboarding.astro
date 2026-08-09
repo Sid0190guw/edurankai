@@ -7,6 +7,7 @@ import { sql } from 'drizzle-orm';
 // each step is waiting on, and acknowledge the policies they are required to read.
 import {
   journeyForEmployee, setItemState, acknowledgeItem, stepCategoryLabel, itemStateLabel,
+  joiningDocumentsProgress,
   type JourneyItem,
 } from '@/lib/onboarding-journey';
 
@@ -93,10 +94,25 @@ if (Astro.request.method === 'POST') {
       pan_number = COALESCE(${pan}, pan_number),
       emergency_contact_name = COALESCE(${emergencyName}, emergency_contact_name),
       emergency_contact_phone = COALESCE(${emergencyPhone}, emergency_contact_phone),
-      onboarding_status = 'submitted', onboarding_submitted_at = NOW(), updated_at = NOW()
+      -- A LATER UPDATE MUST NOT UNDO A DECISION HR HAS ALREADY MADE.
+      --
+      -- This wrote 'submitted' unconditionally. Once the people desk marked somebody Checked or
+      -- Complete on /admin/hr/reconciliation, any further save from this page — a corrected IFSC, a
+      -- new emergency number — silently reset them to Submitted, put them back on the "still
+      -- onboarding" counts on two analytics screens, and left HR to notice on their own that a
+      -- finished onboarding had reopened. The CASE keeps a settled state settled; only a record that
+      -- has not been checked yet moves to 'submitted'.
+      onboarding_status = CASE
+        WHEN onboarding_status IN ('verified', 'complete') THEN onboarding_status
+        ELSE 'submitted' END,
+      -- COALESCE for the same reason: this column means "when they first sent their joining
+      -- details", and a later correction should not rewrite that date.
+      onboarding_submitted_at = COALESCE(onboarding_submitted_at, NOW()), updated_at = NOW()
     WHERE id = ${emp.id}
   `);
-  emp.onboarding_status = 'submitted';
+  if (emp.onboarding_status !== 'verified' && emp.onboarding_status !== 'complete') {
+    emp.onboarding_status = 'submitted';
+  }
   msg = 'submitted';
 
   // A WRITE OF BANK AND IDENTITY DETAILS LEAVES A RECORD, AND SOMEBODY IS TOLD IT ARRIVED.
@@ -139,7 +155,26 @@ if (Astro.request.method === 'POST') {
   }
 }
 
-const done = emp.onboarding_status === 'submitted' || emp.onboarding_status === 'verified';
+// THE END STATE COUNTS AS DONE, AND THE PANEL SAYS WHICH STATE IT IS.
+//
+// This read `'submitted' || 'verified'` and stopped there. 'complete' — the state HR sets on
+// /admin/hr/reconciliation, the one that finally stops a person counting as "currently onboarding"
+// everywhere — was missing from the list, so the moment the people desk finished somebody's
+// onboarding this page threw the blank joining form back at them as though they had never filled it
+// in. That is the same complaint the exit was built to answer, reappearing at the far end of it.
+//
+// The three settled states also read differently to the person in them: waiting to be checked,
+// checked, and finished are not one sentence.
+const onbState = String(emp.onboarding_status || 'pending');
+const done = onbState === 'submitted' || onbState === 'verified' || onbState === 'complete';
+const doneHeading = onbState === 'complete' ? 'Onboarding complete'
+  : onbState === 'verified' ? 'Your details have been checked'
+  : 'Onboarding submitted';
+const doneBody = onbState === 'complete'
+  ? 'The people desk has signed off your joining details. Nothing further is outstanding. If anything changes, write to '
+  : onbState === 'verified'
+  ? 'The people desk has read your bank, identity and emergency details and they are right. Anything still outstanding is on the checklist below. To change a detail, write to '
+  : 'Thank you. HR will verify your details. You can update them by contacting ';
 
 // ADDITIVE. The tracked checklist for this joiner, or null when HR has not started one — an honest
 // absence, rendered as a sentence rather than as an empty list that looks like a bug.
@@ -154,17 +189,36 @@ const myItems: JourneyItem[] = journey
 const otherItems: JourneyItem[] = journey
   ? journey.items.filter((i) => myItems.indexOf(i) < 0)
   : [];
+
+// A CREDENTIAL THAT WAS SENT BACK IS WHY THE STEP IS STILL OPEN, AND THIS IS WHERE IT SAYS SO.
+//
+// joiningDocumentsProgress() was written for exactly this — its own comment says it exists "so a
+// `documents` step on the checklist and the credentials screen can never disagree" — and it had no
+// caller anywhere in src/. So the checklist showed "Submit joining documents" as an open step with
+// no numbers and no link, while the real state of those credentials lived on a different screen the
+// joiner had no reason to revisit. hr-onboarding's progress() only counts a documents step complete
+// when EVERY document is verified and none is rejected, so one bounced credential holds it open
+// indefinitely; the joiner is now told that, here, with the way out.
+const docsState = await joiningDocumentsProgress(String(user.id)).catch((e: any) => {
+  console.error('[portal/employee/onboarding] joining documents progress', e?.cause?.message || e?.message);
+  return null;
+});
+const docsBlocked = !!docsState && docsState.rejected > 0;
 ---
 <BaseLayout title="Employee onboarding - EduRankAI" description="Complete your employee onboarding.">
   <section class="px-[5vw] py-10 md:py-14 max-w-2xl mx-auto">
     <p class="text-[0.62rem] font-mono uppercase tracking-[0.18em] text-burn font-bold mb-2">Welcome aboard</p>
     <h1 class="font-display text-[clamp(1.7rem,4.5vw,2.4rem)] font-semibold text-ink leading-tight mb-2">Employee onboarding</h1>
-    <p class="text-[0.92rem] text-ink-soft mb-6">Hi <strong class="text-ink">{emp.full_name}</strong> — your offer is accepted. Fill in what you have right now. Every field below is <strong>optional</strong>; you can come back and update anything later, and HR will follow up directly for anything missing. We never block your start on a document.</p>
+    {done ? (
+      <p class="text-[0.92rem] text-ink-soft mb-6">Hi <strong class="text-ink">{emp.full_name}</strong> — your joining details are with the people desk. Where you are with them is below, along with anything still outstanding on your checklist.</p>
+    ) : (
+      <p class="text-[0.92rem] text-ink-soft mb-6">Hi <strong class="text-ink">{emp.full_name}</strong> — your offer is accepted. Fill in what you have right now. Every field below is <strong>optional</strong>; you can come back and update anything later, and HR will follow up directly for anything missing. We never block your start on a document.</p>
+    )}
 
     {done ? (
       <div class="bg-leaf-bg/40 border border-leaf-border rounded-2xl p-6">
-        <p class="font-semibold text-leaf mb-1">Onboarding submitted</p>
-        <p class="text-[0.9rem] text-ink-2">Thank you. HR will verify your details. You can update them by contacting <a href="mailto:hr@edurankai.in" class="text-burn hover:underline">hr@edurankai.in</a>.</p>
+        <p class="font-semibold text-leaf mb-1">{doneHeading}</p>
+        <p class="text-[0.9rem] text-ink-2">{doneBody}<a href="mailto:hr@edurankai.in" class="text-burn hover:underline">hr@edurankai.in</a>.</p>
         <a href="/portal/employee" class="inline-block mt-4 bg-ink text-white font-semibold py-2.5 px-5 rounded-lg text-[0.88rem] no-underline">Go to employee portal</a>
       </div>
     ) : (
@@ -224,6 +278,38 @@ const otherItems: JourneyItem[] = journey
         <button type="submit" id="onbSubmit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 rounded-lg text-[0.92rem]">Submit onboarding</button>
       </form>
     )}
+
+    {/* ================================================================================
+        YOUR JOINING CREDENTIALS — the state of them, on the page you are already on.
+        ================================================================================ */}
+    <div class={docsBlocked
+      ? 'mt-8 bg-red-500/5 border border-red-500/30 rounded-2xl p-5'
+      : 'mt-8 bg-white border border-ink/10 rounded-2xl p-5'}>
+      <p class="text-[0.7rem] font-bold uppercase tracking-wider text-burn mb-2">Joining documents</p>
+      {docsState === null ? (
+        <p class="text-[0.88rem] text-ink-2 leading-relaxed">
+          We could not read the state of your credentials just now, so this cannot say how many are
+          verified. Nothing you have sent is lost.
+        </p>
+      ) : docsState.submitted === 0 ? (
+        <p class="text-[0.88rem] text-ink-2 leading-relaxed">
+          You have not shared any credentials yet. They are Google Drive links, not uploads.
+        </p>
+      ) : (
+        <p class="text-[0.88rem] text-ink-2 leading-relaxed">
+          <strong class="text-ink">{docsState.verified} of {docsState.submitted}</strong> verified
+          {docsState.rejected > 0 ? ' · ' + docsState.rejected + ' sent back to you' : ''}
+          {docsState.complete ? ' · nothing outstanding' : ''}
+        </p>
+      )}
+      {docsBlocked && (
+        <p class="text-[0.85rem] text-ink-2 mt-2 leading-relaxed">
+          This step stays open until every credential is verified, so a document that was sent back
+          holds it there. The reason is on each one. Share a fresh link and it moves again.
+        </p>
+      )}
+      <a href="/portal/onboarding" class="inline-block mt-3 bg-ink text-white font-semibold py-2.5 px-4 rounded-lg text-[0.85rem] no-underline min-h-[44px]">Open my joining documents</a>
+    </div>
 
     {/* ================================================================================
         ADDITIVE — YOUR FIRST FORTNIGHT.

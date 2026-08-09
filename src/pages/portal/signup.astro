@@ -64,11 +64,44 @@ if (Astro.request.method === 'POST') {
       errorMsg = 'An account with this email already exists. Try signing in instead.';
     } else {
       const passwordHash = await hashPassword(password);
+      // THE CONSENT TICK WAS BEING THROWN AWAY.
+      //
+      // This form refuses to create an account without it, and then passed it to drizzle as
+      // `consentGivenAt` / `consentIp` - two properties that are on no column of the users table in
+      // src/lib/db/schema.ts and in no CREATE or ALTER anywhere in the repository. drizzle builds an
+      // INSERT from the columns it knows and silently drops anything else, so the statement
+      // succeeded, the account was created, and the record of the agreement that made creating it
+      // lawful was written nowhere. There was nothing to find afterwards and nothing said so.
+      //
+      // It is recorded below instead: an additive column-ensure (IF NOT EXISTS, once per process,
+      // nothing dropped) and a plain UPDATE. Signup is NOT refused when that fails - blocking a
+      // person's account over an audit column would be the worse failure - but the reason is logged
+      // with the account id, so the gap is findable rather than invisible.
       const inserted = await db.insert(users).values({
-        email, name, passwordHash, role: 'applicant', isActive: true,
-        consentGivenAt: new Date(),
-        consentIp: Astro.clientAddress
+        email, name, passwordHash, role: 'applicant', isActive: true
       }).returning({ id: users.id });
+
+      try {
+        const { sql } = await import('drizzle-orm');
+        const { ensureOnce } = await import('@/lib/ensure-once');
+        await ensureOnce('users_consent_columns_v1', async () => {
+          await db.execute(sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_given_at TIMESTAMPTZ`);
+          await db.execute(sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_ip VARCHAR(64)`);
+        });
+        const recorded = await db.execute(sql`
+          UPDATE users
+             SET consent_given_at = NOW(), consent_ip = ${Astro.clientAddress || null}
+           WHERE id = ${inserted[0].id}
+          RETURNING id`);
+        const got = Array.isArray(recorded) ? recorded : ((recorded as any)?.rows || []);
+        if (!got.length) {
+          console.error('[signup] consent was NOT recorded for user', inserted[0].id, '- the update matched no row');
+        }
+      } catch (e: any) {
+        // The real Postgres reason is on e.cause; e.message is only the SQL that failed.
+        console.error('[signup] consent was NOT recorded for user', inserted[0].id, '-',
+          (e as any)?.cause?.message || (e as any)?.message);
+      }
 
       // New profiles are approved on signup — the application fee is the only paid
       // step, so candidates aren't double-charged. Legacy users still on 'pending'

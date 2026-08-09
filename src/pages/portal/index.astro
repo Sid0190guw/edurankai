@@ -181,6 +181,9 @@ try {
 } catch (_) {}
 
 // Pending intents (unpaid application fees).
+// `intentsUnreadable` is declared BEFORE the try that sets it: `const`/`let` is not hoisted in a way
+// a later reader can rely on, and this project has taken pages down that way.
+let intentsUnreadable = false;
 let pendingIntents: any[] = [];
 try {
   const ri = await db.execute(sql`
@@ -208,18 +211,30 @@ try {
     if (seenRoles.has(k)) { dropIds.push(p.id); return false; }
     seenRoles.add(k); return true;
   });
-  if (dropIds.length) {
-    // Only prune intents that have no payment + no waiver attached (pure abandoned restarts).
-    try {
-      await db.execute(sql`
-        DELETE FROM application_intents i
-        WHERE i.id = ANY(${dropIds}::uuid[])
-          AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.reference_id = i.id AND p.status = 'paid')
-          AND NOT EXISTS (SELECT 1 FROM application_fee_waivers w WHERE w.intent_id = i.id)
-      `);
-    } catch (_) {}
+  // THE DELETE THAT USED TO SIT HERE IS GONE, AND ON PURPOSE.
+  //
+  // It read `WHERE i.id = ANY(${dropIds}::uuid[])` — the exact idiom src/lib/pg-array.ts documents
+  // as broken: postgres-js serialises a JS array as a record literal, and Postgres answers "cannot
+  // cast type record to uuid[]". It sat inside `catch (_) {}`, so the statement threw on every
+  // portal load since it was written and NOT ONE ROW WAS EVER PRUNED.
+  //
+  // It is not simply repaired here, because repairing it would switch on a DELETE that has never
+  // once executed — against real application intents, on the first page load of every applicant,
+  // with no way to verify the outcome from this pass. And a GET that renders somebody's home page
+  // should not delete their rows at all: housekeeping belongs in a reviewed maintenance job, not in
+  // a side effect of rendering.
+  //
+  // NOTHING THE APPLICANT SEES CHANGES. The duplicate rows are already filtered out above, which was
+  // the whole user-visible purpose; the leftovers are hidden, not deleted.
+  if (dropIds.length > 0) {
+    console.info('[portal] hid ' + dropIds.length + ' duplicate unpaid application intent(s); rows retained');
   }
-} catch (_) {}
+} catch (e: any) {
+  // This was `catch (_) {}`: an applicant with an unpaid application fee saw no "fee pending" row
+  // at all and no reason why, which reads exactly like "there is nothing to pay".
+  console.error('[portal] pending intents could not be read -', e?.cause?.message || e?.message);
+  intentsUnreadable = true;
+}
 
 // Active in-progress application draft (mid-wizard, before step-6 submission).
 // Lets the applicant resume exactly where they left off.
@@ -413,6 +428,18 @@ if (activeDraft) {
     title: 'Continue your application - step ' + activeDraft.step + ' of 6',
     subtitle: 'Saved progress - resume where you left off',
     href: '/apply/step-' + activeDraft.step,
+  });
+}
+// A FAILED READ IS SAID OUT LOUD. An applicant whose pending-fee query threw used to see nothing
+// at all here, which reads exactly like "there is nothing left to pay" - and the fee is the step
+// between them and a submitted application.
+if (intentsUnreadable) {
+  inboxRows.push({
+    key: 'intents-unreadable',
+    icon: 'wallet',
+    title: 'We could not check your pending application fees',
+    subtitle: 'This is not a confirmation that nothing is outstanding. Please reload, or open Applications.',
+    href: '/portal/applications',
   });
 }
 pendingIntents.forEach((p: any) => {

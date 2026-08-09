@@ -30,6 +30,26 @@ export const ASSESSMENT_MODES = [
 export const PROGRESS_STATES = ['not_started', 'in_progress', 'demonstrated', 'verified'] as const;
 export type ProgressState = typeof PROGRESS_STATES[number];
 
+// WHAT WAS WRONG WITH THIS MODULE.
+//
+// It was a complete competency framework that nothing could reach. /aquintutor/competencies renders
+// DIMENSIONS and ASSESSMENT_MODES — two constant arrays — and tells the reader that "a learner's
+// progress moves through not started, in progress, demonstrated, verified". listCompetencies,
+// addCompetency, progressFor and setProgress were called by no page, so aquin_competencies had no
+// writer and aquin_competency_progress had neither a writer nor a reader. No learner could hold any
+// state at all, and the sentence describing the progression described nothing.
+//
+// The mount is /admin/aquintutor/curriculum — defining competencies against a programme, and
+// recording where a named learner has got to — plus the progress panel on /aquintutor/competencies,
+// where a learner reads her own.
+//
+// THE READS ARE DISCRIMINATED. A programme with no competencies yet and a database that could not be
+// read used to render the identical empty page. The difference matters: the first invites faculty to
+// define some, the second means the ones they already defined are missing.
+
+export type CompetencyRead<T> = { ok: true; value: T } | { ok: false; reason: string };
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+
 let _ready: Promise<void> | null = null;
 export function ensureCompetencySchema(): Promise<void> {
   if (_ready) return _ready;
@@ -55,7 +75,14 @@ export function ensureCompetencySchema(): Promise<void> {
         note TEXT NOT NULL DEFAULT '',
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CONSTRAINT aquin_comp_progress_user_comp_key UNIQUE (user_id, competency_id))`);
-    } catch (_) { _ready = null; }
+    } catch (e: any) {
+      // _ready = null so the NEXT request retries instead of caching a failed bootstrap for the life
+      // of the process. It is also LOGGED now: this used to be `catch (_) { _ready = null; }`, so a
+      // missing table showed up much later as an empty framework page with nothing written anywhere.
+      console.error('[aquin-competencies] schema ensure failed:', reasonOf(e));
+      _ready = null;
+      throw e;
+    }
   })();
   return _ready;
 }
@@ -67,36 +94,97 @@ function toCompetency(r: any): Competency {
   return { id: String(r.id), programSlug: r.program_slug || '', code: r.code || '', name: r.name, dimension: r.dimension || 'theory', assessmentMode: r.assessment_mode || 'online', description: r.description || '' };
 }
 
-export async function listCompetencies(programSlug: string): Promise<Competency[]> {
-  await ensureCompetencySchema();
-  return rows(await db.execute(sql`SELECT * FROM aquin_competencies WHERE program_slug = ${programSlug} ORDER BY sort_order ASC, code ASC`)).map(toCompetency);
+export async function listCompetencies(programSlug: string): Promise<CompetencyRead<Competency[]>> {
+  try {
+    await ensureCompetencySchema();
+    const r = rows(await db.execute(sql`SELECT * FROM aquin_competencies WHERE program_slug = ${programSlug} ORDER BY sort_order ASC, code ASC`));
+    return { ok: true, value: r.map(toCompetency) };
+  } catch (e: any) {
+    const reason = reasonOf(e);
+    console.error('[aquin-competencies] listCompetencies:', reason);
+    return { ok: false, reason };
+  }
+}
+
+/** Every programme that has at least one competency defined, with how many. */
+export async function programsWithCompetencies(): Promise<CompetencyRead<{ programSlug: string; count: number }[]>> {
+  try {
+    await ensureCompetencySchema();
+    const r = rows(await db.execute(sql`
+      SELECT program_slug, COUNT(*)::int AS n FROM aquin_competencies
+      GROUP BY program_slug ORDER BY program_slug ASC`));
+    return { ok: true, value: r.map((x: any) => ({ programSlug: String(x.program_slug || ''), count: Number(x.n || 0) })) };
+  } catch (e: any) {
+    const reason = reasonOf(e);
+    console.error('[aquin-competencies] programsWithCompetencies:', reason);
+    return { ok: false, reason };
+  }
 }
 
 export async function addCompetency(c: { programSlug: string; code?: string; name: string; dimension?: string; assessmentMode?: string; description?: string; sortOrder?: number }): Promise<{ ok: boolean; error?: string }> {
   const name = String(c.name || '').trim();
   if (!name) return { ok: false, error: 'Competency name is required.' };
+  const programSlug = String(c.programSlug || '').trim().slice(0, 80);
+  if (!programSlug) return { ok: false, error: 'Choose the programme this competency belongs to.' };
   const dimension = DIMENSIONS.some((d) => d.key === c.dimension) ? c.dimension! : 'theory';
   const mode = ASSESSMENT_MODES.some((m) => m.key === c.assessmentMode) ? c.assessmentMode! : 'online';
-  await ensureCompetencySchema();
-  await db.execute(sql`INSERT INTO aquin_competencies (program_slug, code, name, dimension, assessment_mode, description, sort_order)
-    VALUES (${String(c.programSlug || '').slice(0, 80)}, ${String(c.code || '').slice(0, 40)}, ${name.slice(0, 200)}, ${dimension}, ${mode}, ${String(c.description || '').slice(0, 600)}, ${c.sortOrder ?? 0})`);
-  return { ok: true };
+  try {
+    await ensureCompetencySchema();
+    await db.execute(sql`INSERT INTO aquin_competencies (program_slug, code, name, dimension, assessment_mode, description, sort_order)
+      VALUES (${programSlug}, ${String(c.code || '').slice(0, 40)}, ${name.slice(0, 200)}, ${dimension}, ${mode}, ${String(c.description || '').slice(0, 600)}, ${c.sortOrder ?? 0})`);
+    return { ok: true };
+  } catch (e: any) {
+    // A write path never swallows. The caller prints this instead of a page that looks like it saved.
+    const reason = reasonOf(e);
+    console.error('[aquin-competencies] addCompetency:', reason);
+    return { ok: false, error: 'That competency was not saved. Nothing has been recorded. (' + reason + ')' };
+  }
 }
 
-/** A learner's progress across a program's competencies (empty when none defined yet). */
-export async function progressFor(userId: string, programSlug: string): Promise<{ competency: Competency; status: ProgressState }[]> {
-  await ensureCompetencySchema();
+/**
+ * A learner's progress across a programme's competencies.
+ *
+ * An empty array used to mean three different things — no competencies defined, none for this
+ * programme, or the query failed — and a learner reading "nothing yet" cannot tell which. The result
+ * is discriminated, and an empty value now means only one thing: nobody has defined any.
+ */
+export async function progressFor(userId: string, programSlug: string): Promise<CompetencyRead<{ competency: Competency; status: ProgressState }[]>> {
   const comps = await listCompetencies(programSlug);
-  if (comps.length === 0) return [];
-  const prog = rows(await db.execute(sql`SELECT competency_id, status FROM aquin_competency_progress WHERE user_id = ${userId}`));
-  const byId = new Map(prog.map((p: any) => [String(p.competency_id), p.status]));
-  return comps.map((c) => ({ competency: c, status: (byId.get(c.id) as ProgressState) || 'not_started' }));
+  if (!comps.ok) return comps;
+  if (comps.value.length === 0) return { ok: true, value: [] };
+  try {
+    const prog = rows(await db.execute(sql`SELECT competency_id, status FROM aquin_competency_progress WHERE user_id = ${userId}`));
+    const byId = new Map(prog.map((p: any) => [String(p.competency_id), p.status]));
+    return {
+      ok: true,
+      value: comps.value.map((c) => ({ competency: c, status: (byId.get(c.id) as ProgressState) || 'not_started' })),
+    };
+  } catch (e: any) {
+    const reason = reasonOf(e);
+    console.error('[aquin-competencies] progressFor:', reason);
+    return { ok: false, reason };
+  }
 }
 
-export async function setProgress(userId: string, competencyId: string, status: ProgressState, verifiedBy?: string | null): Promise<void> {
-  await ensureCompetencySchema();
+/**
+ * Record where a learner has got to on one competency.
+ *
+ * 'verified' is the state that means somebody with authority watched this happen, so verifiedBy is
+ * recorded with it. Reported rather than thrown, because the only caller is a form and a person is
+ * waiting to be told whether it saved.
+ */
+export async function setProgress(userId: string, competencyId: string, status: ProgressState, verifiedBy?: string | null): Promise<{ ok: boolean; error?: string }> {
+  if (!userId || !competencyId) return { ok: false, error: 'Choose both a learner and a competency.' };
   const s = PROGRESS_STATES.includes(status) ? status : 'not_started';
-  await db.execute(sql`INSERT INTO aquin_competency_progress (user_id, competency_id, status, verified_by, updated_at)
-    VALUES (${userId}, ${competencyId}, ${s}, ${verifiedBy || null}, NOW())
-    ON CONFLICT (user_id, competency_id) DO UPDATE SET status = ${s}, verified_by = ${verifiedBy || null}, updated_at = NOW()`);
+  try {
+    await ensureCompetencySchema();
+    await db.execute(sql`INSERT INTO aquin_competency_progress (user_id, competency_id, status, verified_by, updated_at)
+      VALUES (${userId}, ${competencyId}, ${s}, ${verifiedBy || null}, NOW())
+      ON CONFLICT (user_id, competency_id) DO UPDATE SET status = ${s}, verified_by = ${verifiedBy || null}, updated_at = NOW()`);
+    return { ok: true };
+  } catch (e: any) {
+    const reason = reasonOf(e);
+    console.error('[aquin-competencies] setProgress:', reason);
+    return { ok: false, error: 'That was not recorded. The learner still shows whatever they showed before. (' + reason + ')' };
+  }
 }

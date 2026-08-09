@@ -5,7 +5,12 @@ import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { ensureMailSchema, resolveAddress, makeSnippet, getMailConfig } from '@/lib/mail';
+// deliverInbound() rather than a third hand-written copy of the delivery. This file used to thread,
+// insert and stop: the message landed in mail_box, no inbound rule ran against it, and the recipient
+// was told NOTHING — while the same message arriving through the webhook at /api/mail/inbound did
+// get a push. Whether you heard about your own mail depended on which transport the company was
+// using that week. See the block above deliverInbound() in src/lib/mail.ts.
+import { ensureMailSchema, resolveAddress, getMailConfig, deliverInbound } from '@/lib/mail';
 import { randomUUID } from 'node:crypto';
 
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
@@ -135,35 +140,35 @@ export async function pollImapInbox(opts: { force?: boolean; limit?: number } = 
             if (!resolved.userId || seen.has(resolved.userId)) continue;
             seen.add(resolved.userId);
 
-            let threadId: string | null = null;
-            if (inReplyTo) {
-              const t = rows(await db.execute(sql`SELECT thread_id FROM mail_messages WHERE rfc_message_id = ${inReplyTo} LIMIT 1`));
-              if (t[0]) threadId = t[0].thread_id;
-            }
-            if (!threadId) threadId = randomUUID();
-
-            // Skip if we've already delivered this exact RFC id to this user
+            // DE-DUPLICATION STAYS HERE. It is the puller's own problem: a re-poll with `force`, or
+            // a watermark that went backwards, re-reads UIDs already delivered. deliverInbound() is
+            // deliberately not idempotent — the webhook is fired once per message by its sender — so
+            // this check must come BEFORE the call, not inside it.
             const dupe = rows(await db.execute(sql`
               SELECT 1 FROM mail_box b JOIN mail_messages m ON m.id = b.message_id
               WHERE b.user_id = ${resolved.userId} AND m.rfc_message_id = ${rfcId} LIMIT 1
             `));
             if (dupe[0]) continue;
 
-            const ins = rows(await db.execute(sql`
-              INSERT INTO mail_messages (thread_id, subject, from_user_id, from_email, from_name, body_html, body_text, snippet, direction, rfc_message_id, in_reply_to)
-              VALUES (${threadId}, ${subject}, NULL, ${fromAddr}, ${fromName}, ${bodyHtml || null}, ${bodyText || null}, ${makeSnippet(bodyText, bodyHtml)}, 'inbound', ${rfcId}, ${inReplyTo})
-              RETURNING id
-            `));
-            const messageId = ins[0].id;
-            await db.execute(sql`INSERT INTO mail_recipients (message_id, kind, user_id, email, name) VALUES (${messageId}, 'to', ${resolved.userId}, ${resolved.email}, ${resolved.name})`);
-            await db.execute(sql`
-              INSERT INTO mail_box (user_id, message_id, thread_id, folder, is_read)
-              VALUES (${resolved.userId}, ${messageId}, ${threadId}, 'inbox', false)
-              ON CONFLICT (user_id, message_id) DO NOTHING
-            `);
+            await deliverInbound({
+              userId: resolved.userId,
+              email: resolved.email,
+              name: resolved.name,
+              fromEmail: fromAddr, fromName, subject, bodyText, bodyHtml,
+              rfcMessageId: rfcId,
+              inReplyTo,
+            });
             delivered++;
           }
-        } catch (_) { /* parse failure: skip but record UID */ }
+        } catch (e: any) {
+          // NOT A BARE catch (_) ANY MORE. This swallowed everything — a malformed MIME part, yes,
+          // but equally a failed INSERT or a database that had gone away — and the loop then recorded
+          // the UID as processed, so the message was never fetched again. Mail could be dropped
+          // permanently and the only outward sign was `fetched` exceeding `delivered` by a number
+          // nobody was looking at. The UID watermark still advances (a message that cannot be parsed
+          // must not wedge the poll for every message behind it), but the reason is now on the record.
+          console.error('[mail-imap] message UID', msg.uid, 'was NOT delivered -', e?.cause?.message || e?.message);
+        }
       }
     } finally {
       lock.release();

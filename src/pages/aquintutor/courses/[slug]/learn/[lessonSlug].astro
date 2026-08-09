@@ -1,8 +1,37 @@
 ---
+// The lesson runner.
+//
+// TWO THINGS THIS PAGE USED TO GET WRONG, BOTH OF THEM SILENT.
+//
+// 1. IT READ THE WRONG COMPLETION TABLE. "Mark as complete" posts to
+//    /api/aquintutor/lesson-complete, which writes training_lesson_completions. This page decided
+//    whether to show "Completed" by reading training_lesson_progress — a different table whose only
+//    writer (markLessonComplete in the authoring library) was called by nothing. So every learner
+//    pressed the button, watched it turn green, reloaded, and found it saying "Mark as complete"
+//    again. The completion WAS recorded; the page looked in the wrong place. It now asks
+//    isLessonComplete(), which counts both tables and throws rather than answering "no" when it
+//    cannot tell, so the page can say it does not know instead of offering to redo finished work.
+//
+// 2. THE BUTTON COULD DISABLE ITSELF FOREVER. The click handler disabled the button and called
+//    fetch().then() with no .catch: one dropped connection and the promise rejected, the re-enable
+//    line never ran, and the learner was left with a dead grey button and no message.
+//
+// The lesson discussion below is new. training_lesson_discussions was created by the authoring
+// library and READ by the teacher console (/aquintutor/admin/teacher) while nothing anywhere wrote
+// it, so that console's discussion panel could only ever be empty. This composer is its writer. It
+// is an ordinary form posting to this page, with no JavaScript, so it works on a bad connection.
 import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { ensureAquintutorAuthoringSchema, listBlocks } from '@/lib/aquintutor-authoring';
+import {
+  ensureAquintutorAuthoringSchema,
+  listBlocks,
+  isLessonComplete,
+  postDiscussion,
+  listDiscussions,
+} from '@/lib/aquintutor-authoring';
+
+const MAX_COMMENT = 4000;
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
@@ -31,9 +60,58 @@ for (const m of modules) {
   catch { try { lessonsByModule[m.id] = rowsOf(await db.execute(sql`SELECT id, slug, title FROM training_lessons WHERE module_id = ${m.id} ORDER BY created_at ASC`)); } catch { lessonsByModule[m.id] = []; } }
 }
 
-// Progress
-const progressRow = rowsOf(await db.execute(sql`SELECT * FROM training_lesson_progress WHERE user_id = ${user.id} AND lesson_id = ${lesson.id} LIMIT 1`))[0] as any;
-const completed = !!progressRow?.completed_at;
+// --- the discussion post, handled by this page ---------------------------------------------------
+// Declared and handled above the reads below, so a new comment is on the page the redirect lands on
+// rather than one refresh later.
+const PAGE_PATH = '/aquintutor/courses/' + slug + '/learn/' + lessonSlug;
+let commentError = '';
+let keptComment = '';
+
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    keptComment = String(fd.get('body') || '').trim().slice(0, MAX_COMMENT);
+    if (!keptComment) {
+      commentError = 'Write something first.';
+    } else {
+      const parentRaw = String(fd.get('parent_id') || '').trim();
+      const id = await postDiscussion({
+        lessonId: lesson.id,
+        userId: user.id,
+        body: keptComment,
+        parentId: parentRaw || undefined,
+      });
+      if (id) return Astro.redirect(PAGE_PATH + '?posted=1#discussion');
+      commentError = 'That did not post. Nothing was saved, so your words are still in the box.';
+    }
+  } catch (e: any) {
+    // Never swallowed: this is a write path.
+    console.error('[lesson] discussion post:', e?.cause?.message || e?.message);
+    commentError = 'That did not post. Nothing was saved, so your words are still in the box.';
+  }
+}
+
+// Progress. isLessonComplete() reads the table the completion API actually writes, and throws when
+// it cannot tell — "not completed" would be this page offering to redo work already done.
+let completed = false;
+let completionUnknown = false;
+try {
+  completed = await isLessonComplete(user.id, lesson.id);
+} catch (e: any) {
+  console.error('[lesson] isLessonComplete:', e?.cause?.message || e?.message);
+  completionUnknown = true;
+}
+
+// The thread. A failed read is stated, never rendered as "no comments yet".
+let comments: any[] = [];
+let commentsFailed = false;
+try {
+  comments = await listDiscussions(lesson.id);
+} catch (e: any) {
+  console.error('[lesson] listDiscussions:', e?.cause?.message || e?.message);
+  commentsFailed = true;
+}
+const posted = Astro.url.searchParams.get('posted') === '1';
 
 // Adjacent lessons (prev / next in module order)
 const flatLessons: any[] = [];
@@ -103,6 +181,21 @@ const nextL = idx >= 0 && idx < flatLessons.length - 1 ? flatLessons[idx + 1] : 
   .lp-mark.done { background: #1A6B35; }
   .lp-mark[disabled] { opacity: 0.5; cursor: default; }
 
+  .lp-msg { margin: 10px 0 0; font-size: 13px; padding: 10px 14px; border-radius: 8px; background: #FFF3EE; border: 1px solid #FFD4BC; color: #2E2520; }
+  .lp-msg.bad { background: rgba(239,68,68,0.08); border-color: rgba(239,68,68,0.35); }
+
+  .lp-disc { margin-top: 40px; padding-top: 24px; border-top: 1px solid rgba(14,11,8,0.10); }
+  .lp-disc h2 { font-family: 'Cormorant Garamond', serif; font-size: 26px; color: #0E0B08; margin: 0 0 6px; font-weight: 600; }
+  .lp-disc-note { font-size: 13px; color: #7A6F68; margin: 0 0 18px; }
+  .lp-disc-list { list-style: none; margin: 0 0 24px; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+  .lp-disc-item { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 10px; padding: 14px 16px; }
+  .lp-disc-item.reply { margin-left: 24px; border-left: 3px solid rgba(255,79,0,0.35); }
+  .lp-disc-who { font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.06em; color: #7A6F68; margin: 0 0 6px; }
+  .lp-disc-tutor { color: #1A6B35; font-weight: 700; }
+  .lp-disc-body { margin: 0; font-size: 14.5px; line-height: 1.6; color: #2E2520; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .lp-disc-form textarea { width: 100%; box-sizing: border-box; min-height: 110px; padding: 12px; border: 1px solid rgba(14,11,8,0.18); border-radius: 8px; font-family: 'DM Sans', sans-serif; font-size: 15px; line-height: 1.6; resize: vertical; }
+  .lp-disc-form button { margin-top: 10px; background: #FF4F00; color: #fff; border: none; padding: 11px 22px; border-radius: 8px; font-weight: 700; cursor: pointer; font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+
   .lp-nav { display: flex; justify-content: space-between; margin-top: 32px; padding-top: 24px; border-top: 1px solid rgba(14,11,8,0.10); gap: 12px; flex-wrap: wrap; }
   .lp-nav a { color: #FF4F00; text-decoration: none; font-weight: 700; font-size: 13px; padding: 10px 18px; border: 1px solid rgba(255,79,0,0.3); border-radius: 8px; }
   .lp-nav a:hover { background: rgba(255,79,0,0.08); }
@@ -115,9 +208,18 @@ const nextL = idx >= 0 && idx < flatLessons.length - 1 ? flatLessons[idx + 1] : 
       <p class="lp-top-meta"><a href={'/aquintutor/courses/' + slug} style="color:inherit;text-decoration:none;">← {course.title}</a></p>
       <h1 class="lp-top-title">{lesson.title}</h1>
     </div>
-    <button class={"lp-mark" + (completed ? ' done' : '')} id="markCompleteBtn" data-lesson-id={lesson.id} data-course-id={course.id}>
-      {completed ? '✓ Completed' : 'Mark as complete'}
-    </button>
+    <div>
+      <button class={"lp-mark" + (completed ? ' done' : '')} id="markCompleteBtn" data-lesson-id={lesson.id} data-course-id={course.id}>
+        {completed ? 'Completed' : 'Mark as complete'}
+      </button>
+      {completionUnknown && (
+        <p class="lp-msg bad" style="max-width:34ch;">
+          We could not check whether you have already finished this lesson. Marking it again is
+          harmless — it is recorded once — but the button above is not telling you where you stand.
+        </p>
+      )}
+      <p class="lp-msg bad" id="markCompleteError" style="display:none;max-width:34ch;"></p>
+    </div>
   </div>
 
   <div class="lp-grid">
@@ -128,6 +230,47 @@ const nextL = idx >= 0 && idx < flatLessons.length - 1 ? flatLessons[idx + 1] : 
         {prevL ? <a href={'/aquintutor/courses/' + slug + '/learn/' + prevL.slug}>← {prevL.title}</a> : <span></span>}
         {nextL && <a href={'/aquintutor/courses/' + slug + '/learn/' + nextL.slug}>{nextL.title} →</a>}
       </div>
+
+      <!-- The lesson discussion. Its rows are read by the teacher console, which until now had
+           nothing to read because nothing in the codebase wrote this table. -->
+      <section class="lp-disc" id="discussion">
+        <h2>Discussion</h2>
+        <p class="lp-disc-note">
+          Questions about this lesson, in the open, where the next person to be stuck can read the
+          answer. Your name is shown. Tutors answering here are marked.
+        </p>
+
+        {posted && !commentError && <p class="lp-msg">Posted.</p>}
+        {commentError && <p class="lp-msg bad">{commentError}</p>}
+
+        {commentsFailed ? (
+          <p class="lp-msg bad">
+            The discussion could not be loaded. That is not the same as nobody having written
+            anything, so we are not going to show you an empty thread. Your own comment can still be
+            posted below.
+          </p>
+        ) : comments.length === 0 ? (
+          <p class="lp-disc-note">Nothing has been asked about this lesson yet. Yours can be first.</p>
+        ) : (
+          <ul class="lp-disc-list">
+            {comments.map((c: any) => (
+              <li class={'lp-disc-item' + (c.parent_id ? ' reply' : '')}>
+                <p class="lp-disc-who">
+                  {c.user_name || 'A learner'}
+                  {c.is_instructor && <span class="lp-disc-tutor"> · tutor</span>}
+                </p>
+                <p class="lp-disc-body">{c.body}</p>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <form method="POST" class="lp-disc-form">
+          <label for="discussion-body" style="display:block;font-size:13px;color:#7A6F68;margin-bottom:6px;">Ask or answer</label>
+          <textarea id="discussion-body" name="body" maxlength={MAX_COMMENT} required placeholder="What is not clear?">{keptComment}</textarea>
+          <button type="submit">Post to the discussion</button>
+        </form>
+      </section>
     </article>
 
     <aside class="lp-side">
@@ -234,15 +377,39 @@ const nextL = idx >= 0 && idx < flatLessons.length - 1 ? flatLessons[idx + 1] : 
       });
     });
 
-    // Mark complete
+    // Mark complete.
+    //
+    // The .catch is the point. This used to be fetch().then().then() with no rejection handler, so
+    // a dropped connection left the button disabled, grey and silent, with the learner's work
+    // apparently unrecorded and no way to try again short of a reload. Every exit from this handler
+    // now either shows "Completed" or re-enables the button and says why.
     var mb = document.getElementById('markCompleteBtn');
+    var mErr = document.getElementById('markCompleteError');
+    function markSay(msg) {
+      if (!mErr) return;
+      mErr.textContent = msg;
+      mErr.style.display = msg ? 'block' : 'none';
+    }
     if (mb && !mb.classList.contains('done')) {
       mb.addEventListener('click', function () {
         mb.disabled = true;
-        fetch('/api/aquintutor/lesson-complete', { method:'POST', headers:{'Content-Type':'application/json'}, credentials:'same-origin', body: JSON.stringify({ lessonId: lessonId, courseId: courseId }) }).then(function(r){return r.json();}).then(function(d){
-          if (d.ok) { mb.classList.add('done'); mb.innerHTML = '✓ Completed'; if (d.certificate) alert('You completed the course! Certificate: ' + d.certificate); }
-          else { mb.disabled = false; alert(d.error || 'Failed'); }
-        });
+        markSay('');
+        fetch('/api/aquintutor/lesson-complete', { method:'POST', headers:{'Content-Type':'application/json'}, credentials:'same-origin', body: JSON.stringify({ lessonId: lessonId, courseId: courseId }) })
+          .then(function(r){ return r.json().catch(function(){ throw new Error('The server replied with something we could not read.'); }); })
+          .then(function(d){
+            if (d && d.ok) {
+              mb.classList.add('done');
+              mb.textContent = 'Completed';
+              if (d.certificate) markSay('Course finished. Your certificate has been issued.');
+            } else {
+              mb.disabled = false;
+              markSay((d && d.error) ? d.error : 'That did not save. Nothing has been recorded, so press it again.');
+            }
+          })
+          .catch(function(){
+            mb.disabled = false;
+            markSay('We could not reach the server. Nothing has been recorded — check your connection and press it again.');
+          });
       });
     }
   })();

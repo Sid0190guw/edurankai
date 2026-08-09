@@ -261,6 +261,33 @@ export const WORKFLOW_DOMAINS = [
   // nobody ever receives anything they are already owed.
   // ---------------------------------------------------------------------------------------------
   'benefits',
+  // ---------------------------------------------------------------------------------------------
+  // CREDIT. One domain, for the WEEK A MEASUREMENT DID NOT FULLY SUPPORT.
+  //
+  // One credit is one completed week. When the hours are there AND the week is complete, the credit
+  // is granted automatically by src/lib/credit-week.ts and NOTHING comes here — an automatic grant
+  // is not an approval and must never occupy an approver's queue.
+  //
+  // A workflow is started for the OTHER case, and only that case: the hours fell short, or a day was
+  // never checked out of, or the reports or the tasks are not done. Somebody is then being credited
+  // for a week the measurement did not fully support, which is exactly the kind of decision that
+  // must have a named human and a written reason against it.
+  //
+  // ROUTED TO THE REPORTING MANAGER, per row, from the Organization Graph — never from users.role.
+  // Where the graph names nobody the request HALTS and says which relationship is missing, which is
+  // the sentence somebody can act on. `escalateStep()` moves it to the next link ABOVE them, which
+  // is how "a more senior authority" reaches it without a second chain.
+  //
+  // capability: 'employee.manage' — AND THIS IS THE ONE DOMAIN BESIDES `leave` THAT CARRIES ONE.
+  // The founder's correction names three people who may decide a shortfall week: the reporting
+  // manager, HR, or somebody above them. The first is routing and the third is escalation; the
+  // second is a STANDING AUTHORITY, and 'employee.manage' is the key that already means "runs the
+  // HR desk" in permissions.ts (it is what gates /admin/hr and /admin/hr/completion/[id]). Mapping
+  // it here grants nobody anything new — it lets the desk that owns the completion letter decide the
+  // weeks that letter prints, and decideStep() records that they acted via standing authority rather
+  // than as the named approver.
+  // ---------------------------------------------------------------------------------------------
+  'credit',
 ] as const;
 
 export type WorkflowDomain = (typeof WORKFLOW_DOMAINS)[number];
@@ -945,6 +972,27 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
     route: [{ step: 1, via: 'approval_owner' }],
     escalateAfterHours: 96,
     approvalUrl: '/admin/hr/benefits/enrolments',
+  },
+
+  // ===============================================================================================
+  // A WEEK'S CREDIT THE MEASUREMENT DID NOT FULLY SUPPORT. See the note in WORKFLOW_DOMAINS.
+  //
+  // ONE RUNG, for the reason `attendance`, `overtime` and `timesheet` above already give: this is a
+  // small factual question about a week that has already happened, and a three-rung chain for it
+  // means nobody ever decides one and the week is simply lost.
+  //
+  // approvalUrl is a PORTAL path, deliberately. The person this routes to is the intern's reporting
+  // manager, who is very often an ordinary employee with no admin access at all; sending them to
+  // /admin would send them to a redirect.
+  // ===============================================================================================
+  credit: {
+    key: 'credit',
+    label: 'Weekly credit',
+    capability: 'employee.manage',
+    route: [{ step: 1, via: 'reporting_manager' }],
+    escalateAfterHours: 120,
+    approvalUrl: '/portal/employee/credits/approvals',
+    requesterUrl: '/portal/employee/credits',
   },
 };
 

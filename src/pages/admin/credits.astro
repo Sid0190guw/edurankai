@@ -4,6 +4,7 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { grantCredit, getCreditBalance, getCreditLedger } from '@/lib/account-credit';
 import { can } from '@/lib/auth/permissions';
+import { dbReason } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -14,8 +15,9 @@ if (!user) return Astro.redirect('/admin/login');
 //
 // THE `'admin'` ARM WENT WITH THE CONVERSION AND THAT REMOVES ACCESS FROM NOBODY: 'admin' is not a
 // value of userRoleEnum (src/lib/db/schema.ts), so no account can hold it — the same reasoning
-// permissions.ts already uses for not reproducing it in the matrix. The identical dead arm still sits
-// at src/pages/admin/infra.astro; no capability was requested for it, so it is reported, not touched.
+// permissions.ts already uses for not reproducing it in the matrix. The identical dead arm at
+// src/pages/admin/infra.astro has since been removed for the same reason; that page keeps its literal
+// super_admin test, which is a mechanism change and no change of population.
 if (!can(user as any, 'credits.grant')) return Astro.redirect('/admin');
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
@@ -38,16 +40,34 @@ if (Astro.request.method === 'POST') {
 }
 
 // Optional lookup of a single account's balance + ledger.
+//
+// "NO ACCOUNT WITH THAT EMAIL" AND "THE LOOKUP DID NOT ANSWER" WERE THE SAME SENTENCE.
+//
+// `.catch(() => [])` on the lookup left lookupUser null, and the panel below then stated flatly
+// that no account exists with that address. On a screen whose job is putting spendable money on
+// an account, that sentence gets acted on: the operator concludes the person never signed up and
+// either creates a duplicate or grants against the wrong address. Same for the holders roll-up,
+// whose `catch (_) {}` printed "No credit granted yet" over a failed read of the credit ledger.
+//
+// dbReason() takes the real Postgres reason off e.cause; e.message on a drizzle error is only the
+// SQL that failed. `const` before first use.
 const url = new URL(Astro.request.url);
 const lookup = (url.searchParams.get('email') || '').trim().toLowerCase();
 let lookupUser: any = null, balance = 0, ledger: any[] = [];
+let lookupError = '';
 if (lookup) {
-  lookupUser = rows(await db.execute(sql`SELECT id, name, email FROM users WHERE lower(email) = ${lookup} LIMIT 1`).catch(() => []))[0] as any;
-  if (lookupUser) { balance = await getCreditBalance(lookupUser.id); ledger = await getCreditLedger(lookupUser.id, 50); }
+  try {
+    lookupUser = rows(await db.execute(sql`SELECT id, name, email FROM users WHERE lower(email) = ${lookup} LIMIT 1`))[0] as any;
+    if (lookupUser) { balance = await getCreditBalance(lookupUser.id); ledger = await getCreditLedger(lookupUser.id, 50); }
+  } catch (e: any) {
+    lookupError = dbReason(e);
+    console.error('[admin/credits] lookup', lookupError);
+  }
 }
 
 // Accounts that currently hold a positive balance.
 let holders: any[] = [];
+let holdersError = '';
 try {
   holders = rows(await db.execute(sql`
     SELECT u.email, u.name, SUM(l.delta_paise)::bigint AS bal
@@ -55,7 +75,10 @@ try {
     GROUP BY u.email, u.name HAVING SUM(l.delta_paise) > 0
     ORDER BY bal DESC LIMIT 100
   `));
-} catch (_) {}
+} catch (e: any) {
+  holdersError = dbReason(e);
+  console.error('[admin/credits] holders', holdersError);
+}
 
 function inr(p: any) { return 'Rs ' + Math.round((Number(p) || 0) / 100).toLocaleString('en-IN'); }
 function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); } catch { return '-'; } }
@@ -91,7 +114,8 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
 
     {lookup && (
       <div style="background:#fff;border:1px solid rgba(14,11,8,0.1);border-radius:14px;padding:20px;margin-bottom:18px;">
-        {!lookupUser ? <p style="color:#b91c1c;font-size:0.88rem;margin:0;">No account with email {lookup}.</p> : (
+        {lookupError ? <p style="color:#92400e;font-size:0.88rem;margin:0;line-height:1.55;">The lookup did not answer, so this is <strong>not</strong> "no such account" - it is unknown. Do not grant against this address until it does. Reason: {lookupError}</p>
+         : !lookupUser ? <p style="color:#b91c1c;font-size:0.88rem;margin:0;">No account with email {lookup}.</p> : (
           <>
             <h2 style="font-size:1.05rem;font-weight:600;margin:0 0 2px;">{lookupUser.name || lookupUser.email}</h2>
             <p style="font-size:0.82rem;color:#8a8078;margin:0 0 10px;">{lookupUser.email} &middot; Balance: <strong style="color:#FF4F00;">{inr(balance)}</strong></p>
@@ -116,7 +140,8 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
 
     <div style="background:#fff;border:1px solid rgba(14,11,8,0.1);border-radius:14px;padding:20px;">
       <h2 style="font-size:1.05rem;font-weight:600;margin:0 0 12px;">Accounts with a balance</h2>
-      {holders.length === 0 ? <p style="color:#a99e94;font-size:0.86rem;margin:0;">No credit granted yet.</p> : (
+      {holdersError ? <p style="color:#92400e;font-size:0.86rem;margin:0;line-height:1.55;">The credit ledger could not be read, so this is <strong>unknown</strong>, not "no credit granted". Reason: {holdersError}</p>
+       : holders.length === 0 ? <p style="color:#a99e94;font-size:0.86rem;margin:0;">No credit granted yet.</p> : (
         <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
           <thead><tr style="text-align:left;color:#9a8f86;font-size:0.66rem;text-transform:uppercase;letter-spacing:0.05em;"><th style="padding:7px 8px;">Account</th><th style="padding:7px 8px;">Balance</th></tr></thead>
           <tbody>

@@ -2,11 +2,19 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { dbReason } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
-const isSuper = user.role === 'admin' || user.role === 'super_admin';
-if (!isSuper) return Astro.redirect('/admin');
+// THE 'admin' ARM IS GONE AND THAT TAKES ACCESS FROM NOBODY.
+//
+// 'admin' is not a value of userRoleEnum (src/lib/db/schema.ts) - TypeScript said so outright
+// (ts2367: the two types have no overlap) - so no account could ever hold it and the arm could
+// never be true. What it did do was read as a second admitted population that does not exist,
+// which is how somebody concludes a door is wider than it is. src/pages/admin/credits.astro
+// removed the identical dead arm and left a note pointing at this file; this is that note
+// answered. The live population is unchanged: super_admin, and nobody else.
+if (user.role !== 'super_admin') return Astro.redirect('/admin');
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 function fmtBytes(n: number): string {
@@ -19,9 +27,32 @@ function fmtBytes(n: number): string {
 function pct(used: number, limit: number): number { return limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0; }
 
 // ---- Database (Supabase Postgres) - measured live via SQL ----
+//
+// "0 B USED, 0% OF QUOTA" WAS WHAT A FAILED MEASUREMENT LOOKED LIKE.
+//
+// Each read below was wrapped in `catch (_) {}` over a variable initialised to 0, so a refused
+// connection or a permission error on pg_database_size rendered as an empty database with the
+// whole free tier still available - on the one page an operator opens to decide whether there is
+// room left. A quota page that reports plenty when it cannot measure is worse than one that
+// reports nothing. Each read now records whether it answered, and the tiles say "unknown" where
+// it did not.
+//
+// The catches stay (one failed aggregate must not blank the other two) but each now names itself,
+// and dbReason() takes the real Postgres message off e.cause - e.message on a drizzle error is
+// only the SQL that failed. `const` before first use.
+const readFailures: string[] = [];
+const noteFailure = (what: string, e: any) => { readFailures.push(what + ' - ' + dbReason(e)); };
+
 let dbBytes = 0, tableCount = 0, topTables: any[] = [], rowsTotal = 0;
-try { dbBytes = Number(rows(await db.execute(sql`SELECT pg_database_size(current_database()) AS b`))[0]?.b) || 0; } catch (_) {}
-try { tableCount = Number(rows(await db.execute(sql`SELECT count(*)::int AS c FROM information_schema.tables WHERE table_schema = 'public'`))[0]?.c) || 0; } catch (_) {}
+let dbBytesOk = false, tableCountOk = false, topTablesOk = false;
+try {
+  dbBytes = Number(rows(await db.execute(sql`SELECT pg_database_size(current_database()) AS b`))[0]?.b) || 0;
+  dbBytesOk = true;
+} catch (e) { noteFailure('Database size', e); }
+try {
+  tableCount = Number(rows(await db.execute(sql`SELECT count(*)::int AS c FROM information_schema.tables WHERE table_schema = 'public'`))[0]?.c) || 0;
+  tableCountOk = true;
+} catch (e) { noteFailure('Table count', e); }
 try {
   topTables = rows(await db.execute(sql`
     SELECT c.relname AS name, pg_total_relation_size(c.oid) AS bytes,
@@ -32,7 +63,8 @@ try {
     WHERE n.nspname = 'public' AND c.relkind = 'r'
     ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 12`));
   rowsTotal = topTables.reduce((a, t) => a + (Number(t.rows) || 0), 0);
-} catch (_) {}
+  topTablesOk = true;
+} catch (e) { noteFailure('Largest tables', e); }
 // Supabase free tier. This panel once reported a different provider and measured against that
 // provider's quota long after the migration, so an operator checking how much room was left was
 // reading a number about a database this project no longer uses.
@@ -55,7 +87,9 @@ const BLOB_FREE_BYTES = 1024 * 1024 * 1024; // ~1 GB free reference
 // ---- Provider cards: live if the API token is set, else a "connect" hint ----
 const env = (k: string) => (import.meta.env[k] || process.env[k] || '') as string;
 const providers = [
-  { name: 'Supabase (Postgres)', kind: 'Database', live: true, detail: fmtBytes(dbBytes) + ' used' + (DB_FREE_BYTES ? ' of ~' + fmtBytes(DB_FREE_BYTES) : ''), pct: pct(dbBytes, DB_FREE_BYTES), env: '' },
+  // `live: true` was a constant, so this card claimed the database was reachable even while the
+  // size query had just failed. It now reports what the measurement actually did.
+  { name: 'Supabase (Postgres)', kind: 'Database', live: dbBytesOk, detail: dbBytesOk ? (fmtBytes(dbBytes) + ' used' + (DB_FREE_BYTES ? ' of ~' + fmtBytes(DB_FREE_BYTES) : '')) : 'Size could not be measured - this is unknown, not empty', pct: dbBytesOk ? pct(dbBytes, DB_FREE_BYTES) : 0, env: '' },
   { name: 'Vercel Blob', kind: 'Object storage', live: blobOk, detail: blobOk ? (fmtBytes(blobBytes) + ' across ' + blobCount + ' files') : ('Not readable here' + (blobErr ? ' (' + blobErr + ')' : '')), pct: blobOk ? pct(blobBytes, BLOB_FREE_BYTES) : 0, env: blobOk ? '' : 'BLOB_READ_WRITE_TOKEN' },
   { name: 'Vercel (compute / bandwidth)', kind: 'Hosting', live: !!env('VERCEL_API_TOKEN'), detail: env('VERCEL_API_TOKEN') ? 'Token set - usage via Vercel API' : 'Add VERCEL_API_TOKEN to show live build minutes, bandwidth and function usage.', pct: 0, env: env('VERCEL_API_TOKEN') ? '' : 'VERCEL_API_TOKEN' },
   { name: 'GitHub', kind: 'Source / CI', live: !!env('GITHUB_TOKEN'), detail: env('GITHUB_TOKEN') ? 'Token set - Actions minutes + storage via GitHub API' : 'Add GITHUB_TOKEN to show Actions minutes and package storage.', pct: 0, env: env('GITHUB_TOKEN') ? '' : 'GITHUB_TOKEN' },
@@ -68,17 +102,25 @@ const providers = [
     <h1 style="font-size:1.5rem;font-weight:600;color:#fff;margin:0 0 4px;">Infrastructure usage</h1>
     <p style="font-size:0.86rem;color:#8a8a94;margin:0 0 20px;">Live resource usage across the services that run EduRankAI. Database and blob storage are measured directly; hosting/CI/CDN show live once their API token is set. Built to extend to our own servers later.</p>
 
+    {readFailures.length > 0 && (
+      <div style="border:1px solid #e8c46a33;background:#e8c46a0f;border-radius:12px;padding:12px 14px;margin:0 0 18px;font-size:0.8rem;color:#e8c46a;line-height:1.6;">
+        <b>Some measurements did not answer.</b> The figures they feed are unknown below, not zero - do not
+        read this page as "plenty of room left" until they do.
+        <ul style="margin:8px 0 0;padding-left:18px;">{readFailures.map((f) => <li>{f}</li>)}</ul>
+      </div>
+    )}
+
     <!-- Headline measured numbers -->
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:22px;">
       <div style="background:#0f0f14;border:1px solid #1f1f28;border-radius:12px;padding:16px;">
-        <p style="font-size:1.7rem;font-weight:700;color:#fff;margin:0;line-height:1;">{fmtBytes(dbBytes)}</p>
+        <p style={'font-size:1.7rem;font-weight:700;margin:0;line-height:1;color:' + (dbBytesOk ? '#fff' : '#e8c46a')}>{dbBytesOk ? fmtBytes(dbBytes) : 'unknown'}</p>
         <p style="font-size:0.72rem;color:#8a8a94;text-transform:uppercase;letter-spacing:0.05em;margin:6px 0 0;">Database size</p>
-        <p style="font-size:0.7rem;color:#FF7040;margin:3px 0 0;">{pct(dbBytes, DB_FREE_BYTES)}% of ~{fmtBytes(DB_FREE_BYTES)}</p>
+        <p style="font-size:0.7rem;color:#FF7040;margin:3px 0 0;">{dbBytesOk ? pct(dbBytes, DB_FREE_BYTES) + '% of ~' + fmtBytes(DB_FREE_BYTES) : 'not measured'}</p>
       </div>
       <div style="background:#0f0f14;border:1px solid #1f1f28;border-radius:12px;padding:16px;">
-        <p style="font-size:1.7rem;font-weight:700;color:#fff;margin:0;line-height:1;">{tableCount}</p>
+        <p style={'font-size:1.7rem;font-weight:700;margin:0;line-height:1;color:' + (tableCountOk ? '#fff' : '#e8c46a')}>{tableCountOk ? tableCount : 'unknown'}</p>
         <p style="font-size:0.72rem;color:#8a8a94;text-transform:uppercase;letter-spacing:0.05em;margin:6px 0 0;">Tables</p>
-        <p style="font-size:0.7rem;color:#8a8a94;margin:3px 0 0;">{rowsTotal.toLocaleString('en-US')} rows (est.)</p>
+        <p style="font-size:0.7rem;color:#8a8a94;margin:3px 0 0;">{topTablesOk ? rowsTotal.toLocaleString('en-US') + ' rows (est.)' : 'row estimate not read'}</p>
       </div>
       <div style="background:#0f0f14;border:1px solid #1f1f28;border-radius:12px;padding:16px;">
         <p style="font-size:1.7rem;font-weight:700;color:#fff;margin:0;line-height:1;">{blobOk ? fmtBytes(blobBytes) : '-'}</p>
@@ -111,7 +153,9 @@ const providers = [
     <!-- Biggest tables -->
     <h2 style="font-size:1.02rem;font-weight:600;color:#fff;margin:0 0 12px;">Largest tables</h2>
     <div style="background:#0f0f14;border:1px solid #1f1f28;border-radius:12px;overflow:hidden;">
-      {topTables.length === 0 ? <p style="padding:20px;color:#8a8a94;font-size:0.85rem;">Could not read table sizes.</p> : topTables.map((t: any, i: number) => (
+      {!topTablesOk ? <p style="padding:20px;color:#e8c46a;font-size:0.85rem;">Could not read table sizes.</p>
+       : topTables.length === 0 ? <p style="padding:20px;color:#8a8a94;font-size:0.85rem;">The query answered and returned no tables. That is a genuinely empty public schema, not a failed read.</p>
+       : topTables.map((t: any, i: number) => (
         <div style={'display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 16px;' + (i > 0 ? 'border-top:1px solid #1a1a22;' : '')}>
           <span style="font-size:0.84rem;color:#e9edf2;font-family:monospace;">{t.name}</span>
           <span style="font-size:0.8rem;color:#8a8a94;white-space:nowrap;">{Number(t.rows).toLocaleString('en-US')} rows · <strong style="color:#c8c8d0;">{fmtBytes(t.bytes)}</strong></span>

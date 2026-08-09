@@ -104,6 +104,28 @@ const rejectsImagePayload = (body: any): string | null => {
 /** Punch kinds are re-checked inside punch() against the day so far; this is only a shape check. */
 const KINDS = ['clock_in', 'break_start', 'break_end', 'clock_out'];
 
+/**
+ * WHERE A CLOCK-OUT IS WRITTEN NOW, AND IT IS NOT HERE.
+ *
+ * A clock-out requires two things this endpoint cannot collect: a record of the work done, and a
+ * SECOND-FACTOR check. Leaving the kind reachable here would leave a way past both — a stale tab, a
+ * cached script or a bookmarked fetch would clock somebody out with no work record and no identity
+ * check, and nothing about the punch would say so afterwards.
+ *
+ * So it is refused, with a sentence saying where to go and stating plainly that nothing was recorded
+ * and the person is still clocked in — a refusal somebody misreads as "done" is the failure this
+ * whole gate exists to prevent. 409 rather than 400: there is nothing malformed about the request,
+ * it simply belongs on another screen.
+ *
+ * 'clock_out' deliberately STAYS in KINDS above, so a stale client gets this sentence rather than
+ * "that is not something we record", which would be both untrue and useless.
+ */
+const CLOCK_OUT_GATE_PATH = '/portal/employee/attendance/clock-out';
+const CLOCK_OUT_REFUSAL =
+  'Clocking out happens on its own screen now, because it records what you did today and asks you to '
+  + 'confirm who you are before anything is written. NOTHING has been recorded here and you are still '
+  + 'clocked in. Open ' + CLOCK_OUT_GATE_PATH + ' to finish your day.';
+
 const num = (v: unknown): number | null => {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
@@ -147,6 +169,9 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
   const kind = String(body?.kind || '');
   if (!KINDS.includes(kind)) {
     return json({ ok: false, error: 'That is not something we record.' }, 400);
+  }
+  if (kind === 'clock_out') {
+    return json({ ok: false, error: CLOCK_OUT_REFUSAL, redirect: CLOCK_OUT_GATE_PATH }, 409);
   }
 
   // ---------------------------------------------------------------------------------------------

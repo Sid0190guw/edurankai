@@ -144,10 +144,20 @@ export async function createBgvRecord(opts: any) {
   return { ok: true, id: r[0]?.id };
 }
 
+/** The only statuses a check may hold. The screen's picker is built from this same list. */
+export const BGV_STATUSES = ['pending', 'in_progress', 'clear', 'flagged', 'failed', 'n/a'] as const;
+
 export async function updateBgvCheck(id: string, checkKey: string, status: string, notes?: string, evidenceUrl?: string) {
   await ensureBgvSchema();
   // Only allow known check keys.
   if (!BGV_CHECKS.find(c => c.key === checkKey)) return { ok: false, error: 'bad check key' };
+  // AND ONLY A KNOWN STATUS. The posted value went straight into the column unchecked, so a
+  // hand-made POST could store any string at all as the outcome of somebody's criminal-record
+  // check — and the roll-up below reads that column back to decide whether the candidate is
+  // cleared. A rendered <select> is not a validation.
+  if (!(BGV_STATUSES as readonly string[]).includes(String(status))) {
+    return { ok: false, error: 'That is not a verification outcome this register recognises, so nothing was changed.' };
+  }
   const notesCol = checkKey.replace('check_', '') + '_notes';
   const evidenceCol = evidenceColumnFor(checkKey);
 
@@ -161,7 +171,15 @@ export async function updateBgvCheck(id: string, checkKey: string, status: strin
   // Build query manually since column name varies — sql.raw to inject column. Both column names are
   // derived from the closed BGV_CHECKS list and never from caller input, which is the only reason
   // sql.raw is acceptable here; the values themselves are bound parameters.
-  await db.execute(sql`UPDATE hr_bgv_records SET ${sql.raw(checkKey)} = ${status}, ${sql.raw(notesCol)} = ${notes || null}, updated_at = NOW() WHERE id = ${id}`);
+  // RETURNING, so "Check updated." is a report of a row that changed rather than of a statement that
+  // ran. Without it an id that matches nothing — a record deleted in another tab, a stale page — was
+  // answered { ok: true } and the reviewer believed a background check had been recorded.
+  const wrote = rows(await db.execute(
+    sql`UPDATE hr_bgv_records SET ${sql.raw(checkKey)} = ${status}, ${sql.raw(notesCol)} = ${notes || null}, updated_at = NOW() WHERE id = ${id} RETURNING id`,
+  ));
+  if (!wrote.length) {
+    return { ok: false, error: 'That verification record is no longer on the register, so nothing was changed.' };
+  }
   if (evidenceCol && evidenceUrl !== undefined) {
     await db.execute(sql`UPDATE hr_bgv_records SET ${sql.raw(evidenceCol)} = ${rawEvidence || null}, updated_at = NOW() WHERE id = ${id}`);
   }
@@ -170,8 +188,13 @@ export async function updateBgvCheck(id: string, checkKey: string, status: strin
   if (r[0]) {
     const checks = Object.values(r[0]).filter(v => v && v !== 'n/a');
     let overall: string = 'pending';
+    // `[].every(...)` IS TRUE, AND THAT ANSWER WAS "CLEARED". With every check marked not-applicable
+    // — or on any row whose check columns are NULL — the filtered list is empty, every() passed, and
+    // the record was stamped overall_status 'clear' with cleared_at = NOW() having verified nothing.
+    // BGV clearance is a written condition of the offer here. A verdict is never reached from an
+    // empty set of evidence: with nothing to judge, the record stays 'pending'.
     if (checks.includes('failed') || checks.includes('flagged')) overall = (checks.includes('failed') ? 'failed' : 'flagged');
-    else if (checks.every(v => v === 'clear')) overall = 'clear';
+    else if (checks.length > 0 && checks.every(v => v === 'clear')) overall = 'clear';
     else if (checks.includes('in_progress') || checks.includes('clear')) overall = 'in_progress';
     await db.execute(sql`UPDATE hr_bgv_records SET overall_status = ${overall}, ${sql.raw("cleared_at = " + (overall === 'clear' ? 'NOW()' : 'NULL'))}, updated_at = NOW() WHERE id = ${id}`);
   }

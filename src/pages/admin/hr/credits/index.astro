@@ -1,0 +1,357 @@
+---
+// /admin/hr/credits — WEEKLY CREDITS ACROSS PEOPLE. Aggregate, and openable one person at a time.
+//
+// =================================================================================================
+// WHAT THIS SCREEN READS, AND WHAT IT DELIBERATELY DOES NOT DO
+// =================================================================================================
+//
+// It READS THE RECORD. It does not re-measure a cohort. Measuring forty people's weeks on every
+// render would be forty windows of attendance on one page load and - worse - it would GRANT CREDITS
+// as a side effect of somebody scrolling a list. Measurement happens on a person's own page and on
+// the explicit Recompute button here, both of which are one person at a time and both say so.
+//
+// =================================================================================================
+// THREE FACTS, KEPT APART
+// =================================================================================================
+//
+// Credits EARNED (granted automatically on measured data), weeks WAITING on a named person, and
+// weeks that could not be MEASURED at all. They render as three columns because they are three
+// different things, and the whole correction this page belongs to is that they used to be one
+// number with nothing behind it.
+//
+// =================================================================================================
+// THIS IS NOT AN APPROVER'S QUEUE
+// =================================================================================================
+//
+// pendingCreditWeeks() is the FULL list, labelled as such, for the desk that holds `employee.manage`
+// and owns the completion letter these weeks end up on. The narrower per-row question - "what is
+// routed to YOU" - is answered in the portal, at /portal/employee/credits/approvals, because most
+// reporting managers cannot open /admin at all. Deciding happens on a person's own page here, next
+// to the evidence, never from a list where the figures are two columns wide.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can, canAccessSection } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import {
+  reconcileCreditWeeks,
+  routePendingCreditWeeks,
+  syncCreditDecisions,
+  pendingCreditWeeks,
+  ensureCreditWeekSchema,
+  type PendingCreditWeek,
+} from '@/lib/credit-week-ledger';
+import { weekLabel } from '@/lib/credit-week';
+import {
+  creditsLabel, hoursLabel, stateToneDark,
+  CREDIT_UNIT_SENTENCE, INTERN_WEEK_SENTENCE, CREDIT_AUTOMATIC_SENTENCE, CREDIT_SCOPE_SENTENCE,
+} from '@/lib/credit-week-copy';
+
+const user = Astro.locals.user!;
+
+// The same question /admin/hr and /admin/hr/completion/[id] ask, asked the same way. 'employee.manage'
+// is granted to hr and super_admin; the custom-role arm stays because can() cannot see custom roles
+// and the registry resolves an `hr` section grant as hr.edit, never as employee.manage.
+const isHrDesk = can(user, 'employee.manage');
+const mayOpen = can(user, 'admin.access')
+  && (isHrDesk || await canAccessSection(user as any, 'hr', 'edit').catch(() => false));
+if (!mayOpen) return Astro.redirect('/admin');
+
+const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const isUuid = (v: unknown): boolean =>
+  typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+
+let msg = '';
+let msgOk = true;
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE. An explicit action; nothing here happens on a render.
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('_action') || '');
+    const employeeId = String(fd.get('employee_id') || '');
+
+    if (action !== 'recompute') {
+      msg = 'That is not something this page does.';
+      msgOk = false;
+    } else if (!isUuid(employeeId)) {
+      msg = 'That is not an employee record. Nothing was recomputed.';
+      msgOk = false;
+    } else {
+      // Decisions taken elsewhere first, so a settled week is not re-measured as though it were
+      // still open. Then measure. Then route what still needs a person. All three are idempotent:
+      // pressing this twice grants nothing twice.
+      await syncCreditDecisions(employeeId);
+      const res = await reconcileCreditWeeks(employeeId, { maxWeeks: 52 });
+      if (!res.ok) {
+        msg = 'Nothing was recorded: ' + (res.error || 'the weekly credit record could not be built.');
+        msgOk = false;
+      } else if (!res.applicable) {
+        msg = res.notApplicableReason || 'That engagement is not measured in weekly credits.';
+      } else {
+        const routed = await routePendingCreditWeeks(employeeId, String(user.id));
+        msg = res.weeksExamined + ' week(s) examined, ' + creditsLabel(res.granted)
+          + ' granted automatically, ' + res.pending + ' waiting on a decision'
+          + (routed.routed > 0 ? ', ' + routed.routed + ' sent to an approver' : '')
+          + (routed.halted.length > 0
+            ? '. ' + routed.halted.length + ' could not be sent: ' + routed.halted[0].reason
+            : '.')
+          + (res.unread.length ? ' Could not read: ' + res.unread.join(', ') + '.' : '');
+        msgOk = routed.halted.length === 0 && res.unread.length === 0;
+      }
+    }
+  } catch (e: any) {
+    // NEVER SWALLOWED. This page grants and records credits.
+    console.error('[admin/hr/credits] post', e?.cause?.message || e?.message);
+    msg = 'That did not happen: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    msgOk = false;
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+// Interns are found the way /admin/hr already finds them: employment type AND job title are both
+// checked, because the two are written inconsistently across records.
+let people: any[] = [];
+let peopleError = '';
+try {
+  people = rows(await db.execute(sql`
+    SELECT e.id::text AS id, e.full_name, e.employee_code, e.designation, e.joining_date,
+           d.name AS dept_name
+      FROM hr_employees e
+      LEFT JOIN departments d ON d.id::text = e.department_id::text
+     WHERE e.is_active = TRUE
+       AND (e.employment_type ILIKE '%intern%' OR e.designation ILIKE '%intern%'
+            OR e.employment_type ILIKE '%apprentice%' OR e.designation ILIKE '%apprentice%')
+     ORDER BY e.full_name ASC
+     LIMIT 200`));
+} catch (e: any) {
+  console.error('[admin/hr/credits] people', e?.cause?.message || e?.message);
+  peopleError = String(e?.cause?.message || e?.message || 'The intern list could not be read.');
+}
+
+// ONE GROUPED READ FOR THE WHOLE COHORT, rather than a per-person call in a loop. A console that
+// issues a query per head is how an overview becomes the slowest page in the product.
+const totals = new Map<string, { earned: number; approved: number; pending: number; refused: number; incomplete: number; hours: number; latest: string }>();
+let totalsOk = true;
+let totalsError = '';
+try {
+  await ensureCreditWeekSchema();
+  for (const r of rows(await db.execute(sql`
+    SELECT employee_id::text AS employee_id,
+           SUM(CASE WHEN state = 'earned-automatically' THEN credit_value ELSE 0 END) AS earned,
+           SUM(CASE WHEN state = 'approved'             THEN credit_value ELSE 0 END) AS approved,
+           COUNT(*) FILTER (WHERE state = 'pending')  AS pending,
+           COUNT(*) FILTER (WHERE state = 'refused')  AS refused,
+           COUNT(*) FILTER (WHERE incomplete_days > 0) AS incomplete,
+           SUM(hours_measured) AS hours,
+           MAX(week_start)::text AS latest
+      FROM hr_credit_weeks
+     GROUP BY employee_id`))) {
+    totals.set(String(r.employee_id || ''), {
+      earned: Number(r.earned) || 0,
+      approved: Number(r.approved) || 0,
+      pending: Number(r.pending) || 0,
+      refused: Number(r.refused) || 0,
+      incomplete: Number(r.incomplete) || 0,
+      hours: Math.round((Number(r.hours) || 0) * 100) / 100,
+      latest: r.latest ? String(r.latest).slice(0, 10) : '',
+    });
+  }
+} catch (e: any) {
+  console.error('[admin/hr/credits] totals', e?.cause?.message || e?.message);
+  totalsOk = false;
+  totalsError = String(e?.cause?.message || e?.message || 'The weekly credit record could not be read.');
+}
+
+let waiting: PendingCreditWeek[] = [];
+try {
+  waiting = await pendingCreditWeeks(80);
+} catch (e: any) {
+  console.error('[admin/hr/credits] pending', e?.cause?.message || e?.message);
+}
+
+const list = people.map((p: any) => {
+  const t = totals.get(String(p.id));
+  return {
+    id: String(p.id),
+    name: p.full_name || 'Unnamed record',
+    code: p.employee_code || '',
+    designation: p.designation || '',
+    dept: p.dept_name || '',
+    recorded: !!t,
+    credits: t ? t.earned + t.approved : 0,
+    earned: t ? t.earned : 0,
+    approved: t ? t.approved : 0,
+    pending: t ? t.pending : 0,
+    incomplete: t ? t.incomplete : 0,
+    hours: t ? t.hours : 0,
+  };
+});
+
+let totalCredits = 0;
+let totalPending = 0;
+let totalIncomplete = 0;
+let unrecorded = 0;
+for (const r of list) {
+  totalCredits += r.credits;
+  totalPending += r.pending;
+  totalIncomplete += r.incomplete;
+  if (!r.recorded) unrecorded++;
+}
+
+const card = 'border:1px solid #2a2a30;border-radius:12px;background:#0f0f14;padding:14px;';
+const num = 'text-align:right;font-family:\'Geist Mono\',monospace;';
+---
+<AdminLayout title="Weekly credits">
+  <div style="max-width:1080px;">
+    <h1 style="font-family:'Fraunces',serif;font-size:24px;margin:0 0 4px;">Weekly credits</h1>
+    <p style="font-size:13px;color:#8a8a94;margin:0 0 6px;line-height:1.6;">{CREDIT_UNIT_SENTENCE} {INTERN_WEEK_SENTENCE}</p>
+    <p style="font-size:13px;color:#8a8a94;margin:0 0 14px;line-height:1.6;">{CREDIT_AUTOMATIC_SENTENCE}</p>
+
+    {msg && (
+      <div style={'padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:13px;line-height:1.55;border:1px solid '
+        + (msgOk ? '#14532d;background:rgba(20,83,45,0.2);' : 'rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;')}>{msg}</div>
+    )}
+
+    {peopleError && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;font-size:13px;line-height:1.55;">
+        <strong>The intern list could not be read, so this page is not a measurement.</strong>
+        <span style="display:block;margin-top:6px;font-family:'Geist Mono',monospace;font-size:11px;">{peopleError}</span>
+      </div>
+    )}
+
+    {!totalsOk && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;font-size:13px;line-height:1.55;">
+        <strong>The weekly credit record could not be read.</strong>
+        <span> Every figure below is a placeholder of zero, which looks identical to a cohort that has
+        earned nothing. Nothing has been granted or refused on the strength of it.</span>
+        <span style="display:block;margin-top:6px;font-family:'Geist Mono',monospace;font-size:11px;">{totalsError}</span>
+      </div>
+    )}
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px;">
+      <div style={card}>
+        <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Credits recorded</p>
+        <p style="font-size:20px;font-weight:700;margin:0;font-family:'Geist Mono',monospace;">{totalCredits}</p>
+      </div>
+      <div style={card}>
+        <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Weeks waiting</p>
+        <p style={'font-size:20px;font-weight:700;margin:0;font-family:\'Geist Mono\',monospace;color:' + (totalPending ? '#fcd34d' : '#e8e8ee') + ';'}>{totalPending}</p>
+      </div>
+      <div style={card}>
+        <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Weeks not measurable</p>
+        <p style={'font-size:20px;font-weight:700;margin:0;font-family:\'Geist Mono\',monospace;color:' + (totalIncomplete ? '#fca5a5' : '#e8e8ee') + ';'}>{totalIncomplete}</p>
+      </div>
+      <div style={card}>
+        <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Nothing recorded yet</p>
+        <p style="font-size:20px;font-weight:700;margin:0;font-family:'Geist Mono',monospace;">{unrecorded}</p>
+      </div>
+    </div>
+
+    {unrecorded > 0 && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid #b45309;background:rgba(180,83,9,0.14);font-size:13px;line-height:1.55;">
+        <strong>{unrecorded} {unrecorded === 1 ? 'person has' : 'people have'} nothing recorded yet.</strong>
+        <span> That is an absence of RECORDS, not an absence of work, and their rows read a dash
+        rather than a zero for that reason. Their weeks are measured the first time their own credits
+        page is opened, or when you press Recompute on their row. This page never measures a whole
+        cohort on a render, because that would grant credits as a side effect of looking at a list.</span>
+      </div>
+    )}
+
+    {list.length === 0 ? (
+      <div style={card}>
+        <p style="font-size:13px;margin:0;">No active internship or apprenticeship records. Employment
+        type and job title are both checked, because the two are written inconsistently.</p>
+      </div>
+    ) : (
+      <div style="overflow-x:auto;margin-bottom:22px;">
+        <table class="admin-table" style="min-width:820px;">
+          <thead>
+            <tr>
+              <th>Person</th>
+              <th style="text-align:right;">Credits</th>
+              <th style="text-align:right;">Automatic</th>
+              <th style="text-align:right;">By decision</th>
+              <th style="text-align:right;">Waiting</th>
+              <th style="text-align:right;">Not measurable</th>
+              <th style="text-align:right;">Hours measured</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {list.map((r) => (
+              <tr>
+                <td>
+                  <a href={'/admin/hr/credits/' + r.id} style="color:#e8e8ee;font-weight:600;text-decoration:none;">{r.name}</a>
+                  <span style="display:block;font-size:11px;color:#6e6e78;">
+                    {r.code ? r.code + ' · ' : ''}{r.designation || 'role not recorded'}{r.dept ? ' · ' + r.dept : ''}
+                  </span>
+                </td>
+                <td style={num + 'font-weight:700;'}>{r.recorded ? r.credits : '—'}</td>
+                <td style={num}>{r.recorded ? r.earned : '—'}</td>
+                <td style={num}>{r.recorded ? r.approved : '—'}</td>
+                <td style={num + 'color:' + (r.pending ? '#fcd34d' : '#8a8a94') + ';'}>{r.recorded ? r.pending : '—'}</td>
+                <td style={num + 'color:' + (r.incomplete ? '#fca5a5' : '#8a8a94') + ';'}>{r.recorded ? r.incomplete : '—'}</td>
+                <td style={num}>{r.recorded ? hoursLabel(r.hours) : '—'}</td>
+                <td style="text-align:right;">
+                  <form method="POST" style="display:inline;">
+                    <input type="hidden" name="_action" value="recompute" />
+                    <input type="hidden" name="employee_id" value={r.id} />
+                    <button type="submit" style="background:#1a1a22;border:1px solid #2a2a30;color:#e8e8ee;font-size:12px;padding:8px 12px;border-radius:6px;cursor:pointer;min-height:44px;">Recompute</button>
+                  </form>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+
+    <h2 style="font-family:'Fraunces',serif;font-size:18px;margin:0 0 4px;">Weeks waiting on a decision</h2>
+    <p style="font-size:12px;color:#6e6e78;margin:0 0 10px;line-height:1.6;">
+      The full list for this desk, not a personal queue. A reporting manager sees only what is routed
+      to them, in the portal at /portal/employee/credits/approvals. Open a person to decide a week
+      next to the evidence it is being decided against.
+    </p>
+
+    {waiting.length === 0 && (
+      <div style={card}>
+        <p style="font-size:13px;margin:0;color:#8a8a94;">Nothing is waiting. A week whose hours were
+        there and whose work was done never enters this list - it credits itself.</p>
+      </div>
+    )}
+
+    {waiting.map((w) => (
+      <div style={card + 'margin-bottom:10px;'}>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+          <a href={'/admin/hr/credits/' + w.employeeId} style="color:#e8e8ee;font-weight:650;font-size:13.5px;text-decoration:none;">{w.employeeName}</a>
+          <span style="font-size:12px;color:#8a8a94;">{w.label || weekLabel(w.weekStart)}</span>
+          <span style={'display:inline-flex;padding:3px 9px;border-radius:999px;border:1px solid;font-size:10.5px;font-weight:700;background:'
+            + stateToneDark(w.state).bg + ';color:' + stateToneDark(w.state).fg + ';border-color:' + stateToneDark(w.state).bd + ';'}>
+            {w.haltReason ? 'Waiting on nobody' : 'Waiting for a decision'}
+          </span>
+        </div>
+        <p style="font-size:12.5px;color:#8a8a94;margin:6px 0 0;line-height:1.55;">
+          {hoursLabel(w.hoursMeasured)} measured of {hoursLabel(w.hoursRequired)} required
+          {' · reports ' + w.reportsFiled + '/' + w.reportsExpected}
+          {' · tasks ' + w.tasksCompleted + '/' + w.tasksAssigned}
+          {w.evidence && w.evidence.incompleteDates.length > 0
+            ? ' · ' + w.evidence.incompleteDates.length + ' day(s) never clocked out of'
+            : ''}
+        </p>
+        {w.haltReason && (
+          <p style="font-size:12.5px;color:#fca5a5;margin:6px 0 0;line-height:1.55;">
+            <strong>Halted:</strong> {w.haltReason} Until that relationship is recorded in the
+            organization graph this week is waiting on nobody, which is exactly why it says so
+            instead of sitting quietly on a queue.
+          </p>
+        )}
+      </div>
+    ))}
+
+    <p style="font-size:11.5px;color:#6e6e78;margin:16px 0 0;line-height:1.6;">{CREDIT_SCOPE_SENTENCE}</p>
+  </div>
+</AdminLayout>

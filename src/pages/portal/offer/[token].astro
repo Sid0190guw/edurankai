@@ -21,6 +21,9 @@ if (!token) return Astro.redirect('/portal');
 let errorMsg = '';
 let successMsg = '';
 let acceptedNow = false;   // show the joining-documents call to action right after acceptance
+// Declared HERE, above the POST handler that assigns it. `const`/`let` are not hoisted, and a
+// declaration below the handler throws on its first line while the page reports success.
+let trackerNotClosed = false;
 
 // Fetch the offer
 const offerList = await db.select().from(offerLetters)
@@ -241,7 +244,50 @@ if (Astro.request.method === 'POST' && isOwner) {
         // (src/lib/reapply-window.ts) rather than by taking their account away.
 
         if (app) {
+          const _oldAppStatus = String(app.status || '');
           await db.update(applications).set({ status: 'rejected', updatedAt: new Date() }).where(eq(applications.id, app.id));
+
+          // THE STATUS CHANGE GOES THROUGH THE ENGINE THAT OWNS IT, not only through this UPDATE.
+          // onApplicationStatusChange() is what closes an employee record when somebody who was
+          // already hired stops being hired; going around it here is the exact shape that produced a
+          // second-class employee record on the signing path. Today it is a no-op for offer ->
+          // rejected, which is precisely why it was easy to leave out and easy to get wrong later.
+          try {
+            const { onApplicationStatusChange } = await import('@/lib/hr/sync');
+            const _sync = await onApplicationStatusChange(String(app.id), 'rejected', _oldAppStatus, String(user.id));
+            if (_sync && !_sync.ok) {
+              console.error('[offer] HR sync after decline did not complete for application', app.id, '-', _sync.error);
+            }
+          } catch (e: any) {
+            console.error('[offer] HR sync after decline threw for application', app.id, '-', e?.cause?.message || e?.message);
+          }
+
+          // THE SIX-STEP TRACKER REACHES AN ENDING.
+          //
+          // Declining left applications.stage exactly where it was, and nothing in the product ever
+          // wrote a terminal stage — so somebody who had turned a job down went on being shown an
+          // open step with an open step's blurb ("Final yes or no, with a written explanation either
+          // way") on /portal/applications/[id], indefinitely. advanceStage() writes the ending, logs
+          // it in the stage history and tells them; a failure here must not undo the decline, so it
+          // is reported to the person rather than thrown or hidden.
+          try {
+            const { advanceStage } = await import('@/lib/application-stages');
+            const _moved = await advanceStage({
+              applicationId: String(app.id),
+              toStage: 'withdrawn',
+              actorUserId: String(user.id),
+              actorName: offer.candidateName || user.name || 'Candidate',
+              note: 'Offer declined by the candidate.' + (reason ? ' Reason: ' + reason : ''),
+            });
+            if (!_moved.ok) {
+              console.error('[offer] the tracker did NOT close for application', app.id, '-', _moved.error);
+              trackerNotClosed = true;
+            }
+          } catch (e: any) {
+            console.error('[offer] the tracker did NOT close for application', app.id, '-', e?.cause?.message || e?.message);
+            trackerNotClosed = true;
+          }
+
           await db.insert(applicationMessages).values({
             applicationId: app.id,
             senderUserId: user.id,
@@ -255,14 +301,22 @@ if (Astro.request.method === 'POST' && isOwner) {
         try {
           const { pushNotify } = await import('@/lib/push');
           await pushNotify.offerDeclined(offer.candidateName || 'Candidate', offer.roleTitle || 'a role', app?.id || '');
-        } catch (_) {}
+        } catch (e: any) {
+          // Was `catch (_) {}`. The decline is recorded either way, but this is the ONLY thing that
+          // reaches the people desk — nobody is watching this token — so a failure has to leave a
+          // trace with the real Postgres reason rather than vanish.
+          console.error('[offer] the people desk was NOT told about the decline of offer', offer.id, '-', e?.cause?.message || e?.message);
+        }
 
         offer.status = 'declined';
         (offer as any).declinedAt = new Date();
         (offer as any).declinedReason = reason || null;
-        successMsg = 'You have declined this offer. Your account stays active and your records remain available to you. You can apply for this same role again after 30 days, and every other open role is available now.';
+        successMsg = 'You have declined this offer. Your account stays active and your records remain available to you. You can apply for this same role again after 30 days, and every other open role is available now.'
+          + (trackerNotClosed ? ' Your application tracker may still show the previous step for a little while; your decline is recorded regardless.' : '');
       } catch (err: any) {
-        errorMsg = 'Failed to record decline: ' + (err.message || 'Unknown error');
+        // `.message` on a drizzle error is only the failed SQL; the reason lives on `.cause`.
+        console.error('[offer] decline failed for offer', offer.id, '-', err?.cause?.message || err?.message);
+        errorMsg = 'Failed to record decline: ' + (err?.cause?.message || err?.message || 'Unknown error');
       }
     }
   } else if (offer.status === 'signed') {
