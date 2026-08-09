@@ -52,7 +52,15 @@ export const POST: APIRoute = async ({ request, locals }) => {
       RETURNING id
     `);
     const rows = Array.isArray(r) ? r : (r?.rows || []);
-    return json({ ok: true, id: (rows[0] as any)?.id });
+    const id = (rows[0] as any)?.id;
+    // ok:true WITH NO ID IS NOT A SUCCESS. The only caller (/portal/courses/<slug>/discuss) does
+    // `location.search = '?t=' + d.id` on ok, so an empty RETURNING navigated the poster to
+    // `?t=undefined` - a thread view that resolves to nothing - having told them the thread posted.
+    if (!id) {
+      console.error('[api/discuss/thread] insert returned no row for course', courseId);
+      return json({ ok: false, error: 'Your post was not saved. Nothing has been published; try again.' }, 500);
+    }
+    return json({ ok: true, id });
   } catch (e: any) {
     // e.message on a drizzle/postgres-js error is the failed SQL STATEMENT — table and column names
     // handed straight to whoever posted — while the database's actual complaint sits unread on

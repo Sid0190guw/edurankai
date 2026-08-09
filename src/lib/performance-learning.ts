@@ -258,7 +258,12 @@ export async function allAssignments(opts: { overdueOnly?: boolean; limit?: numb
   try {
     await ensurePerformanceSchema();
     const overdue = opts.overdueOnly === true
-      ? sql`AND a.due_on IS NOT NULL AND a.due_on < CURRENT_DATE AND en.completed_at IS NULL`
+      // OVERDUE AGAINST THE COMPANY'S DAY, NOT THE SERVER'S. CURRENT_DATE is the database session's
+      // date; nothing sets that session's zone, so it is UTC while the learner's deadline was set in
+      // IST. Between 00:00 and 05:29 IST an assignment that fell due yesterday was still not counted
+      // overdue, so the console under-reported for the first five and a half hours of every day.
+      // The module already declares its civil-date helper for exactly this reason.
+      ? sql`AND a.due_on IS NOT NULL AND a.due_on < (NOW() AT TIME ZONE 'Asia/Kolkata')::date AND en.completed_at IS NULL`
       : sql``;
     const rows = rowsOf(await db.execute(sql`
       ${ITEM_SELECT}

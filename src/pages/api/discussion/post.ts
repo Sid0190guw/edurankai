@@ -8,6 +8,11 @@ import { sql } from 'drizzle-orm';
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
+// postgres-js resolves to a plain array, never a { rows } object. Declared above the handler that
+// reads them - `const` is not hoisted.
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+// The real Postgres reason lives on e.cause; e.message is only the SQL that failed.
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
@@ -29,8 +34,15 @@ export const POST: APIRoute = async ({ request, locals }) => {
       VALUES (${user.id}, ${txt}, ${category}, ${parentId})
       RETURNING id, body, category, parent_id, created_at
     `);
-    const rows = Array.isArray(r) ? r : (r?.rows || []);
-    const post = rows[0] as any;
+    const post = rowsOf(r)[0] as any;
+    // An INSERT that returned no row means the post is not there. Reading `post.id` off undefined
+    // threw into the catch below, which then handed the caller a TypeError as though it were a
+    // database complaint; and had the shape ever been { rows }, ok:true would have been reported
+    // over a post nobody would ever see.
+    if (!post?.id) {
+      console.error('[api/discussion/post] insert returned no row for user', String(user.id));
+      return json({ ok: false, error: 'Your post was not saved. Nothing has been published; try again.' }, 500);
+    }
 
     return json({
       ok: true,
@@ -47,6 +59,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
       }
     });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'db error' }, 500);
+    // e.message on a drizzle/postgres-js error is the failed SQL STATEMENT - table and column names
+    // handed to whoever posted - while the database's actual complaint sits unread on e.cause. A post
+    // that was never created also left nothing behind for anyone asked about it afterwards.
+    console.error('[api/discussion/post] insert failed for user', String(user?.id || ''), '-', reasonOf(e));
+    return json({ ok: false, error: 'Your post was not saved. Nothing has been published; try again.' }, 500);
   }
 };

@@ -190,8 +190,14 @@ export async function getBalance(employeeId: string, currencyHint?: string): Pro
       SELECT COALESCE(ss.currency, e.currency, 'INR') AS cur
         FROM hr_employees e
         LEFT JOIN hr_salary_structures ss ON ss.employee_id = e.id
-             AND ss.effective_from <= CURRENT_DATE
-             AND (ss.effective_to IS NULL OR ss.effective_to >= CURRENT_DATE)
+             -- TODAY IS CUT IN THE ZONE THE COMPANY WORKS IN. CURRENT_DATE is the database
+             -- SESSION's date, and nothing in this codebase sets it - db/index.ts opens the pooled
+             -- connection with no SET TIME ZONE - so it resolves to UTC while everyone paid out of
+             -- this wallet is in IST. A salary structure taking effect today was therefore not yet
+             -- in force between 00:00 and 05:29 IST, and the currency the whole balance is then
+             -- summed and compared in fell back to the previous structure's.
+             AND ss.effective_from <= (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+             AND (ss.effective_to IS NULL OR ss.effective_to >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date)
        WHERE e.id = ${employeeId}::uuid
        ORDER BY ss.effective_from DESC NULLS LAST
        LIMIT 1`))[0] || {};

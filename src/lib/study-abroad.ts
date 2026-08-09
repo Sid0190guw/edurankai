@@ -197,6 +197,42 @@ export async function getRequestById(id: string) {
   `))[0] || null;
 }
 
+/**
+ * ONE request, scoped to the person asking for it, with a flag saying whether the read RAN.
+ *
+ * getRequestById() takes an id and nothing else — correct for the admin console, and not something a
+ * portal page may call, because the id is in the URL. The ownership test is in the WHERE clause here
+ * rather than in a JavaScript comparison after the fetch, so another applicant's request is never
+ * read in the first place.
+ *
+ * `ok:false` is not the same answer as `request:null`. /portal/study-abroad/[id] must be able to tell
+ * "this is not your request" apart from "the database did not answer", and print different words.
+ */
+export async function getApplicantRequest(
+  id: string,
+  userId: string,
+): Promise<{ ok: boolean; request: any | null; reason?: string }> {
+  if (!id || !userId) return { ok: true, request: null };
+  try {
+    await ensureStudyAbroadSchema();
+    const r = rows(await db.execute(sql`
+      SELECT r.*, c.display_name AS consultant_name
+      FROM study_abroad_requests r
+      LEFT JOIN study_abroad_consultants c ON c.id = r.consultant_id
+      WHERE r.id = ${id} AND r.applicant_user_id = ${userId}
+      LIMIT 1
+    `))[0] || null;
+    return { ok: true, request: r };
+  } catch (e: any) {
+    // The real Postgres reason is on e.cause; e.message is only the SQL that failed. A malformed id
+    // in the URL arrives here as 22P02 and is reported as "could not be read", not as "not found" —
+    // the page above turns a null request into a 404 and that must stay a fact, not a guess.
+    const real = e?.cause?.message || e?.message;
+    console.error('[study-abroad] getApplicantRequest failed for', id, '-', real);
+    return { ok: false, request: null, reason: String(real || 'unknown reason').slice(0, 200) };
+  }
+}
+
 export async function listApplicantRequests(userId: string) {
   await ensureStudyAbroadSchema();
   return rows(await db.execute(sql`

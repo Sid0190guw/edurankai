@@ -492,6 +492,32 @@ export async function verifySecondFactor(
     return { ok: false, error: 'That sign-in step expired. Please sign in again.' };
   }
 
+  // THE SECOND STEP MAY NOT BE THE FACTOR THAT WAS ALREADY USED, AND THIS IS WHERE THAT IS DECIDED.
+  //
+  // A face descriptor is not single-use and carries no freshness: verifyFaceSecondFactor() compares
+  // whatever arrives against the stored template, and nothing else. So on a face-first sign-in
+  // (src/pages/portal/login.astro, action `face_verified`, which starts a challenge with
+  // firstFactor='face') the EXACT SAME `live_descriptor` string that satisfied the first factor
+  // satisfied the second one too. The whole mandatory second step was one re-POST of a value the
+  // caller already held.
+  //
+  // The rule itself was not new. portal/login.astro renders the challenge with
+  // `offerFace = methods.indexOf('face') >= 0 && pending.firstFactor !== 'face'`, and gateApiSignIn()
+  // below says it in a comment. Both of those decide what the page OFFERS. A form posts what it
+  // likes: `method=face` plus a descriptor reached this function whatever the page had drawn, which
+  // is a hidden control rather than a closed door - the same shape /api/2fa/start was repaired for.
+  //
+  // Nobody loses a way in. A face-first challenge is only ever started for an account that has an
+  // authenticator (portal/login refuses to start one otherwise, in as many words), and recovery
+  // codes remain available on every account with enforcement turned on. The three password-first
+  // surfaces are untouched: face is a different factor from a password and stays offered there.
+  if (method === 'face' && pending.firstFactor === 'face') {
+    return {
+      ok: false,
+      error: 'You are already signed in this far with your face, so the second step has to be something else. Enter a code from your authenticator app, or one of your recovery codes.',
+    };
+  }
+
   const accountBucket = '2fa:user:' + pending.userId;
   const total = await countAttempt(accountBucket, 900);
   if (total > 10) {
@@ -551,13 +577,32 @@ export async function gateApiSignIn(
   const required = await isSecondStepRequired(userId);
   if (!required) return { gated: false, redirect: '' };
   const methods = await availableSecondFactors(userId);
-  // The second factor must be something OTHER than the one just used. A
-  // recovery code always remains available, which is why they are mandatory.
+  // WHAT IS AND IS NOT ENFORCED ABOUT "a DIFFERENT factor", stated instead of implied.
+  //
+  // This block used to claim "the second factor must be something OTHER than the one just used" and
+  // then drop the list it had just computed on the floor (`void methods`). Half of that claim is now
+  // real and lives in verifySecondFactor() above, where a form post cannot route around it: a face
+  // first factor can no longer be answered with a face.
+  //
+  // The other half is NOT enforced, deliberately, and the reason belongs on the record. An
+  // authenticator-code first factor (/api/auth/totp-login) can still be answered with another
+  // authenticator code, because the challenge screens accept a live code and a one-time recovery code
+  // through the same input and cannot tell a caller which they must use. Refusing the live code would
+  // force a recovery code on every such sign-in for an account whose only enrolled factor is an
+  // authenticator, spending a finite resource that exists for lost devices - a worse failure than the
+  // one it closes. It is not a replay: claimTotpStep() (src/lib/auth/twofactor.ts) spends the 30-second
+  // step, so the second code must be a LATER one read from the device again. Changing it is a policy
+  // decision about what an account must hold, not a mechanism fix.
+  //
+  // `methods` is read here rather than discarded, so the log says which factors the account could
+  // actually complete when a challenge was raised.
+  if (methods.length === 0) {
+    console.warn('[auth/two-factor] second step required with no enrolled factor left; recovery codes only', { userId, surface, firstFactor });
+  }
   const token = await startPendingChallenge(userId, surface, firstFactor);
   cookies.set(pendingCookieName(surface), token, {
     path: '/', httpOnly: true, sameSite: 'lax', secure: PENDING_COOKIE_SECURE, maxAge: PENDING_TTL_SECONDS,
   });
-  void methods;
   return { gated: true, redirect: loginPathFor(surface) };
 }
 

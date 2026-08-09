@@ -2,10 +2,70 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { textArray } from '@/lib/pg-array';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 if (user.role === 'applicant') return Astro.redirect('/portal');
+
+// WHAT CHANGED, AND WHY
+//
+// 1. EVERY WRITE WAS FRONTED BY `user.role === 'applicant'` AND NOTHING ELSE. src/middleware.ts maps
+//    this path to the `interviews_ai` section and getViewableSectionKeys() enforces VIEW there and
+//    only VIEW — so any account that could READ this console could delete a template and all its
+//    questions, publish an interview to candidates, or rewrite the proctoring settings a candidate
+//    is judged under. `role !== 'applicant'` is the exact test src/lib/auth/permissions.ts warns
+//    against. The identical repair was already made on /admin/hr/training. Deleting asks for
+//    'delete' rather than 'edit' because canAccessSection() draws that line itself: a default role
+//    holding a section may edit in it and may not delete.
+//
+// 2. NOTHING CHECKED WHETHER ANY WRITE LANDED. Eight statements, no RETURNING, and one
+//    unconditional green message each — so "Template deleted." / "Question added." / "Proctoring
+//    settings saved." printed over an id that matched nothing (a stale list, a row another admin had
+//    just removed) exactly as they printed over a real change.
+//
+// 3. expected_topics WAS WRITTEN AS `${topics}` — a JS array interpolated into a drizzle sql
+//    template. That is the precise bug src/lib/pg-array.ts was written about: postgres-js serialises
+//    it as a RECORD literal and Postgres refuses the statement. With the failure swallowed into
+//    "Question added." nobody could see it. textArray() sends one ordinary text parameter and lets
+//    Postgres unpack it.
+//
+// 4. THE PROCTORING VALUES WENT IN AS POSTED. proctor_level is read back by the interview runner and
+//    rendered as a badge from a fixed three-value list on this same page, so anything else is a
+//    setting no screen describes and no runner understands; the counters had no bounds at all, so a
+//    hand-made POST could set max_strikes to 0 and end every candidate's interview on the first
+//    frame. Proctoring on this product is ADVISORY — a human decides — and that only holds if the
+//    thresholds are the ones somebody chose.
+//
+// 5. PUBLISH DID NOT ASK WHETHER THERE WAS AN INTERVIEW TO PUBLISH. /api/aquintutor/interview/start
+//    answers 503 "No questions configured for this interview yet." when no seed is active, so a
+//    template published with none was a live link on /aquintutor/interview/<slug> that dead-ended
+//    every candidate who followed it. The refusal is stated here instead.
+//
+// 6. The catch printed `e?.message` at the operator — on a drizzle/postgres-js error that is the
+//    failed SQL statement, table and column names included — while the database's real reason sat
+//    unread on e.cause, and nothing was logged. Both reads ended in `catch (_) {}`, so an unreadable
+//    table drew "No templates yet. Create one above." — the calmest possible reading of the most
+//    alarming state.
+
+// Declared before the POST handler that reads them — `const` is not hoisted.
+const LANGS = ['en-IN','en-US','en-GB','hi-IN','bn-IN','ta-IN','te-IN','mr-IN','gu-IN','es-ES','fr-FR','de-DE','ar-SA','zh-CN','ja-JP'];
+const PROCTOR_LEVELS = ['relaxed', 'standard', 'strict'];
+const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const causeOf = (e: any): string => e?.cause?.message || e?.message || 'unknown error';
+// An id that is not a uuid raises 22P02, which reached the operator as a database complaint about
+// their own click. Every id on this page comes from a list this page rendered, so anything else is
+// a hand-made POST and is refused rather than explained.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const clampInt = (raw: unknown, lo: number, hi: number, fallback: number): number => {
+  const n = parseInt(String(raw ?? ''), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(hi, Math.max(lo, n));
+};
+
+const canEdit = await canAccessSection(user as any, 'interviews_ai', 'edit');
+const canDelete = await canAccessSection(user as any, 'interviews_ai', 'delete');
 
 let okMsg = '';
 let errorMsg = '';
@@ -13,96 +73,159 @@ let errorMsg = '';
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = (fd.get('action') as string) || '';
+  const destructive = action === 'delete_template' || action === 'delete_seed';
+  const postedId = ((fd.get('id') as string) || (fd.get('template_id') as string) || '').trim();
+  const idActions = ['update_template', 'toggle_publish', 'delete_template', 'add_seed', 'delete_seed', 'toggle_seed', 'save_proctor'];
+  if (destructive ? !canDelete : !canEdit) {
+    errorMsg = destructive
+      ? 'Your role can open this console but cannot delete from it. Nothing was removed.'
+      : 'Your role can open this console but cannot change it. Nothing was saved.';
+  } else if (idActions.includes(action) && !UUID_RE.test(postedId)) {
+    errorMsg = 'That request did not name a template or question this console recognises. Nothing was changed.';
+  } else {
   try {
     if (action === 'create_template') {
       const title = (fd.get('title') as string || '').trim();
       const slug = (fd.get('slug') as string || '').trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
       const description = (fd.get('description') as string || '').trim() || null;
-      const languageDefault = (fd.get('language_default') as string || 'en-IN').trim();
-      const maxMinutes = parseInt(fd.get('max_minutes') as string || '30') || 30;
+      const languageRaw = (fd.get('language_default') as string || 'en-IN').trim();
+      const languageDefault = LANGS.includes(languageRaw) ? languageRaw : 'en-IN';
+      const maxMinutes = clampInt(fd.get('max_minutes'), 5, 180, 30);
       if (!title || !slug) errorMsg = 'Title and slug are required.';
       else {
-        await db.execute(sql`
+        const r = await db.execute(sql`
           INSERT INTO ai_interview_templates (title, slug, description, language_default, max_minutes, is_published)
-          VALUES (${title}, ${slug}, ${description}, ${languageDefault}, ${maxMinutes}, false)
+          SELECT ${title}, ${slug}, ${description}, ${languageDefault}, ${maxMinutes}, false
+          WHERE NOT EXISTS (SELECT 1 FROM ai_interview_templates WHERE slug = ${slug})
+          RETURNING id
         `);
-        okMsg = 'Template created. Add seed questions below.';
+        if (rows(r).length) okMsg = 'Template created. Add seed questions below.';
+        else errorMsg = 'Nothing was created: the slug "' + slug + '" is already in use by another template. Pick a different one.';
       }
     } else if (action === 'update_template') {
-      const id = fd.get('id') as string;
+      const id = (fd.get('id') as string || '').trim();
       const title = (fd.get('title') as string || '').trim();
       const description = (fd.get('description') as string || '').trim() || null;
-      const languageDefault = (fd.get('language_default') as string || 'en-IN').trim();
-      const maxMinutes = parseInt(fd.get('max_minutes') as string || '30') || 30;
-      await db.execute(sql`
-        UPDATE ai_interview_templates SET title=${title}, description=${description},
-          language_default=${languageDefault}, max_minutes=${maxMinutes}, updated_at=NOW()
-        WHERE id=${id}
-      `);
-      okMsg = 'Template updated.';
+      const languageRaw = (fd.get('language_default') as string || 'en-IN').trim();
+      const languageDefault = LANGS.includes(languageRaw) ? languageRaw : 'en-IN';
+      const maxMinutes = clampInt(fd.get('max_minutes'), 5, 180, 30);
+      if (!title) errorMsg = 'A template needs a title. Nothing was changed.';
+      else {
+        const r = await db.execute(sql`
+          UPDATE ai_interview_templates SET title=${title}, description=${description},
+            language_default=${languageDefault}, max_minutes=${maxMinutes}, updated_at=NOW()
+          WHERE id=${id}
+          RETURNING id
+        `);
+        if (rows(r).length) okMsg = 'Template updated.';
+        else errorMsg = 'Nothing was updated — that template no longer exists. The list below is the current state.';
+      }
     } else if (action === 'toggle_publish') {
-      const id = fd.get('id') as string;
-      await db.execute(sql`UPDATE ai_interview_templates SET is_published = NOT is_published, updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Publish status toggled.';
+      const id = (fd.get('id') as string || '').trim();
+      const cur = rows(await db.execute(sql`
+        SELECT is_published,
+               (SELECT COUNT(*)::int FROM ai_interview_seeds WHERE template_id = t.id AND is_active = true) AS live_seeds
+        FROM ai_interview_templates t WHERE id = ${id} LIMIT 1
+      `))[0] as any;
+      if (!cur) {
+        errorMsg = 'Nothing was changed — that template no longer exists.';
+      } else if (!cur.is_published && Number(cur.live_seeds) === 0) {
+        // Publishing an empty template puts a link in front of candidates that /api/.../start
+        // refuses with 503. Say so here rather than shipping the dead end.
+        errorMsg = 'This template has no active questions, so publishing it would give candidates an interview that cannot start. Add at least one question first.';
+      } else {
+        const r = await db.execute(sql`
+          UPDATE ai_interview_templates SET is_published = NOT is_published, updated_at = NOW()
+          WHERE id = ${id} RETURNING is_published
+        `);
+        const now = rows(r)[0] as any;
+        if (now) okMsg = now.is_published ? 'Template published. Candidates can start it now.' : 'Template unpublished. Candidates can no longer start it.';
+        else errorMsg = 'Nothing was changed — that template no longer exists.';
+      }
     } else if (action === 'delete_template') {
-      const id = fd.get('id') as string;
-      await db.execute(sql`DELETE FROM ai_interview_seeds WHERE template_id = ${id}`);
-      await db.execute(sql`DELETE FROM ai_interview_templates WHERE id = ${id}`);
-      okMsg = 'Template deleted.';
+      const id = (fd.get('id') as string || '').trim();
+      // Two statements, and the seed delete must not be able to commit on its own — a template
+      // stripped of its questions but still listed and still publishable is worse than either
+      // outcome on its own.
+      const r = await db.execute(sql`
+        WITH gone_seeds AS (DELETE FROM ai_interview_seeds WHERE template_id = ${id} RETURNING 1)
+        DELETE FROM ai_interview_templates WHERE id = ${id} RETURNING id
+      `);
+      if (rows(r).length) okMsg = 'Template deleted, with all of its questions.';
+      else errorMsg = 'Nothing was deleted — that template no longer exists.';
     } else if (action === 'add_seed') {
-      const templateId = fd.get('template_id') as string;
+      const templateId = (fd.get('template_id') as string || '').trim();
       const promptText = (fd.get('prompt_text') as string || '').trim();
       const topicsRaw = (fd.get('expected_topics') as string || '').trim();
       const topics = topicsRaw ? topicsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
-      const sortOrder = parseInt(fd.get('sort_order') as string || '99') || 99;
+      const sortOrder = clampInt(fd.get('sort_order'), 1, 9999, 99);
       if (!promptText) errorMsg = 'Question text required.';
       else {
-        await db.execute(sql`
+        const r = await db.execute(sql`
           INSERT INTO ai_interview_seeds (template_id, prompt_text, expected_topics, sort_order, is_active)
-          VALUES (${templateId}, ${promptText}, ${topics}, ${sortOrder}, true)
+          SELECT ${templateId}::uuid, ${promptText}, ${textArray(topics)}, ${sortOrder}, true
+          WHERE EXISTS (SELECT 1 FROM ai_interview_templates WHERE id = ${templateId}::uuid)
+          RETURNING id
         `);
-        okMsg = 'Question added.';
+        if (rows(r).length) okMsg = 'Question added.';
+        else errorMsg = 'The question was not added — that template no longer exists.';
       }
     } else if (action === 'delete_seed') {
-      const id = fd.get('id') as string;
-      await db.execute(sql`DELETE FROM ai_interview_seeds WHERE id = ${id}`);
-      okMsg = 'Question deleted.';
+      const id = (fd.get('id') as string || '').trim();
+      const r = await db.execute(sql`DELETE FROM ai_interview_seeds WHERE id = ${id} RETURNING id`);
+      if (rows(r).length) okMsg = 'Question deleted.';
+      else errorMsg = 'Nothing was deleted — that question no longer exists.';
     } else if (action === 'toggle_seed') {
-      const id = fd.get('id') as string;
-      await db.execute(sql`UPDATE ai_interview_seeds SET is_active = NOT is_active WHERE id = ${id}`);
-      okMsg = 'Toggled.';
+      const id = (fd.get('id') as string || '').trim();
+      const r = await db.execute(sql`UPDATE ai_interview_seeds SET is_active = NOT is_active WHERE id = ${id} RETURNING is_active`);
+      const now = rows(r)[0] as any;
+      if (now) okMsg = now.is_active ? 'Question switched on.' : 'Question switched off.';
+      else errorMsg = 'Nothing was changed — that question no longer exists.';
     } else if (action === 'save_proctor') {
-      const id = fd.get('id') as string;
-      const level = (fd.get('proctor_level') as string || 'standard');
-      const requireFaceEnroll = fd.get('require_face_enroll') === 'on';
-      const blockTabSwitch = fd.get('block_tab_switch') === 'on';
-      const maxTabSwitches = parseInt(fd.get('max_tab_switches') as string || '3') || 3;
-      const maxStrikes = parseInt(fd.get('max_strikes') as string || '5') || 5;
-      const requireFullscreen = fd.get('require_fullscreen') === 'on';
-      const enableObjectDetection = fd.get('enable_object_detection') === 'on';
-      const allowPaste = fd.get('allow_paste') === 'on';
-      await db.execute(sql`
-        UPDATE ai_interview_templates SET
-          proctor_level = ${level},
-          require_face_enroll = ${requireFaceEnroll},
-          block_tab_switch = ${blockTabSwitch},
-          max_tab_switches = ${maxTabSwitches},
-          max_strikes = ${maxStrikes},
-          require_fullscreen = ${requireFullscreen},
-          enable_object_detection = ${enableObjectDetection},
-          allow_paste = ${allowPaste},
-          updated_at = NOW()
-        WHERE id = ${id}
-      `);
-      okMsg = 'Proctoring settings saved.';
+      const id = (fd.get('id') as string || '').trim();
+      const levelRaw = (fd.get('proctor_level') as string || 'standard').trim();
+      if (!PROCTOR_LEVELS.includes(levelRaw)) {
+        errorMsg = 'That is not one of the strictness levels this product knows, so nothing was saved.';
+      } else {
+        const requireFaceEnroll = fd.get('require_face_enroll') === 'on';
+        const blockTabSwitch = fd.get('block_tab_switch') === 'on';
+        const maxTabSwitches = clampInt(fd.get('max_tab_switches'), 0, 20, 3);
+        const maxStrikes = clampInt(fd.get('max_strikes'), 1, 20, 5);
+        const requireFullscreen = fd.get('require_fullscreen') === 'on';
+        const enableObjectDetection = fd.get('enable_object_detection') === 'on';
+        const allowPaste = fd.get('allow_paste') === 'on';
+        const r = await db.execute(sql`
+          UPDATE ai_interview_templates SET
+            proctor_level = ${levelRaw},
+            require_face_enroll = ${requireFaceEnroll},
+            block_tab_switch = ${blockTabSwitch},
+            max_tab_switches = ${maxTabSwitches},
+            max_strikes = ${maxStrikes},
+            require_fullscreen = ${requireFullscreen},
+            enable_object_detection = ${enableObjectDetection},
+            allow_paste = ${allowPaste},
+            updated_at = NOW()
+          WHERE id = ${id}
+          RETURNING id
+        `);
+        if (rows(r).length) okMsg = 'Proctoring settings saved. These flags are advisory - a human decides what a flag means.';
+        else errorMsg = 'Nothing was saved — that template no longer exists.';
+      }
     }
   } catch (e: any) {
-    errorMsg = 'Error: ' + (e?.message || 'Unknown');
+    // e.message on a drizzle error is the failed SQL; the database's own words are on e.cause, and
+    // nothing at all used to be written to a log.
+    console.error('[admin/ai-interview-templates]', action, 'failed -', causeOf(e));
+    okMsg = '';
+    errorMsg = 'Nothing was saved. Reason: ' + causeOf(e);
+  }
   }
 }
 
 let templates: any[] = [];
 let seedsByTemplate: Record<string, any[]> = {};
+// J: an unreadable table must not render as "no templates".
+let readFailed = '';
 try {
   const r = await db.execute(sql`
     SELECT id, slug, title, description, language_default, max_minutes, is_published, created_at,
@@ -118,16 +241,19 @@ try {
       (SELECT COUNT(*)::int FROM ai_interview_sessions WHERE template_id = t.id) as session_count
     FROM ai_interview_templates t ORDER BY created_at DESC
   `);
-  templates = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+  templates = rows(r);
+} catch (e: any) {
+  console.error('[admin/ai-interview-templates] templates read', causeOf(e));
+  readFailed = 'The template list could not be read.';
+}
 
 try {
   const r = await db.execute(sql`SELECT id, template_id, prompt_text, expected_topics, sort_order, is_active FROM ai_interview_seeds ORDER BY template_id, sort_order ASC`);
-  const rows = (Array.isArray(r) ? r : (r?.rows || [])) as any[];
-  for (const s of rows) (seedsByTemplate[s.template_id] = seedsByTemplate[s.template_id] || []).push(s);
-} catch (_) {}
-
-const LANGS = ['en-IN','en-US','en-GB','hi-IN','bn-IN','ta-IN','te-IN','mr-IN','gu-IN','es-ES','fr-FR','de-DE','ar-SA','zh-CN','ja-JP'];
+  for (const s of rows(r)) (seedsByTemplate[s.template_id] = seedsByTemplate[s.template_id] || []).push(s);
+} catch (e: any) {
+  console.error('[admin/ai-interview-templates] seeds read', causeOf(e));
+  readFailed = (readFailed ? readFailed + ' ' : '') + 'The seed questions could not be read, so every template below shows zero questions whether or not it has any.';
+}
 ---
 <AdminLayout title="AI Interview Templates" activeNav="ai-interview-templates">
   <div style="max-width:1100px;margin:0 auto;padding:24px;">
@@ -141,7 +267,20 @@ const LANGS = ['en-IN','en-US','en-GB','hi-IN','bn-IN','ta-IN','te-IN','mr-IN','
     {okMsg && <div style="background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:13px;">{okMsg}</div>}
     {errorMsg && <div style="background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:13px;">{errorMsg}</div>}
 
+    {readFailed && (
+      <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:13px;line-height:1.55;">
+        {readFailed} This is not the same as "there are none". The reason is in the server log.
+      </div>
+    )}
+
+    {!canEdit && (
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;color:#8a8a94;padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:12.5px;line-height:1.55;">
+        Your role can read this console. Creating, editing, publishing and deleting are not offered here, so nothing below can be changed by you.
+      </div>
+    )}
+
     <!-- Create template -->
+    {canEdit && (
     <details style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:14px 18px;margin-bottom:18px;">
       <summary style="cursor:pointer;font-size:13px;font-weight:700;color:#fff;">+ Create new template</summary>
       <form method="POST" style="margin-top:14px;display:grid;grid-template-columns:1fr 1fr;gap:10px;">
@@ -161,9 +300,10 @@ const LANGS = ['en-IN','en-US','en-GB','hi-IN','bn-IN','ta-IN','te-IN','mr-IN','
         <div style="grid-column:span 2;"><button type="submit" style="background:#FF4F00;color:#fff;border:none;font-size:13px;font-weight:700;padding:9px 16px;border-radius:8px;cursor:pointer;">Create template</button></div>
       </form>
     </details>
+    )}
 
-    {templates.length === 0 && (
-      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:30px;text-align:center;color:#8a8a94;font-size:13px;">No templates yet. Create one above.</div>
+    {templates.length === 0 && !readFailed && (
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:30px;text-align:center;color:#8a8a94;font-size:13px;">No templates yet. {canEdit ? 'Create one above.' : ''}</div>
     )}
 
     {templates.map((t: any) => {
@@ -177,21 +317,28 @@ const LANGS = ['en-IN','en-US','en-GB','hi-IN','bn-IN','ta-IN','te-IN','mr-IN','
               {t.description && <p style="font-size:12.5px;color:#d8d8de;margin:8px 0 0;line-height:1.55;">{t.description}</p>}
             </div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;">
-              <form method="POST" style="display:inline;">
-                <input type="hidden" name="action" value="toggle_publish" />
-                <input type="hidden" name="id" value={t.id} />
-                <button type="submit" style={'background:' + (t.is_published ? '#10b981' : '#15151a') + ';color:#fff;border:1px solid #1a1a1f;font-size:11px;font-weight:700;padding:5px 12px;border-radius:6px;cursor:pointer;'}>{t.is_published ? 'Published' : 'Draft'}</button>
-              </form>
+              {canEdit ? (
+                <form method="POST" style="display:inline;">
+                  <input type="hidden" name="action" value="toggle_publish" />
+                  <input type="hidden" name="id" value={t.id} />
+                  <button type="submit" style={'background:' + (t.is_published ? '#10b981' : '#15151a') + ';color:#fff;border:1px solid #1a1a1f;font-size:11px;font-weight:700;padding:5px 12px;border-radius:6px;cursor:pointer;'}>{t.is_published ? 'Published' : 'Draft'}</button>
+                </form>
+              ) : (
+                <span style={'background:' + (t.is_published ? '#10b981' : '#15151a') + ';color:#fff;border:1px solid #1a1a1f;font-size:11px;font-weight:700;padding:5px 12px;border-radius:6px;'}>{t.is_published ? 'Published' : 'Draft'}</span>
+              )}
               <a href={'/aquintutor/interview/' + t.slug} target="_blank" style="background:#15151a;color:#fff;border:1px solid #1a1a1f;font-size:11px;font-weight:600;padding:5px 12px;border-radius:6px;text-decoration:none;">View</a>
-              <form method="POST" style="display:inline;" onsubmit="return confirm('Delete this template and all its questions?')">
-                <input type="hidden" name="action" value="delete_template" />
-                <input type="hidden" name="id" value={t.id} />
-                <button type="submit" style="background:rgba(239,68,68,0.12);color:#fca5a5;border:1px solid rgba(239,68,68,0.3);font-size:11px;font-weight:600;padding:5px 12px;border-radius:6px;cursor:pointer;">Delete</button>
-              </form>
+              {canDelete && (
+                <form method="POST" style="display:inline;" onsubmit="return confirm('Delete this template and all its questions?')">
+                  <input type="hidden" name="action" value="delete_template" />
+                  <input type="hidden" name="id" value={t.id} />
+                  <button type="submit" style="background:rgba(239,68,68,0.12);color:#fca5a5;border:1px solid rgba(239,68,68,0.3);font-size:11px;font-weight:600;padding:5px 12px;border-radius:6px;cursor:pointer;">Delete</button>
+                </form>
+              )}
             </div>
           </div>
 
           <!-- Proctoring -->
+          {canEdit && (
           <details style="margin-top:10px;background:#0d1117;border:1px solid #1a1a1f;border-radius:10px;padding:10px 14px;">
             <summary style="cursor:pointer;font-size:11.5px;font-weight:700;color:#fff;display:flex;align-items:center;gap:8px;">
               Proctoring &middot; <span style={'font-family:Geist Mono,monospace;text-transform:uppercase;font-size:10px;padding:2px 7px;border-radius:100px;background:' + (t.proctor_level === 'strict' ? 'rgba(239,68,68,0.18);color:#fca5a5' : t.proctor_level === 'relaxed' ? 'rgba(16,185,129,0.18);color:#6ee7b7' : 'rgba(217,119,87,0.18);color:#f0b48f') + ';'}>{t.proctor_level}</span>
@@ -235,8 +382,10 @@ const LANGS = ['en-IN','en-US','en-GB','hi-IN','bn-IN','ta-IN','te-IN','mr-IN','
               </div>
             </form>
           </details>
+          )}
 
           <!-- Generate questions from an uploaded document (any format) -->
+          {canEdit && (
           <details style="margin-top:10px;background:#0d1117;border:1px solid #243244;border-radius:10px;padding:10px 14px;">
             <summary style="cursor:pointer;font-size:11.5px;font-weight:700;color:#67e8f9;">Generate questions from a document (PDF / image / text) &middot; AI</summary>
             <div class="genDoc" data-tid={t.id} style="margin-top:12px;display:grid;gap:10px;">
@@ -252,6 +401,7 @@ const LANGS = ['en-IN','en-US','en-GB','hi-IN','bn-IN','ta-IN','te-IN','mr-IN','
               <p class="gd-status" style="font-size:11.5px;color:#8a8a94;margin:0;"></p>
             </div>
           </details>
+          )}
 
           <!-- Seeds list -->
           <div style="margin-top:10px;">
@@ -264,16 +414,23 @@ const LANGS = ['en-IN','en-US','en-GB','hi-IN','bn-IN','ta-IN','te-IN','mr-IN','
                   {s.expected_topics && s.expected_topics.length > 0 && <p style="font-size:10.5px;color:#8a8a94;margin:3px 0 0;font-family:'Geist Mono',monospace;">topics: {s.expected_topics.join(', ')}</p>}
                 </div>
                 <div style="display:flex;gap:4px;">
-                  <form method="POST" style="display:inline;"><input type="hidden" name="action" value="toggle_seed" /><input type="hidden" name="id" value={s.id} />
-                    <button type="submit" style={'background:' + (s.is_active ? '#10b981' : '#15151a') + ';color:#fff;border:1px solid #1a1a1f;font-size:10px;font-weight:600;padding:3px 8px;border-radius:5px;cursor:pointer;'}>{s.is_active ? 'On' : 'Off'}</button>
-                  </form>
-                  <form method="POST" style="display:inline;" onsubmit="return confirm('Delete this question?')"><input type="hidden" name="action" value="delete_seed" /><input type="hidden" name="id" value={s.id} />
-                    <button type="submit" style="background:rgba(239,68,68,0.12);color:#fca5a5;border:1px solid rgba(239,68,68,0.3);font-size:10px;font-weight:600;padding:3px 8px;border-radius:5px;cursor:pointer;">X</button>
-                  </form>
+                  {canEdit ? (
+                    <form method="POST" style="display:inline;"><input type="hidden" name="action" value="toggle_seed" /><input type="hidden" name="id" value={s.id} />
+                      <button type="submit" style={'background:' + (s.is_active ? '#10b981' : '#15151a') + ';color:#fff;border:1px solid #1a1a1f;font-size:10px;font-weight:600;padding:3px 8px;border-radius:5px;cursor:pointer;'}>{s.is_active ? 'On' : 'Off'}</button>
+                    </form>
+                  ) : (
+                    <span style={'background:' + (s.is_active ? '#10b981' : '#15151a') + ';color:#fff;border:1px solid #1a1a1f;font-size:10px;font-weight:600;padding:3px 8px;border-radius:5px;'}>{s.is_active ? 'On' : 'Off'}</span>
+                  )}
+                  {canDelete && (
+                    <form method="POST" style="display:inline;" onsubmit="return confirm('Delete this question?')"><input type="hidden" name="action" value="delete_seed" /><input type="hidden" name="id" value={s.id} />
+                      <button type="submit" style="background:rgba(239,68,68,0.12);color:#fca5a5;border:1px solid rgba(239,68,68,0.3);font-size:10px;font-weight:600;padding:3px 8px;border-radius:5px;cursor:pointer;">X</button>
+                    </form>
+                  )}
                 </div>
               </div>
             ))}
 
+            {canEdit && (
             <form method="POST" style="display:grid;grid-template-columns:80px 1fr 200px 110px;gap:8px;margin-top:8px;align-items:end;">
               <input type="hidden" name="action" value="add_seed" />
               <input type="hidden" name="template_id" value={t.id} />
@@ -291,6 +448,7 @@ const LANGS = ['en-IN','en-US','en-GB','hi-IN','bn-IN','ta-IN','te-IN','mr-IN','
               </div>
               <button type="submit" style="background:#FF4F00;color:#fff;border:none;font-size:12px;font-weight:700;padding:8px 12px;border-radius:6px;cursor:pointer;">+ Add</button>
             </form>
+            )}
           </div>
         </div>
       );
@@ -302,6 +460,7 @@ const LANGS = ['en-IN','en-US','en-GB','hi-IN','bn-IN','ta-IN','te-IN','mr-IN','
       var tid = box.getAttribute('data-tid');
       var btn = box.querySelector('.gd-btn');
       var statusEl = box.querySelector('.gd-status');
+      if (!btn || !statusEl) return;
       btn.addEventListener('click', function () {
         var fileInput = box.querySelector('.gd-file');
         var file = fileInput && fileInput.files && fileInput.files[0];

@@ -24,7 +24,7 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { dueScheduled, markScheduled, rewriteLinksForTracking } from '@/lib/mail-advanced';
+import { claimDueScheduled, markScheduled, rewriteLinksForTracking } from '@/lib/mail-advanced';
 import { deliverMessage, parseAddressList, logOutbound, getMailConfig, getMailboxAddress } from '@/lib/mail';
 import { sendExternal } from '@/lib/mail-transport';
 import { cronAuth } from '@/lib/auth/cron-auth';
@@ -32,7 +32,13 @@ import { cronAuth } from '@/lib/auth/cron-auth';
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
 async function run() {
-  const due = await dueScheduled(50);
+  // CLAIM, THEN SEND. This was `dueScheduled(50)` — a plain SELECT — followed by a loop that only
+  // marked each row once its send had finished. Two overlapping invocations of this URL (a cron
+  // retry, a manual trigger during the scheduled run, two warm instances) therefore read the same
+  // queued messages and BOTH delivered them: the recipient got the mail twice and nothing recorded
+  // it. claimDueScheduled() takes ownership in the same statement that selects, so a message is
+  // picked up by exactly one run. See its docblock in src/lib/mail-advanced.ts.
+  const due = await claimDueScheduled(50);
   let sent = 0, failed = 0;
   for (const s of due) {
     try {

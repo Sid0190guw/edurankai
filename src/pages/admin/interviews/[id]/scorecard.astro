@@ -12,6 +12,24 @@ let interview: any = null;
 let existingCard: any = null;
 let okMsg = '', errorMsg = '';
 
+// =================================================================================================
+// EVERY const AND EVERY HELPER ABOVE THE POST HANDLER. `const` is not hoisted, and a declaration
+// under the handler that reads it throws on the handler's first line.
+// =================================================================================================
+
+/** postgres-js returns PLAIN ARRAYS. Never r.rows[0]. */
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+/** The four rated dimensions, named once: the form renders these and the handler validates these. */
+const SCORE_KEYS = ['technical_score', 'communication_score', 'culture_score', 'problem_solving_score'] as const;
+const RECOMMENDATIONS = ['strong_hire', 'hire', 'no_hire', 'strong_no_hire'] as const;
+
+// "THE INTERVIEW DOES NOT EXIST" AND "THE QUERY DID NOT ANSWER" ARE OPPOSITE FACTS.
+// The load below ended in `catch(e) {}`, so a pooler timeout left `interview` null and the next line
+// bounced the interviewer straight back to the list with no explanation at all - indistinguishable
+// from following a link to a round somebody had deleted. It now says which of the two happened.
+let loadFailed = '';
+
 try {
   const r = await db.execute(sql`
     SELECT ir.*, a.first_name, a.last_name, a.email as candidate_email, a.role_title_snapshot, a.application_number
@@ -25,44 +43,113 @@ try {
   const r2 = await db.execute(sql`SELECT * FROM interview_scorecards WHERE interview_id = ${id} AND interviewer_id = ${user.id} LIMIT 1`);
   const r2rows = Array.isArray(r2) ? r2 : (r2?.rows || []);
   existingCard = r2rows[0] || null;
-} catch(e) {}
+} catch (e: any) {
+  // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+  console.error('[interviews/scorecard] load', id, e?.cause?.message || e?.message);
+  loadFailed = 'That scorecard could not be read just now, so nothing was shown and nothing could be '
+    + 'saved. Any evaluation already submitted is untouched. Try again in a moment.';
+}
 
+if (loadFailed) return Astro.redirect('/admin/interviews?err=' + encodeURIComponent(loadFailed));
 if (!interview) return Astro.redirect('/admin/interviews');
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   try {
-    const techScore = parseInt(fd.get('technical_score') as string || '0');
-    const commScore = parseInt(fd.get('communication_score') as string || '0');
-    const cultScore = parseInt(fd.get('culture_score') as string || '0');
-    const psScore = parseInt(fd.get('problem_solving_score') as string || '0');
-    const overall = ((techScore + commScore + cultScore + psScore) / 4).toFixed(2);
-    const recommendation = fd.get('recommendation') as string;
-    const strengths = fd.get('strengths') as string;
-    const weaknesses = fd.get('weaknesses') as string;
-    const notes = fd.get('notes') as string;
+    // ===========================================================================================
+    // A MISSING RATING IS NOT A RATING OF ZERO
+    // ===========================================================================================
+    //
+    // Each of the four was `parseInt(fd.get(k) as string || '0')`. `required` on a radio is a
+    // browser courtesy, not a rule: a submission arriving without one - a hand-made POST, a form
+    // restored from bfcache, a client with validation off - recorded a 0 for a dimension nobody
+    // rated and then divided that 0 into the overall. Zero is not even on the 1-5 scale this form
+    // describes, and the number it produces is read by a hiring decision. Anything out of range,
+    // or missing, is now refused and said out loud instead of assumed.
+    const scores: number[] = [];
+    for (const k of SCORE_KEYS) {
+      const raw = String(fd.get(k) ?? '').trim();
+      const n = Number(raw);
+      if (!raw || !Number.isInteger(n) || n < 1 || n > 5) {
+        errorMsg = 'Every one of the four ratings has to be a whole number from 1 to 5. Nothing was saved.';
+        break;
+      }
+      scores.push(n);
+    }
+    const recommendation = String(fd.get('recommendation') ?? '');
+    if (!errorMsg && (RECOMMENDATIONS as readonly string[]).indexOf(recommendation) < 0) {
+      // The column is read back by the hiring screens and coloured from a fixed list. A value off
+      // that list is a verdict no screen can describe and no filter finds - stored, not rejected,
+      // and nobody ever learns.
+      errorMsg = 'Pick one of the four recommendations. Nothing was saved.';
+    }
 
-    await db.execute(sql`
-      INSERT INTO interview_scorecards
-        (interview_id, interviewer_id, technical_score, communication_score, culture_score, problem_solving_score, overall_score, recommendation, strengths, weaknesses, notes)
-      VALUES (${id}, ${user.id}, ${techScore}, ${commScore}, ${cultScore}, ${psScore}, ${overall}, ${recommendation}, ${strengths||null}, ${weaknesses||null}, ${notes||null})
-      ON CONFLICT (interview_id, interviewer_id) DO UPDATE SET
-        technical_score=${techScore}, communication_score=${commScore}, culture_score=${cultScore},
-        problem_solving_score=${psScore}, overall_score=${overall}, recommendation=${recommendation},
-        strengths=${strengths||null}, weaknesses=${weaknesses||null}, notes=${notes||null}, submitted_at=NOW()
-    `);
+    if (!errorMsg) {
+      const techScore = scores[0], commScore = scores[1], cultScore = scores[2], psScore = scores[3];
+      const overall = ((techScore + commScore + cultScore + psScore) / 4).toFixed(2);
+      const strengths = fd.get('strengths') as string;
+      const weaknesses = fd.get('weaknesses') as string;
+      const notes = fd.get('notes') as string;
 
-    // Update interview's aggregate score
-    await db.execute(sql`
-      UPDATE interview_rounds SET
-        final_score = (SELECT AVG(overall_score) FROM interview_scorecards WHERE interview_id = ${id}),
-        final_recommendation = ${recommendation},
-        updated_at = NOW()
-      WHERE id = ${id}
-    `);
+      const saved = rowsOf(await db.execute(sql`
+        INSERT INTO interview_scorecards
+          (interview_id, interviewer_id, technical_score, communication_score, culture_score, problem_solving_score, overall_score, recommendation, strengths, weaknesses, notes)
+        VALUES (${id}, ${user.id}, ${techScore}, ${commScore}, ${cultScore}, ${psScore}, ${overall}, ${recommendation}, ${strengths||null}, ${weaknesses||null}, ${notes||null})
+        ON CONFLICT (interview_id, interviewer_id) DO UPDATE SET
+          technical_score=${techScore}, communication_score=${commScore}, culture_score=${cultScore},
+          problem_solving_score=${psScore}, overall_score=${overall}, recommendation=${recommendation},
+          strengths=${strengths||null}, weaknesses=${weaknesses||null}, notes=${notes||null}, submitted_at=NOW()
+        RETURNING id`));
 
-    return Astro.redirect('/admin/interviews?saved=1');
-  } catch(e: any) { errorMsg = e.message; }
+      if (!saved.length) {
+        errorMsg = 'Nothing was saved - the scorecard did not write, and nothing on this interview has changed.';
+      } else {
+        // THE PANEL'S VERDICT, NOT WHOEVER PRESSED SAVE LAST.
+        //
+        // final_recommendation was written as this interviewer's own `${recommendation}`, while
+        // final_score beside it was an average across the whole panel. On a two-person panel the
+        // second person to save silently replaced the first one's recorded outcome, and the two
+        // columns on the same row then disagreed about what the panel had said.
+        //
+        // It is now derived the same way the score is - the majority verdict across every scorecard
+        // on this round - and left NULL when the panel is split evenly, because a tie is a real
+        // answer and the old line invented a winner for it.
+        await db.execute(sql`
+          UPDATE interview_rounds SET
+            final_score = (SELECT AVG(overall_score) FROM interview_scorecards WHERE interview_id = ${id}),
+            final_recommendation = (
+              SELECT CASE WHEN COUNT(*) = 1 THEN MIN(top.r) ELSE NULL END
+                FROM (
+                  SELECT recommendation AS r, COUNT(*) AS c
+                    FROM interview_scorecards
+                   WHERE interview_id = ${id} AND recommendation IS NOT NULL
+                   GROUP BY recommendation
+                ) AS top
+               WHERE top.c = (
+                 SELECT MAX(a.c) FROM (
+                   SELECT COUNT(*) AS c FROM interview_scorecards
+                    WHERE interview_id = ${id} AND recommendation IS NOT NULL
+                    GROUP BY recommendation
+                 ) AS a
+               )
+            ),
+            updated_at = NOW()
+          WHERE id = ${id}
+        `);
+
+        return Astro.redirect('/admin/interviews?saved=1');
+      }
+    }
+  } catch (e: any) {
+    // WAS `errorMsg = e.message` with nothing logged. On a drizzle/postgres-js failure e.message is
+    // only the STATEMENT that failed - table and column names put in front of the operator - while
+    // the database's real reason sits unread on e.cause. An evaluation that never saved also left
+    // no trace at all for anyone asked about it afterwards.
+    console.error('[interviews/scorecard] save', id, e?.cause?.message || e?.message);
+    errorMsg = 'The scorecard was not saved: '
+      + String(e?.cause?.message || 'the database refused the write')
+      + '. Nothing on this interview has changed.';
+  }
 }
 
 const scheduledLocal = interview.scheduled_at ? new Date(interview.scheduled_at).toISOString() : '';

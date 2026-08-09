@@ -198,9 +198,29 @@ export async function getAllowCredentials(userId: string): Promise<any[]> {
   const rows = rowsOf(await db.execute(sql`SELECT credential_id, transports FROM user_passkeys WHERE user_id = ${userId}`));
   return rows.map((r) => ({ id: r.credential_id, type: 'public-key', transports: (r.transports || '').split(',').filter(Boolean) }));
 }
-export async function deletePasskey(userId: string, id: string): Promise<void> {
+/**
+ * Remove one of this user's passkeys. Returns whether a row was actually deleted.
+ *
+ * IT USED TO RETURN void, and its only caller (src/components/security/TwoFactorPanel.astro, through
+ * /api/2fa/passkey/delete) answered ok:true on the strength of the call not throwing. A DELETE that
+ * matched nothing - an id from a list rendered before the credential was removed in another tab, an
+ * id belonging to somebody else - reported a removal that never happened, on the screen that answers
+ * whether a lost device can still sign in to this account. "Your fingerprint is no longer enrolled"
+ * is not a sentence to say without asking.
+ *
+ * The id is validated as a uuid before it is bound: user_passkeys.id is a uuid column, and a
+ * malformed value raised 22P02, which surfaced as a 500 - a database complaint about the person's
+ * own click.
+ */
+export async function deletePasskey(userId: string, id: string): Promise<boolean> {
   await ensurePasskeySchema();
-  await db.execute(sql`DELETE FROM user_passkeys WHERE user_id = ${userId} AND id = ${id}`);
+  if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(id || ''))) {
+    return false;
+  }
+  const gone = rowsOf(await db.execute(
+    sql`DELETE FROM user_passkeys WHERE user_id = ${userId} AND id = ${id}::uuid RETURNING id`
+  ));
+  return gone.length > 0;
 }
 
 /** Resolve the owner of a credential — used for passwordless ("tap fingerprint")

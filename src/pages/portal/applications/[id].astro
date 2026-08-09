@@ -57,7 +57,11 @@ if (Astro.request.method === 'POST') {
       } catch (_) {}
       return Astro.redirect('/portal/applications/' + id + '?sent=1');
     } catch (err: any) {
-      errorMsg = 'Failed to send: ' + (err.message || 'Unknown error');
+      // err.message on a drizzle/postgres-js failure is the SQL STATEMENT — table and column names
+      // handed to the applicant — while the database's real reason sits unread on err.cause. It is
+      // logged, and the person is told plainly that nothing was sent.
+      console.error('[portal/applications] send message', err?.cause?.message || err?.message);
+      errorMsg = 'Your message was NOT sent, and nothing has been recorded. Please try again in a moment.';
     }
   }
 }
@@ -101,15 +105,36 @@ const STATUS_COLORS: Record<string, string> = {
 
 const statusClass = STATUS_COLORS[app.status] || 'bg-cream-2 text-ink-soft border-ink/15';
 
+// THE SERVER IS UTC AND THE READERS ARE IN IST.
+//
+// `toLocaleString(undefined, ...)` in page frontmatter formats against the RENDER process's zone, not
+// the reader's — so a message sent at 10:00 IST was stamped "4:30 am" on the thread, and a message
+// sent between 00:00 and 05:29 IST carried the previous day's date. The client script at the bottom of
+// this file was written to correct exactly that and looked for `.msg-ts-local[data-ts]`, a class no
+// element on the page has ever carried, so it matched nothing and re-formatted nothing. The markup now
+// carries the class and the ISO instant, so the script does the job it was written for; this server
+// value is the no-JavaScript fallback and is pinned to Asia/Kolkata rather than to whatever region the
+// render happens to run in.
 function formatTime(d: Date): string {
-  return new Date(d).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+  return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
 }
-// Load offer for this application (to show "Accept Offer" CTA)
+// Load offer for this application (to show "Accept Offer" CTA).
+//
+// THE ONLY DOOR TO THE OFFER, AND IT USED TO CLOSE IN SILENCE. This was `catch (e) {}`, so a failed
+// read left myOffer null and the whole "You have an offer waiting / View & Accept Offer" panel simply
+// did not render — on the page that tells the applicant, three inches lower, that we do not send
+// email and that the offer letter appears in this thread. A candidate reloading a page that shows no
+// offer concludes there is no offer. The read is now reported: nothing is invented, but the failure
+// is named so the person knows to look again rather than to give up.
 let myOffer: any = null;
+let offerUnreadable = false;
 try {
   const oList = await db.select().from(offerLetters).where(eq(offerLetters.applicationId, id)).limit(1);
   if (oList.length > 0) myOffer = oList[0];
-} catch (e) {}
+} catch (e: any) {
+  console.error('[portal/applications] offer', e?.cause?.message || e?.message);
+  offerUnreadable = true;
+}
 
 // Recruitment-funnel stage (6 steps from /policy/recruitment).
 // ensureStageSchema() re-throws now rather than swallowing its own failure (a memoised silent failure
@@ -139,6 +164,15 @@ try {
 } catch (_) {}
 ---
 <BaseLayout title={'Application ' + shortId + ' - EduRankAI'} description="Conversation with the EduRankAI team about your application.">
+  {offerUnreadable && (
+    <div style="background:#fff5f0;border:1px solid #f0b49a;border-radius:14px;padding:16px 18px;margin:18px 0;">
+      <p style="font-size:14px;font-weight:600;color:#9a3412;margin:0;">We could not check whether you have an offer.</p>
+      <p style="font-size:13px;color:#5c5349;margin:6px 0 0;line-height:1.65;">
+        This is <strong>not</strong> a statement that there is no offer for you. The record could not be read on
+        this load. Please reload in a moment — nothing has been withdrawn.
+      </p>
+    </div>
+  )}
   {myOffer && myOffer.status !== 'withdrawn' && (
     <div id="myOfferCta" style="background:linear-gradient(135deg,#FFE9D9,#FFF5EC);border:2px solid #FF4F00;border-radius:14px;padding:20px;margin:18px 0;display:flex;flex-direction:column;gap:10px;">
       <div style="display:flex;align-items:center;gap:8px;">
@@ -296,7 +330,7 @@ try {
                     </p>
                   )}
                   <p class="text-[0.88rem] leading-relaxed whitespace-pre-wrap">{msg.body}</p>
-                  <p class={`text-[0.62rem] font-mono mt-1 ${isMe ? "text-white/60" : "text-ink-soft"}`}>{formatTime(msg.createdAt)}</p>
+                  <p class={`msg-ts-local text-[0.62rem] font-mono mt-1 ${isMe ? "text-white/60" : "text-ink-soft"}`} data-ts={new Date(msg.createdAt).toISOString()}>{formatTime(msg.createdAt)}</p>
                 </div>
               </div>
             );
@@ -331,7 +365,22 @@ document.querySelectorAll('.msg-ts-local[data-ts]').forEach(function(el) {
     : { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' };
   el.textContent = d.toLocaleString(undefined, opts);
 });
-  setTimeout(function() {
-    window.location.reload();
-  }, 30000);
+  // A THIRTY-SECOND RELOAD USED TO THROW AWAY WHATEVER WAS BEING TYPED. This thread is the only
+  // channel the page offers ("we do not send email"), the textarea takes up to 5000 characters, and
+  // an unconditional reload wiped a half-written message every half minute with no warning — on a
+  // phone, mid-sentence. The refresh still happens, but never while there is unsent text in the box
+  // and never while the person is interacting with it; it waits and checks again.
+  (function () {
+    var box = document.querySelector('textarea[name="body"]');
+    function busy() {
+      if (!box) return false;
+      if (box.value && box.value.trim().length > 0) return true;
+      return document.activeElement === box;
+    }
+    function tick() {
+      if (busy()) { setTimeout(tick, 10000); return; }
+      window.location.reload();
+    }
+    setTimeout(tick, 30000);
+  })();
 </script>
