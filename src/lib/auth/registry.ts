@@ -445,6 +445,28 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     group: 'People',
     description: 'Assign a course to any employee with a due date, and schedule or cancel anything on the training calendar. A manager assigns to their own reports through the reporting line; this is the version that reaches the whole organization. EduRankAI is the technology platform — accredited partners award the credentials.',
   },
+  'learning.progress.view': {
+    label: 'See the whole learning record',
+    group: 'People',
+    description: 'Read progress per person and per cohort across the organization, and open one person from the aggregate. A department head sees their own department without this, through the department_head relationship in the Organization Graph, resolved per row. This is the version that reaches everybody with no relationship at all.',
+  },
+  'learning.completion.override': {
+    label: 'Record or withdraw a course completion',
+    group: 'People',
+    description: 'Mark a course complete for somebody by hand, or withdraw a completion already recorded, in both cases with a written reason that is kept. This is a statement about what a person did and it outlives the platform. It is a record of work done on this platform — it is not a qualification, and accredited partners award credentials, not us.',
+    sensitive: true,
+  },
+  'learning.certificate.manage': {
+    label: 'Issue or withdraw a course certificate',
+    group: 'People',
+    description: 'Issue a certificate for a completed course, and withdraw one that should not have been issued, both with a written reason. A withdrawal is recorded as a later fact against the certificate number rather than by deleting it: the ledger is a hash chain, and removing an entry would break verification for every certificate issued after it.',
+    sensitive: true,
+  },
+  'learning.rules.manage': {
+    label: 'Say what counts as completing a course',
+    group: 'People',
+    description: 'Choose, per course, whether completion means the lessons were viewed, an assessment was passed, or a mark reached a threshold. It changes nobody\'s record on its own — it changes how the next recomputation reads the evidence.',
+  },
   'settings.view': { label: 'View settings', group: 'System', description: 'See platform configuration.' },
   'settings.edit': {
     label: 'Edit settings',

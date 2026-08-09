@@ -1,7 +1,15 @@
 ---
 import AdminLayout from '@/layouts/AdminLayout.astro';
-import { listLeave, decideLeave, describeUnits, leaveTypeName } from '@/lib/hr-leave';
+// readLeave(), NOT listLeave(). listLeave() goes through an internal safe() helper that catches,
+// logs and returns [] — so a total read failure rendered "No leave requests waiting." on the screen
+// where being wrong means somebody's time off is never actioned. Day one and an outage were the same
+// sentence. readLeave() carries the outcome; the page says which of the three it is looking at.
+import { readLeave, decideLeave, describeUnits, leaveTypeName } from '@/lib/hr-leave';
 import { canAccessSection } from '@/lib/auth/permissions';
+import DayOne from '@/components/admin/DayOne.astro';
+// Whether there is anybody to have leave, and whether the holiday calendar exists. Both change what
+// an empty queue MEANS on this page, and neither was ever stated on it.
+import { readSetupStatus, PREREQUISITE } from '@/lib/day-one';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -35,9 +43,32 @@ if (Astro.request.method === 'POST') {
   return Astro.redirect('/admin/hr/leave?msg=' + encodeURIComponent(flash));
 }
 
-const all = await listLeave({});
+const leaveRead = await readLeave({});
+const all = leaveRead.rows;
 const pending = all.filter((l: any) => l.status === 'pending');
 const recent = all.filter((l: any) => l.status !== 'pending').slice(0, 25);
+
+// WHAT AN EMPTY QUEUE MEANS HERE DEPENDS ON TWO THINGS OUTSIDE THIS TABLE.
+//
+//   * With no employee records, nobody can have requested leave. The queue is empty because the
+//     platform is not set up, not because everybody is at their desk.
+//   * With no holiday calendar, approvals still work — and charge every day in a request as an
+//     ordinary day, so a public holiday inside somebody's week off costs them a day of their
+//     allowance. That happens from the FIRST approval, silently, and this page never said so.
+//
+// Both are counted behind safeRows and neither can take this page down.
+let employeesConfigured: boolean | null = null;
+let holidaysConfigured: boolean | null = null;
+try {
+  const setup = await readSetupStatus();
+  const emp = setup.find((s) => s.step.id === 'employees');
+  const hol = setup.find((s) => s.step.id === 'holidays');
+  employeesConfigured = emp && emp.state !== 'unknown' ? emp.state === 'done' : null;
+  holidaysConfigured = hol && hol.state !== 'unknown' ? hol.state === 'done' : null;
+} catch (e: any) {
+  // Never silently: an absent prerequisite notice would read as "everything is configured".
+  console.error('[admin/hr/leave] setup status could not be read -', e?.cause?.message || e?.message);
+}
 const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
 const fmt = (d: any) => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 const statusColor: Record<string, string> = { approved: '#86efac', rejected: '#fca5a5', cancelled: '#8a8a94' };
@@ -78,8 +109,38 @@ const dayPartWords = (l: any) =>
       inside a request is never charged against anybody's allowance.
     </p>
 
-    <h2 style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#c2410c;font-weight:700;margin:0 0 10px;">Pending · {pending.length}</h2>
-    {pending.length === 0 && <p style="color:#8a8a94;font-size:13px;margin-bottom:20px;">No leave requests waiting.</p>}
+    {/* THE HOLIDAY CALENDAR, NAMED ON THE SCREEN WHERE ITS ABSENCE COSTS SOMETHING.
+        Approvals here start working immediately. With no calendar every day inside a request is
+        charged, and the only route to the calendar in the whole console was a sentence at the bottom
+        of this page — on a screen the sidebar does not carry. */}
+    {holidaysConfigured === false && (
+      <div style="margin:0 0 16px;">
+        <DayOne
+          state="unconfigured"
+          thing="The holiday calendar"
+          unconfiguredBody="Approving leave below works, and it is charging every day in each request as an ordinary working day. No holiday has been recorded for this year, so a public holiday falling inside somebody's time off costs them a day of their allowance — from the first approval, with nothing on screen to say it happened."
+          prereqs={[PREREQUISITE.holidays]}
+          compact={true}
+        />
+      </div>
+    )}
+
+    <h2 style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#c2410c;font-weight:700;margin:0 0 10px;">Pending · {leaveRead.ok ? pending.length : 'unknown'}</h2>
+    {/* THREE STATES ON A DECISION SCREEN. "No leave requests waiting." used to be printed over a
+        failed read, over a platform with no employees in it, and over a genuinely clear queue. */}
+    {pending.length === 0 && (
+      <div style="margin-bottom:20px;">
+        <DayOne
+          state={!leaveRead.ok ? 'unreadable' : (employeesConfigured === false ? 'unconfigured' : 'empty')}
+          thing="The leave queue"
+          error={leaveRead.error}
+          unconfiguredBody="No employee record exists yet, so nobody can have requested leave. This queue is empty because the platform has not been set up, not because everybody is at their desk."
+          emptyBody="No leave request is waiting on a decision. Nothing is stuck; this is the state you want it in."
+          prereqs={employeesConfigured === false ? [PREREQUISITE.employees] : []}
+          compact={true}
+        />
+      </div>
+    )}
     {pending.map((l: any) => (
       <div class="lrow">
         <div class="lmeta">

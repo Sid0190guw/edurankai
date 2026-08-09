@@ -478,6 +478,42 @@ export type Permission =
   | 'learning.assign'
 
   // =============================================================================================
+  // LEARNING ADMINISTRATION. Four keys behind /admin/learning/*, and the derivation for each.
+  //
+  // WHAT IS DELIBERATELY NOT HERE. Creating, editing and publishing a course is ALREADY a
+  // capability: `lessons.author` and `lessons.publish`, held by INTERNAL_ROLE_KEYS — every
+  // non-applicant role — which is the exact population the four existing course editors admit with
+  // their `user.role === 'applicant'` test. Adding a fifth key meaning the same thing would give one
+  // authority two names, and the second name is the one nobody remembers to grant. The new catalogue
+  // screen asks for those two.
+  //
+  // THE POPULATION FOR ALL FOUR BELOW is super_admin + hr: the holders of `learning.assign`, who are
+  // the only accounts that reach /admin/hr/performance/learning today and the only ones that reach
+  // /admin/hr/training through the `training` section in ROLE_SECTIONS. Nobody gains a surface they
+  // could not already open; they gain actions that until now NOBODY could perform, because there was
+  // no screen for them anywhere in this codebase.
+  // =============================================================================================
+
+  // Read the learning record: progress per person and per cohort, and one person from inside the
+  // aggregate. A DEPARTMENT HEAD needs none of this to see their own department — that is a
+  // `department_head` edge in the Organization Graph, resolved per ROW by userHeadedDepartmentIds().
+  // This is the version that reaches the whole organization with no relationship at all.
+  | 'learning.progress.view'
+  // Record a completion by hand, and withdraw one. SENSITIVE: it is a statement about what a person
+  // did, it outlives the platform, and until this build nothing in this repository could write
+  // training_enrollments.completed_at at all.
+  | 'learning.completion.override'
+  // Issue a course certificate by hand, and withdraw one. SENSITIVE for the same reason, and more
+  // so: a certificate is the artefact a person shows somebody else. Withdrawal is recorded as a
+  // later fact rather than a deletion — course_certificates is a hash chain and removing a block
+  // would break verification for every certificate issued after it.
+  | 'learning.certificate.manage'
+  // Configure what counts as complete for a course: lessons viewed, an assessment passed, or a mark
+  // at or above a threshold. Not a statement about any one person, but it decides how everybody's
+  // completion is computed, which is why it is a key of its own rather than folded into authoring.
+  | 'learning.rules.manage'
+
+  // =============================================================================================
   // PROJECTS. TWO KEYS, AND NEITHER OF THEM MAKES ANYBODY A PROJECT MANAGER.
   //
   // READ THIS BEFORE GRANTING EITHER. "Runs this project" is an ORGANISATIONAL RELATIONSHIP — the
@@ -821,6 +857,13 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // comments already claims. Nobody but super_admin gains anything, and super_admin is unrestricted
     // in the section filter these pages also sit behind.
     'performance.manage', 'skills.manage', 'learning.assign',
+    // LEARNING ADMINISTRATION. The same population as `learning.assign` on the line above, because
+    // the derivation is the same one: super_admin and hr are the only accounts that reach the
+    // learning desk or the course catalogue today. Two of the four are SENSITIVE in the registry —
+    // they change a record of achievement, so granting them to a custom role fails unless the audit
+    // row naming the granter can be written.
+    'learning.progress.view', 'learning.completion.override',
+    'learning.certificate.manage', 'learning.rules.manage',
     // PROJECTS. The portfolio read and the project register. NEITHER makes the founder the manager
     // of any project — that is a `project_manager` edge in the Organization Graph, scoped to one
     // project, and /admin/projects resolves it per row exactly like every other surface here.
@@ -878,6 +921,13 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // is the only non-super_admin role that reaches /admin/hr/performance and /admin/hr/training
     // today. Exact population, named instead of spelled — nobody gains and nobody loses.
     'performance.manage', 'skills.manage', 'learning.assign',
+    // LEARNING ADMINISTRATION. Same population and same derivation as the line above: `hr` already
+    // holds the learning desk and the training section, and already reads every employee record.
+    // What these four add is the ability to CORRECT the record — mark a completion, revoke one,
+    // issue or withdraw a certificate, and say what counts as complete — which nobody in this
+    // product could do before, in any role, on any screen.
+    'learning.progress.view', 'learning.completion.override',
+    'learning.certificate.manage', 'learning.rules.manage',
     // PROJECTS. `hr` already holds the org-wide reads that a portfolio is made of — every employee
     // record (employee.manage), the whole claim queue (expenses.review), the purchasing record
     // (procurement.view) and aggregate reporting (analytics.view) — so a register of what the

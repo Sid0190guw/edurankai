@@ -495,6 +495,20 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   { id: 'roles', label: 'Roles', href: '/admin/roles', icon: 'briefcase', section: 'roles' },
   { id: 'team-roles', label: 'Custom Roles', href: '/admin/team/roles', icon: 'shield', section: 'team_roles' },
   { id: 'departments', label: 'Departments', href: '/admin/departments', icon: 'grid', section: 'departments' },
+  // THE ORGANISATION LAYER'S SECOND SURFACE, and until this entry it was reachable only by typing
+  // the URL or by finding it on the /admin/setup checklist. src/lib/org-structure.ts is the writer
+  // for org_teams, org_positions and org_employee_assignments — the tables src/lib/org-chart.ts
+  // reads to draw the Team dimension of /portal/organization — so a page nobody can find is a team
+  // dimension that stays structurally empty. Filed BESIDE Departments because they are the same
+  // layer (where a seat is, and who is in it) and on the SAME section key, so the population that
+  // is offered this link is exactly the population already offered Departments: no new disclosure.
+  //
+  // The section is the menu's gate, not the page's. middleware.ts has no PATH_SECTION entry for
+  // /admin/org, and the page guards itself — `admin.access` to read, `employee.manage` to change
+  // anything — so a reader without that capability gets the page in read-only form and is told so.
+  // It is NOT an authorization screen: posting somebody to a team grants nothing, capabilities
+  // still come from auth/permissions.ts and relationships from org-graph.ts.
+  { id: 'org-structure', label: 'Teams & Positions', href: '/admin/org/structure', icon: 'users', section: 'departments' },
   { id: 'events', label: 'Events', href: '/admin/events', icon: 'calendar', section: 'events' },
   { id: 'forms', label: 'Forms', href: '/admin/forms', icon: 'document', section: 'content' },
   { id: 'products', label: 'Products', href: '/admin/products', icon: 'package', section: 'products' },
@@ -511,6 +525,17 @@ export const ADMIN_NAV: AdminNavEntry[] = [
     ],
   },
   { id: 'content', label: 'Content Pages', href: '/admin/content', icon: 'document', section: 'content' },
+  // THE ONLY SURFACE THAT CAN PUT A MENTOR ON THE MARKETPLACE, and it had no entry here at all.
+  // /portal/mentors renders the grid and /portal/mentors/[slug] takes the booking, both linked from
+  // the portal — but `mentors` had no INSERT reachable from any menu, so the marketplace could only
+  // ever render empty and every booking screen was unreachable by construction. The page also holds
+  // the other half nobody could find: pendingSessions(), the queue where a booking request is
+  // answered. A request a learner can send and no admin is shown is the same broken promise.
+  //
+  // Gated on `content` because that mirrors the door: the page asks for `admin.access` to open and
+  // `content.edit` before it will create, verify or de-list anybody. middleware.ts has no
+  // PATH_SECTION entry for /admin/mentors, so the page's own guard is the lock and this is the menu.
+  { id: 'mentors', label: 'Mentor marketplace', href: '/admin/mentors', icon: 'users', section: 'content' },
   { id: 'knowledge', label: 'Knowledge', href: '/admin/knowledge', icon: 'grid', section: 'lms' },
   { id: 'assessments', label: 'Assessments', href: '/admin/assessments', icon: 'document', section: 'lms' },
   { id: 'tutor', label: 'AI Tutor (Ask Aquin)', href: '/admin/tutor', icon: 'chat', section: 'audit' },

@@ -901,13 +901,31 @@ export async function payWithdrawal(id: string, user: any, manualRef?: string): 
       // THE MONEY HAS LEFT AND THE LEDGER DOES NOT KNOW. Not swallowed: the request is marked paid so
       // nobody releases it a second time, and the caller is told the balance is now wrong.
       console.error('[hr-wallet] payout', id, 'was released but the wallet debit FAILED -', real);
-      await db.execute(sql`UPDATE hr_withdrawal SET status = 'paid', payout_ref = ${ref}, paid_at = NOW() WHERE id = ${id} AND status = 'paying'`).catch(() => {});
+      // THE MARK-PAID IS WHAT STOPS A SECOND RELEASE, so a failure here is the worse half of an
+      // already-bad outcome: the money has left, the ledger does not know, and now the request is
+      // still sitting at 'paying' where somebody may release it again. `.catch(() => {})` discarded
+      // that entirely. Still non-fatal — the caller is told the balance is wrong either way — but the
+      // reason reaches the log, and the sentence says which of the two states this ended in.
+      let stuckAtPaying = false;
+      try {
+        await db.execute(sql`UPDATE hr_withdrawal SET status = 'paid', payout_ref = ${ref}, paid_at = NOW() WHERE id = ${id} AND status = 'paying'`);
+      } catch (e2: any) {
+        stuckAtPaying = true;
+        console.error('[hr-wallet] payout', id, 'was released, the debit FAILED, and the request could'
+          + ' not be marked paid either - it is still at "paying" and can be released again:',
+          e2?.cause?.message || e2?.message);
+      }
       await hrAudit(user.id, 'hr.withdrawal.paid_debit_failed', String(id),
         { employeeId: w.employee_id, amount: Number(w.amount), currency: w.currency, paidVia, payoutRef: ref, error: real });
       return {
         ok: false,
         error: 'The payout was released but the wallet was NOT debited, so the balance now reads higher '
-          + 'than it is. Do not release it again — record the correction by hand. (' + (real || 'database error') + ')',
+          + 'than it is. Do not release it again — record the correction by hand.'
+          + (stuckAtPaying
+            ? ' This request could not be marked paid either, so it is still showing as being released:'
+              + ' do NOT use the release button on it.'
+              : '')
+          + ' (' + (real || 'database error') + ')',
       };
     }
   }

@@ -52,14 +52,30 @@ export const POST: APIRoute = async ({ request }) => {
     const order = await createOrder({ amountPaise: fx.paise, currency: 'INR', receipt: ('fdr_' + kind + '_' + Date.now()).slice(0, 40), notes: { kind, email, service: 'founder' } });
     if (!order.ok) return json({ ok: false, error: order.error }, 502);
     const bookingId = await createServicePending({ kind, name, email, phone, preferred, durationMin, note, docsUrl, orderId: order.order.id, amountPaise: fx.paise, currency: 'INR', paid: false });
-    await db.execute(sql`
-      INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, email, notes)
-      VALUES (${order.order.id}, ${fx.paise}, 'INR', 'created', ${'founder_' + kind}, 'founder', ${bookingId}, ${email},
-        ${sql.raw("'" + JSON.stringify({ kind, priceChf, name }).replace(/'/g, "''") + "'::jsonb")})
-    `).catch(() => {});
+    // THE PAYMENTS ROW IS NOT OPTIONAL, AND ITS FAILURE MUST NOT BE SWALLOWED.
+    //
+    // It ended in `.catch(() => {})`. This row is the money record: /api/founder/pay/verify marks it
+    // paid by order id, getRevenue() counts it, and /receipt/[order] renders from it. Its absence is
+    // also indistinguishable from "not refunded" in verify's terminal-state check. So a failed insert
+    // meant somebody paid for a consult that no revenue figure, receipt or refund could see.
+    //
+    // The pending booking above is already written and stays unpaid, which is the recoverable state.
+    try {
+      await db.execute(sql`
+        INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, email, notes)
+        VALUES (${order.order.id}, ${fx.paise}, 'INR', 'created', ${'founder_' + kind}, 'founder', ${bookingId}, ${email},
+          ${sql.raw("'" + JSON.stringify({ kind, priceChf, name }).replace(/'/g, "''") + "'::jsonb")})
+      `);
+    } catch (e: any) {
+      console.error('[founder/pay/create] order', order.order.id, 'could not be recorded for booking', bookingId,
+        '-', e?.cause?.message || e?.message);
+      return json({ ok: false, error: 'We could not start that payment just now, so nothing was charged. Try again in a moment.' }, 500);
+    }
     const inrLabel = '₹' + (fx.paise / 100).toLocaleString('en-IN', { maximumFractionDigits: 2 });
     return json({ ok: true, paid: true, orderId: order.order.id, keyId: getPublicKeyId(), amountPaise: fx.paise, currency: 'INR', name, email, priceLabel: priceChf + ' ' + f.currency, inrLabel });
   } catch (e: any) {
-    return json({ ok: false, error: e?.cause?.message || e?.message || 'could not start payment' }, 500);
+    // The database's reason is for the log, not for the buyer's screen.
+    console.error('[founder/pay/create]', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'We could not start that payment just now, so nothing was charged. Try again in a moment.' }, 500);
   }
 };

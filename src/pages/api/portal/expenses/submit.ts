@@ -35,14 +35,35 @@ export const POST: APIRoute = async ({ request, locals, redirect }) => {
   if (!user?.id) return redirect('/portal/login?next=' + encodeURIComponent(PAGE));
 
   let employeeId = '';
+  // THE CURRENCY IS RESOLVED HERE, WITH THE SUBJECT, AND FOR THE SAME REASON.
+  //
+  // It used to be `currency: s('currency')` — read straight off the posted form. Every other field
+  // that decides what happens to money is validated: employeeId comes from the session, `kind` and
+  // `category` are matched against allow-lists, and settlesAdvanceId is checked against this
+  // person's own advances. The currency was the one left trusting the body, and submitClaim() does
+  // not second-guess it (src/lib/expenses.ts: `String(input?.currency || 'INR').toUpperCase()` and
+  // nothing else) — so a crafted POST, or a page cached from another employee's session, wrote an
+  // arbitrary currency onto the claim.
+  //
+  // That figure is not cosmetic. On approval it is what hr_wallet_txn is credited in
+  // (src/lib/expenses.ts passes claim.currency), and hr-wallet.ts exists to stop two currencies
+  // being mixed in one balance. /admin/hr/payroll/claims sums a queue and labels the total with a
+  // currency; there is no exchange rate anywhere in this codebase. A claim in a currency the
+  // employee is not paid in is a number nobody can convert and an approver has no way to question.
+  //
+  // The page already renders the employee's own currency into a hidden field; this reads it from
+  // the record instead, in the same query that answers who is claiming.
+  let employeeCurrency = 'INR';
   try {
     const found = rowsOf(await db.execute(sql`
-      SELECT id FROM hr_employees WHERE user_id = ${user.id} AND is_active = true LIMIT 1`))[0]
+      SELECT id, currency FROM hr_employees WHERE user_id = ${user.id} AND is_active = true LIMIT 1`))[0]
       || rowsOf(await db.execute(sql`
-      SELECT id FROM hr_employees
+      SELECT id, currency FROM hr_employees
        WHERE (work_email = ${user.email} OR personal_email = ${user.email} OR email = ${user.email})
          AND is_active = true LIMIT 1`))[0];
     employeeId = found?.id ? String(found.id) : '';
+    const cur = String(found?.currency || '').trim().toUpperCase();
+    if (cur) employeeCurrency = cur.slice(0, 8);
   } catch (e: any) {
     // NOT SWALLOWED into a success. The cause goes to the log and the person is told nothing was
     // saved, rather than being shown a claim list that silently does not contain their claim.
@@ -70,7 +91,8 @@ export const POST: APIRoute = async ({ request, locals, redirect }) => {
     title: s('title'),
     description: s('description'),
     amount: s('amount'),
-    currency: s('currency'),
+    // NOT s('currency') — see the lookup above. The posted field is ignored.
+    currency: employeeCurrency,
     incurredOn: s('incurred_on'),
     travelFrom: s('travel_from'),
     travelTo: s('travel_to'),

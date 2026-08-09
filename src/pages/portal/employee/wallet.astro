@@ -75,9 +75,32 @@ if (Astro.request.method === 'POST' && employee) {
   return Astro.redirect('/portal/employee/wallet?msg=' + encodeURIComponent(flash));
 }
 
+// =================================================================================================
+// A ZERO BALANCE IS THREE DIFFERENT FACTS AND THIS PAGE PRINTED ONE NUMBER FOR ALL THREE
+// =================================================================================================
+//
+// getBalance() reads through hr-wallet's safe() helper, which logs a failed read and returns no
+// rows. The SUM over no rows is 0. So an unreachable pooler, a wallet ledger that has never had a
+// row written to it, and a genuinely spent-down wallet all rendered the same 44px currency zero at
+// the top of the page, with nothing underneath saying which. "You have no money" is not a sentence
+// a screen may produce from a read that did not complete.
+//
+// This probe asks one question the SUM cannot: can the ledger be read at all. It selects a single
+// row and throws it away - no ordering, no aggregate, nothing that can fail for a reason other than
+// the table being unreachable. The comparison is written the same way listTxns() writes it, with no
+// ::uuid cast, so it cannot fail on a type mismatch the real read would not have hit.
 const bal = employee
   ? await getBalance(employee.id)
   : { balance: 0, currency: 'INR', pending: 0, available: 0, otherCurrencies: [] };
+let ledgerReadable = true;
+if (employee) {
+  try {
+    await db.execute(sql`SELECT 1 FROM hr_wallet_txn WHERE employee_id = ${employee.id} LIMIT 1`);
+  } catch (e: any) {
+    ledgerReadable = false;
+    console.error('[portal/employee/wallet] wallet ledger unreadable -', e?.cause?.message || e?.message);
+  }
+}
 const txns = employee ? await listTxns(employee.id, 20) : [];
 const banks = employee ? await listBankAccounts(employee.id) : [];
 const withdrawals = employee ? await listWithdrawals({ employeeId: employee.id }) : [];
@@ -146,11 +169,45 @@ const statusColor: Record<string, string> = { pending: '#b45309', approved: '#25
   {employee && (<div>
     <div class="card" style="background:linear-gradient(160deg,#1a1510,#2b241b);color:#faf6ef;border:none;">
       <h3 style="color:rgba(250,246,239,.6);">Available balance</h3>
-      <div style="font-family:'Fraunces',serif;font-size:44px;font-weight:600;line-height:1;">{inr(bal.available)}</div>
-      <div style="display:flex;gap:22px;margin-top:14px;font-size:12px;">
-        <div><div style="color:rgba(250,246,239,.55);font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;">In wallet</div><div style="font-weight:700;margin-top:2px;">{inr(bal.balance)}</div></div>
-        <div><div style="color:rgba(250,246,239,.55);font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;">Pending withdrawal</div><div style="font-weight:700;margin-top:2px;color:#fbbf24;">{inr(bal.pending)}</div></div>
-      </div>
+
+      {!ledgerReadable && (
+        <div role="alert">
+          <div style="font-family:'Fraunces',serif;font-size:30px;font-weight:600;line-height:1.15;">Not known right now</div>
+          <p style="font-size:12.5px;line-height:1.6;color:rgba(250,246,239,.8);margin-top:10px;">
+            Your wallet ledger could not be read, so no balance is shown. This is deliberately not a
+            zero: money may well be in there. Nothing has been lost and nothing has been paid out.
+            Try again in a few minutes, and tell HR if it keeps happening.
+          </p>
+        </div>
+      )}
+
+      {ledgerReadable && (
+        <div>
+          <div style="font-family:'Fraunces',serif;font-size:44px;font-weight:600;line-height:1;">{inr(bal.available)}</div>
+          <div style="display:flex;gap:22px;margin-top:14px;font-size:12px;">
+            <div><div style="color:rgba(250,246,239,.55);font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;">In wallet</div><div style="font-weight:700;margin-top:2px;">{inr(bal.balance)}</div></div>
+            <div><div style="color:rgba(250,246,239,.55);font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;">Pending withdrawal</div><div style="font-weight:700;margin-top:2px;color:#fbbf24;">{inr(bal.pending)}</div></div>
+          </div>
+
+          {/* WHAT THE NUMBER COUNTS, BESIDE THE NUMBER. Three figures in a currency, with no period
+              and no source, are unreadable to somebody seeing them for the first time. */}
+          <p style="font-size:11.5px;line-height:1.6;color:rgba(250,246,239,.72);margin-top:12px;">
+            In wallet is everything credited to you since you joined, less everything already paid out.
+            Pending withdrawal is what you have asked for and is not yet decided; it is held back, which
+            is why available balance is the smaller figure and the only one you can withdraw against.
+          </p>
+
+          {bal.balance === 0 && bal.pending === 0 && (
+            <p style="font-size:12.5px;line-height:1.65;color:rgba(250,246,239,.85);margin-top:10px;border-top:1px solid rgba(250,246,239,.15);padding-top:10px;">
+              Your wallet was read and is genuinely empty. Nothing has been credited to it yet, and on
+              day one that is expected rather than wrong. Money reaches it in two ways: net pay, when a
+              payroll run that includes you is marked paid, and an expense claim or reimbursement, once
+              it is approved. If your engagement is unpaid, no payroll credit will ever arrive here and
+              a reimbursed expense is the only thing that will.
+            </p>
+          )}
+        </div>
+      )}
       {/* Money held in another currency is never added into the balance above — there is no exchange
           rate in this system — but it must not be invisible either, or an employee is simply not
           shown money that is theirs. */}
@@ -192,6 +249,15 @@ const statusColor: Record<string, string> = { pending: '#b45309', approved: '#25
     </div>)}
 
     <div class="card"><h3>Bank accounts</h3>
+      {/* A HEADING OVER NOTHING. With no account on file this card rendered its title and then an
+          empty body with a disclosure toggle under it, which reads as a list that failed to load. */}
+      {banks.length === 0 && (
+        <p style="font-size:13px;color:#6b6255;line-height:1.6;">
+          No bank account is on file for you yet. Nothing is wrong and nobody is waiting on you: an
+          account is needed only when there is money in your wallet to withdraw, and it is used for
+          nothing else. Add one now or when the first credit appears, using the form below.
+        </p>
+      )}
       {banks.map((b: any) => (
         <div class="ledger"><div><div style="font-weight:600;">{b.bank_name || 'Bank'} · {b.account_masked || b.upi_id}</div><div style="font-size:11px;color:#6b6255;">{b.holder}{b.ifsc ? ' · ' + b.ifsc : ''}</div></div>{b.is_primary && <span class="pill" style="color:#059669;background:#05966918;">primary</span>}</div>
       ))}
@@ -208,7 +274,19 @@ const statusColor: Record<string, string> = { pending: '#b45309', approved: '#25
     </div>
 
     <div class="card"><h3>Transactions</h3>
-      {txns.length === 0 && <p style="font-size:13px;color:#6b6255;">No transactions yet. Salary and reimbursements appear here.</p>}
+      {!ledgerReadable && (
+        <p role="alert" style="font-size:13px;color:#92400e;line-height:1.6;">
+          Your transactions could not be read, so none are listed. This is not a statement that there
+          are none. Try again shortly.
+        </p>
+      )}
+      {ledgerReadable && txns.length === 0 && (
+        <p style="font-size:13px;color:#6b6255;line-height:1.6;">
+          This ledger was read and has no entries. Every credit and every payout appears here in the
+          order it happened, from the day you joined onwards, so an empty list means no money has moved
+          either way yet.
+        </p>
+      )}
       {txns.map((t: any) => (
         <div class="ledger">
           <div><div style="font-weight:600;text-transform:capitalize;">{t.kind}{t.note ? ' · ' + t.note : ''}</div><div style="font-size:11px;color:#6b6255;">{new Date(t.created_at).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}</div></div>

@@ -1,0 +1,438 @@
+---
+// /admin/setup — CAN SOMEBODY WHO HAS NEVER SEEN THIS PRODUCT OPERATE IT ON DAY ONE?
+//
+// WHY THIS PAGE EXISTS. Every other pass on this console fixed faults. This one answers a different
+// question: a person signs in for the first time, against a database with almost nothing in it, and
+// has to work out what to do. Until now the answer was nowhere. There was no first-run surface of
+// any kind; grep across src/pages/admin and src/lib for "setup", "first-run" or "getting started"
+// returned only unrelated prose. The dashboard offered "New Role", "Add Employee", "Leave Requests"
+// and "Run Payroll" as unordered peers, and nothing anywhere said that departments come before
+// employees, that employees come before the organization graph, or that a payroll run cannot be
+// undone. Eleven admin pages, and no statement of which one to open first.
+//
+// TWO THINGS ARE ON THIS PAGE AND THEY ARE DIFFERENT PROBLEMS.
+//
+//   1. THE ORDER. Six steps, in the order they have to be done, each with a live count, each saying
+//      what stays broken until it is done. The count comes from src/lib/day-one.ts, which reads one
+//      COUNT per step behind safeRows so a single missing table cannot blank the whole checklist —
+//      and a missing table is reported as "not set up yet", which is what it means, rather than as
+//      an outage.
+//
+//   2. WHAT EXISTS AT ALL. The sidebar in src/layouts/AdminLayout.astro is a hand-maintained list
+//      that has drifted from src/lib/admin-nav.ts, the module written to replace it: forty-nine
+//      hrefs in admin-nav.ts are absent from the rendered sidebar, and three live pages
+//      (/admin/org/structure, /admin/hr/payroll/components, /admin/hr/payroll/claims) are in
+//      NEITHER list. A first-time operator cannot find roughly a third of the product and nothing
+//      on any screen tells them it is there. This pass may not edit src/layouts/, so the fix here is
+//      a reachable index: the directory below is built from admin-nav.ts through buildAdminNav(),
+//      which filters per person and fails closed, plus the three screens that are in no list at all.
+//      It does not widen anybody's access — the middleware and each page's own gate still decide —
+//      it only stops the product hiding from the people who own it.
+//
+// NO DATABASE WRITE HAPPENS ON THIS PAGE, and no DDL. It counts and it links. Where the next action
+// is a migration this console does not perform, it prints the command for a human to run rather
+// than offering a button that pretends to.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import DayOne from '@/components/admin/DayOne.astro';
+import { readSetupStatus, outstandingSteps, uncheckableSteps, type SetupStatus } from '@/lib/day-one';
+import { buildAdminNav, isNavGroup, type AdminNavEntry, type AdminNavItem } from '@/lib/admin-nav';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { clip } from '@/lib/page-safety';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+// -------------------------------------------------------------------------------------------------
+// CONSTANTS FIRST. `const` is not hoisted; a binding declared under its first reader has taken pages
+// down on this project.
+// -------------------------------------------------------------------------------------------------
+const CARD = 'background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:16px 18px;';
+const HD = "font-size:10.5px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.12em;font-weight:700;margin:0 0 10px;";
+
+// THE CHECKLIST. Never throws; a step it could not count says so rather than reading as "not done".
+const statuses: SetupStatus[] = await readSetupStatus();
+const todo = outstandingSteps(statuses);
+const unknown = uncheckableSteps(statuses);
+const doneCount = statuses.filter((s) => s.state === 'done').length;
+
+/** The org-graph step, singled out because it is the prerequisite that halts the most modules. */
+const graphStatus = statuses.find((s) => s.step.id === 'orgGraph') || null;
+
+// THE DIRECTORY. buildAdminNav() answers for THIS person and fails closed on any error — no session,
+// a degraded permission resolve, a thrown query all return Dashboard and Notifications only, never
+// the full tree. A menu that opens up when the database blinks is the same mistake as a gate that
+// does, so the failure mode here is a short list, not a long one.
+let navEntries: AdminNavEntry[] = [];
+let navError = '';
+try {
+  navEntries = await buildAdminNav(user as any, { locals: Astro.locals });
+} catch (e: any) {
+  navError = String(e?.cause?.message || e?.message || 'unknown error');
+  console.error('[admin/setup] admin nav could not be built -', navError);
+}
+
+/** Flatten the tree into { group, items } for a printed index rather than a menu. */
+const directory: { label: string; items: AdminNavItem[] }[] = [];
+const loose: AdminNavItem[] = [];
+for (const entry of navEntries) {
+  if (isNavGroup(entry)) {
+    if (entry.children.length) directory.push({ label: entry.label, items: entry.children });
+  } else {
+    loose.push(entry as AdminNavItem);
+  }
+}
+if (loose.length) directory.unshift({ label: 'Always available', items: loose });
+
+// THE THREE SCREENS THAT ARE IN NEITHER NAVIGATION LIST. Each is gated on the section its own page
+// and the middleware already require, so listing it here reveals nothing a person could not reach by
+// typing the URL — and hides it from anybody who could not.
+const mayHr = await canAccessSection(user as any, 'hr', 'view');
+const mayPayroll = await canAccessSection(user as any, 'payroll', 'view');
+const unlisted: { href: string; label: string; note: string; show: boolean }[] = [
+  {
+    href: '/admin/org/structure',
+    label: 'Organization structure',
+    note: 'Teams, positions and who sits in them. Referenced by no menu and by no other page — reachable today only by typing this URL. Read the note under "The organization graph" below before using it: it does NOT record reporting relationships.',
+    show: mayHr,
+  },
+  {
+    href: '/admin/hr/payroll/components',
+    label: 'Salary components',
+    note: 'What a payroll run deducts. In neither navigation list, and a run created before it is configured deducts nothing and cannot be regenerated.',
+    show: mayPayroll,
+  },
+  {
+    href: '/admin/hr/payroll/claims',
+    label: 'Expense claims',
+    note: 'Claim review. In neither navigation list; linked only from the payroll tab strip.',
+    show: mayPayroll,
+  },
+];
+const unlistedVisible = unlisted.filter((u) => u.show);
+
+/** One line per step for the header summary, without ever printing a count we could not read. */
+function stepCountWords(s: SetupStatus): string {
+  if (s.state === 'unknown' || s.count === null) return 'could not be counted';
+  if (s.count === 0) return 'none yet';
+  return s.count + ' ' + s.step.unit + (s.count === 1 ? '' : 's');
+}
+---
+<AdminLayout title="Set up the platform" activeNav="dashboard">
+  <div class="setup-wrap">
+
+    <div class="setup-head">
+      <p class="setup-eyebrow">First run</p>
+      <h1 class="setup-title">Set up the platform</h1>
+      <p class="setup-sub">
+        Six things, in this order. Each one says what stops working until it is done. The counts
+        beside them are read live: a step that could not be counted says so rather than showing you a
+        zero it cannot stand behind.
+      </p>
+    </div>
+
+    {unknown.length > 0 && (
+      <div class="setup-alert setup-alert-bad">
+        <p>
+          {unknown.length === 1 ? 'One step could not be checked' : unknown.length + ' steps could not be checked'},
+          so this page does not know whether {unknown.length === 1 ? 'it has' : 'they have'} been done.
+          Treat the checklist below as incomplete rather than as an answer.
+        </p>
+        <ul>
+          {unknown.map((s) => (
+            <li><strong>{s.step.label}</strong> — {clip(s.error || 'unknown database error', 240)}</li>
+          ))}
+        </ul>
+      </div>
+    )}
+
+    {unknown.length === 0 && todo.length === 0 && (
+      <div class="setup-alert setup-alert-ok">
+        <p>
+          Every required step has something recorded against it. That is not the same as being
+          finished — one department and one employee satisfy this checklist — but nothing below is
+          blocking a whole module any more.
+        </p>
+      </div>
+    )}
+
+    {todo.length > 0 && (
+      <div class="setup-alert setup-alert-todo">
+        <p>
+          {doneCount} of {statuses.length} steps have something recorded.
+          Start at <a href={todo[0].step.href}>{todo[0].step.label}</a> — it is the earliest one with
+          nothing in it, and the steps under it depend on it.
+        </p>
+      </div>
+    )}
+
+    <ol class="setup-list">
+      {statuses.map((s) => (
+        <li class={'setup-step ' + (s.state === 'done' ? 'is-done' : s.state === 'unknown' ? 'is-unknown' : 'is-todo')}>
+          <div class="setup-step-head">
+            <span class="setup-num" aria-hidden="true">{s.step.order}</span>
+            <div class="setup-step-title">
+              <h2>{s.step.label}{s.step.optional ? ' (only if you need it)' : ''}</h2>
+              <p class="setup-count">{stepCountWords(s)}</p>
+            </div>
+            <span class={'setup-badge ' + (s.state === 'done' ? 'b-done' : s.state === 'unknown' ? 'b-unknown' : 'b-todo')}>
+              {s.state === 'done' ? 'recorded' : s.state === 'unknown' ? 'unknown' : 'not yet'}
+            </span>
+          </div>
+
+          <p class="setup-why">{s.step.why}</p>
+          <p class="setup-blocks"><strong>Until this exists:</strong> {s.step.blocks}</p>
+
+          {s.state === 'unknown' && s.error && (
+            <p class="setup-reason">{clip(s.error, 300)}</p>
+          )}
+
+          <p class="setup-do"><a href={s.step.href}>{s.step.action}</a></p>
+        </li>
+      ))}
+    </ol>
+
+    <!-- =========================================================================================
+         THE ORGANIZATION GRAPH — the prerequisite that halts a dozen modules, explained on a screen
+         that is actually reachable. Until now the only place it was named was a sentence repeated
+         verbatim on fifteen admin pages, every one of which is missing from the rendered sidebar.
+         ========================================================================================= -->
+    <section id="org-graph" class="setup-section">
+      <p style={HD}>The organization graph</p>
+
+      {graphStatus && graphStatus.state === 'unknown' ? (
+        <DayOne
+          state="unreadable"
+          thing="The organization graph"
+          error={graphStatus.error}
+        />
+      ) : graphStatus && graphStatus.state === 'todo' ? (
+        <DayOne
+          state="unconfigured"
+          thing="The organization graph"
+          unconfiguredBody="It carries no active relationship, so no approval anywhere in this product has anybody to route to."
+        />
+      ) : (
+        <div class="setup-alert setup-alert-ok">
+          <p>
+            The graph carries {graphStatus && graphStatus.count !== null ? graphStatus.count : 'some'} active
+            relationship{graphStatus && graphStatus.count === 1 ? '' : 's'}. Approvals can resolve an
+            owner. That does not mean every person has a manager — a screen that says nobody is
+            recorded for one employee is telling you about that employee, not about the graph.
+          </p>
+        </div>
+      )}
+
+      <div class="setup-prose">
+        <h3>What it is</h3>
+        <p>
+          Relationships in this product are per-row facts between two employee records — this person
+          reports to that person, this person heads that department, this person may approve for that
+          scope. They are never read from an account role. That is deliberate and it is why a "manager"
+          role name grants nobody any authority over anybody.
+        </p>
+
+        <h3>What records a relationship today, and what does not</h3>
+        <p>
+          One screen in this console writes to the graph: assigning a manager to a project on a
+          project's own page records a <em>project manager</em> relationship. Nothing else does.
+          <strong> Reporting manager, department head, approval owner and delegate have no screen at
+          all</strong> — they are seeded from the employee records by a migration, listed below, that a
+          person runs by hand.
+        </p>
+        <p class="setup-warn">
+          <strong>/admin/org/structure is not this.</strong> It records teams, positions and who sits
+          in them, in a separate set of tables. Building the whole structure there leaves the graph
+          exactly as empty as it was, and every screen that says the organization graph is not set up
+          will keep saying it. Two different things are called "the org" and only one of them routes
+          an approval.
+        </p>
+
+        <h3>How it is seeded</h3>
+        <p>
+          By running these against the database, in this order, as the person who holds the
+          credentials. This console does not run them and there is no button here that claims to:
+          they write rows to production, and the established pattern on this project is that a
+          migration is handed over rather than fired from a web page.
+        </p>
+        <pre class="setup-cmd">psql "$DATABASE_URL" -f db/org-graph-schema.sql
+psql "$DATABASE_URL" -f db/org-graph-backfill.sql
+psql "$DATABASE_URL" -f db/org-graph-validate.sql</pre>
+        <p>
+          Read the output of the third one. It is the only thing that tells you the second one did
+          what it was supposed to: a green message from a script proves the script ran, not that it
+          did the intended work against the intended database. If it reports cycles, orphans or
+          unmapped managers, fix those and run the backfill and the validation again.
+          <code>db/org-graph-rollback.sql</code> undoes it.
+        </p>
+        <p>
+          The backfill reads <code>hr_employees.reporting_manager_id</code>, so it can only seed
+          relationships for employees who already have a manager recorded on their employment tab. If
+          step 2 above is still empty, running it now will insert nothing.
+        </p>
+      </div>
+    </section>
+
+    <!-- =========================================================================================
+         BEFORE THE FIRST PAYROLL RUN. Its own block because it is the one action on this console
+         that cannot be undone, and the only screen offering it is a screen a curious operator opens
+         on their first afternoon.
+         ========================================================================================= -->
+    <section class="setup-section">
+      <p style={HD}>Before the first payroll run</p>
+      <div class="setup-prose">
+        <p class="setup-warn">
+          A payroll run cannot be regenerated, deleted or voided anywhere in this product. Creating
+          one for a month permanently consumes that month: a second run for the same period is
+          refused. Do not press Run Payroll to see what it does.
+        </p>
+        <p>Before the first run, in this order:</p>
+        <ul>
+          <li><a href="/admin/hr/employees">Employee records exist</a> and each person who is to be paid is active.</li>
+          <li><a href="/admin/hr/payroll?tab=salary">Pay is recorded</a> for each of them. A run refuses to write a payslip for anybody with no base salary and no salary structure, and lists them by name instead of paying them a zero that balances.</li>
+          <li><a href="/admin/hr/payroll/components">Salary components are configured</a>. A run applies exactly what is configured and assumes nothing, so a run created before this deducts no provident fund, no state insurance, no professional tax and no withholding — and cannot be redone afterwards.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- =========================================================================================
+         THE DIRECTORY.
+         ========================================================================================= -->
+    <section class="setup-section">
+      <p style={HD}>Everything you can open</p>
+      <p class="setup-sub" style="margin-top:0;">
+        The sidebar does not list every screen you have access to. This is the full set for your
+        account, built from the permission registry. A screen you cannot open is not listed here and
+        listing one here would not let you open it — the page and the middleware still decide.
+      </p>
+
+      {navError && (
+        <DayOne
+          state="unreadable"
+          thing="Your menu"
+          error={navError}
+        />
+      )}
+
+      {unlistedVisible.length > 0 && (
+        <div class="setup-alert setup-alert-todo">
+          <p><strong>In no menu at all.</strong> These are live screens that neither navigation list
+          carries, so nothing in the product would ever have shown them to you.</p>
+          <ul>
+            {unlistedVisible.map((u) => (
+              <li><a href={u.href}>{u.label}</a> — {u.note}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {directory.map((g) => (
+        <div class="setup-dirgroup">
+          <h3 class="setup-dirhead">{g.label}</h3>
+          <ul class="setup-dirlist">
+            {g.items.map((it) => (
+              <li><a href={it.href}>{it.label}</a></li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </section>
+
+  </div>
+
+  <style>
+    /* 360px first. One column, 44px targets, nothing with a fixed width. */
+    .setup-wrap { max-width: 900px; margin: 0 auto; padding: 20px 16px 90px; }
+    .setup-head { margin-bottom: 16px; }
+    .setup-eyebrow {
+      font-size: 10px; font-family: 'Geist Mono', monospace; color: #FF7040;
+      letter-spacing: 0.14em; text-transform: uppercase; margin: 0 0 5px;
+    }
+    .setup-title { font-size: 22px; font-weight: 800; color: #fff; margin: 0 0 6px; letter-spacing: -0.01em; }
+    .setup-sub { font-size: 13px; color: #8a8a94; line-height: 1.65; margin: 0 0 4px; }
+
+    .setup-alert { border-radius: 12px; padding: 13px 15px; margin: 0 0 16px; font-size: 12.5px; line-height: 1.65; }
+    .setup-alert p { margin: 0; }
+    .setup-alert ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }
+    .setup-alert a { color: inherit; text-decoration: underline; text-underline-offset: 3px; font-weight: 700; }
+    .setup-alert-bad { background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.32); color: #fca5a5; }
+    .setup-alert-todo { background: rgba(245,158,11,0.07); border: 1px solid rgba(245,158,11,0.30); color: #fcd34d; }
+    .setup-alert-ok { background: rgba(16,185,129,0.07); border: 1px solid rgba(16,185,129,0.26); color: #6ee7b7; }
+
+    .setup-list { list-style: none; margin: 0 0 24px; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+    .setup-step { background: #0f0f14; border: 1px solid #1a1a1f; border-left: 3px solid #26262c; border-radius: 12px; padding: 14px 15px; }
+    .setup-step.is-todo { border-left-color: #f59e0b; }
+    .setup-step.is-done { border-left-color: #10b981; }
+    .setup-step.is-unknown { border-left-color: #ef4444; }
+    .setup-step-head { display: flex; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+    .setup-num {
+      flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%; background: #15151a;
+      border: 1px solid #26262c; color: #8a8a94; font-family: 'Geist Mono', monospace;
+      font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+    }
+    .setup-step-title { flex: 1 1 180px; min-width: 0; }
+    .setup-step-title h2 { font-size: 14.5px; font-weight: 700; color: #fff; margin: 0; overflow-wrap: anywhere; }
+    .setup-count { font-size: 11.5px; color: #8a8a94; margin: 2px 0 0; font-family: 'Geist Mono', monospace; }
+    .setup-badge {
+      flex: 0 0 auto; font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+      padding: 3px 8px; border-radius: 100px; font-family: 'Geist Mono', monospace;
+    }
+    .b-done { background: rgba(16,185,129,0.14); color: #6ee7b7; }
+    .b-todo { background: rgba(245,158,11,0.14); color: #fcd34d; }
+    .b-unknown { background: rgba(239,68,68,0.14); color: #fca5a5; }
+    .setup-why { font-size: 12.5px; color: #8a8a94; line-height: 1.65; margin: 10px 0 0; overflow-wrap: anywhere; }
+    .setup-blocks { font-size: 12.5px; color: #b8b8c0; line-height: 1.65; margin: 7px 0 0; overflow-wrap: anywhere; }
+    .setup-blocks strong { color: #fcd34d; }
+    .setup-reason {
+      margin: 8px 0 0; font-family: 'Geist Mono', monospace; font-size: 11px; color: #f87171;
+      background: rgba(0,0,0,0.28); border-radius: 6px; padding: 7px 9px; overflow-wrap: anywhere;
+    }
+    .setup-do { margin: 4px 0 0; }
+    .setup-do a {
+      display: inline-flex; align-items: center; min-height: 44px; color: #FF7040;
+      font-size: 13px; font-weight: 600; text-decoration: underline; text-underline-offset: 3px;
+    }
+
+    .setup-section { margin: 0 0 24px; }
+    .setup-prose { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 15px 16px; }
+    .setup-prose h3 { font-size: 13px; font-weight: 700; color: #fff; margin: 16px 0 6px; }
+    .setup-prose h3:first-child { margin-top: 0; }
+    .setup-prose p { font-size: 12.5px; color: #8a8a94; line-height: 1.7; margin: 0 0 8px; overflow-wrap: anywhere; }
+    .setup-prose ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 8px; }
+    .setup-prose li { font-size: 12.5px; color: #8a8a94; line-height: 1.7; overflow-wrap: anywhere; }
+    .setup-prose a { color: #FF7040; text-decoration: underline; text-underline-offset: 3px; }
+    .setup-prose strong { color: #d8d8de; }
+    .setup-prose em { color: #d8d8de; font-style: normal; font-weight: 600; }
+    .setup-prose code {
+      font-family: 'Geist Mono', monospace; font-size: 11.5px; color: #cfd6da;
+      background: #15151a; border: 1px solid #26262c; border-radius: 4px; padding: 1px 5px;
+    }
+    .setup-warn { color: #fcd34d !important; }
+    /* A command line must never be clipped or reflowed into something that is no longer the command.
+       It scrolls inside its own box; the page never scrolls sideways. */
+    .setup-cmd {
+      font-family: 'Geist Mono', monospace; font-size: 11.5px; color: #cfd6da; background: #08080a;
+      border: 1px solid #26262c; border-radius: 8px; padding: 11px 12px; margin: 0 0 10px;
+      overflow-x: auto; white-space: pre; line-height: 1.8;
+    }
+
+    .setup-dirgroup { margin-top: 14px; }
+    .setup-dirhead {
+      font-size: 10.5px; font-family: 'Geist Mono', monospace; color: #8a8a94; font-weight: 700;
+      letter-spacing: 0.12em; text-transform: uppercase; margin: 0 0 6px;
+    }
+    .setup-dirlist { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr; gap: 2px; }
+    .setup-dirlist a {
+      display: flex; align-items: center; min-height: 44px; padding: 0 10px;
+      background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 8px;
+      color: #cfd6da; font-size: 12.5px; text-decoration: none; overflow-wrap: anywhere;
+    }
+    .setup-dirlist a:hover { background: #15151c; border-color: #2a2a33; color: #fff; }
+    .setup-dirlist a:focus-visible { outline: 2px solid #FF7040; outline-offset: 2px; }
+
+    @media (min-width: 720px) {
+      .setup-wrap { padding: 26px 22px 90px; }
+      .setup-dirlist { grid-template-columns: 1fr 1fr; gap: 6px; }
+    }
+  </style>
+</AdminLayout>

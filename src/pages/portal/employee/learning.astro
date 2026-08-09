@@ -5,20 +5,35 @@
 // WHAT THIS PAGE IS
 // =================================================================================================
 //
-//   Path        the courses assigned to this person, with their REAL progress and a link into the
-//               existing course player at /portal/courses/<slug>.
-//   Skills      what they can do, at what level, with evidence. Their own to record; a manager or
-//               the people team may assess it.
+//   Path        the courses assigned to this person, IN ORDER, with the real progress, the next
+//               lesson by name, and a door into the player that can actually render it.
+//   Records     what they have completed and what each completion rests on.
+//   Skills      what they can do, at what level, and whether that level was checked or stated.
 //   Calendar    scheduled training sessions, and a sign-up.
 //
-// IT REUSES THE COURSE ENGINE AND BUILDS NO SECOND ONE. training_courses, training_lessons and
-// training_enrollments are the existing machinery; certificates come through src/lib/certificates.ts,
-// which owns the hash-chained ledger. This page links into /portal/courses rather than reimplementing
-// a player, and src/lib/performance-learning.ts explains exactly which gap the one new table fills.
+// IT BUILDS NO SECOND COURSE ENGINE AND NO THIRD ONE. training_courses, training_lessons and
+// training_enrollments are the existing machinery. The percentage on this page is not this page's
+// arithmetic: it comes from src/lib/learning-progress.ts, which counts a lesson once across every
+// completion table both players write, so the figure here is the figure the course shows. Where the
+// next lesson is and which player can render it comes from src/lib/learning-doors.ts. Completion
+// records come through src/lib/certificates.ts, which owns the hash-chained ledger.
 //
-// EduRankAI IS THE TECHNOLOGY PLATFORM. Courses here are internal training. Accredited partners award
-// credentials; nothing on this page claims otherwise, and the certificate wording says what the
-// certificate is.
+// A DOOR, NOT A DUPLICATE LISTING. The link on an assigned course goes to the next unfinished lesson
+// — into the AquinTutor runner when the course is authored in blocks, because the portal player
+// renders those lessons blank, and into the portal player otherwise.
+//
+// =================================================================================================
+// THREE EMPTY STATES, THREE DIFFERENT SENTENCES
+// =================================================================================================
+//
+//   nothing assigned yet        a real, quiet answer. Nobody has asked you to do anything.
+//   assigned and not started    work is waiting, and the page says where to begin.
+//   we could not read this      OUR FAULT, said plainly. This one used to render identically to the
+//                               first, which is how an unconfigured surface became indistinguishable
+//                               from a broken one across this whole product.
+//
+// EduRankAI IS THE TECHNOLOGY PLATFORM. A completion here is a record of work done on this platform.
+// Accredited partners award credentials; no string on this page says or implies otherwise.
 //
 // =================================================================================================
 // POST-REDIRECT-GET, EVERY CONST ABOVE THE HANDLER, NO CLIENT JAVASCRIPT
@@ -26,13 +41,13 @@
 //
 // `const` is not hoisted and a handler reaching a later declaration throws on its first line while
 // the page reports success — that has taken pages down here. Tabs are links; disclosure is native
-// <details>. Mobile first at 360px with a 44px touch floor, and the page never scrolls sideways.
+// <details>; every control is a form. Mobile first: one column at 360px, 44px targets.
 import { composeWorkspace } from '@/lib/workforce/composer';
 import { resolvePerfViewer, LEARNING_ASSIGN, SKILLS_MANAGE } from '@/lib/performance-scope';
 import {
-  learningPathFor,
+  learningPathRead,
   learningForEmployees,
-  certificatesFor,
+  certificatesRead,
   listTrainingEvents,
   setTrainingSignup,
   assignCourse,
@@ -43,6 +58,12 @@ import {
   type TrainingEvent,
   type CourseOption,
 } from '@/lib/performance-learning';
+import {
+  doorsFor,
+  passedAssessmentsFor,
+  type CourseDoor,
+  type AssessmentPass,
+} from '@/lib/learning-doors';
 import {
   listSkills,
   skillsForEmployee,
@@ -56,12 +77,10 @@ import {
 
 const PATH = '/portal/employee/learning';
 
-const user = Astro.locals.user;
-if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
-
 // ---- Constants and helpers, ALL declared above the POST handler ----------------------------------
 const VIEWS = [
   { key: 'path', label: 'My learning' },
+  { key: 'records', label: 'Completed' },
   { key: 'skills', label: 'Skills' },
   { key: 'calendar', label: 'Training calendar' },
 ] as const;
@@ -77,11 +96,31 @@ const fmtWhen = (iso: string | null) =>
     day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
   }) : '';
 
-const STATE_LABELS: Record<string, string> = {
-  not_started: 'Not started',
-  in_progress: 'In progress',
-  complete: 'Complete',
+/** Plain functions rather than typed maps — a Record<string,string> read inside JSX breaks parsing. */
+const stateLabel = (s: string): string =>
+  s === 'complete' ? 'Complete' : s === 'in_progress' ? 'In progress' : 'Not started';
+
+const sourceLabel = (s: string): string => SKILL_SOURCE_LABELS[s] || s;
+
+/** Was this level CHECKED against a record, or is it somebody's word? Both are worth having. */
+const isEvidenced = (s: string): boolean => s === 'course' || s === 'assessment';
+
+/**
+ * The order a learner should work in: what is late, then what is required, then the rest, then what
+ * is already done. A learning path that is only a set leaves somebody to guess where to start.
+ */
+const rankOf = (i: LearningItem): number =>
+  i.state === 'complete' ? 3 : i.overdue ? 0 : i.required ? 1 : 2;
+
+/** How much of a course is finished, in lessons, when the lessons are known. */
+const lessonLine = (i: LearningItem): string => {
+  if (i.totalLessons > 0) return i.lessonsCompleted + ' of ' + i.totalLessons + ' lessons finished';
+  if (i.progressPct === null) return 'Not opened yet';
+  return Math.round(i.progressPct) + '% recorded';
 };
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
 
 let composed: any = null;
 try {
@@ -115,12 +154,27 @@ if (Astro.request.method === 'POST') {
   }
 
   if (action === 'set_skill') {
+    // EVIDENCE IS A REFERENCE, NOT A SENTENCE. The form sends what the level rests on; skills.ts
+    // re-reads that completion or that attempt against this person's own record and refuses the
+    // write if it is not there. Nothing here decides that a level is "evidenced".
+    //
+    // ONE control, so the kind and the reference cannot be told apart by the person filling it in:
+    // the option value carries both, as "course|<id>" or "assessment|<id>". A pair that does not
+    // parse is treated as no evidence at all rather than guessed at.
+    const picked = String(fd.get('evidence_pick') || '');
+    const bar = picked.indexOf('|');
+    const kindRaw = bar > 0 ? picked.slice(0, bar) : '';
+    const refRaw = bar > 0 ? picked.slice(bar + 1) : '';
+    const evidenceRef = (kindRaw === 'course' || kindRaw === 'assessment') && refRaw
+      ? { kind: kindRaw as 'course' | 'assessment', id: refRaw }
+      : null;
     const r = await setEmployeeSkill(viewer, {
       employeeId: String(fd.get('employee_id') || viewer.employeeId),
       skillId: String(fd.get('skill_id') || ''),
       level: Number(fd.get('level') || 1),
       evidence: String(fd.get('evidence') || ''),
       evidenceUrl: String(fd.get('evidence_url') || ''),
+      evidenceRef,
       // `skills.manage`, resolved from the composed context and handed down. NOT viewer.managesOrg,
       // which carries `performance.manage` — a different capability held by the same roles today, so
       // reading the wrong one would work perfectly until somebody granted one without the other.
@@ -170,15 +224,80 @@ const requested = String(params.get('view') || 'path');
 const view = (VIEWS as readonly { key: string }[]).some((v) => v.key === requested) ? requested : 'path';
 const msg = String(params.get('msg') || '').slice(0, 300);
 
+// THE READ STATE TRAVELS WITH THE LIST. An empty array is two different facts and this page has to
+// tell them apart before it writes a sentence about them.
+let pathRead: 'ok' | 'unreadable' = 'ok';
 let path: LearningItem[] = [];
+let ordered: LearningItem[] = [];
+let doors: Record<string, CourseDoor> = {};
 let teamPath: LearningItem[] = [];
-let certificates: CertificateRow[] = [];
 let courses: CourseOption[] = [];
+
+if ((view === 'path' || view === 'records' || view === 'skills') && viewer.employeeId) {
+  const r = await learningPathRead(viewer.employeeId);
+  pathRead = r.read;
+  path = r.items;
+  ordered = path.slice().sort((a, b) => {
+    const d = rankOf(a) - rankOf(b);
+    if (d !== 0) return d;
+    return String(a.dueOn || '9999-12-31').localeCompare(String(b.dueOn || '9999-12-31'));
+  });
+}
+
 if (view === 'path' && viewer.employeeId) {
-  path = await learningPathFor(viewer.employeeId);
-  certificates = await certificatesFor(viewer.userId);
+  doors = await doorsFor(viewer.userId, ordered.map((i) => i.courseId));
   if (viewer.reportIds.length > 0) teamPath = await learningForEmployees(viewer.reportIds);
   if (viewer.reportIds.length > 0 || canAssignOrg) courses = await courseOptions();
+}
+
+let certRead: 'ok' | 'unreadable' = 'ok';
+let certificates: CertificateRow[] = [];
+let assessments: AssessmentPass[] = [];
+let assessRead: 'ok' | 'absent' | 'unreadable' = 'ok';
+if (view === 'records' || view === 'skills') {
+  const c = await certificatesRead(viewer.userId);
+  certRead = c.read;
+  certificates = c.items;
+  const a = await passedAssessmentsFor(viewer.userId);
+  assessments = a.items;
+  assessRead = a.read;
+}
+
+// WHAT EACH COMPLETION RESTS ON, built without a second reader of anything: the lesson counts come
+// from the assignment rows that already carry them, and the record number from the ledger's owner.
+const certByCourse = new Map<string, CertificateRow>();
+for (const c of certificates) if (c.courseId) certByCourse.set(c.courseId, c);
+
+const completions = ordered
+  .filter((i) => i.state === 'complete')
+  .map((i) => {
+    const cert = certByCourse.get(i.courseId) || null;
+    return {
+      key: i.courseId,
+      courseId: i.courseId as string | null,
+      title: i.courseTitle,
+      when: i.completedAt,
+      lessons: i.totalLessons > 0 ? i.lessonsCompleted + ' of ' + i.totalLessons + ' lessons' : null,
+      number: cert ? cert.certNumber : null,
+      verifyUrl: cert && cert.certNumber ? '/verify/' + cert.certNumber : null,
+      assigned: true,
+    };
+  });
+
+// Completions from courses nobody assigned — somebody started them themselves, and they are just as
+// much theirs.
+for (const c of certificates) {
+  if (c.courseId && completions.some((x) => x.key === c.courseId)) continue;
+  completions.push({
+    key: c.courseId || c.id,
+    courseId: c.courseId,
+    title: c.courseTitle,
+    when: c.issuedAt,
+    lessons: null,
+    number: c.certNumber,
+    verifyUrl: c.certNumber ? '/verify/' + c.certNumber : null,
+    assigned: false,
+  });
 }
 
 let catalogue: Skill[] = [];
@@ -196,8 +315,17 @@ if (view === 'calendar') {
 const recorded = new Set(mySkills.map((s) => s.skillId));
 const unrecorded = catalogue.filter((s) => !recorded.has(s.id));
 const hrefFor = (v: string) => PATH + '?view=' + v;
-const required = path.filter((i) => i.required);
-const optional = path.filter((i) => !i.required);
+
+// The one item to begin with, and the count of what is outstanding.
+const outstanding = ordered.filter((i) => i.state !== 'complete');
+const nextUpId = outstanding.length > 0 ? outstanding[0].assignmentId : '';
+const noneStarted = ordered.length > 0 && ordered.every((i) => i.state === 'not_started');
+const evidencedSkills = mySkills.filter((s) => isEvidenced(s.source));
+const statedSkills = mySkills.filter((s) => !isEvidenced(s.source));
+// Evidence a level can be hung on. Only a completion that names a COURSE can be offered: the check
+// in skills.ts re-reads the completion by course id, and a record without one has nothing to re-read.
+const evidenceCourses = completions.filter((c) => !!c.courseId);
+const hasEvidence = evidenceCourses.length > 0 || assessments.length > 0;
 ---
 
 <!doctype html>
@@ -229,7 +357,6 @@ const optional = path.filter((i) => !i.required);
     .tab[aria-current="page"]{background:#1a1510;border-color:#1a1510;color:#fff}
     .tab:focus-visible{outline:2px solid #c2410c;outline-offset:2px}
     .wrap{max-width:640px;margin:0 auto;padding:12px 14px}
-    .scope{font-size:12.5px;line-height:1.55;color:#6b6255;margin:2px 0 12px}
     .flash{background:rgba(5,150,105,.09);border:1px solid rgba(5,150,105,.3);color:#065f46;
       border-radius:10px;padding:11px 13px;font-size:13px;line-height:1.5;margin-bottom:14px;
       overflow-wrap:anywhere}
@@ -241,11 +368,17 @@ const optional = path.filter((i) => !i.required);
     .empty{background:#fbf8f2;border:1px dashed #e0d5c0;border-radius:14px;padding:18px 16px;
       margin-bottom:13px}
     .empty b{display:block;font-size:14px;margin-bottom:5px}
+    .broke{background:#fdf6f4;border:1px solid #e7c3b6;border-radius:14px;padding:18px 16px;
+      margin-bottom:13px}
+    .broke b{display:block;font-size:14px;margin-bottom:5px;color:#8a2c0d}
     .item{border:1px solid #ece4d6;border-radius:13px;padding:13px;margin-bottom:10px;background:#fff}
+    .item.next{border-color:#c2410c;box-shadow:0 0 0 2px rgba(194,65,12,.10)}
     .item__top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
     .item__t{font-size:14.5px;font-weight:650;line-height:1.35;overflow-wrap:anywhere}
     .item a{color:#c2410c;font-size:13px;font-weight:600;text-decoration:none;display:inline-flex;
-      align-items:center;min-height:44px}
+      align-items:center;min-height:44px;overflow-wrap:anywhere}
+    .step{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9.5px;letter-spacing:.1em;
+      text-transform:uppercase;color:#6b6255;font-weight:700;margin-bottom:5px;display:block}
     .pill{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9.5px;font-weight:700;
       padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;flex:none;
       background:#f2ece0;color:#6b6255}
@@ -253,6 +386,8 @@ const optional = path.filter((i) => !i.required);
     .pill.late{background:rgba(220,38,38,.1);color:#991b1b}
     .bar{height:7px;border-radius:99px;background:#f0e9db;overflow:hidden;margin:9px 0 4px}
     .bar i{display:block;height:100%;background:#c2410c;border-radius:99px}
+    .note{font-size:12.5px;line-height:1.55;color:#8a2c0d;background:#fdf6f4;border-radius:9px;
+      padding:9px 11px;margin-top:8px;overflow-wrap:anywhere}
     label{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9.5px;letter-spacing:.1em;
       text-transform:uppercase;color:#6b6255;font-weight:700;display:block;margin:10px 0 4px}
     input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;
@@ -279,6 +414,7 @@ const optional = path.filter((i) => !i.required);
     .lvl{display:flex;flex-wrap:wrap;gap:7px;margin-top:7px}
     .lvl b{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:10px;font-weight:700;
       padding:5px 9px;border-radius:99px;background:#f2ece0;color:#6b6255}
+    .lvl b.ok{background:rgba(5,150,105,.12);color:#065f46}
     .foot{font-size:11.5px;line-height:1.6;color:#6b6255;padding:14px 2px 0;border-top:1px solid #ece4d6;
       margin-top:16px;overflow-wrap:anywhere}
     @media (min-width:560px){ .row2{grid-template-columns:1fr 1fr} }
@@ -315,57 +451,84 @@ const optional = path.filter((i) => !i.required);
   {/* -------------------------------------------------------------------- PATH */}
   {view === 'path' && viewer.employeeId && (
     <>
-      {path.length === 0 && (
+      {/* EMPTY STATE 3 OF 3: our fault, and it does not pretend to be either of the other two. */}
+      {pathRead === 'unreadable' && (
+        <div class="broke">
+          <b>We could not read your learning just now</b>
+          <p class="muted">This is a fault on our side, not an empty path. Nothing has been lost and
+            nothing has been marked late because of it. Please reload in a moment; if it keeps
+            happening, tell the people team what this page says.</p>
+        </div>
+      )}
+
+      {/* EMPTY STATE 1 OF 3: nothing has been asked of you. */}
+      {pathRead === 'ok' && ordered.length === 0 && (
         <div class="empty">
-          <b>Nothing has been assigned to you</b>
-          <p class="muted">Courses are assigned by your manager or by the people team. You can start
-            anything in the catalogue on your own at any time —
-            <a href="/portal/courses"> browse the catalogue</a>.</p>
+          <b>Nothing has been assigned to you yet</b>
+          <p class="muted">Courses are assigned by your manager or by the people team, and none has
+            been. You can start anything in the catalogue on your own at any time —
+            <a href="/portal/courses"> browse the catalogue</a>. Anything you finish on your own still
+            shows under Completed.</p>
         </div>
       )}
 
-      {required.length > 0 && (
-        <div class="card">
-          <h3>Required</h3>
-          <p class="muted">These were assigned as required. Everything else is yours to pace.</p>
+      {/* EMPTY STATE 2 OF 3: work is waiting, and this says where to begin. */}
+      {noneStarted && (
+        <div class="empty">
+          <b>Assigned, and not started yet</b>
+          <p class="muted">{ordered.length === 1 ? 'One course is waiting for you.' : ordered.length + ' courses are waiting for you.'}
+            {' '}The first one is marked below. Opening it takes you straight to its first lesson.</p>
         </div>
       )}
 
-      {required.concat(optional).map((i) => (
-        <div class="item">
+      {ordered.map((i, idx) => (
+        <div class={'item' + (i.assignmentId === nextUpId ? ' next' : '')}>
+          <span class="step">
+            Step {idx + 1} of {ordered.length}{i.assignmentId === nextUpId ? ' · next up' : ''}
+          </span>
           <div class="item__top">
             <div class="item__t">{i.courseTitle}</div>
             <span class={'pill ' + (i.state === 'complete' ? 'done' : i.overdue ? 'late' : '')}>
-              {i.overdue && i.state !== 'complete' ? 'Overdue' : STATE_LABELS[i.state]}
+              {i.overdue && i.state !== 'complete' ? 'Overdue' : stateLabel(i.state)}
             </span>
           </div>
           <div class="bar"><i style={'width:' + Math.max(0, Math.min(100, Math.round(i.progressPct || 0))) + '%'}></i></div>
           <p class="muted">
-            {i.progressPct === null ? 'Not opened yet' : Math.round(i.progressPct) + '% done'}
+            {lessonLine(i)}
             {i.dueOn ? ' · due ' + fmtDate(i.dueOn) : ''}
             {i.required ? ' · required' : ''}
           </p>
           {i.reason && <p class="muted" style="margin-top:5px">Why: {i.reason}</p>}
-          {i.courseSlug
-            ? <a href={'/portal/courses/' + i.courseSlug}>Open the course</a>
-            : <p class="muted" style="margin-top:6px">This course is no longer published, so there is
-                nothing to open. Ask whoever assigned it.</p>}
+
+          {doors[i.courseId] && doors[i.courseId].read === 'unreadable' && (
+            <p class="note">We could not work out where this course opens just now. That is a fault on
+              our side — your progress on it is untouched. Please try again in a moment.</p>
+          )}
+
+          {doors[i.courseId] && doors[i.courseId].read === 'ok' && doors[i.courseId].href && (
+            <a href={doors[i.courseId].href}>{doors[i.courseId].label}</a>
+          )}
+
+          {doors[i.courseId] && doors[i.courseId].note && (
+            <p class="note">{doors[i.courseId].note}</p>
+          )}
+
+          {!doors[i.courseId] && i.courseSlug && (
+            <a href={'/portal/courses/' + i.courseSlug}>Open the course</a>
+          )}
+          {!doors[i.courseId] && !i.courseSlug && (
+            <p class="muted" style="margin-top:6px">This course is no longer published, so there is
+              nothing to open. Ask whoever assigned it.</p>
+          )}
         </div>
       ))}
 
-      <div class="card">
-        <h3>Certificates you have earned</h3>
-        {certificates.length === 0
-          ? <p class="muted">None yet. Completing a course here issues one against your account.
-              EduRankAI is the technology platform — accredited partners award formal credentials, and
-              a course certificate records what you completed here.</p>
-          : certificates.map((c) => (
-            <div class="kv">
-              <span>{fmtDate(c.issuedAt)}</span>
-              <b>{c.courseTitle}{c.grade ? ' — ' + c.grade : ''}</b>
-            </div>
-          ))}
-      </div>
+      {ordered.length > 0 && (
+        <p class="muted" style="margin:2px 0 14px">
+          The percentage here counts each lesson once, wherever you finished it — the course player
+          and this page read the same completions, so the two numbers cannot drift apart.
+        </p>
+      )}
 
       {(viewer.reportIds.length > 0 || canAssignOrg) && courses.length > 0 && (
         <details>
@@ -429,6 +592,72 @@ const optional = path.filter((i) => !i.required);
     </>
   )}
 
+  {/* ----------------------------------------------------------------- RECORDS */}
+  {view === 'records' && viewer.employeeId && (
+    <>
+      {certRead === 'unreadable' && (
+        <div class="broke">
+          <b>We could not read your completion records just now</b>
+          <p class="muted">This is a fault on our side. Nothing you have completed has been removed —
+            the ledger simply did not answer. Please reload in a moment.</p>
+        </div>
+      )}
+
+      {certRead === 'ok' && completions.length === 0 && (
+        <div class="empty">
+          <b>Nothing completed yet</b>
+          <p class="muted">Finishing every lesson of a course records a completion against your
+            account. EduRankAI is the technology platform: a record here says what you did on this
+            platform, and accredited partners award formal credentials.</p>
+        </div>
+      )}
+
+      {completions.map((c) => (
+        <div class="item">
+          <div class="item__top">
+            <div class="item__t">{c.title}</div>
+            <span class="pill done">Complete</span>
+          </div>
+          <p class="muted" style="margin-top:6px">
+            {/* WHAT IT RESTS ON, in plain words rather than a badge. */}
+            {c.when ? 'Recorded on ' + fmtDate(c.when) : 'Recorded on this platform'}
+            {c.lessons ? ', after ' + c.lessons + ' were finished' : ''}
+            {c.assigned ? ', from a course assigned to you' : ', from a course you started yourself'}.
+          </p>
+          {c.number
+            ? <p class="muted" style="margin-top:5px">Record number {c.number}.</p>
+            : <p class="muted" style="margin-top:5px">No record number has been written for this course
+                yet. The completion itself is counted from your finished lessons.</p>}
+          {c.verifyUrl && <a href={c.verifyUrl}>Confirm this record</a>}
+        </div>
+      ))}
+
+      <div class="card">
+        <h3>Assessments you have passed</h3>
+        {assessRead === 'unreadable' && (
+          <p class="muted">We could not read your assessment results just now. That is a fault on our
+            side, not an empty result list.</p>
+        )}
+        {assessRead === 'absent' && (
+          <p class="muted">No assessment has been set up on this platform yet, so there is nothing to
+            show here.</p>
+        )}
+        {assessRead === 'ok' && assessments.length === 0 && (
+          <p class="muted">You have not passed an assessment here yet.</p>
+        )}
+        {assessments.map((a) => (
+          <div class="kv">
+            <span>{fmtDate(a.submittedAt)}</span>
+            <b>{a.testTitle}{a.percentage === null ? '' : ' — ' + Math.round(a.percentage) + '%'}</b>
+          </div>
+        ))}
+      </div>
+
+      <p class="muted">A completion is a record of work done on this platform. It is not a
+        qualification and it does not confer one; accredited partners award credentials.</p>
+    </>
+  )}
+
   {/* ------------------------------------------------------------------ SKILLS */}
   {view === 'skills' && viewer.employeeId && (
     <>
@@ -437,6 +666,10 @@ const optional = path.filter((i) => !i.required);
         {SKILL_LEVELS.map((l) => (
           <div class="kv"><span>{l.level} · {l.label}</span><b style="font-weight:400;font-size:12.5px;text-align:right">{l.hint}</b></div>
         ))}
+        <p class="muted" style="margin-top:9px">Every level says where it came from. A level checked
+          against a completed course or a passed assessment is marked as evidenced; a level you or a
+          manager simply state is marked as stated. Both are worth recording, and the difference is
+          worth being able to see.</p>
       </div>
 
       {catalogue.length === 0 && (
@@ -447,10 +680,10 @@ const optional = path.filter((i) => !i.required);
         </div>
       )}
 
-      {mySkills.length > 0 && (
+      {evidencedSkills.length > 0 && (
         <div class="card">
-          <h3>Your skills</h3>
-          {mySkills.map((s) => (
+          <h3>Evidenced by your record</h3>
+          {evidencedSkills.map((s) => (
             <div style="border-bottom:1px solid #f2ece0;padding:10px 0">
               <div class="kv" style="border:none;padding:0">
                 <span>{s.category}</span>
@@ -458,14 +691,39 @@ const optional = path.filter((i) => !i.required);
               </div>
               <div class="lvl">
                 <b>Level {s.level} · {s.levelLabel}</b>
-                <b>{SKILL_SOURCE_LABELS[s.source] || s.source}</b>
+                <b class="ok">{sourceLabel(s.source)}</b>
+              </div>
+              {s.evidence && <p class="muted" style="margin-top:6px">{s.evidence}</p>}
+              {s.evidenceUrl && <p class="muted" style="margin-top:4px"><a href={s.evidenceUrl} rel="noopener noreferrer">Confirm this record</a></p>}
+              {/* NAMES THE SKILL, ITS LEVEL AND WHERE THE LEVEL CAME FROM. Removing it drops the
+                  level and its evidence together, and the row is one of a repeating stack with the
+                  button in the same place on every card. */}
+              <form method="post" style="margin-top:7px" onsubmit={'return confirm("Remove ' + String(s.skillName || '').replace(/[^\w \-.,]/g, '').slice(0, 60) + ' at level ' + String(s.level) + ' from your skills?\\n\\nThe level and the evidence recorded against it go too.")'}>
+                <input type="hidden" name="action" value="remove_skill" />
+                <input type="hidden" name="view" value="skills" />
+                <input type="hidden" name="employee_skill_id" value={s.id} />
+                <button class="btn ghost slim" type="submit">Remove</button>
+              </form>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {statedSkills.length > 0 && (
+        <div class="card">
+          <h3>Stated, not yet evidenced</h3>
+          {statedSkills.map((s) => (
+            <div style="border-bottom:1px solid #f2ece0;padding:10px 0">
+              <div class="kv" style="border:none;padding:0">
+                <span>{s.category}</span>
+                <b>{s.skillName}</b>
+              </div>
+              <div class="lvl">
+                <b>Level {s.level} · {s.levelLabel}</b>
+                <b>{sourceLabel(s.source)}</b>
               </div>
               {s.evidence && <p class="muted" style="margin-top:6px">{s.evidence}</p>}
               {s.evidenceUrl && <p class="muted" style="margin-top:4px"><a href={s.evidenceUrl} rel="noopener noreferrer" target="_blank">Evidence link</a></p>}
-              {/* NAMES THE SKILL, ITS LEVEL AND WHERE THE LEVEL CAME FROM. A skill assessed by a
-                  manager or earned through training is not something the reader can put back
-                  themselves — removing it drops the level and the evidence with it, and the row is
-                  one of a repeating stack with the button in the same place on every card. */}
               <form method="post" style="margin-top:7px" onsubmit={'return confirm("Remove ' + String(s.skillName || '').replace(/[^\w \-.,]/g, '').slice(0, 60) + ' at level ' + String(s.level) + ' from your skills?\\n\\nThe level and any evidence recorded against it go too, and a level set by somebody else cannot be put back by you.")'}>
                 <input type="hidden" name="action" value="remove_skill" />
                 <input type="hidden" name="view" value="skills" />
@@ -477,9 +735,51 @@ const optional = path.filter((i) => !i.required);
         </div>
       )}
 
+      {mySkills.length === 0 && catalogue.length > 0 && (
+        <div class="empty">
+          <b>No skills recorded yet</b>
+          <p class="muted">Nothing has been recorded against you, by you or by anybody else. If you
+            have finished a course or passed an assessment here, the form below can hang a level on
+            it rather than on your word alone.</p>
+        </div>
+      )}
+
+      {unrecorded.length > 0 && hasEvidence && (
+        <div class="card">
+          <h3>Record a level, with evidence</h3>
+          <p class="muted">Choose something you have actually finished here. The completion is checked
+            against your record before the level is saved, and the wording is written from that
+            record rather than typed.</p>
+          <form method="post">
+            <input type="hidden" name="action" value="set_skill" />
+            <input type="hidden" name="view" value="skills" />
+            <input type="hidden" name="employee_id" value={viewer.employeeId} />
+            <label for="e-skill">Skill</label>
+            <select id="e-skill" name="skill_id" required>
+              <option value="">Choose a skill</option>
+              {unrecorded.map((s) => <option value={s.id}>{s.name} — {s.category}</option>)}
+            </select>
+            <label for="e-level">Level</label>
+            <select id="e-level" name="level" required>
+              {SKILL_LEVELS.map((l) => <option value={l.level}>{l.level} · {l.label}</option>)}
+            </select>
+            <label for="e-ref">What it rests on</label>
+            <select id="e-ref" name="evidence_pick" required>
+              <option value="">Choose something you finished</option>
+              {evidenceCourses.map((c) => <option value={'course|' + c.courseId}>Course: {c.title}</option>)}
+              {assessments.map((a) => <option value={'assessment|' + a.attemptId}>Assessment: {a.testTitle}</option>)}
+            </select>
+            <p class="muted" style="margin-top:8px">If that record cannot be confirmed against your
+              account, nothing is saved and this page says so — rather than recording a level as
+              evidenced when it is not.</p>
+            <button class="btn" type="submit">Record with evidence</button>
+          </form>
+        </div>
+      )}
+
       {unrecorded.length > 0 && (
         <div class="card">
-          <h3>Record a skill</h3>
+          <h3>Record a level you can vouch for</h3>
           <form method="post">
             <input type="hidden" name="action" value="set_skill" />
             <input type="hidden" name="view" value="skills" />
@@ -499,10 +799,16 @@ const optional = path.filter((i) => !i.required);
             <label for="s-url">Evidence link</label>
             <input id="s-url" name="evidence_url" maxlength="500" placeholder="https://" />
             <p class="muted" style="margin-top:8px">A level you record yourself is marked as your own
-              claim. A manager or the people team can assess it separately.</p>
+              statement. A manager or the people team can assess it separately. Links only — nothing
+              is uploaded here.</p>
             <button class="btn" type="submit">Record skill</button>
           </form>
         </div>
+      )}
+
+      {!hasEvidence && (
+        <p class="muted">Nothing you have completed here can back a level yet. Finish an assigned
+          course or pass an assessment and it becomes available above.</p>
       )}
 
       {canManageSkills && (
@@ -557,9 +863,10 @@ const optional = path.filter((i) => !i.required);
   )}
 
   <p class="foot">
-    Courses, progress and certificates come from the existing course engine — this page links into it
-    rather than keeping a second copy. Who may assign learning to whom is resolved from the
-    Organization Graph, one relationship at a time.
+    Courses, progress and completion records come from the existing course engine — this page links
+    into it rather than keeping a second copy, and the lessons you finish in either player count once.
+    Who may assign learning to whom is resolved from the Organization Graph, one relationship at a
+    time. EduRankAI is the technology platform; accredited partners award credentials.
   </p>
 </main>
 </body>

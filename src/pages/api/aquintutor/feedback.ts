@@ -51,6 +51,11 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
     `);
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   } catch (e: any) {
+    // The sentence to the writer was already right; what was missing was any record at all. A lab
+    // rating that was never stored left NOTHING behind, so /admin/feedback showing fewer responses
+    // than the labs actually received had no explanation anywhere. e.message is only the failed SQL;
+    // the database's real complaint is on e.cause.
+    console.error('[api/aquintutor/feedback] not saved:', String(e?.cause?.message || e?.message || 'unknown error'));
     return new Response(JSON.stringify({ ok: false, error: 'Could not save feedback.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
   }
 };

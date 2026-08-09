@@ -43,6 +43,34 @@ function ensureSchema(): Promise<void> {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await reconcileXpEventsColumns();
 
+    // IDEMPOTENCY, ADOPTED FROM THE LEDGER THIS MODULE REPLACED.
+    //
+    // src/lib/xp-ledger.ts is gone; it awarded XP for lesson completions and assessment passes into
+    // edu_xp_ledger, and the one thing it did better than this module was a UNIQUE award_key, so
+    // re-opening the same lesson could never award twice. Collapsing to one ledger without that
+    // column would have been a regression dressed as a cleanup: those two paths would have paid out
+    // on every re-submit. award_key is nullable and UNIQUE — Postgres does not compare NULLs, so
+    // every historic row and every award that is legitimately repeatable (practice answers, daily
+    // challenges) is unaffected, and only a caller that PASSES a key gets the once-only guarantee.
+    await db.execute(sql`ALTER TABLE xp_events ADD COLUMN IF NOT EXISTS award_key TEXT`);
+    await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS xp_events_award_key_uidx ON xp_events (award_key)`);
+
+    // THE LEADERBOARD OPT-OUT REGISTER, ALSO ADOPTED RATHER THAN RE-CREATED.
+    //
+    // edu_gamer_state was the retired ledger's table. Its streak/last_day columns are dead —
+    // user_xp.streak_days is the streak now — but opt_out holds a PRIVACY CHOICE that learners have
+    // already made on /aquintutor/xp. Re-homing that choice into a new column would mean copying it,
+    // and a copy that half-runs publishes by name somebody who asked not to be listed. So the column
+    // stays exactly where it is and this module becomes its only reader and writer. CREATE TABLE IF
+    // NOT EXISTS is here so the leaderboard's LEFT JOIN cannot throw on a database that never ran the
+    // old ledger.
+    await db.execute(sql`CREATE TABLE IF NOT EXISTS edu_gamer_state (user_id UUID PRIMARY KEY, streak INT NOT NULL DEFAULT 0, last_day TEXT, opt_out BOOLEAN NOT NULL DEFAULT false)`);
+
+    // The per-action XP amounts an admin sets on /admin/xp-config. Same reasoning: the table holds a
+    // decision somebody made, and the screen that makes it is live and linked in the admin nav, so
+    // the amounts move to this module instead of quietly ceasing to apply to anything.
+    await db.execute(sql`CREATE TABLE IF NOT EXISTS edu_xp_config (id INTEGER PRIMARY KEY DEFAULT 1, values JSONB NOT NULL DEFAULT '{}'::jsonb)`);
+
     // xp_period_rollups had NO CREATE TABLE anywhere in the repository, and it is not only written
     // here: src/lib/friends.ts:96 and src/lib/classrooms.ts:92 LEFT JOIN it with NO try around them,
     // so the friends list and the classroom roster threw on every load — a missing table taking out
@@ -99,6 +127,15 @@ export async function reconcileXpEventsColumns(): Promise<void> {
   await db.execute(sql`ALTER TABLE xp_events ALTER COLUMN delta DROP NOT NULL`);
 }
 
+/**
+ * Make the XP tables exist. Exported for modules that query user_xp, xp_period_rollups or the
+ * leaderboard opt-out register DIRECTLY rather than through this module — without it, the first
+ * such query on a fresh database throws on a missing table and the caller shows an empty board.
+ */
+export function ensureXpSchema(): Promise<void> {
+  return ensureSchema();
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** ref_id is a UUID column; a non-UUID reference goes to source_id instead of throwing. */
 function asUuid(v: any): string | null {
@@ -117,6 +154,17 @@ export interface XpAward {
   delta: number;
   refId?: string | null;
   reason?: string;
+  /**
+   * Pass a key for an award that must happen AT MOST ONCE — completing a particular lesson,
+   * passing a particular assessment. A repeat returns awarded:0 and touches nothing. Leave it
+   * undefined for awards that are legitimately repeatable (a practice answer, a daily challenge).
+   */
+  awardKey?: string | null;
+}
+
+/** Deterministic once-only key. Same user + same action + same object = same key. Pure. */
+export function xpAwardKey(userId: string, source: string, objectId: string): string {
+  return String(userId) + '|' + String(source) + '|' + String(objectId);
 }
 
 function levelFromXp(xp: number): number {
@@ -128,6 +176,36 @@ export async function awardXp(p: XpAward): Promise<{ xp: number; level: number; 
   if (!p.userId || !p.delta) {
     const cur = await getUserXp(p.userId);
     return { xp: cur.totalXp, level: cur.level, streak: cur.streakDays, awarded: 0, leveledUp: false };
+  }
+
+  // ONCE-ONLY AWARDS ARE CLAIMED BEFORE ANYTHING IS PAID.
+  // The event row is the claim: if the INSERT conflicts on award_key this award already
+  // happened, and we return the learner's CURRENT totals with awarded:0 rather than adding the
+  // XP a second time. Writing the event first is what makes that true — the old order (totals
+  // first, log afterwards) can pay twice and log once.
+  let eventInserted = false;
+  if (p.awardKey) {
+    try {
+      const claim = rows(await db.execute(sql`
+        INSERT INTO xp_events (user_id, source, ref_id, source_id, delta, xp_amount, reason, award_key)
+        VALUES (${p.userId}, ${p.source}, ${asUuid(p.refId)}, ${p.refId ? String(p.refId).slice(0, 140) : null},
+                ${p.delta}, ${p.delta}, ${p.reason || null}, ${p.awardKey})
+        ON CONFLICT DO NOTHING RETURNING id
+      `));
+      if (claim.length === 0) {
+        const cur = await getUserXp(p.userId);
+        return { xp: cur.totalXp, level: cur.level, streak: cur.streakDays, awarded: 0, leveledUp: false };
+      }
+      eventInserted = true;
+    } catch (e: any) {
+      // The claim could not be made — the unique index is missing, or the column is. That is a
+      // real fault and it is LOGGED, not swallowed. We still award: silently refusing a learner
+      // the XP they just earned is the worse of the two failures, and the log names the risk.
+      logEvent('error', 'xp.award_key_claim_failed', {
+        userId: p.userId, source: p.source, awardKey: p.awardKey,
+        reason: e?.cause?.message || e?.message || 'unknown',
+      });
+    }
   }
 
   // Upsert the user row if missing
@@ -235,16 +313,18 @@ export async function awardXp(p: XpAward): Promise<{ xp: number; level: number; 
   // Both amount columns are written so a reader on either historic shape sees the award. The
   // failure is LOGGED rather than dropped: this is the append-only XP audit trail, and a silent
   // catch here is how it would stop recording without anything on any screen saying so.
-  try {
-    await db.execute(sql`
-      INSERT INTO xp_events (user_id, source, ref_id, source_id, delta, xp_amount, reason)
-      VALUES (${p.userId}, ${p.source}, ${asUuid(p.refId)}, ${p.refId ? String(p.refId).slice(0, 140) : null},
-              ${p.delta}, ${p.delta}, ${p.reason || null})
-    `);
-  } catch (e: any) {
-    logEvent('error', 'xp.event_log_write_failed', {
-      userId: p.userId, source: p.source, reason: e?.cause?.message || e?.message || 'unknown',
-    });
+  if (!eventInserted) {
+    try {
+      await db.execute(sql`
+        INSERT INTO xp_events (user_id, source, ref_id, source_id, delta, xp_amount, reason)
+        VALUES (${p.userId}, ${p.source}, ${asUuid(p.refId)}, ${p.refId ? String(p.refId).slice(0, 140) : null},
+                ${p.delta}, ${p.delta}, ${p.reason || null})
+      `);
+    } catch (e: any) {
+      logEvent('error', 'xp.event_log_write_failed', {
+        userId: p.userId, source: p.source, reason: e?.cause?.message || e?.message || 'unknown',
+      });
+    }
   }
 
   return { xp: newXp, level: newLevel, streak: newStreak, awarded: p.delta, leveledUp };
@@ -322,4 +402,168 @@ export async function getRecentXpEvents(userId: string, limit = 8): Promise<{ so
     SELECT source, COALESCE(delta, xp_amount) AS delta, reason, created_at FROM xp_events
     WHERE user_id = ${userId} ORDER BY created_at DESC LIMIT ${limit}
   `)) as any;
+}
+
+// =================================================================================================
+// THE LEADERBOARD OPT-OUT.
+//
+// A learner can ask not to appear on any leaderboard. The choice lives in edu_gamer_state.opt_out
+// (see ensureSchema above for why it was adopted rather than copied), and this module is its only
+// reader and writer. EVERY board in this codebase must consult isOptedOutOfLeaderboard() or the
+// same predicate in SQL — a board that forgets it publishes, by name, somebody who asked not to be
+// listed, which is not a cosmetic bug.
+// =================================================================================================
+
+export async function isOptedOutOfLeaderboard(userId: string): Promise<boolean> {
+  await ensureSchema();
+  if (!userId) return false;
+  try {
+    const r = rows(await db.execute(sql`SELECT opt_out FROM edu_gamer_state WHERE user_id = ${userId} LIMIT 1`))[0] as any;
+    return !!r?.opt_out;
+  } catch (e: any) {
+    // Fail CLOSED on a privacy read: if we cannot tell whether they opted out, treat them as opted
+    // out. The cost of being wrong that way is a missing row; the other way it is a published name.
+    logEvent('error', 'xp.optout_read_failed', { userId, reason: e?.cause?.message || e?.message || 'unknown' });
+    return true;
+  }
+}
+
+/** Returns false when the choice could not be stored, so the caller can say so instead of nodding. */
+export async function setLeaderboardOptOut(userId: string, optOut: boolean): Promise<boolean> {
+  await ensureSchema();
+  if (!userId) return false;
+  try {
+    await db.execute(sql`
+      INSERT INTO edu_gamer_state (user_id, opt_out) VALUES (${userId}, ${!!optOut})
+      ON CONFLICT (user_id) DO UPDATE SET opt_out = ${!!optOut}
+    `);
+    return true;
+  } catch (e: any) {
+    logEvent('error', 'xp.optout_not_saved', { userId, optOut: !!optOut, reason: e?.cause?.message || e?.message || 'unknown' });
+    return false;
+  }
+}
+
+// =================================================================================================
+// PER-ACTION XP AMOUNTS.
+//
+// /admin/xp-config (admin nav: Gamification) lets somebody holding configure on gamification set
+// what each kernel learning action is worth. Those amounts used to drive the ledger that has now
+// been retired, so they drive THIS one instead — otherwise the screen becomes a set of inputs that
+// change nothing, which is the exact failure this pass exists to end.
+//
+// HONEST LIMIT, and it is printed on the screen too: only the actions listed here are configurable.
+// The other XP sources in this codebase (practice answers, SRS reviews, daily challenges, story
+// completions, tutor sessions) pass their own delta at the call site and are NOT governed by this.
+// =================================================================================================
+
+export const XP_ACTION_DEFAULTS: Readonly<Record<string, number>> = {
+  lesson_complete: 10,
+  assessment_pass: 25,
+  assessment_practice: 2,
+  mastery: 5,
+};
+
+export async function getXpConfig(): Promise<Record<string, number>> {
+  await ensureSchema();
+  try {
+    const r = rows(await db.execute(sql`SELECT values FROM edu_xp_config WHERE id = 1 LIMIT 1`))[0] as any;
+    const stored = (r && typeof r.values === 'object' && r.values) ? r.values : {};
+    return { ...XP_ACTION_DEFAULTS, ...stored };
+  } catch (e: any) {
+    logEvent('error', 'xp.config_read_failed', { reason: e?.cause?.message || e?.message || 'unknown' });
+    return { ...XP_ACTION_DEFAULTS };
+  }
+}
+
+/** Returns false when the values could not be stored — the admin screen must not report 'Saved'. */
+export async function setXpConfig(values: Record<string, number>): Promise<boolean> {
+  await ensureSchema();
+  const clean: Record<string, number> = {};
+  for (const k of Object.keys(XP_ACTION_DEFAULTS)) {
+    const v = Number((values || {})[k]);
+    if (Number.isFinite(v) && v >= 0) clean[k] = Math.floor(v);
+  }
+  try {
+    await db.execute(sql`
+      INSERT INTO edu_xp_config (id, values) VALUES (1, ${JSON.stringify(clean)}::jsonb)
+      ON CONFLICT (id) DO UPDATE SET values = ${JSON.stringify(clean)}::jsonb
+    `);
+    return true;
+  } catch (e: any) {
+    logEvent('error', 'xp.config_not_saved', { reason: e?.cause?.message || e?.message || 'unknown' });
+    return false;
+  }
+}
+
+/** What one configurable action is worth right now. Falls back to the built-in default. */
+export async function xpAmountFor(action: string): Promise<number> {
+  const cfg = await getXpConfig();
+  const v = Number(cfg[action]);
+  return Number.isFinite(v) && v >= 0 ? Math.floor(v) : Number(XP_ACTION_DEFAULTS[action] || 0);
+}
+
+// =================================================================================================
+// ADMIN READS over the one ledger. Both return a discriminated result: an empty list that actually
+// means 'the query failed' is the lie this area of the codebase has told before.
+// =================================================================================================
+
+export type LedgerEntry = { at: any; userId: string; userName: string; source: string; delta: number; reason: string | null };
+export type LedgerResult = { ok: true; rows: LedgerEntry[] } | { ok: false; reason: string };
+
+/**
+ * The audit trail: every XP event, newest first, whoever earned it. Not a leaderboard — an opt-out
+ * hides a learner from a public ranking, it does not erase them from an audit log that only
+ * somebody holding audit on gamification can open.
+ */
+export async function recentXpEvents(limit = 50): Promise<LedgerResult> {
+  await ensureSchema();
+  const cap = Math.min(500, Math.max(1, Math.floor(limit || 50)));
+  try {
+    const rs = rows(await db.execute(sql`
+      SELECT e.created_at, e.user_id::text AS user_id, e.source,
+             COALESCE(e.delta, e.xp_amount) AS delta, e.reason,
+             COALESCE(u.name, u.email, 'Learner') AS user_name
+      FROM xp_events e LEFT JOIN users u ON u.id = e.user_id
+      ORDER BY e.created_at DESC LIMIT ${cap}
+    `));
+    return { ok: true, rows: rs.map((r: any) => ({
+      at: r.created_at,
+      userId: String(r.user_id || ''),
+      userName: String(r.user_name || 'Learner'),
+      source: String(r.source || ''),
+      delta: Number(r.delta || 0),
+      reason: r.reason || null,
+    })) };
+  } catch (e: any) {
+    logEvent('error', 'xp.ledger_read_failed', { reason: e?.cause?.message || e?.message || 'unknown' });
+    return { ok: false, reason: e?.cause?.message || e?.message || 'unknown' };
+  }
+}
+
+export type WeeklyEntry = { userId: string; name: string; xp: number };
+export type WeeklyResult = { ok: true; rows: WeeklyEntry[] } | { ok: false; reason: string };
+
+/**
+ * This week's XP from xp_period_rollups — the table awardXp() maintains. Opted-out learners are
+ * excluded, because this one IS a ranking.
+ */
+export async function weeklyXpLeaderboard(limit = 10): Promise<WeeklyResult> {
+  await ensureSchema();
+  const cap = Math.min(200, Math.max(1, Math.floor(limit || 10)));
+  try {
+    const rs = rows(await db.execute(sql`
+      SELECT r.user_id::text AS user_id, COALESCE(u.name, u.email, 'Learner') AS name, r.total_xp
+      FROM xp_period_rollups r
+      LEFT JOIN users u ON u.id = r.user_id
+      LEFT JOIN edu_gamer_state g ON g.user_id = r.user_id
+      WHERE r.period = 'week' AND r.period_key = date_trunc('week', CURRENT_DATE)::date
+        AND COALESCE(g.opt_out, false) = false AND r.total_xp > 0
+      ORDER BY r.total_xp DESC, r.user_id ASC LIMIT ${cap}
+    `));
+    return { ok: true, rows: rs.map((r: any) => ({ userId: String(r.user_id), name: String(r.name || 'Learner'), xp: Number(r.total_xp || 0) })) };
+  } catch (e: any) {
+    logEvent('error', 'xp.weekly_board_read_failed', { reason: e?.cause?.message || e?.message || 'unknown' });
+    return { ok: false, reason: e?.cause?.message || e?.message || 'unknown' };
+  }
 }

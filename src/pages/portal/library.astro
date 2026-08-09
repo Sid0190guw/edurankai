@@ -6,13 +6,25 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/library'));
 
 function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
-// -- Schema bootstrap (idempotent) -----------------------------------------
+// -- Schema bootstrap ------------------------------------------------------
+//
+// THREE CREATE TABLES AND A COUNT RAN ON EVERY SINGLE LOAD OF THIS PAGE, inside two bare
+// `catch (_) {}`. Four round trips per page view for work that can only matter once, on a pooled
+// connection this project has already exhausted once — and a bootstrap that failed left no trace
+// anywhere while every read below it failed for a reason nobody could see. The identical repair was
+// already made on notes.astro, flashcards.astro, liveclass.astro and jobs.astro.
+//
+// The try/catch is INSIDE the ensureOnce callback, not around it: ensureOnce() returns
+// `p.catch(() => {})` (src/lib/ensure-once.ts:24), so an outer catch can never fire and would be a
+// comforting lie. The reason is caught and logged in here, where it can actually be seen.
+await ensureOnce('portal-library-schema', async () => {
 try {
   await db.execute(sql`
     CREATE TABLE IF NOT EXISTS library_resources (
@@ -43,9 +55,14 @@ try {
       status VARCHAR(20) DEFAULT 'pending'
     )
   `);
-} catch (_) {}
+} catch (e: any) {
+  console.error('[portal/library] schema bootstrap failed -', e?.cause?.message || e?.message);
+  throw e;   // rethrow so ensureOnce drops the memo and the next request retries
+}
 
 // -- Seed a starter catalogue on first visit (only if completely empty) ----
+// Inside the same guard: the COUNT is the expensive half and it can only ever answer "not empty"
+// after the first run of a process. It was a separate round trip on every page view.
 try {
   const c = rowsOf(await db.execute(sql`SELECT COUNT(*)::int AS n FROM library_resources`));
   if ((c[0]?.n || 0) === 0) {
@@ -85,7 +102,13 @@ try {
       }
     }
   }
-} catch (_) {}
+} catch (e: any) {
+  // A seed that did not land is not fatal — the catalogue simply renders empty, and the reads below
+  // say so honestly. But it was silent, so "the shelf is empty" and "the starter catalogue could not
+  // be written" were the same screen with nothing anywhere to tell them apart.
+  console.error('[portal/library] starter catalogue seed failed -', e?.cause?.message || e?.message);
+}
+});
 
 // -- Form handlers ---------------------------------------------------------
 let flash: { kind: 'ok' | 'err'; text: string } | null = null;

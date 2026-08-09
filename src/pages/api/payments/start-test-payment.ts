@@ -34,11 +34,30 @@ export const POST: APIRoute = async ({ locals }) => {
   const result = await createOrder({ amountPaise: 100, currency: 'INR', receipt, notes: { purpose: 'test_ping', by: user.id } });
   if (!result.ok) return json({ ok: false, error: result.error }, 502);
 
-  await db.execute(sql`
-    INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, notes)
-    VALUES (${result.order.id}, 100, 'INR', 'created', 'test_ping', 'test_ping', ${user.id}, ${user.id}, ${user.email || 'admin@edurankai.in'},
-      ${sql.raw("'" + JSON.stringify({ receipt }).replace(/'/g, "''") + "'::jsonb")})
-  `).catch(() => {});
+  // THE WHOLE POINT OF THIS ROUTE IS TO ANSWER "DOES THE PAYMENT PATH WORK", and the payments row is
+  // half of that path — /api/payments/verify updates the row by order id, and the finance console
+  // reads it back. `.catch(() => {})` meant a ping whose OWN record failed still reported success,
+  // which is the one answer a diagnostic must never give. The order is real either way, so it is
+  // reported rather than refused, and the response says which half worked.
+  let recorded = true;
+  try {
+    await db.execute(sql`
+      INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, notes)
+      VALUES (${result.order.id}, 100, 'INR', 'created', 'test_ping', 'test_ping', ${user.id}, ${user.id}, ${user.email || 'admin@edurankai.in'},
+        ${sql.raw("'" + JSON.stringify({ receipt }).replace(/'/g, "''") + "'::jsonb")})
+    `);
+  } catch (e: any) {
+    recorded = false;
+    console.error('[payments] test ping order', result.order.id, 'was created at the gateway but NOT recorded in payments -',
+      e?.cause?.message || e?.message);
+  }
 
-  return json({ ok: true, orderId: result.order.id, keyId: getPublicKeyId(), amountPaise: 100, currency: 'INR', prefill: { name: user.name || '', email: user.email || '' } });
+  return json({
+    ok: true, orderId: result.order.id, keyId: getPublicKeyId(), amountPaise: 100, currency: 'INR',
+    recorded,
+    warning: recorded ? undefined
+      : 'The order was created at the gateway but could not be written to the payments table, so this '
+        + 'ping will not appear in the finance console and /api/payments/verify will have nothing to update.',
+    prefill: { name: user.name || '', email: user.email || '' },
+  });
 };

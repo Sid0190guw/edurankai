@@ -120,7 +120,17 @@ export function ensureCommunitySchema(): Promise<void> {
         interest_count INT NOT NULL DEFAULT 0,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
-    } catch (_) {}
+    } catch (e: any) {
+      // NOT SWALLOWED, AND NOT CACHED AS DONE. `catch (_) {}` left `ready` RESOLVED, so a boot that
+      // failed was never retried for the life of the process and said nothing anywhere: every
+      // listStudyGroups / listClubs / listHackathons / listCollabPosts after it threw "relation
+      // does not exist" into a page that reports it as an empty board, and a transient pooler blip
+      // during the first request of a deployment poisoned the whole process. The reason goes to the
+      // log and the promise is dropped so the next call tries again. This is the same repair
+      // mail-groups.ts carries; the clubs, groups and hackathons pages sit on this one.
+      console.error('[community] schema boot failed:', e?.cause?.message || e?.message);
+      ready = null;
+    }
   })();
   return ready;
 }

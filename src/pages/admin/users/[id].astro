@@ -47,11 +47,24 @@ if (!target) return Astro.redirect('/admin/users');
 const activity = rows(await db.execute(sql`SELECT action, entity, entity_id, ip_address, created_at FROM audit_log WHERE user_id = ${id} ORDER BY created_at DESC LIMIT 60`));
 
 // Employee profile + today's clock status + today's report (if any).
+//
+// "TODAY" IS AN IST DAY, AND THIS ASKED FOR A UTC ONE. Both reads used CURRENT_DATE, which is the
+// DATABASE SESSION's date - src/lib/db/index.ts opens postgres() with no timezone option and no
+// SET TIME ZONE, so it inherits the server default, UTC. The rows on the other side are cut in IST:
+// src/lib/attendance.ts writes against `(NOW() AT TIME ZONE 'Asia/Kolkata')::date`, deliberately,
+// because "did I clock in today" is a claim about somebody's pay. So between 00:00 and 05:29 IST
+// this profile showed YESTERDAY's punches under "today", omitted the shift that had just started,
+// and drew "Not clocked in" beside somebody who was at work - on the screen an admin opens to check
+// exactly that. /admin/hr was repaired for the identical fault; this is the per-person half of it.
+const PROFILE_TIME_ZONE = 'Asia/Kolkata';
+const TODAY_IST = sql`(NOW() AT TIME ZONE ${PROFILE_TIME_ZONE})::date`;
 const emp: any = rows(await db.execute(sql`SELECT * FROM hr_employees WHERE user_id = ${id} OR lower(personal_email) = ${(target.email || '').toLowerCase()} OR lower(email) = ${(target.email || '').toLowerCase()} LIMIT 1`))[0];
 let clockToday: any[] = [], reportToday: any = null;
 if (emp) {
-  clockToday = rows(await db.execute(sql`SELECT event_type, event_time, location_name FROM hr_clock_events WHERE employee_id = ${emp.id} AND DATE(event_time) = CURRENT_DATE ORDER BY event_time ASC`));
-  reportToday = rows(await db.execute(sql`SELECT * FROM hr_daily_reports WHERE employee_id = ${emp.id} AND report_date = CURRENT_DATE LIMIT 1`))[0] || null;
+  // event_time is a timestamp: it is converted into the same zone before its date is taken, so the
+  // two halves of the comparison are in one calendar.
+  clockToday = rows(await db.execute(sql`SELECT event_type, event_time, location_name FROM hr_clock_events WHERE employee_id = ${emp.id} AND (event_time AT TIME ZONE ${PROFILE_TIME_ZONE})::date = ${TODAY_IST} ORDER BY event_time ASC`));
+  reportToday = rows(await db.execute(sql`SELECT * FROM hr_daily_reports WHERE employee_id = ${emp.id} AND report_date = ${TODAY_IST} LIMIT 1`))[0] || null;
 }
 const lastClock = clockToday.length ? clockToday[clockToday.length - 1] : null;
 const liveStatus = lastClock ? (lastClock.event_type === 'clock_in' || lastClock.event_type === 'break_end' ? 'Working' : lastClock.event_type === 'break_start' ? 'On break' : 'Clocked out') : 'Not clocked in';
@@ -78,7 +91,7 @@ const photo = target.photo_url || null;
       )}
       <div>
         <h1 style="font-size:20px;font-weight:800;color:#fff;margin:0;">{target.name || 'Unnamed'}</h1>
-        <p style="font-size:12.5px;color:#a0a0ab;margin:4px 0 0;">{ROLE_LABELS[target.role] || target.role} · {target.email}{handle ? ' · @' + handle : ''}</p>
+        <p style="font-size:12.5px;color:#a0a0ab;margin:4px 0 0;">{ROLE_LABELS[target.role as keyof typeof ROLE_LABELS] || target.role} · {target.email}{handle ? ' · @' + handle : ''}</p>
         <p style="font-size:11.5px;color:#6e6e78;margin:4px 0 0;">
           {target.photo_verified ? <span style="color:#6ee7b7;">Photo verified (ID + face)</span> : <span style="color:#fbbf24;">Photo not yet verified</span>}
           {' · '}Last login: {ago(target.last_login_at)} · {target.is_active ? 'active' : 'inactive'}

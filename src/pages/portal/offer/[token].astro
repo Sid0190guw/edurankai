@@ -355,14 +355,38 @@ if (Astro.request.method === 'POST' && isOwner) {
         const ipHeader = Astro.request.headers.get('x-forwarded-for') || Astro.request.headers.get('cf-connecting-ip') || '';
         const ua = Astro.request.headers.get('user-agent') || '';
 
-        await db.update(offerLetters).set({
+        // ONE SIGNATURE PER OFFER, DECIDED BY THE DATABASE AND NOT BY THIS PAGE.
+        //
+        // The status test that guards this branch (`else if (offer.status === 'signed')`) reads a
+        // row fetched at the TOP of the render, before the form was even parsed. Two POSTs arriving
+        // together — a double tap on a phone, a resubmitted form on a flaky connection, the browser
+        // retrying a request it thinks timed out — both read 'sent', both passed that test, and both
+        // ran the whole acceptance: two thread messages on the application, two audit rows asserting
+        // consent, two handoff rows on /admin/hr/reconciliation, two pushes to the people desk. The
+        // employee record itself survives (completeHire() finds the existing row and refuses to
+        // create a second), but the durable record of the moment somebody accepted a job said it
+        // happened twice.
+        //
+        // The condition now lives inside the UPDATE, where the row is locked while it is evaluated,
+        // and RETURNING says which caller won. The loser is told the offer is already signed —
+        // exactly what the page says to anyone else arriving at a signed offer — and nothing
+        // downstream runs a second time.
+        const signedRows = await db.update(offerLetters).set({
           status: 'signed',
           signedAt: new Date(),
           signatureDataUrl,
           signatureIp: ipHeader.substring(0, 64),
           signatureUserAgent: ua,
           updatedAt: new Date()
-        }).where(eq(offerLetters.id, offer.id));
+        }).where(and(eq(offerLetters.id, offer.id), eq(offerLetters.status, 'sent')))
+          .returning({ id: offerLetters.id });
+
+        if (signedRows.length === 0) {
+          // Nothing was changed by this request. Say so rather than running the handoff again on
+          // the strength of a statement that matched no row.
+          console.warn('[offer] a second signature POST matched no unsigned row for offer', offer.id);
+          errorMsg = 'This offer has already been signed. Nothing was recorded twice.';
+        } else {
 
         // -----------------------------------------------------------------------------------------
         // THE WHOLE HANDOFF, IN ONE CALL THAT LEAVES A TRACE.
@@ -471,14 +495,27 @@ if (Astro.request.method === 'POST' && isOwner) {
               typedName, typedNameMatchesAccount: typedName.toLowerCase() === String(offer.candidateName || '').trim().toLowerCase(),
               userAgent: ua.slice(0, 300) },
           });
-        } catch (_) {}
+        } catch (e: any) {
+          // THE EVIDENCE OF CONSENT, LOST WITHOUT A WORD. This entry is the only durable record that
+          // a named person read the terms, typed their legal name and agreed — the thing anyone
+          // would go looking for if the acceptance were ever questioned. `catch (_) {}` meant a
+          // failure here left nothing at all: no audit row, no log line, and a screen still saying
+          // the offer was accepted. The signature itself is committed and must not be undone for
+          // this, but the gap has to be findable.
+          console.error('[offer] the acceptance audit entry was NOT written for offer', offer.id, '-', e?.cause?.message || e?.message);
+        }
 
         // The face-2FA selfie was captured before this employee record existed (middleware forces
         // enrolment on the first protected page load), so promote it to the profile photo now.
         try {
           const { promoteEnrolmentPhoto } = await import('@/lib/hr-onboarding');
           await promoteEnrolmentPhoto(String(user.id));
-        } catch (_) {}
+        } catch (e: any) {
+          // Cosmetic on its own — the new joiner's record simply has no photo — but a photo that
+          // never arrived with nothing anywhere saying why is how HR ends up asking the person to
+          // re-enrol a face that is already enrolled.
+          console.error('[offer] enrolment photo not promoted for user', user.id, '-', e?.cause?.message || e?.message);
+        }
 
         // Push notification to admins. The application id falls back to the offer's own column: it
         // was `app?.id || ''`, and `app` is null whenever the applicant record could not be matched
@@ -492,7 +529,11 @@ if (Astro.request.method === 'POST' && isOwner) {
             offer.roleTitle || 'a role',
             String(app?.id || offer.applicationId || ''),
           );
-        } catch (_) {}
+        } catch (e: any) {
+          // Nobody is watching this token. This push is the ONLY thing that tells the people desk a
+          // hire has just signed, so a failure that leaves no trace is a hire nobody is expecting.
+          console.error('[offer] the people desk was NOT told about the signature on offer', offer.id, '-', e?.cause?.message || e?.message);
+        }
 
         // THE SENTENCE MATCHES WHAT HAPPENED. It read "Offer accepted. You are officially part of
         // EduRankAI." on every path, including the ones where no employee record existed — a person
@@ -507,8 +548,15 @@ if (Astro.request.method === 'POST' && isOwner) {
         offer.status = 'signed';
         offer.signedAt = new Date();
         offer.signatureDataUrl = signatureDataUrl;
+        }
       } catch (err: any) {
-        errorMsg = 'Failed to record signature: ' + (err.message || 'Unknown error');
+        // `.message` on a drizzle/postgres-js error is only the SQL that failed — table and column
+        // names, handed to a candidate mid-signature — while the database's real reason sits unread
+        // on `.cause`. This printed the former and logged NOTHING, so a signature that never landed
+        // left no trace anywhere and nobody could answer why afterwards. The decline branch twenty
+        // lines above was already written this way.
+        console.error('[offer] signature failed for offer', offer.id, '-', err?.cause?.message || err?.message, err?.stack);
+        errorMsg = 'Your signature could not be recorded, so nothing has been accepted. Please try again in a moment — if it keeps failing, reply on your application thread and we will complete it by hand.';
       }
     }
   }
@@ -527,7 +575,12 @@ if (offer.createdUserId) {
     const { users } = await import('@/lib/db/schema');
     const u = await db.select({ h: users.internalHandle }).from(users).where(eq(users.id, offer.createdUserId)).limit(1);
     if (u.length > 0) internalHandle = u[0].h;
-  } catch (e) {}
+  } catch (e: any) {
+    // The handle is shown to the joiner as the account they will sign in with. A blank one where a
+    // handle exists reads as "you have no account yet", so the reason belongs in the log rather
+    // than nowhere.
+    console.error('[offer] internal handle lookup failed for user', offer.createdUserId, '-', e?.cause?.message || e?.message);
+  }
 }
 const isWithdrawn = offer.status === 'withdrawn';
 const isSigned = offer.status === 'signed';

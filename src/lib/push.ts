@@ -156,7 +156,15 @@ async function persistNotifications(userIds: string[], p: PushPayload) {
           AND n.created_at > NOW() - INTERVAL '2 minutes'
       )
     `);
-  } catch (e) { /* silent — never block delivery */ }
+  } catch (e: any) {
+    // NOT BLOCKING, BUT NOT SILENT EITHER. This is the ONE writer of the in-app notification feed and
+    // nineteen call sites reach it. Swallowed without a word, a failing INSERT meant nobody was
+    // notified of anything — no bell, no /admin/notifications row, no /portal/notifications row —
+    // while every caller carried on as though the person had been told. Still never re-thrown (a
+    // notification must not take down the action that triggered it), but now traceable.
+    // e.message is only the failed SQL; the database's reason is on e.cause.
+    console.error('[push] in-app notification NOT stored for', ids.length, 'recipient(s):', String(e?.cause?.message || e?.message || 'unknown error'));
+  }
 }
 
 // Send a push notification to all admin users who have opted in for this type.
@@ -179,8 +187,9 @@ export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: str
   if (payload.type !== 'activity_alert' && payload.type !== 'activity_digest') {
     import('@/lib/activity-feed')
       .then((m) => m.record('notify.' + payload.type, { title: payload.title, body: payload.body, url: payload.url }, { reach: 'log-only' }))
-      // Never let bookkeeping stop a notification the user is waiting on.
-      .catch(() => {});
+      // Never let bookkeeping stop a notification the user is waiting on — but say when it did not
+      // happen, because /admin/activity reading empty is otherwise indistinguishable from a quiet day.
+      .catch((e: any) => console.error('[push] activity feed not recorded for', payload.type, '-', String(e?.cause?.message || e?.message || 'unknown error')));
   }
 
   const vapidConfigured = !!(VAPID_PUBLIC && VAPID_PRIVATE);
@@ -254,6 +263,11 @@ export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: str
           // 410 Gone = subscription expired/revoked - clean it up
           if (err.statusCode === 410 || err.statusCode === 404) {
             await db.delete(pushSubscriptions).where(eq(pushSubscriptions.id, sub.id));
+          } else {
+            // EVERY OTHER FAILURE USED TO VANISH. A rejected payload, an auth error against the push
+            // service, a 5xx from the browser vendor: all discarded here, so push could stop
+            // delivering entirely and the only outward sign was that people stopped mentioning it.
+            console.error('[push] delivery refused by the push service (status ' + (err?.statusCode ?? 'none') + '):', err?.body || err?.message || 'unknown error');
           }
         }
       })
@@ -286,6 +300,9 @@ export async function sendPushToUser(userId: string, payload: PushPayload): Prom
         } catch (err: any) {
           if (err.statusCode === 410 || err.statusCode === 404) {
             await db.delete(pushSubscriptions).where(eq(pushSubscriptions.id, sub.id));
+          } else {
+            // Same silence as the admin fan-out above, on the single-recipient path.
+            console.error('[push] delivery to one user refused (status ' + (err?.statusCode ?? 'none') + '):', err?.body || err?.message || 'unknown error');
           }
         }
       })

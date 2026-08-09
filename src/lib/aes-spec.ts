@@ -24,7 +24,6 @@ const ALL = MODULES as unknown as AesModule[];
 /** Every module, in execution order (chapter ascending = the dependency sequence). */
 export function allModules(): AesModule[] { return ALL; }
 export function moduleById(id: string): AesModule | null { return ALL.find((m) => m.id === id) || null; }
-export function modulesByVolume(volume: string): AesModule[] { return ALL.filter((m) => m.volume === volume); }
 
 /** Volumes present in the books, with counts — ordered numerically. */
 export function volumeSummary(): { volume: string; count: number; first: number; last: number }[] {

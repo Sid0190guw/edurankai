@@ -222,7 +222,16 @@ export type LeaderboardResult =
   | { ok: true; rows: LeaderboardRow[] }
   | { ok: false; reason: string };
 
-/** Top N learners by total XP, read from user_xp — the table src/lib/xp.ts actually writes. */
+/**
+ * Top N learners by total XP, read from user_xp — the table src/lib/xp.ts actually writes.
+ *
+ * OPT-OUT IS PART OF THE QUERY, NOT A DECORATION ON IT. A learner who has asked not to appear on a
+ * leaderboard is excluded here, in SQL, so no caller can forget. That register (edu_gamer_state.
+ * opt_out) came from the XP ledger this codebase has just retired: /aquintutor/xp honoured it and
+ * this board did not, so collapsing the two systems without moving the filter first would have
+ * published, by name, people who had already opted out. src/lib/xp.ts owns the register now and its
+ * ensureSchema() creates the table, which getUserXp('') below runs before this join touches it.
+ */
 export async function getLeaderboard(limit: number = 20): Promise<LeaderboardResult> {
   await ensureGamificationSchema();
   const cap = Math.min(200, Math.max(1, Math.floor(limit || 20)));
@@ -242,7 +251,8 @@ export async function getLeaderboard(limit: number = 20): Promise<LeaderboardRes
         ROW_NUMBER() OVER (ORDER BY ux.total_xp DESC, ux.user_id ASC) AS rank
       FROM user_xp ux
       LEFT JOIN users u ON u.id = ux.user_id
-      WHERE ux.total_xp > 0
+      LEFT JOIN edu_gamer_state g ON g.user_id = ux.user_id
+      WHERE ux.total_xp > 0 AND COALESCE(g.opt_out, false) = false
       ORDER BY ux.total_xp DESC, ux.user_id ASC
       LIMIT ${cap}
     `));
@@ -275,6 +285,9 @@ export type LearnerStats = {
   progress: ReturnType<typeof xpProgressForUser>;
   totalBadges: number;
   recentBadges: any[];
+  /** EVERY earned badge key, not just the twelve most recent — a badge grid that marks the rest as
+   *  unearned needs the full set or it prints a badge somebody has already won as still to come. */
+  badgeKeys: string[];
   /** null means "not ranked yet" (no XP), which is different from "rank unknown". */
   rank: number | null;
   recentXp: { source: string; source_id: string | null; xp_amount: number; created_at: any }[];
@@ -304,6 +317,8 @@ export async function getLearnerStats(userId: string): Promise<LearnerStatsResul
     // Rank: how many learners are strictly ahead. Only meaningful once you have XP.
     let rank: number | null = null;
     if (totalXp > 0) {
+      // Deliberately NOT filtered by opt-out: this is the learner's own standing, shown only to
+      // them. Opting out means "do not list me to other people", not "stop counting me".
       const ahead = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM user_xp WHERE total_xp > ${totalXp}`))[0];
       rank = Number(ahead?.c || 0) + 1;
     }
@@ -372,6 +387,7 @@ export async function getLearnerStats(userId: string): Promise<LearnerStatsResul
         progress,
         totalBadges: badges.length,
         recentBadges: badges.slice(0, 12),
+        badgeKeys: badges.map((b: any) => String(b.badge_key || '')),
         rank,
         recentXp,
         newBadges: synced.ok ? synced.newlyAwarded : [],

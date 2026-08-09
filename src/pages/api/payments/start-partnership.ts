@@ -26,10 +26,20 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
   // Look up the application (do NOT reference starter_fee_paid — that column is
   // added lazily by applyPaidEffects, so it may not exist on older rows yet).
-  const app = rows(await db.execute(sql`
-    SELECT id, tier, org_name, contact_email, contact_phone
-    FROM partnership_applications WHERE id = ${applicationId} LIMIT 1
-  `).catch(() => []))[0] as any;
+  //
+  // "NOT FOUND" IS A CLAIM ABOUT THE PARTNER'S RECORD. It used to be produced by `.catch(() => [])`
+  // as well, so an unreachable pooler told a partner their application does not exist — they go and
+  // apply again, and now there are two. A read that did not complete says so instead.
+  let app: any;
+  try {
+    app = rows(await db.execute(sql`
+      SELECT id, tier, org_name, contact_email, contact_phone
+      FROM partnership_applications WHERE id = ${applicationId} LIMIT 1
+    `))[0] as any;
+  } catch (e: any) {
+    console.error('[payments/start-partnership] application lookup failed for', applicationId, '-', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'We could not read your application just now, so nothing was charged. Try again in a moment.' }, 500);
+  }
   if (!app) return json({ ok: false, error: 'application not found' }, 404);
   if (app.tier !== 'starter') return json({ ok: false, error: 'Only the Starter tier has an upfront fee. The Scale tier is 15% revenue share, billed on what each course earns.' }, 400);
 
@@ -44,16 +54,30 @@ export const POST: APIRoute = async ({ request, locals }) => {
   });
   if (!result.ok) return json({ ok: false, error: result.error }, 502);
 
-  await db.execute(sql`
-    INSERT INTO payments (
-      order_id, amount_paise, currency, status, purpose,
-      reference_type, reference_id, user_id, email, contact, notes
-    ) VALUES (
-      ${result.order.id}, ${amountPaise}, 'INR', 'created', 'partnership_starter',
-      'partnership_application', ${applicationId}, ${(locals as any)?.user?.id || null}, ${email}, ${app.contact_phone || null},
-      ${sql.raw("'" + JSON.stringify({ receipt, feeChf: STARTER_FEE_CHF, fxRate: fx.rate, fxDate: fx.date, fxLive: fx.live, org: app.org_name }).replace(/'/g, "''") + "'::jsonb")}
-    )
-  `).catch(() => {});
+  // THE PAYMENTS ROW IS NOT OPTIONAL, AND ITS FAILURE MUST NOT BE SWALLOWED.
+  //
+  // This ended in `.catch(() => {})`. applyPaidEffects() reads the order out of `payments` and
+  // returns IMMEDIATELY when there is none, so a failed insert here meant the partner paid the
+  // one-time CHF 100 Starter fee, starter_fee_paid was never set, onboarding never opened for them,
+  // and no row existed for anyone to reconcile or refund against.
+  //
+  // Refusing costs an unused order at the gateway, which expires on its own and charges nobody.
+  try {
+    await db.execute(sql`
+      INSERT INTO payments (
+        order_id, amount_paise, currency, status, purpose,
+        reference_type, reference_id, user_id, email, contact, notes
+      ) VALUES (
+        ${result.order.id}, ${amountPaise}, 'INR', 'created', 'partnership_starter',
+        'partnership_application', ${applicationId}, ${(locals as any)?.user?.id || null}, ${email}, ${app.contact_phone || null},
+        ${sql.raw("'" + JSON.stringify({ receipt, feeChf: STARTER_FEE_CHF, fxRate: fx.rate, fxDate: fx.date, fxLive: fx.live, org: app.org_name }).replace(/'/g, "''") + "'::jsonb")}
+      )
+    `);
+  } catch (e: any) {
+    console.error('[payments] partnership Starter fee order', result.order.id, 'could not be recorded for application',
+      applicationId, '-', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'We could not open checkout just now, so nothing was charged. Try again in a moment.' }, 500);
+  }
 
   return json({ ok: true, orderId: result.order.id, keyId: getPublicKeyId(), amountPaise, currency: 'INR', email, name: app.org_name || '', feeChf: STARTER_FEE_CHF });
 };

@@ -26,10 +26,28 @@
 // It deliberately does NOT return a row per person: a department view exists to answer "where are we
 // thin", and turning it into a per-person ranking is a different screen with different consequences
 // for the people on it.
+//
+// =================================================================================================
+// A FOURTH KIND OF CLAIM: ONE THAT WAS CHECKED
+// =================================================================================================
+//
+// SKILL_SOURCES has always declared 'course' and 'assessment', and until now nothing could write
+// them: every row in the matrix came from a human choosing a level in a form, so a department grid
+// that looked like a record of capability was a record of confidence. A level may now be attached to
+// a completion or a passed assessment — and the attachment is CONFIRMED HERE, against the learner's
+// own record, through the modules that own those facts (learning-progress.ts for a completion,
+// learning-doors.ts for an assessment). A hidden field in a form is not evidence, and this module
+// never takes one at its word.
+//
+// EduRankAI is the technology platform. The evidence sentence stored on such a row says what was
+// done on this platform; it does not say qualified, certified or accredited. Accredited partners
+// award credentials.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { logAudit } from '@/lib/audit';
 import { ensurePerformanceSchema } from '@/lib/performance-schema';
+import { completionEvidence, resolveLearnerUserId } from '@/lib/learning-progress';
+import { verifyAssessmentEvidence } from '@/lib/learning-doors';
 import {
   canSeePerformanceOf,
   clean,
@@ -314,6 +332,18 @@ export async function setEmployeeSkill(
      * answer down.
      */
     orgWide?: boolean;
+    /**
+     * What this level rests on, when it rests on something this platform can check.
+     *
+     * `course` is a training_courses.id and `assessment` is a test_attempts.id. NEITHER IS TRUSTED:
+     * both are re-read against the employee's own learner account below, and a reference that does
+     * not confirm is refused rather than downgraded — a level silently saved as a self-claim when
+     * somebody meant to attach evidence is a quieter kind of wrong.
+     *
+     * The evidence text and link are written from the confirmed record, never from the form, so two
+     * screens cannot word the same completion differently.
+     */
+    evidenceRef?: { kind: 'course' | 'assessment'; id: string } | null;
   },
 ): Promise<SkillWriteResult> {
   const employeeId = String(input?.employeeId || '');
@@ -334,11 +364,59 @@ export async function setEmployeeSkill(
     };
   }
 
-  const source = own ? 'self' : 'manager';
-  const evidence = clean(input?.evidence, 2000) || null;
-  const evidenceUrl = clean(input?.evidenceUrl, 500) || null;
+  let source = own ? 'self' : 'manager';
+  let evidence = clean(input?.evidence, 2000) || null;
+  let evidenceUrl = clean(input?.evidenceUrl, 500) || null;
   if (evidenceUrl && !/^https?:\/\//i.test(evidenceUrl)) {
     return { ok: false, error: 'An evidence link must start with http:// or https://' };
+  }
+
+  // ---- EVIDENCE, CONFIRMED RATHER THAN ACCEPTED ---------------------------------------------------
+  // The check is against the EMPLOYEE's learner account, not the caller's: a manager may record a
+  // level evidenced by their report's completion, and it is still that report's completion. When the
+  // employee record has no linked account there is nothing to confirm against, and that is said out
+  // loud rather than quietly downgraded to a self-claim the person did not make.
+  const refKind = input?.evidenceRef?.kind;
+  const ref = refKind === 'course' || refKind === 'assessment'
+    ? { kind: refKind, id: String(input?.evidenceRef?.id || '') }
+    : null;
+  if (ref) {
+    if (!isUuid(ref.id)) return { ok: false, error: 'Choose the completion or assessment this level rests on.' };
+    const learnerUserId = await resolveLearnerUserId(employeeId);
+    if (!isUuid(learnerUserId || '')) {
+      return {
+        ok: false,
+        error: 'This employee record has no linked account, so nothing on it can be confirmed as evidence. '
+          + 'The level can still be recorded as a stated claim without evidence.',
+      };
+    }
+    if (ref.kind === 'course') {
+      const ev = await completionEvidence(String(learnerUserId), ref.id);
+      if (!ev) {
+        return { ok: false, error: 'We could not read that course record just now, so nothing was saved. Please try again in a moment.' };
+      }
+      if (!ev.complete) {
+        return {
+          ok: false,
+          error: 'That course is not recorded as complete on this record, so it cannot be the evidence for a level. '
+            + 'A level recorded without evidence is kept as a stated claim, which is an honest thing to record.',
+        };
+      }
+      source = 'course';
+      evidence = ev.evidence;
+      evidenceUrl = ev.evidenceUrl || null;
+    } else {
+      const ev = await verifyAssessmentEvidence(String(learnerUserId), ref.id);
+      if (!ev) {
+        return {
+          ok: false,
+          error: 'That assessment result is not a passed attempt on this record, so it cannot be the evidence for a level.',
+        };
+      }
+      source = 'assessment';
+      evidence = ev.label;
+      evidenceUrl = ev.url || null;
+    }
   }
 
   try {

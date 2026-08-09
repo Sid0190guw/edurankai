@@ -22,9 +22,6 @@ export function validateBody<S extends ZodTypeAny>(schema: S, body: unknown): { 
   return { ok: false, error: first ? `${first.path.join('.') || 'body'}: ${first.message}` : 'invalid input' };
 }
 
-/** Pure rate-limit decision (pair with a windowed counter). */
-export function rateExceeded(countInWindow: number, maxPerWindow: number): boolean { return countInWindow >= maxPerWindow; }
-
 /** A sanitized, user-safe error message — the real cause is logged server-side, never returned. */
 export function sanitizeError(e: any): string {
   const msg = String(e?.cause?.message || e?.message || '');
@@ -37,4 +34,3 @@ export function sanitizeError(e: any): string {
 export function secureJson(data: any, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...secureHeaders() } });
 }
-export function errorJson(e: any, status = 200): Response { return secureJson({ ok: false, error: sanitizeError(e) }, status); }

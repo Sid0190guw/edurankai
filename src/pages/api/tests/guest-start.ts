@@ -74,13 +74,28 @@ export const POST: APIRoute = async ({ request, cookies, clientAddress }) => {
       notes: { purpose: 'test_enrollment', guest: 'true', testSlug: test.slug, name, email, phone: ph.e164 || '' },
     });
     if (!result.ok) return json({ ok: false, error: result.error }, 502);
-    await db.execute(sql`
-      INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, contact, notes)
-      VALUES (${result.order.id}, ${fx.paise}, 'INR', 'created', 'test_enrollment', 'test', ${test.id}, NULL, ${email}, ${ph.e164},
-        ${sql.raw("'" + JSON.stringify({ receipt, guest: true, testSlug: test.slug, name }).replace(/'/g, "''") + "'::jsonb")})
-    `).catch(() => {});
+    // THE PAYMENTS ROW IS NOT OPTIONAL, AND ITS FAILURE MUST NOT BE SWALLOWED.
+    //
+    // It ended in `.catch(() => {})`. This row is the only record a GUEST payment has — there is no
+    // account behind it — and it is what the confirmation path reads to unlock the test. Without it
+    // the person paid, the test stayed locked, and nobody could find the payment by name, e-mail or
+    // order to put it right. Refusing costs an unused order at the gateway, which charges nobody.
+    try {
+      await db.execute(sql`
+        INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, contact, notes)
+        VALUES (${result.order.id}, ${fx.paise}, 'INR', 'created', 'test_enrollment', 'test', ${test.id}, NULL, ${email}, ${ph.e164},
+          ${sql.raw("'" + JSON.stringify({ receipt, guest: true, testSlug: test.slug, name }).replace(/'/g, "''") + "'::jsonb")})
+      `);
+    } catch (e: any) {
+      console.error('[tests/guest-start] order', result.order.id, 'could not be recorded for', email, 'test', test.id,
+        '-', e?.cause?.message || e?.message);
+      return json({ ok: false, error: 'We could not open checkout just now, so nothing was charged. Try again in a moment.' }, 500);
+    }
     return json({ ok: true, paid: true, orderId: result.order.id, keyId: getPublicKeyId(), amountPaise: fx.paise, currency: 'INR', testTitle: test.title, testSlug: test.slug, prefill: { name, email, contact: ph.e164 } });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'server error' }, 500);
+    // `.message` on a drizzle/postgres-js error is only the SQL that failed; the reason is on
+    // `.cause` and belongs in the log rather than in a stranger's browser.
+    console.error('[tests/guest-start]', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'We could not start that just now, so nothing was charged. Try again in a moment.' }, 500);
   }
 };

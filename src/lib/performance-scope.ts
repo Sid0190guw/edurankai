@@ -27,7 +27,7 @@
 // wrongly shown an empty team list asks HR one question; a manager wrongly shown somebody else's
 // appraisal is a disclosure that cannot be taken back.
 import {
-  employeeIdForUser,
+  readEmployeeIdForUser,
   getDirectReports,
   isInitialized,
   isResponsibleFor,
@@ -127,8 +127,28 @@ export async function resolvePerfViewer(
     managesOrg = false;
   }
 
-  const employeeId = await employeeIdForUser(base.userId);
+  // THE READ, AND WHETHER IT HAPPENED. This was `employeeIdForUser()`, which logs a failed lookup and
+  // returns null — the same value it returns for an account that is genuinely not an employee. The
+  // scope then fell to kind 'none' and explain() printed "This account has no employee record, so
+  // there is no performance record attached to it": a statement about a person, made out of a pooler
+  // timeout, which sends them to HR to be added to a register they are already on. The header of this
+  // file already refuses the same shape one level up ("NEVER 'you manage nobody'"); this is the same
+  // rule applied to the lookup that resolves who they are at all.
+  //
+  // NOTHING IS OPENED BY IT. A failed read still resolves no reports, no review subjects and no
+  // employee id, so every surface still shows only what a null employee id allows — the flag changes
+  // the sentence and nothing else.
+  const employeeRead = await readEmployeeIdForUser(base.userId);
+  const employeeId = employeeRead.employeeId;
   const initialized = await isInitialized();
+  if (!employeeRead.ok) {
+    return {
+      ...base,
+      initialized,
+      explanation: 'We could not read your employee record just now, so this shows nothing rather '
+        + 'than guessing. This is not a statement that you have no employee record.',
+    };
+  }
 
   let fullName: string | null = null;
   let departmentId: string | null = null;

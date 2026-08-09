@@ -71,6 +71,23 @@ try {
 let interests: string[] = [];
 let follows: string[] = [];
 let dailyCap = 90;
+// A FAILED READ OF SOMEBODY'S OWN SETTINGS USED TO BE INDISTINGUISHABLE FROM HAVING NONE, and this
+// row is not decoration - it is the ONLY copy of two things the reader chose.
+//
+//   THE INTERESTS TEXTAREA IS PREFILLED FROM `interests`. On a swallowed failure it rendered EMPTY,
+//   and the Save button under it is an upsert with DO UPDATE SET interests = EXCLUDED.interests. So
+//   a reader who opened the Interests tab during a pooler hiccup, saw a blank box and pressed Save
+//   - the obvious thing to do when your tags have apparently vanished - overwrote every tag they
+//   had ever set with nothing, and the recommender they were told drives this feed lost its only
+//   personal input.
+//
+//   THE DAILY CAP IS A STATED WELLBEING CONTROL. `daily_cap_minutes` fell back to 90, and the
+//   banner at the top of the page then says in words "we cap daily watch time at 90 min" to a
+//   person who set theirs to 30. A number presented as a promise must not be a default standing in
+//   for a value nobody could read.
+//
+// The reason is kept and stated, and the tab refuses to pretend it knows what these are.
+let prefsReadError = '';
 try {
   const r = rows(await db.execute(sql`
     SELECT interests, follows, daily_cap_minutes FROM feed_user_interests WHERE user_id = ${user.id}
@@ -87,7 +104,10 @@ try {
       ON CONFLICT (user_id) DO NOTHING
     `);
   }
-} catch (e) {}
+} catch (e: any) {
+  prefsReadError = dbReason(e);
+  console.error('[feed] interests read failed:', prefsReadError);
+}
 
 // ---------------- View + AR-filter-use logging (JSON) ----------------
 //
@@ -160,7 +180,8 @@ if (
         SELECT ${user.id}, ${postId}::uuid, ${pct}, ${device}
          WHERE NOT EXISTS (
            SELECT 1 FROM feed_view_events
-            WHERE user_id = ${user.id} AND post_id = ${postId}::uuid AND created_at >= CURRENT_DATE
+            WHERE user_id = ${user.id} AND post_id = ${postId}::uuid
+             AND (created_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
          )
       `);
       return jsonOut({ ok: true }, 200);
@@ -175,7 +196,12 @@ if (
     }
     return jsonOut({ ok: false, error: 'nothing to record' }, 400);
   } catch (e: any) {
-    return jsonOut({ ok: false, error: String(e?.cause?.message || e?.message || 'failed').slice(0, 160) }, 500);
+    // The database's own words went to the reader's browser and NOWHERE ELSE - nothing was logged,
+    // so a view, comment or share that never recorded left no trace anybody could find, while the
+    // person who tapped the button was handed a Postgres complaint about a table they have never
+    // heard of. The reason is written down; the caller gets a sentence.
+    console.error('[feed] json action failed:', dbReason(e));
+    return jsonOut({ ok: false, error: 'That did not go through. Please try again.' }, 500);
   }
 }
 
@@ -268,9 +294,19 @@ const seenSet = new Set(seenRows.map((r: any) => r.post_id));
 let watchRow: any[] = [];
 let watchReadFailed = false;
 try {
+  // "TODAY" WAS THE DATABASE SESSION'S TODAY, WHICH IS UTC. Nothing in this codebase sets the
+  // session zone (src/lib/db opens postgres() without one) and every reader of this feed is in IST,
+  // so CURRENT_DATE cut the day at 05:30 IST. Two consequences, both on a control this page states
+  // in words: between 00:00 and 05:29 IST the total still carried the WHOLE of the previous IST
+  // evening, so the "Time's up for today" blocker could fire on somebody who had just opened the
+  // app at midnight; and from 05:30 IST onward everything watched in those small hours dropped out
+  // of the count entirely. The dedup guard above shared the boundary, so a reel seen last night
+  // still counted as "already seen today" at 1am. Cut in Asia/Kolkata, which is where the day is.
   watchRow = rows(await db.execute(sql`
     SELECT COALESCE(SUM(watched_pct), 0)::int AS pct_sum
-    FROM feed_view_events WHERE user_id = ${user.id} AND created_at >= CURRENT_DATE
+    FROM feed_view_events
+    WHERE user_id = ${user.id}
+      AND (created_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
   `));
 } catch (e: any) {
   watchReadFailed = true;
@@ -280,7 +316,10 @@ const pctSumToday = watchRow[0]?.pct_sum || 0;
 // Rough: assume avg post is 45s, watched_pct of 100 = 45s watched. So minutes ~ pct_sum/100 * 45 / 60
 const minutesToday = Math.floor((pctSumToday / 100) * 45 / 60);
 const watchPct = Math.min(100, Math.floor((minutesToday / dailyCap) * 100));
-const capReached = minutesToday >= dailyCap;
+// NOT reached on a figure nobody could read. `dailyCap` falls back to 90 when the settings row is
+// unreadable and `pctSumToday` falls back to 0 when the watch read fails; a full-screen blocker
+// built out of either default is a rule applied to a number that is not the reader's.
+const capReached = !watchReadFailed && !prefsReadError && minutesToday >= dailyCap;
 
 // ---------------- Hand-rolled recommendation scoring ----------------
 function jaccard(a: string[], b: string[]) {
@@ -623,9 +662,11 @@ const safeInterests = JSON.stringify(interests);
 
   <div class="wellbeing">
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1v6m0 6v6m11-11h-6m-6 0H1"/></svg>
-    <span>We use engagement signals to recommend, but we cap daily watch time at {dailyCap} min and never show you content optimised purely for outrage.</span>
-    <div class="wb-meter"><div style={`width:${watchPct}%`}></div></div>
-    <span class="wb-text">{watchReadFailed ? 'watch time unavailable' : minutesToday + 'm / ' + dailyCap + 'm today'}</span>
+    <span>{prefsReadError
+      ? 'We use engagement signals to recommend, and we cap daily watch time - but your own cap could not be read just now, so no figure here is yours. We never show you content optimised purely for outrage.'
+      : 'We use engagement signals to recommend, but we cap daily watch time at ' + dailyCap + ' min and never show you content optimised purely for outrage.'}</span>
+    <div class="wb-meter"><div style={`width:${(watchReadFailed || prefsReadError) ? 0 : watchPct}%`}></div></div>
+    <span class="wb-text">{(watchReadFailed || prefsReadError) ? 'watch time unavailable' : minutesToday + 'm / ' + dailyCap + 'm today'}</span>
   </div>
 
   {!schemaBoot.ok && (
@@ -812,11 +853,20 @@ const safeInterests = JSON.stringify(interests);
     <div style="padding:24px; max-width:680px">
       <h2 style="font-weight:500; font-size:28px; margin:0 0 10px 0">Your interests</h2>
       <p style="color:#c8c8d2; margin:0 0 18px 0">Comma-separated tags. We use these to drive the recommendation algorithm.</p>
-      <form method="POST">
-        <input type="hidden" name="action" value="save_interests" />
-        <textarea name="interests" rows="4" style="width:100%; background:#11131a; border:1px solid #2a2a35; color:#e8e8ee; padding:12px; border-radius:8px; font-family:'Geist Mono', monospace; font-size:13px">{interests.join(', ')}</textarea>
-        <button type="submit" style="margin-top:14px; background:#67e8f9; color:#0a0a0c; border:0; padding:10px 18px; border-radius:8px; font-family:inherit; font-weight:600; cursor:pointer; font-size:15px">Save interests</button>
-      </form>
+      {prefsReadError ? (
+        <div class="read-error">
+          Your saved interests could not be read ({prefsReadError}), so this box is empty for a
+          reason that is not "you have not set any". Saving now would replace whatever you have
+          stored with whatever is typed here, so the form is withheld until the read succeeds.
+          Reload once the database recovers.
+        </div>
+      ) : (
+        <form method="POST">
+          <input type="hidden" name="action" value="save_interests" />
+          <textarea name="interests" rows="4" style="width:100%; background:#11131a; border:1px solid #2a2a35; color:#e8e8ee; padding:12px; border-radius:8px; font-family:'Geist Mono', monospace; font-size:13px">{interests.join(', ')}</textarea>
+          <button type="submit" style="margin-top:14px; background:#67e8f9; color:#0a0a0c; border:0; padding:10px 18px; border-radius:8px; font-family:inherit; font-weight:600; cursor:pointer; font-size:15px">Save interests</button>
+        </form>
+      )}
 
       <h3 style="margin:32px 0 10px 0; font-weight:500">Algorithm transparency</h3>
       <pre style="background:#11131a; border:1px solid #2a2a35; padding:14px; border-radius:8px; font-size:11px; line-height:1.6; color:#c8c8d2; overflow-x:auto">score = log(views+1) * 0.4

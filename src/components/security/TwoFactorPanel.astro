@@ -134,10 +134,30 @@ function fmtDate(d: any): string { try { return d ? new Date(d).toLocaleDateStri
     var setup = $('tfaSetup'), onBox = $('tfaOn'), remainEl = $('tfaRemain');
     var offCode = $('tfaOffCode'), offBtn = $('tfaOffBtn'), offErr = $('tfaOffErr');
 
+    // THE FETCH ITSELF WAS NOT GUARDED, AND EVERY CALLER RE-ENABLES ITS BUTTON AFTER THE AWAIT.
+    //
+    // Only `r.json()` was wrapped. `fetch` REJECTS on a dropped connection, a flaky phone network or
+    // a blocked request - and that rejection propagated out of the click handler, so the line that
+    // puts the button back (`confirmBtn.disabled = false`, `offBtn.disabled = false`) never ran and
+    // no error text was ever written. The visible result on this panel was a dead "Turn off" button
+    // and total silence: somebody who pressed it and saw nothing happen concludes their second step
+    // is off when it is still on, which is the one wrong thing this screen can say.
+    //
+    // Every failure now comes back in the shape the endpoints use, so the callers' existing
+    // `if (!d.ok)` branch reports it and hands the button back.
     async function post(url, body) {
-      var r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify(body || {}) });
-      var d = {}; try { d = await r.json(); } catch (_) {}
-      return d;
+      try {
+        var r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify(body || {}) });
+        var d = null; try { d = await r.json(); } catch (_) { d = null; }
+        if (d && typeof d.ok !== 'undefined') return d;
+        // No JSON body at all: an expired session or a server error, not a refusal this panel can
+        // explain. Say which, rather than falling through to the caller's generic "Could not".
+        return { ok: false, error: (r.status === 401 || r.status === 403)
+          ? 'Your sign-in has expired. Reload the page and sign in again - nothing has changed.'
+          : 'The server did not answer that request (status ' + r.status + '). Nothing has changed - try again.' };
+      } catch (_) {
+        return { ok: false, error: 'Could not reach the server, so nothing has changed. Check your connection and try again.' };
+      }
     }
 
     if (startBtn) startBtn.addEventListener('click', async function () {
@@ -199,8 +219,19 @@ function fmtDate(d: any): string { try { return d ? new Date(d).toLocaleDateStri
       b.addEventListener('click', async function () {
         if (!confirm('Remove this passkey?')) return;
         b.disabled = true;
-        var r = await fetch('/api/2fa/passkey/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ id: b.getAttribute('data-id') }) });
-        var d = {}; try { d = await r.json(); } catch (_) {}
+        // Same guard as post() above: an unguarded `await fetch` rejects on a dropped connection and
+        // takes the rest of this handler with it, leaving the Remove button disabled for ever with
+        // nothing said - on the control that answers whether a lost device can still sign in.
+        var d = null;
+        try {
+          var r = await fetch('/api/2fa/passkey/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ id: b.getAttribute('data-id') }) });
+          try { d = await r.json(); } catch (_) { d = null; }
+          if (!d || typeof d.ok === 'undefined') {
+            d = { ok: false, error: 'The server did not answer that request (status ' + r.status + '). The passkey has NOT been removed.' };
+          }
+        } catch (_) {
+          d = { ok: false, error: 'Could not reach the server. The passkey has NOT been removed - check your connection and try again.' };
+        }
         if (d.ok) location.reload(); else { b.disabled = false; if (err) err.textContent = (d.error || 'Could not remove'); }
       });
     });

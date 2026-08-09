@@ -1110,7 +1110,25 @@ export async function getRelationshipHistory(employeeId: string): Promise<OrgEdg
  * rather than throw.
  */
 export async function employeeIdForUser(userId: string): Promise<string | null> {
-  if (!isUuid(userId)) return null;
+  return (await readEmployeeIdForUser(userId)).employeeId;
+}
+
+/**
+ * The same lookup, keeping "this account is not an employee" apart from "the lookup did not answer".
+ *
+ * NULL WAS BEING PRINTED AS A FACT ABOUT A PERSON. employeeIdForUser() logs a failed read and hands
+ * back null, which is the identical value it returns for an account that genuinely has no employee
+ * record — and callers then say so out loud. src/lib/performance-scope.ts printed "This account has
+ * no employee record, so there is no performance record attached to it" on the strength of it, which
+ * sends an employee to HR to be added to a register they are already on.
+ *
+ * `ok: false` means only that the read failed. It is never a grant: every caller still fails closed
+ * on a null employeeId; the flag exists so the sentence beside the emptiness can be honest.
+ */
+export async function readEmployeeIdForUser(
+  userId: string,
+): Promise<{ ok: boolean; employeeId: string | null }> {
+  if (!isUuid(userId)) return { ok: true, employeeId: null };
   try {
     const r = await db.execute(sql`
       SELECT id FROM hr_employees
@@ -1118,10 +1136,10 @@ export async function employeeIdForUser(userId: string): Promise<string | null> 
        ORDER BY is_active DESC, created_at ASC
        LIMIT 1`);
     const list = rows(r);
-    return list.length && list[0]?.id ? String(list[0].id) : null;
+    return { ok: true, employeeId: list.length && list[0]?.id ? String(list[0].id) : null };
   } catch (e: any) {
     logFail('employeeIdForUser', e);
-    return null;
+    return { ok: false, employeeId: null };
   }
 }
 

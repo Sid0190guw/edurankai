@@ -54,34 +54,79 @@ if (!invalidReason && Astro.request.method === 'POST') {
     errorMsg = 'Passwords do not match.';
   } else {
     try {
-      const newHash = await hashPassword(password);
-      await db.update(users).set({
-        passwordHash: newHash,
-        emailVerified: true,
-        updatedAt: new Date()
-      }).where(eq(users.id, invite!.userId));
+      // ═══ THE INVITE IS BURNED FIRST, ATOMICALLY, AND ONLY THEN IS A PASSWORD WRITTEN ═══
+      //
+      // WHAT WAS HERE: the password was written, and THEN `UPDATE invite_tokens SET used_at = now()
+      // WHERE token = ...` — a bare write, narrowed by nothing. The only test that the link was still
+      // unspent was the SELECT in this page's frontmatter, forty lines and one scrypt earlier. That
+      // is a read-modify-write with no guard on the one credential-setting path that is reachable by
+      // anybody holding a URL:
+      //
+      //   * TWO CONCURRENT POSTS on the same link both read `usedAt` as null, both pass, and both
+      //     set a password. The last writer wins and is handed a session — so an invite link that
+      //     leaked (a forwarded mail, a shared inbox, a link preview that was clicked) can be raced
+      //     against the person it was sent to, and the loser is told it worked.
+      //   * THE ORDER WAS BACKWARDS. Writing the credential before spending the token means a
+      //     failure between the two leaves a changed password AND a live link. reset-password.astro
+      //     states the rule for the other recovery path in as many words: consume first, atomically,
+      //     and only then write — if the write fails the token is already spent, which is the safe
+      //     direction.
+      //
+      // The UPDATE below matches only while `used_at IS NULL` and the link is unexpired, so exactly
+      // one caller can ever win it. Nobody loses a way in: a genuine first claim matches, and a
+      // second attempt now gets a sentence instead of silently overwriting the password that was
+      // just set.
+      const burned = await db.update(inviteTokens)
+        .set({ usedAt: new Date() })
+        .where(and(
+          eq(inviteTokens.token, token),
+          isNull(inviteTokens.usedAt),
+          gt(inviteTokens.expiresAt, new Date()),
+        ))
+        .returning({ userId: inviteTokens.userId });
+      const claimedUserId = burned[0]?.userId;
 
-      await db.update(inviteTokens).set({
-        usedAt: new Date()
-      }).where(eq(inviteTokens.token, token));
+      if (!claimedUserId) {
+        errorMsg = 'This invitation link has just been used, or it has expired. If you have already set a password, sign in with it. Otherwise email hr@edurankai.in.';
+      } else if (userRow?.isActive === false) {
+        // A DEACTIVATED ACCOUNT IS NOT CLAIMABLE, AND THIS DOOR HAD NO CHECK AT ALL.
+        //
+        // Offboarding (src/pages/admin/hr/employees/[id].astro, `mark_relieved`) sets
+        // users.is_active = false and tells the operator "The account is deactivated, so no sign-in
+        // method works." An unused invite still sitting in that person's mailbox let them set a
+        // fresh password on it. reset-password.astro was repaired for exactly this and this second
+        // credential-setting surface was left behind. The token is already spent at this point,
+        // which is the safe direction — nothing live is left lying in a mailbox.
+        errorMsg = 'That account has been deactivated, so it cannot be claimed here. Email hr@edurankai.in if you think that is wrong.';
+      } else {
+        const newHash = await hashPassword(password);
+        await db.update(users).set({
+          passwordHash: newHash,
+          emailVerified: true,
+          updatedAt: new Date()
+        }).where(eq(users.id, claimedUserId));
 
-      // Auto sign-in
-      const sessionToken = generateSessionToken();
-      const session = await createSession(sessionToken, invite!.userId, {
-        userAgent: Astro.request.headers.get('user-agent') || undefined,
-        ipAddress: Astro.clientAddress
-      });
-      setSessionCookie(Astro.cookies, sessionToken, session.expiresAt);
+        // Auto sign-in
+        const sessionToken = generateSessionToken();
+        const session = await createSession(sessionToken, claimedUserId, {
+          userAgent: Astro.request.headers.get('user-agent') || undefined,
+          ipAddress: Astro.clientAddress
+        });
+        setSessionCookie(Astro.cookies, sessionToken, session.expiresAt);
 
-      await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, invite!.userId));
+        await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, claimedUserId));
 
-      return Astro.redirect('/portal');
+        return Astro.redirect('/portal');
+      }
     } catch (err: any) {
       // The real Postgres reason is on err.cause; err.message is only the SQL that failed, and this
       // is an UNAUTHENTICATED surface — anyone holding an invite link was being shown the failed
       // statement, while nothing was logged for whoever had to work out why the claim did not take.
       console.error('[portal/claim] set password', err?.cause?.message || err?.message, err?.stack);
-      errorMsg = 'We could not set your password just now. Please try again, or email hr@edurankai.in.';
+      // The link may already have been spent by the atomic burn above, so this does not promise a
+      // retry will work. Saying "try again" alone would send somebody round a loop that can only
+      // fail, with nobody told.
+      errorMsg = 'We could not finish setting your password. The invitation link has been used up, so email hr@edurankai.in and a person will send you a fresh one.';
     }
   }
 }

@@ -257,17 +257,6 @@ export async function lockEvidence(
   }
 }
 
-/**
- * The pair of numbers /admin/hei has always displayed, computed where the rest of the codebase can
- * reach them. `total === 0` genuinely means no evidence has been attached — which, now that
- * attaching is possible, is a statement about the finding rather than about the software.
- */
-export async function evidenceLockCounts(findingId: string): Promise<{ ok: true; locked: number; total: number } | { ok: false; reason: string }> {
-  const res = await listEvidence(findingId);
-  if (!res.ok) return { ok: false, reason: res.reason };
-  return { ok: true, locked: res.rows.filter((r) => r.isLocked).length, total: res.rows.length };
-}
-
 export type PromoteResult = { ok: boolean; message: string };
 
 /**

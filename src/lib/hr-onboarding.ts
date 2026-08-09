@@ -202,15 +202,29 @@ export async function pendingForReview(limit = 100): Promise<any[]> {
 export async function promoteEnrolmentPhoto(userId: string): Promise<boolean> {
   const { db, sql } = await ctx();
   try {
-    await db.execute(sql`ALTER TABLE user_face_enrollments ADD COLUMN IF NOT EXISTS selfie_url TEXT`).catch(() => {});
-    await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS photo_url TEXT`).catch(() => {});
+    await db.execute(sql`ALTER TABLE user_face_enrollments ADD COLUMN IF NOT EXISTS selfie_url TEXT`)
+      .catch((e: any) => console.error('[hr-onboarding] selfie_url column', e?.cause?.message || e?.message));
+    await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS photo_url TEXT`)
+      .catch((e: any) => console.error('[hr-onboarding] photo_url column', e?.cause?.message || e?.message));
     const r = rows(await db.execute(sql`SELECT selfie_url FROM user_face_enrollments WHERE user_id = ${userId} AND selfie_url IS NOT NULL LIMIT 1`));
     const photo = r[0]?.selfie_url;
     if (!photo) return false;
-    await db.execute(sql`UPDATE users SET photo_url = COALESCE(photo_url, ${photo}) WHERE id = ${userId}::uuid`).catch(() => {});
-    await db.execute(sql`UPDATE hr_employees SET photo_url = COALESCE(photo_url, ${photo}) WHERE user_id = ${userId}`).catch(() => {});
-    return true;
-  } catch { return false; }
+    // TRUE MEANT "THE PHOTO WAS PROMOTED" AND WAS RETURNED WHATEVER HAPPENED. Both writes ended in
+    // `.catch(() => {})` and the function then answered true regardless, so a failure to copy the
+    // picture onto the employee record was reported to the offer-signing flow as a success and left
+    // no trace anywhere. The failures are now logged and the answer says whether either write landed.
+    let promoted = false;
+    await db.execute(sql`UPDATE users SET photo_url = COALESCE(photo_url, ${photo}) WHERE id = ${userId}::uuid`)
+      .then(() => { promoted = true; })
+      .catch((e: any) => console.error('[hr-onboarding] users.photo_url NOT set for', userId, '-', e?.cause?.message || e?.message));
+    await db.execute(sql`UPDATE hr_employees SET photo_url = COALESCE(photo_url, ${photo}) WHERE user_id = ${userId}`)
+      .then(() => { promoted = true; })
+      .catch((e: any) => console.error('[hr-onboarding] hr_employees.photo_url NOT set for', userId, '-', e?.cause?.message || e?.message));
+    return promoted;
+  } catch (e: any) {
+    console.error('[hr-onboarding] promoteEnrolmentPhoto', userId, '-', e?.cause?.message || e?.message);
+    return false;
+  }
 }
 
 /** Progress for a hire: how far through the credential step they are. */

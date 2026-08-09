@@ -1,6 +1,24 @@
 ---
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+// ONE COMPLETION FACT, SHARED WITH THE AQUINTUTOR PLAYER.
+//
+// This page used to keep its own ledger: it inserted training_progress, counted THAT table, and
+// wrote the result into training_enrollments.progress_pct — the same column
+// /api/aquintutor/lesson-complete was writing from a different table entirely. Two denominators,
+// last writer wins: finish four of five lessons in the AquinTutor runner (80%), mark one lesson
+// done here, and the stored figure silently became 20%. It also minted its own certificate number
+// off Date.now() into training_certificates, which /verify could not verify because the number was
+// never in the hash-chained ledger.
+//
+// Both players now go through src/lib/learning-progress.ts. Existing training_progress rows are
+// still counted — nothing was dropped and nobody's finished work disappears.
+import {
+  completedLessonIds as countedLessonIds,
+  completionEvidence,
+  ensureEnrolment,
+  recordLessonComplete,
+} from '@/lib/learning-progress';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
@@ -14,11 +32,12 @@ const { slug } = Astro.params;
 let course: any = null;
 let modules: any[] = [];
 let lessons: any[] = [];
-let enrollment: any = null;
 let completedLessonIds: string[] = [];
 let certificate: any = null;
 // Did each read RUN? An empty bucket and an unreadable one are different sentences, and the
-// screens below used to print the first one over the second.
+// screens below used to print the first one over the second. `progressOk` is false when the
+// completion count could not be read at all — a tick list rendered from a failed read would tell
+// somebody their finished lessons are gone.
 let lessonsOk = false;
 let progressOk = false;
 
@@ -43,40 +62,22 @@ const accessOk = course.access_type === 'public' || course.access_type === 'both
   (course.access_type === 'applicants' && !isEmployee);
 if (!accessOk) return Astro.redirect('/portal/courses');
 
-// AUTO-ENROLMENT, AND WHY THE SHAPE MATTERS.
+// AUTO-ENROLMENT, THROUGH THE ONE ENROLMENT WRITER.
 //
 // Opening a course enrols the reader. That was a SELECT, then a comparison in JavaScript, then an
-// unconditional INSERT and an unconditional `enrolled_count + 1`. Two loads arriving together — a
-// double tap on a phone, a link opened twice, a prefetch — both read "no enrolment", both inserted,
-// and the counter was bumped twice. training_enrollments carries no unique key this code can rely
-// on, so the result was two enrolment rows for one person on one course: progress written to
-// whichever one the next SELECT happened to return, and a published enrolment figure that has no way
-// back down.
+// unconditional INSERT and an unconditional `enrolled_count + 1`: two loads arriving together — a
+// double tap on a phone, a prefetch — both read "no enrolment", both inserted, and the counter was
+// bumped twice. The test and the write are now ONE statement inside ensureEnrolment(), which is the
+// same call HR's assignCourse() makes, so an employee ASKED to do a course and an employee who just
+// opened it end up in exactly one place.
 //
-// The test and the write are now ONE statement, and the counter is bumped only when that statement
-// actually created a row. HONEST LIMIT: without a unique constraint on (course_id, user_id) this
-// narrows the window rather than closing it — two statements can still pass NOT EXISTS at the same
-// instant. Adding that constraint is a migration for the founder to run against live data (it fails
-// if duplicates already exist), so it is not bootstrapped from a page load. NOT VERIFIED at runtime.
+// HONEST LIMIT, unchanged: training_enrollments still has no unique key on (course_id, user_id), so
+// this narrows the window rather than closing it. Adding that constraint is a migration for the
+// founder to run against live data (it fails if duplicates already exist), so it is not
+// bootstrapped from a page load. NOT VERIFIED at runtime.
 try {
-  const made = await db.execute(sql`
-    INSERT INTO training_enrollments (course_id, user_id, progress_pct)
-    SELECT ${course.id}, ${user.id}, 0
-     WHERE NOT EXISTS (
-       SELECT 1 FROM training_enrollments
-        WHERE course_id = ${course.id} AND user_id = ${user.id}
-     )
-    RETURNING *`);
-  const madeRows = Array.isArray(made) ? made : (made as any)?.rows || [];
-  if (madeRows.length > 0) {
-    enrollment = madeRows[0];
-    await db.execute(sql`UPDATE training_courses SET enrolled_count = COALESCE(enrolled_count, 0) + 1 WHERE id = ${course.id}`);
-  } else {
-    // Already enrolled — read the existing row rather than assuming what it holds.
-    const r = await db.execute(sql`SELECT * FROM training_enrollments WHERE course_id = ${course.id} AND user_id = ${user.id} LIMIT 1`);
-    const rows = Array.isArray(r) ? r : (r?.rows || []);
-    enrollment = rows[0] || null;
-  }
+  const enrol = await ensureEnrolment(String(user.id), String(course.id));
+  if (!enrol.ok) logFail('enrollment', new Error(enrol.error || 'enrolment did not complete'));
 } catch(e) { logFail('enrollment', e); }
 
 try {
@@ -87,19 +88,23 @@ try {
   lessonsOk = true;
 } catch(e) { logFail('modules + lessons', e); }
 
-if (enrollment) {
-  try {
-    const r = await db.execute(sql`SELECT lesson_id FROM training_progress WHERE enrollment_id = ${enrollment.id}`);
-    const rows = Array.isArray(r) ? r : (r?.rows || []);
-    completedLessonIds = (rows as any[]).map((r: any) => r.lesson_id);
-    progressOk = true;
-  } catch(e) { logFail('progress', e); }
-}
-
+// THE COMPLETED LESSONS, COUNTED ACROSS EVERY COMPLETION TABLE — including the rows this page
+// wrote into training_progress before the seam was closed, and the rows the AquinTutor runner
+// wrote into training_lesson_completions. A learner who finished lessons over there now sees them
+// ticked over here, on the first load, with no migration.
 try {
-  const r = await db.execute(sql`SELECT * FROM training_certificates WHERE course_id = ${course.id} AND user_id = ${user.id} LIMIT 1`);
-  const rows = Array.isArray(r) ? r : (r?.rows || []);
-  certificate = rows[0] || null;
+  completedLessonIds = await countedLessonIds(String(user.id), String(course.id));
+  progressOk = true;
+} catch(e) { logFail('progress', e); }
+
+// THE CERTIFICATE COMES FROM THE LEDGER, not from this page's own table. A number minted here off
+// Date.now() was reported as unverifiable by /verify, which portal/certificate/[number] already
+// documents. completionEvidence() reads course_certificates through its owner, and the
+// compatibility row written at completion carries the same number, so the older /portal/certificate
+// and /credentials links keep working and now point at something that verifies.
+try {
+  const ev = await completionEvidence(String(user.id), String(course.id));
+  certificate = ev && ev.certNumber ? { certificate_number: ev.certNumber } : null;
 } catch(e) { logFail('certificate', e); }
 
 if (Astro.request.method === 'POST') {
@@ -109,32 +114,21 @@ if (Astro.request.method === 'POST') {
     // THE BANNER USED TO BE UNCONDITIONAL. `?done=1` was appended to the redirect whether the
     // INSERT landed or threw, and the catch was empty, so a failed write rendered "Lesson
     // completed!" over a lesson that is still outstanding — and the reason never reached a log.
-    // It also fell straight through when `enrollment` was null (its own read having failed), so
-    // the button did nothing at all and said nothing about it.
-    let saved = false;
-    if (!enrollment) {
-      logFail('complete_lesson', new Error('no enrolment resolved for user ' + user.id + ' on course ' + course.id));
-    } else {
-      try {
-        await db.execute(sql`INSERT INTO training_progress (enrollment_id, lesson_id) VALUES (${enrollment.id}, ${lessonId}) ON CONFLICT DO NOTHING`);
-        // The percentage is only trustworthy when BOTH the lesson list and the existing progress
-        // were read. Writing one derived from a partial read would overwrite a correct figure with
-        // a lower one, so the completion row still lands and the percentage is left alone.
-        if (lessonsOk && progressOk) {
-          const total = lessons.length;
-          const done = completedLessonIds.includes(lessonId) ? completedLessonIds.length : completedLessonIds.length + 1;
-          const pct = total > 0 ? Math.min(100, Math.round((done/total)*100)) : 0;
-          await db.execute(sql`UPDATE training_enrollments SET progress_pct=${pct}, last_lesson_id=${lessonId}, updated_at=NOW() WHERE id=${enrollment.id}`);
-          if (pct >= 100 && !certificate) {
-            const certNum = 'ERA-CERT-' + Date.now().toString(36).toUpperCase();
-            await db.execute(sql`INSERT INTO training_certificates (course_id,user_id,enrollment_id,certificate_number) VALUES (${course.id},${user.id},${enrollment.id},${certNum}) ON CONFLICT DO NOTHING`);
-          }
-        } else {
-          await db.execute(sql`UPDATE training_enrollments SET last_lesson_id=${lessonId}, updated_at=NOW() WHERE id=${enrollment.id}`);
-        }
-        saved = true;
-      } catch(e) { logFail('complete_lesson', e); }
-    }
+    //
+    // The write itself is now the SINGLE writer both players share. It counts every completion
+    // table, writes the percentage once, sets completed_at — which nothing in this repository wrote
+    // before, so a course finished here stayed "in progress" on the employee learning path forever
+    // — and issues the certificate through the hash-chained ledger rather than minting a number.
+    // It enrols the reader if the enrolment above did not land, so a failed enrolment no longer
+    // means the button silently does nothing.
+    const done = await recordLessonComplete({
+      userId: String(user.id),
+      courseId: String(course.id),
+      lessonId,
+      source: 'portal',
+    });
+    const saved = done.ok;
+    if (!saved) logFail('complete_lesson', new Error(done.error || 'completion did not record'));
     return Astro.redirect(`/portal/courses/${slug}?lesson=${lessonId}&` + (saved ? 'done=1' : 'err=save'));
   }
 }
@@ -145,7 +139,13 @@ const justDone = urlP.get('done') === '1';
 // One code, from this page's own redirect, never anything variable off the request.
 const saveFailed = urlP.get('err') === 'save';
 const activeLesson = (lessons as any[]).find((l: any) => l.id === activeLessonId) || lessons[0] || null;
-const progressPct = enrollment?.progress_pct || 0;
+// The percentage a learner sees is the COUNTED one — the same lessons, out of the same tables, the
+// AquinTutor player counts — not the stored column the two players used to overwrite for each
+// other. Guarded on progressOk: a bar drawn from a read that failed reports zero, and zero here
+// reads as "your finished work is gone".
+const progressPct = progressOk && lessons.length > 0
+  ? Math.min(100, Math.round((completedLessonIds.length / lessons.length) * 100))
+  : 0;
 const currentIdx = activeLesson ? (lessons as any[]).findIndex((l: any) => l.id === activeLesson.id) : -1;
 const prevLesson = currentIdx > 0 ? lessons[currentIdx-1] : null;
 const nextLesson = currentIdx < lessons.length-1 ? lessons[currentIdx+1] : null;

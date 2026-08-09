@@ -9,6 +9,7 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { logAudit } from '@/lib/audit';
 import { denyAdminApi } from '@/lib/auth/api-guard';
+import { ensureOnce } from '@/lib/ensure-once';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
@@ -58,14 +59,22 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
     }, 400);
   }
 
+  // Six DDL round trips on every manual refund, inside a bare `catch (_) {}`, for columns that need
+  // adding once — and a bootstrap failure nothing could see, followed by an UPDATE that needs those
+  // columns and had no error handling of its own. Behind ensureOnce now; the write below reports its
+  // own failure, which is what makes a missing column visible instead of a bare 500.
   try {
-    await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_id VARCHAR(64)`);
-    await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_amount BIGINT`);
-    await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ`);
-    await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_reason TEXT`);
-    await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refunded_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL`);
-    await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_mode VARCHAR(20)`);
-  } catch (_) {}
+    await ensureOnce('payments.refund_columns_manual', async () => {
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_id VARCHAR(64)`);
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_amount BIGINT`);
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ`);
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_reason TEXT`);
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refunded_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL`);
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_mode VARCHAR(20)`);
+    });
+  } catch (e: any) {
+    console.error('[payments/refund-manual] refund columns could not be provisioned -', e?.cause?.message || e?.message);
+  }
 
   // BOTH SIDES IN PAISE. refundAmount was `amountPaise` (paise) or `pay.amount` (which this file
   // believed to be rupees), and the comparison below then decided the status by comparing the two
@@ -73,18 +82,41 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
   // with 500 and wrote 'refunded' on a payment four fifths of which had not been returned.
   const refundAmount = (amountPaise && amountPaise > 0) ? amountPaise : paidPaise;
   const newStatus = refundAmount < paidPaise ? 'partially_refunded' : 'refunded';
+  // ONE reference, COMPUTED ONCE. `'MANUAL-' + Date.now()` was evaluated separately in the UPDATE and
+  // again in the response, so the reference the operator was shown — and wrote against the bank
+  // transfer they were reconciling — was a different number from the one stored on the row whenever
+  // the two calls landed in different milliseconds. Nothing else anywhere carries this reference.
+  const manualRef = 'MANUAL-' + Date.now();
 
-  await db.execute(sql`
-    UPDATE payments
-    SET status = ${newStatus},
-        refund_id = ${'MANUAL-' + Date.now()},
-        refund_amount = ${refundAmount},
-        refunded_at = NOW(),
-        refund_reason = ${'[MANUAL] ' + reason},
-        refunded_by_user_id = ${user.id},
-        refund_mode = 'manual'
-    WHERE id = ${paymentRowId}
-  `);
+  // GUARDED, AND THE ANSWER IS READ. The refusal above is a READ, so two operators recording the same
+  // offline refund at the same moment both passed it and the second overwrote the first — and this
+  // row holds ONE refund amount, so the earlier entry simply vanished. The guard is repeated on the
+  // statement and zero rows back is reported instead of answered with "Marked refunded (manual)".
+  let written: any[] = [];
+  try {
+    written = rows(await db.execute(sql`
+      UPDATE payments
+      SET status = ${newStatus},
+          refund_id = ${manualRef},
+          refund_amount = ${refundAmount},
+          refunded_at = NOW(),
+          refund_reason = ${'[MANUAL] ' + reason},
+          refunded_by_user_id = ${user.id},
+          refund_mode = 'manual'
+      WHERE id = ${paymentRowId}
+        AND status NOT IN ('refunded', 'partially_refunded')
+      RETURNING id
+    `));
+  } catch (e: any) {
+    console.error('[payments/refund-manual] payment', paymentRowId, 'was not marked refunded -', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'That refund could not be recorded. Nothing was changed. Try again in a moment.' }, 500);
+  }
+  if (written.length === 0) {
+    return json({
+      ok: false,
+      error: 'This payment was recorded as refunded by somebody else a moment ago. Nothing was changed — check what has already gone back before recording anything more.',
+    }, 409);
+  }
 
   try {
     await logAudit({
@@ -92,10 +124,14 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
       action: 'payment.refund_manual',
       entity: 'payment',
       entityId: paymentRowId,
-      diff: { amount: refundAmount, reason, mode: 'manual', warning: 'No Razorpay API call — accounting-only entry' },
+      diff: { amount: refundAmount, reason, mode: 'manual', refundId: manualRef, warning: 'No Razorpay API call — accounting-only entry' },
       ipAddress: clientAddress,
     });
-  } catch (_) {}
+  } catch (e: any) {
+    // A refund written into the books by hand with nothing recording who wrote it is the entry nobody
+    // can answer for later.
+    console.error('[payments/refund-manual] the audit entry for', manualRef, 'on payment', paymentRowId, 'could not be written -', e?.cause?.message || e?.message);
+  }
 
-  return json({ ok: true, refundId: 'MANUAL-' + Date.now(), amount: refundAmount, mode: 'manual' });
+  return json({ ok: true, refundId: manualRef, amount: refundAmount, mode: 'manual' });
 };

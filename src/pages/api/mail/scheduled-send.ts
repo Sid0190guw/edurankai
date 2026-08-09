@@ -71,14 +71,25 @@ async function run() {
         });
         const status = send.ok ? 'sent' : (send.provider === 'none' ? 'no_transport' : 'failed');
         for (const e of result.external) await logOutbound({ messageId: result.messageId, rfcMessageId: result.rfcMessageId, to: e.email, from: fromEmail, subject: s.subject || '', status, provider: send.provider, error: send.error }).catch((le: any) => console.error('[scheduled-send] delivery log failed:', le?.cause?.message || le?.message));
-        await db.execute(sql`UPDATE mail_messages SET direction = 'outbound' WHERE id = ${result.messageId}`).catch(() => {});
+        // Same best-effort-but-never-silent rule as /api/mail/send: `direction` is what the analytics
+        // console counts and what places the Sent copy, so a failure here hides a message that did go.
+        await db.execute(sql`UPDATE mail_messages SET direction = 'outbound' WHERE id = ${result.messageId}`)
+          .catch((de: any) => console.error('[scheduled-send] outbound flag not set for ' + result.messageId + ':', de?.cause?.message || de?.message));
         if (!send.ok) externalError = send.error || 'the mail server refused the message';
       }
       // A scheduled message whose SMTP attempt was REFUSED used to be recorded as 'sent' — so the
       // scheduled list told the sender their message had gone when the only thing that happened
       // was a copy landing in their own Sent folder. It says what happened now.
       if (externalError) {
-        await markScheduled(s.id, 'failed', result.messageId, ('Saved to Sent, but not delivered: ' + externalError).slice(0, 240)).catch(() => {});
+        // THE STATEMENT THAT RECORDS THE FAILURE WAS ITSELF ALLOWED TO FAIL IN SILENCE, and this
+        // one is not cosmetic. claimDueScheduled() has already moved the row to 'sending', and it
+        // reclaims anything left in that state for more than 15 minutes - so a markScheduled() that
+        // throws leaves the queue row claimed-but-never-settled and the NEXT run picks it up and
+        // sends the same message to the same recipient again. Mail cannot be recalled. It stays
+        // best-effort (the send has happened; throwing here changes nothing about that) but the
+        // reason is written down, because a redelivery with no log is unfindable.
+        await markScheduled(s.id, 'failed', result.messageId, ('Saved to Sent, but not delivered: ' + externalError).slice(0, 240))
+          .catch((me: any) => console.error('[scheduled-send] status not recorded for ' + s.id + ' (it may be re-sent):', me?.cause?.message || me?.message));
         failed++;
       } else {
         await markScheduled(s.id, 'sent', result.messageId);
@@ -87,7 +98,8 @@ async function run() {
     } catch (e: any) {
       const reason = String(e?.cause?.message || e?.message || e);
       console.error('[scheduled-send] failed for', s.id, reason);
-      await markScheduled(s.id, 'failed', undefined, reason.slice(0, 240)).catch(() => {});
+      await markScheduled(s.id, 'failed', undefined, reason.slice(0, 240))
+        .catch((me: any) => console.error('[scheduled-send] status not recorded for ' + s.id + ' (it may be retried):', me?.cause?.message || me?.message));
       failed++;
     }
   }

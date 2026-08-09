@@ -145,16 +145,31 @@ export const POST: APIRoute = async ({ request, locals }) => {
     if (!result.ok) return json({ ok: false, error: result.error }, 502);
 
     const notesJson = JSON.stringify({ receipt, testSlug: test.slug, displayCurrency, displayAmountMinor, fxRate, fxDate, fxLive });
-    await db.execute(sql`
-      INSERT INTO payments (
-        order_id, amount_paise, currency, status, purpose,
-        reference_type, reference_id, user_id, email, notes
-      ) VALUES (
-        ${result.order.id}, ${amountPaise}, 'INR', 'created', 'test_enrollment',
-        'test', ${test.id}, ${user.id}, ${user.email || 'unknown@edurankai.in'},
-        ${notesJson}::jsonb
-      )
-    `).catch(() => {});
+    // THE PAYMENTS ROW IS NOT OPTIONAL, AND ITS FAILURE MUST NOT BE SWALLOWED.
+    //
+    // It ended in `.catch(() => {})`. This row is what unlocks the test: /aquintutor/test/[slug]
+    // gates the runner on a PAID payments row with reference_type 'test' and this test's id, and
+    // /api/aquintutor/confirm-test-payment looks the order up here. So a failed insert meant the
+    // candidate paid the test fee and the runner stayed locked, with nothing anywhere recording that
+    // money had been taken.
+    //
+    // Refusing costs an unused order at the gateway, which expires on its own and charges nobody.
+    try {
+      await db.execute(sql`
+        INSERT INTO payments (
+          order_id, amount_paise, currency, status, purpose,
+          reference_type, reference_id, user_id, email, notes
+        ) VALUES (
+          ${result.order.id}, ${amountPaise}, 'INR', 'created', 'test_enrollment',
+          'test', ${test.id}, ${user.id}, ${user.email || 'unknown@edurankai.in'},
+          ${notesJson}::jsonb
+        )
+      `);
+    } catch (e: any) {
+      console.error('[aquintutor/start-test-enrollment] order', result.order.id, 'could not be recorded for user', user.id,
+        'test', test.id, '-', e?.cause?.message || e?.message);
+      return json({ ok: false, error: 'We could not open checkout just now, so nothing was charged. Try again in a moment.' }, 500);
+    }
 
     return json({
       ok: true,
@@ -171,6 +186,9 @@ export const POST: APIRoute = async ({ request, locals }) => {
       prefill: { name: user.name || '', email: user.email || '' },
     });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'server error' }, 500);
+    // `.message` on a drizzle/postgres-js error is only the SQL that failed — table and column names
+    // handed to whoever posted; the real reason is on `.cause` and belongs in the log.
+    console.error('[aquintutor/start-test-enrollment]', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'We could not start that test payment just now, so nothing was charged. Try again in a moment.' }, 500);
   }
 };

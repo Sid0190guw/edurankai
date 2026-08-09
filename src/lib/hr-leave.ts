@@ -904,9 +904,17 @@ async function routeLeaveRequest(
       // NOT SWALLOWED. The request is filed and has no chain; the caller says so on screen and the
       // row carries the reason, so it can be found and re-routed rather than sitting unowned.
       const why = wf.error || 'The approval chain could not be started.';
-      await db.execute(sql`
-        UPDATE hr_leave_request SET halt_reason = ${why.slice(0, 500)}
-         WHERE id = ${requestId} AND status = 'pending'`).catch(() => {});
+      // NOT SWALLOWED. This UPDATE is what carries the halt sentence onto the row, and the docblock
+      // above says why it matters: without it /portal/employee/leave reads status 'pending' and shows
+      // the employee a wait with no cause. `.catch(() => {})` meant a failure to record the reason
+      // left no trace at all, so the request looked like an ordinary pending one to every screen.
+      try {
+        await db.execute(sql`
+          UPDATE hr_leave_request SET halt_reason = ${why.slice(0, 500)}
+           WHERE id = ${requestId} AND status = 'pending'`);
+      } catch (e2: any) {
+        logFail('routeLeaveRequest.markHalt', e2);
+      }
       return { halted: true, haltReason: why, instanceId: null, routed: false };
     }
     const halted = wf.state === 'halted';
@@ -1291,6 +1299,42 @@ export async function listLeave(opts: { employeeId?: string; status?: string } =
     FROM hr_leave_request l LEFT JOIN hr_employees e ON l.employee_id = e.id
     ${opts.status ? sql`WHERE l.status = ${opts.status}` : sql``}
     ORDER BY (l.status='pending') DESC, l.start_date DESC LIMIT 120`);
+}
+
+/**
+ * The same read, WITH the outcome — for a screen where being wrong costs somebody their time off.
+ *
+ * listLeave() goes through safe(), which catches, logs and returns []. That tolerance is right for a
+ * widget on a workspace: one broken query must not blank a whole console. It is wrong for
+ * /admin/hr/leave, where the identical empty array renders as "No leave requests waiting." — a
+ * confident empty on a DECISION screen. Nobody investigates the word "none", so a total read failure
+ * looked exactly like a quiet Tuesday and every pending request sat unactioned behind it.
+ *
+ * Same query, same shape, same ordering. The only difference is that the caller can tell the
+ * difference between "nothing is waiting" and "we do not know what is waiting". Callers that
+ * legitimately want the tolerant form keep listLeave(); nothing about it changes.
+ *
+ * Never throws — the failure comes back as `{ ok: false, error }`, so a page cannot forget to handle
+ * it by forgetting a try/catch.
+ */
+export async function readLeave(
+  opts: { employeeId?: string; status?: string } = {},
+): Promise<{ ok: boolean; rows: any[]; error: string | null }> {
+  try {
+    await ensureLeaveSchema();
+    const q = opts.employeeId
+      ? sql`SELECT * FROM hr_leave_request WHERE employee_id = ${opts.employeeId} ORDER BY start_date DESC LIMIT 60`
+      : sql`SELECT l.*, e.full_name, e.employee_code, e.designation
+          FROM hr_leave_request l LEFT JOIN hr_employees e ON l.employee_id = e.id
+          ${opts.status ? sql`WHERE l.status = ${opts.status}` : sql``}
+          ORDER BY (l.status='pending') DESC, l.start_date DESC LIMIT 120`;
+    return { ok: true, rows: await strictRead(q), error: null };
+  } catch (e: any) {
+    // The real Postgres reason is on e.cause; e.message is only the SQL that failed.
+    const reason = String(e?.cause?.message || e?.message || 'unknown database error');
+    logFail('readLeave', e);
+    return { ok: false, rows: [], error: reason };
+  }
 }
 
 /**

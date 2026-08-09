@@ -463,6 +463,22 @@ function mapEvent(r: any): AssetEvent {
 
 /** The register, with whoever is currently holding each thing joined on. */
 export async function listAssets(opts: { kind?: string | null; status?: string | null; q?: string | null; limit?: number } = {}): Promise<Asset[]> {
+  return (await readAssets(opts)).rows;
+}
+
+/**
+ * THE SAME READ, SAYING WHETHER IT WORKED.
+ *
+ * listAssets() catches its own error and returns [], so a failed read rendered as "Nothing on the
+ * register yet. Add the first thing below" — an instruction to REGISTER something that may already
+ * be registered, on the screen whose whole job is to be the single record of what the company owns
+ * and who is holding it. Duplicating a laptop's tag is not a cosmetic error.
+ *
+ * `ok:false` means UNKNOWN, never "none".
+ */
+export async function readAssets(
+  opts: { kind?: string | null; status?: string | null; q?: string | null; limit?: number } = {},
+): Promise<{ ok: boolean; rows: Asset[]; error: string | null }> {
   const limit = Math.min(Math.max(Number(opts.limit) || 200, 1), 500);
   try {
     await ensureAssetSchema();
@@ -486,10 +502,11 @@ export async function listAssets(opts: { kind?: string | null; status?: string |
        WHERE TRUE ${byKind} ${byStatus} ${byQ}
        ORDER BY (a.status IN ('retired','lost')) ASC, a.created_at DESC
        LIMIT ${limit}`);
-    return rows(r).map(mapAsset);
+    return { ok: true, rows: rows(r).map(mapAsset), error: null };
   } catch (e: any) {
-    logFail('listAssets', e);
-    return [];
+    logFail('readAssets', e);
+    // The real Postgres reason is on e.cause; e.message is only the SQL that failed.
+    return { ok: false, rows: [], error: String(e?.cause?.message || e?.message || 'unknown database error') };
   }
 }
 

@@ -1,0 +1,472 @@
+---
+// /admin/learning/person/[employeeId] — ONE PERSON'S LEARNING RECORD, AND THE ABILITY TO CORRECT IT.
+//
+// THIS IS WHERE THE TWO PLAYERS ARE RECONCILED. For every assigned course this screen counts the
+// lessons finished in the portal player (training_progress), the lessons finished in the AquinTutor
+// runner (training_lesson_completions) and the third ledger the authoring module already unions —
+// and shows one figure, with the two sources beside it so a disagreement is visible rather than
+// merely fixed. "Recompute" writes that one figure back onto every enrolment row for this person and
+// course, and writes training_enrollments.completed_at, which nothing else in this repository writes.
+//
+// WHAT IS SENSITIVE HERE. Recording a completion, withdrawing one, issuing a certificate and
+// withdrawing one are statements about a person that outlive this platform. Each needs its own
+// capability, each needs a written reason, each is audited, and each tells the person it is about.
+// A withdrawal is recorded as a later fact — the certificate ledger is a hash chain and deleting an
+// entry would break verification for everybody who came after.
+//
+// SCOPE IS PER ROW. `learning.progress.view` reaches everybody; a department head reaches their own
+// department through the Organization Graph. The check runs against THIS employee before the page
+// renders anything and again before any write.
+//
+// EduRankAI is the technology platform; accredited partners award credentials. A completion here is a
+// record of work done on this platform, not a qualification.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { flashFailed } from '@/lib/flash-tone';
+import { can } from '@/lib/auth/permissions';
+import { confirmAttr, clip } from '@/lib/page-safety';
+import { resolvePerfViewer, LEARNING_ASSIGN } from '@/lib/performance-scope';
+import { withdrawAssignment } from '@/lib/performance-learning';
+import {
+  resolveLearningScope,
+  scopeCoversEmployee,
+  personRecord,
+  recomputeEnrolment,
+  markCompletion,
+  revokeCompletion,
+  issueCourseCertificate,
+  withdrawCertificate,
+  extendDeadline,
+  overrideHistory,
+  COMPLETION_KIND_LABELS,
+  LEARNING_PROGRESS_VIEW,
+  LEARNING_COMPLETION_OVERRIDE,
+  LEARNING_CERTIFICATE_MANAGE,
+  type LearningScope,
+  type PersonRecord,
+} from '@/lib/learning-admin';
+
+const employeeId = String(Astro.params.employeeId || '');
+const PATH = '/admin/learning/person/' + employeeId;
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=' + encodeURIComponent(PATH));
+if (!can(user as any, 'admin.access')) return Astro.redirect('/admin');
+
+// Every const above the handler — `const` is not hoisted, and a const read before its declaration
+// throws on the handler's first line.
+const holds = (k: string) => can(user as any, k as any);
+const scope: LearningScope = await resolveLearningScope(String(user.id), holds, LEARNING_PROGRESS_VIEW);
+const inScope = await scopeCoversEmployee(scope, employeeId);
+const canOverride = can(user as any, LEARNING_COMPLETION_OVERRIDE as any);
+const canCertificates = can(user as any, LEARNING_CERTIFICATE_MANAGE as any);
+const canAssign = can(user as any, LEARNING_ASSIGN as any) || (!scope.orgWide && scope.departmentIds.length > 0);
+const actor = { userId: String(user.id) };
+
+const back = (msg: string) => Astro.redirect(PATH + '?msg=' + encodeURIComponent(msg.slice(0, 400)));
+
+const fmtDay = (d: string | null) =>
+  d ? new Date(d + 'T00:00:00Z').toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : 'No date';
+
+const fmtWhen = (isoStr: string | null) =>
+  isoStr ? new Date(isoStr).toLocaleString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+
+if (Astro.request.method === 'POST') {
+  if (!inScope) return back('That person is not inside your scope, so nothing was changed.');
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const courseId = String(fd.get('course_id') || '');
+  const learnerUserId = String(fd.get('learner_user_id') || '');
+
+  if (action === 'recompute') {
+    const r = await recomputeEnrolment(actor.userId, learnerUserId, courseId);
+    if (!r.ok) return back(r.error || 'Nothing was recomputed.');
+    const p = r.progress;
+    return back(
+      'Recomputed: ' + (p ? p.lessonsDone + ' of ' + p.totalLessons + ' lessons, ' + p.pct + '%. ' : '')
+      + (p && p.isComplete ? 'This course is now recorded as complete.' : 'This course is not complete yet.'),
+    );
+  }
+
+  if (action === 'mark_complete') {
+    if (!canOverride) return back('You do not hold the ability to record a completion, so nothing was changed.');
+    const r = await markCompletion(actor, {
+      userId: learnerUserId,
+      courseId,
+      employeeId,
+      reason: String(fd.get('reason') || ''),
+    });
+    return back(r.ok ? (r.info || 'Completion recorded.') : (r.error || 'Nothing was recorded.'));
+  }
+
+  if (action === 'revoke_complete') {
+    if (!canOverride) return back('You do not hold the ability to withdraw a completion, so nothing was changed.');
+    const r = await revokeCompletion(actor, {
+      userId: learnerUserId,
+      courseId,
+      employeeId,
+      reason: String(fd.get('reason') || ''),
+    });
+    return back(r.ok ? (r.info || 'Completion withdrawn.') : (r.error || 'Nothing was withdrawn.'));
+  }
+
+  if (action === 'issue_cert') {
+    if (!canCertificates) return back('You do not hold the ability to issue a certificate, so nothing was issued.');
+    const r = await issueCourseCertificate(actor, {
+      userId: learnerUserId,
+      courseId,
+      grade: String(fd.get('grade') || ''),
+      reason: String(fd.get('reason') || ''),
+    });
+    return back(r.ok ? (r.info || 'Certificate issued.') : (r.error || 'Nothing was issued.'));
+  }
+
+  if (action === 'withdraw_cert') {
+    if (!canCertificates) return back('You do not hold the ability to withdraw a certificate, so nothing was changed.');
+    const r = await withdrawCertificate(actor, {
+      certNumber: String(fd.get('cert_number') || ''),
+      reason: String(fd.get('reason') || ''),
+    });
+    return back(r.ok ? (r.info || 'Certificate withdrawn.') : (r.error || 'Nothing was withdrawn.'));
+  }
+
+  if (action === 'extend') {
+    if (!canAssign) return back('You do not hold the ability to move a learning deadline, so nothing was changed.');
+    const r = await extendDeadline(actor.userId, {
+      assignmentId: String(fd.get('assignment_id') || ''),
+      dueOn: String(fd.get('due_on') || ''),
+      reason: String(fd.get('reason') || ''),
+    });
+    return back(r.ok ? (r.info || 'Deadline moved.') : (r.error || 'Nothing was changed.'));
+  }
+
+  if (action === 'withdraw_assignment') {
+    if (!canAssign) return back('You do not hold the ability to withdraw an assignment, so nothing was changed.');
+    const viewer = await resolvePerfViewer(String(user.id), holds);
+    const r = await withdrawAssignment(viewer, String(fd.get('assignment_id') || ''), true);
+    return back(r.ok ? 'Assignment withdrawn. The row is kept, so the record still says it was asked for.' : (r.error || 'Nothing was withdrawn.'));
+  }
+
+  return back('That action is not one this page performs.');
+}
+
+const msg = String(Astro.url.searchParams.get('msg') || '').slice(0, 400);
+
+const record: PersonRecord | null = inScope ? await personRecord(employeeId) : null;
+const history = record && record.userId ? await overrideHistory(record.userId, 30) : [];
+const completeCount = record ? record.assignments.filter((a) => a.progress.isComplete).length : 0;
+const disagreeCount = record ? record.assignments.filter((a) => a.progress.ledgersDisagree).length : 0;
+const staleCount = record
+  ? record.assignments.filter((a) => a.progress.isComplete && !a.progress.storedCompletedAt).length
+  : 0;
+---
+
+<AdminLayout title="Learning record" activeNav="hr">
+  <style>
+    .pr{max-width:1000px;padding:16px 16px 80px;margin:0 auto}
+    .pr h1{font-size:21px;font-weight:700;letter-spacing:-.01em;margin:0 0 4px;color:var(--o-hi,#fff)}
+    .pr .lede{font-size:13px;line-height:1.6;color:#9aa6b6;margin:0 0 16px;max-width:74ch}
+    .pr .flash{background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.34);color:#34d399;
+      border-radius:10px;padding:11px 13px;font-size:13px;line-height:1.5;margin-bottom:14px;overflow-wrap:anywhere}
+    .pr .flash.warn{background:rgba(220,38,38,.1);border-color:rgba(220,38,38,.36);color:#fca5a5}
+    .pr .notice{background:rgba(255,79,0,.07);border:1px solid rgba(255,79,0,.26);color:#ffb08a;
+      border-radius:11px;padding:12px 14px;font-size:12.5px;line-height:1.6;margin-bottom:12px;max-width:78ch}
+    .pr .card{background:var(--o-bg2,#11151c);border:1px solid var(--o-stroke,#1a1a1f);border-radius:14px;
+      padding:15px;margin-bottom:13px}
+    .pr .card h2{font-family:'Geist Mono',ui-monospace,monospace;font-size:10px;letter-spacing:.13em;
+      text-transform:uppercase;color:#FF7040;font-weight:700;margin:0 0 11px}
+    .pr .card h3{font-size:15px;font-weight:700;color:var(--o-hi,#fff);margin:0 0 6px}
+    .pr .muted{font-size:12.5px;line-height:1.6;color:#9aa6b6;overflow-wrap:anywhere}
+    .pr label{font-family:'Geist Mono',ui-monospace,monospace;font-size:9.5px;letter-spacing:.1em;
+      text-transform:uppercase;color:#8a8a94;font-weight:700;display:block;margin:10px 0 4px}
+    .pr input,.pr select,.pr textarea{width:100%;background:var(--o-bg0,#08080a);
+      border:1px solid var(--o-stroke,#2a2a32);border-radius:9px;padding:10px 12px;font-size:14px;
+      font-family:inherit;color:var(--o-hi,#fff);outline:none;min-height:44px;box-sizing:border-box}
+    .pr textarea{min-height:70px;resize:vertical;font-size:13px}
+    .pr input:focus,.pr select:focus,.pr textarea:focus{border-color:#FF4F00}
+    .pr .btn{background:#FF4F00;color:#fff;border:none;border-radius:10px;padding:11px 17px;font-size:14px;
+      font-weight:650;cursor:pointer;font-family:inherit;min-height:44px;margin-top:10px}
+    .pr .btn.ghost{background:transparent;color:#c9ccd4;border:1px solid var(--o-stroke,#2a2a32)}
+    .pr .btn.slim{padding:9px 13px;font-size:12.5px;margin-top:0;min-height:40px}
+    .pr .pill{font-family:'Geist Mono',ui-monospace,monospace;font-size:9px;font-weight:700;padding:3px 8px;
+      border-radius:99px;text-transform:uppercase;letter-spacing:.05em;background:rgba(255,255,255,.07);
+      color:#9aa6b6;display:inline-block;white-space:nowrap}
+    .pr .pill.live{background:rgba(16,185,129,.15);color:#34d399}
+    .pr .pill.late{background:rgba(220,38,38,.13);color:#fca5a5}
+    .pr .pill.warn{background:rgba(234,179,8,.15);color:#facc15}
+    .pr .bar{height:7px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;margin:7px 0}
+    .pr .bar i{display:block;height:100%;background:#FF4F00}
+    .pr .sub{border-top:1px solid var(--o-stroke,#1a1a1f);margin-top:12px;padding-top:12px}
+    .pr .inline{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .pr a.lnk{color:#FF7040;text-decoration:none}
+    .pr details{margin-top:10px}
+    .pr summary{cursor:pointer;font-size:12.5px;color:#FF7040;min-height:44px;display:flex;align-items:center}
+  </style>
+
+  <div class="pr">
+    <p class="muted" style="margin-bottom:8px">
+      <a class="lnk" href="/admin/learning/progress">Back to learning progress</a>
+    </p>
+
+    {!inScope && (
+      <div class="notice">
+        <p><b>This record is not inside your scope.</b> {scope.explanation}</p>
+        <p style="margin-top:8px">Nothing about this person is shown, including whether the record
+        exists at all — a screen that distinguished "outside your scope" from "no such person" would
+        answer a question you are not entitled to ask.</p>
+      </div>
+    )}
+
+    {inScope && record && !record.ok && (
+      <p class="flash warn" role="alert">This record could not be read: {record.error}. That is a
+        failed read, not an empty record.</p>
+    )}
+
+    {inScope && record && record.ok && (
+      <>
+        <h1>{clip(record.name, 60)}</h1>
+        <p class="lede">
+          {record.departmentName ? record.departmentName + '. ' : ''}
+          {record.assignments.length} assigned course{record.assignments.length === 1 ? '' : 's'},
+          {' ' + completeCount} complete. Every percentage below is counted across both players.
+        </p>
+
+        {msg && <p class={flashFailed(msg) ? 'flash warn' : 'flash'} role={flashFailed(msg) ? 'alert' : 'status'}>{msg}</p>}
+
+        {!record.userId && (
+          <div class="notice">
+            <p><b>This employee record has no platform account linked to it.</b> Progress joins on the
+            account, so nothing this person does in either player can ever reach this screen, and no
+            completion or certificate can be recorded against them. Link an account first.</p>
+          </div>
+        )}
+
+        {disagreeCount > 0 && (
+          <div class="notice">
+            <p><b>On {disagreeCount} course{disagreeCount === 1 ? '' : 's'} the two lesson ledgers hold
+            different counts.</b> That is the seam: the portal player and the AquinTutor runner each
+            write their own table and each overwrite the same percentage column. The figure shown here
+            counts the union of both. Recomputing writes that union back.</p>
+          </div>
+        )}
+
+        {staleCount > 0 && (
+          <div class="notice">
+            <p><b>{staleCount} course{staleCount === 1 ? ' meets' : 's meet'} the completion rule but
+            carry no completion date on the enrolment.</b> Nothing in the players writes that date.
+            Recompute to write it, and the employee learning surface will stop calling it unfinished.</p>
+          </div>
+        )}
+
+        {record.assignments.length === 0 && (
+          <div class="card">
+            <p class="muted">Nothing has been assigned to this person. They can still take anything the
+              catalogue offers them — an assignment is a request with a date on it, not permission to
+              learn.</p>
+          </div>
+        )}
+
+        {record.assignments.map((a) => (
+          <div class="card">
+            <h3>{clip(a.courseTitle, 70)}</h3>
+            <p class="muted">
+              {a.required ? 'Required. ' : 'Recommended. '}
+              Due {fmtDay(a.dueOn)}.
+              {a.status === 'withdrawn' ? ' This assignment has been withdrawn.' : ''}
+              {' '}
+              {a.progress.isComplete
+                ? <span class="pill live">Complete</span>
+                : a.overdue
+                  ? <span class="pill late">Overdue</span>
+                  : <span class="pill">In progress</span>}
+            </p>
+
+            <div class="bar"><i style={'width:' + Math.max(0, Math.min(100, a.progress.pct)) + '%'}></i></div>
+            <p class="muted">
+              <b style="color:var(--o-hi,#fff)">{a.progress.pct}%</b> counted across both players
+              ({a.progress.lessonsDone} of {a.progress.totalLessons} lessons).
+              Stored on the enrolment: {a.progress.storedPct === null ? 'nothing yet' : a.progress.storedPct + '%'}.
+            </p>
+            <p class="muted">
+              Portal player: {a.progress.fromPortalPlayer} · AquinTutor runner: {a.progress.fromAquinPlayer}
+              {a.progress.ledgersDisagree ? ' — these disagree.' : '.'}
+              {a.progress.enrolmentRows > 1
+                ? ' There are ' + a.progress.enrolmentRows + ' enrolment rows for this person on this course; a recompute writes all of them.'
+                : ''}
+            </p>
+            <p class="muted">
+              Rule: {COMPLETION_KIND_LABELS[a.progress.rule.kind] || a.progress.rule.kind}
+              {a.progress.rule.isDefault ? ' (the default)' : ''}. {a.progress.ruleExplanation}
+            </p>
+            {a.progress.override && (
+              <p class="muted">
+                <span class={a.progress.override.state === 'complete' ? 'pill live' : 'pill warn'}>
+                  {a.progress.override.state === 'complete' ? 'Recorded by hand' : 'Withdrawn by hand'}
+                </span>
+                {' ' + fmtWhen(a.progress.override.at)} — {clip(a.progress.override.reason, 200)}
+              </p>
+            )}
+            {a.progress.readFailed && (
+              <p class="flash warn" role="alert" style="margin-top:8px">Part of this record could not be
+                read, so the figures above may understate what was done. Nothing was written.</p>
+            )}
+
+            <div class="inline sub">
+              {record.userId && (
+                <form method="post">
+                  <input type="hidden" name="action" value="recompute" />
+                  <input type="hidden" name="course_id" value={a.courseId} />
+                  <input type="hidden" name="learner_user_id" value={record.userId} />
+                  <button class="btn slim ghost" type="submit">Recompute from the evidence</button>
+                </form>
+              )}
+              {canAssign && a.status !== 'withdrawn' && (
+                <form method="post">
+                  <input type="hidden" name="action" value="withdraw_assignment" />
+                  <input type="hidden" name="assignment_id" value={a.assignmentId} />
+                  <button class="btn slim ghost" type="submit"
+                    onclick={confirmAttr('Withdraw "' + a.courseTitle + '" from ' + record.name + '?')}>
+                    Unassign
+                  </button>
+                </form>
+              )}
+            </div>
+
+            {canAssign && (
+              <details>
+                <summary>Move the deadline</summary>
+                <form method="post">
+                  <input type="hidden" name="action" value="extend" />
+                  <input type="hidden" name="assignment_id" value={a.assignmentId} />
+                  <label for={'d-' + a.assignmentId}>New date</label>
+                  <input id={'d-' + a.assignmentId} name="due_on" type="date" required value={a.dueOn || ''} />
+                  <label for={'dr-' + a.assignmentId}>Why it is moving</label>
+                  <textarea id={'dr-' + a.assignmentId} name="reason" maxlength="1000" required></textarea>
+                  <button class="btn slim" type="submit">Move it</button>
+                </form>
+              </details>
+            )}
+
+            {canOverride && record.userId && (
+              <details>
+                <summary>Record or withdraw a completion</summary>
+                <p class="muted">
+                  A completion is a statement about what this person did. It is kept with your reason
+                  against it, the person is told, and it is written into the audit log. It records work
+                  done on this platform — accredited partners award credentials, and this is not one.
+                </p>
+                <form method="post">
+                  <input type="hidden" name="action" value="mark_complete" />
+                  <input type="hidden" name="course_id" value={a.courseId} />
+                  <input type="hidden" name="learner_user_id" value={record.userId} />
+                  <label for={'mc-' + a.assignmentId}>Why this counts as complete</label>
+                  <textarea id={'mc-' + a.assignmentId} name="reason" maxlength="2000" required
+                    placeholder="For example: completed in a classroom session on 3 March, attendance sheet held by HR"></textarea>
+                  <button class="btn slim" type="submit"
+                    onclick={confirmAttr('Record "' + a.courseTitle + '" as complete for ' + record.name + '? They are told, and it is kept on the record.')}>
+                    Record it as complete
+                  </button>
+                </form>
+                <form method="post" style="margin-top:12px">
+                  <input type="hidden" name="action" value="revoke_complete" />
+                  <input type="hidden" name="course_id" value={a.courseId} />
+                  <input type="hidden" name="learner_user_id" value={record.userId} />
+                  <label for={'rc-' + a.assignmentId}>Why a completion is being withdrawn</label>
+                  <textarea id={'rc-' + a.assignmentId} name="reason" maxlength="2000" required></textarea>
+                  <button class="btn slim ghost" type="submit"
+                    onclick={confirmAttr('Withdraw the completion of "' + a.courseTitle + '" for ' + record.name + '? They are told. Any certificate stays standing until it is withdrawn too.')}>
+                    Withdraw the completion
+                  </button>
+                </form>
+              </details>
+            )}
+
+            {canCertificates && record.userId && (
+              <details>
+                <summary>Issue a certificate for this course</summary>
+                <p class="muted">
+                  A certificate can only be issued for a course this record says is complete. It is
+                  written into the signed ledger through the one function that owns it.
+                </p>
+                <form method="post">
+                  <input type="hidden" name="action" value="issue_cert" />
+                  <input type="hidden" name="course_id" value={a.courseId} />
+                  <input type="hidden" name="learner_user_id" value={record.userId} />
+                  <label for={'g-' + a.assignmentId}>Grade recorded</label>
+                  <input id={'g-' + a.assignmentId} name="grade" maxlength="8" value="Pass" />
+                  <label for={'ir-' + a.assignmentId}>Why it is being issued by hand</label>
+                  <textarea id={'ir-' + a.assignmentId} name="reason" maxlength="2000" required></textarea>
+                  <button class="btn slim" type="submit">Issue the certificate</button>
+                </form>
+              </details>
+            )}
+          </div>
+        ))}
+
+        <div class="card">
+          <h2>Certificates</h2>
+          {record.certificates.length === 0 && (
+            <p class="muted">No certificates in the signed ledger for this person.</p>
+          )}
+          {record.certificates.length > 0 && (
+            <p class="notice">
+              A withdrawal recorded here is visible on this screen and in the audit log. The public
+              verification pages do not consult it yet — they are not part of this build — so a
+              withdrawn certificate still verifies as genuine there until that one call is added.
+            </p>
+          )}
+          {record.certificates.map((c) => (
+            <div class="sub">
+              <p>
+                <b style="color:var(--o-hi,#fff)">{clip(c.courseTitle, 60)}</b>
+                {' '}
+                {c.withdrawn ? <span class="pill late">Withdrawn</span> : <span class="pill live">Standing</span>}
+              </p>
+              <p class="muted">
+                {c.certNumber} · issued {fmtWhen(c.issuedAt)}{c.grade ? ' · ' + c.grade : ''}
+              </p>
+              {c.withdrawn && (
+                <p class="muted">Withdrawn {fmtWhen(c.withdrawnAt)} — {clip(c.withdrawnReason, 300)}</p>
+              )}
+              {canCertificates && !c.withdrawn && (
+                <details>
+                  <summary>Withdraw this certificate</summary>
+                  <p class="muted">
+                    The ledger entry is kept. It is a block in a hash chain, and deleting it would break
+                    verification for every certificate issued after it, including certificates belonging
+                    to people who did nothing wrong. The withdrawal is recorded against the number.
+                  </p>
+                  <form method="post">
+                    <input type="hidden" name="action" value="withdraw_cert" />
+                    <input type="hidden" name="cert_number" value={c.certNumber} />
+                    <label for={'w-' + c.id}>Why it is being withdrawn</label>
+                    <textarea id={'w-' + c.id} name="reason" maxlength="2000" required></textarea>
+                    <button class="btn slim ghost" type="submit"
+                      onclick={confirmAttr('Withdraw certificate ' + c.certNumber + ' from ' + record.name + '? They are told, and the withdrawal is kept on the record.')}>
+                      Withdraw it
+                    </button>
+                  </form>
+                </details>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {history.length > 0 && (
+          <div class="card">
+            <h2>Corrections made by hand</h2>
+            <p class="muted">Every manual decision about this person's completions, newest first.
+              Nothing here is ever removed.</p>
+            {history.map((h) => (
+              <p class="muted sub">
+                <span class={h.state === 'complete' ? 'pill live' : 'pill warn'}>
+                  {h.state === 'complete' ? 'Recorded complete' : 'Withdrawn'}
+                </span>
+                {' ' + fmtWhen(h.at)} — {clip(h.reason, 300)}
+              </p>
+            ))}
+          </div>
+        )}
+      </>
+    )}
+  </div>
+</AdminLayout>

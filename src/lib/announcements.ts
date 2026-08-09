@@ -1083,7 +1083,29 @@ export async function listAnnouncements(
   viewer: FeedViewer,
   opts: ListOptions = {},
 ): Promise<Announcement[]> {
-  if (!viewer.hasWorkspace) return [];
+  return (await readAnnouncements(viewer, opts)).rows;
+}
+
+/**
+ * THE SAME READ, SAYING WHETHER IT WORKED.
+ *
+ * listAnnouncements() catches its own error and returns [], so a failed read and a company that has
+ * never posted a notice are the same observable fact. On a reader's feed that tolerance is right —
+ * one broken query must not blank somebody's workspace. On the PUBLISHER'S console it is not: the
+ * empty list renders as "Nothing here yet", the publisher writes the notice again, and the whole
+ * company is asked to read the same thing twice.
+ *
+ * `ok:false` means UNKNOWN, never "none". Identical query, identical ordering, identical mapping.
+ * The only difference is that the caller can tell which of the two it is holding.
+ *
+ * `hasWorkspace:false` comes back as `ok:true` with no rows on purpose: that is a real, known answer
+ * about this viewer — they have no employee record — not a failure to find out.
+ */
+export async function readAnnouncements(
+  viewer: FeedViewer,
+  opts: ListOptions = {},
+): Promise<{ ok: boolean; rows: Announcement[]; error: string | null }> {
+  if (!viewer.hasWorkspace) return { ok: true, rows: [], error: null };
   const limit = Math.min(Math.max(Number(opts.limit || 60), 1), 200);
   const admin = opts.includeUnpublished === true && viewer.canPublish;
   try {
@@ -1096,7 +1118,7 @@ export async function listAnnouncements(
     const audiencePart = opts.audience && isAnnouncementAudience(opts.audience)
       ? sql`AND a.audience = ${opts.audience}`
       : sql``;
-    return rows(await db.execute(sql`
+    const list = rows(await db.execute(sql`
       SELECT a.*,
              EXISTS (
                SELECT 1 FROM announcement_acks k
@@ -1112,9 +1134,11 @@ export async function listAnnouncements(
        ORDER BY a.pinned DESC, a.urgent DESC,
                 COALESCE(a.published_at, a.created_at) DESC
        LIMIT ${limit}`)).map(mapAnnouncement);
+    return { ok: true, rows: list, error: null };
   } catch (e: any) {
-    logFail('listAnnouncements', e);
-    return [];
+    logFail('readAnnouncements', e);
+    // The real Postgres reason is on e.cause; e.message is only the SQL that failed.
+    return { ok: false, rows: [], error: String(e?.cause?.message || e?.message || 'unknown database error') };
   }
 }
 
