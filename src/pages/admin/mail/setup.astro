@@ -22,6 +22,8 @@ const imap = await getImapConfig();
 const transport = await transportStatus();
 
 const smtpOk = !!cfg.smtpHost && !!cfg.smtpUser && !!cfg.smtpPass;
+// A config that could not be READ is not a config that is missing - see getImapConfig().
+const imapUnreadable = imap.configRead === false;
 const imapOk = !!imap.host && !!imap.user && !!imap.pass;
 const inboundOk = !!cfg.inboundSecret;
 const cronOk = !!process.env.CRON_SECRET;
@@ -51,7 +53,7 @@ const steps = [
   { key: 'verify',   done: smtpOk && !!lastTestSendAt, title: 'Verify SMTP + send a test email', go: '#verify-section' },
   { key: 'inbound',  done: inboundOk, title: 'Set inbound webhook secret',               go: '#inbound-section' },
   { key: 'cron',     done: cronOk,    title: 'Set CRON_SECRET on Vercel (for IMAP cron)', go: '#cron-section' },
-  { key: 'imap',     done: imapOk,    title: 'Configure IMAP (inbound polling)',         go: '/admin/mail/settings#imap' },
+  { key: 'imap',     done: imapOk,    title: imapUnreadable ? 'Configure IMAP (inbound polling) - settings could NOT be read, so this step is unknown rather than undone' : 'Configure IMAP (inbound polling)', go: '/admin/mail/settings#imap' },
   { key: 'dns',      done: false,     title: 'Add SPF / DKIM / DMARC DNS records',       go: '#dns-section' },
 ];
 const doneCount = steps.filter(s => s.done).length;
@@ -286,22 +288,31 @@ const totalCount = steps.length;
     fetch('/api/mail/dns-check', { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (d) {
       btn.disabled = false; btn.textContent = prev;
       if (!d.ok) { box.innerHTML = '<div style="padding:10px 12px;color:#fca5a5;">' + (d.error || 'lookup failed') + '</div>'; return; }
-      function line(label, ok, detail, note) {
-        var c = ok ? '#6ee7b7' : '#fca5a5'; var icon = ok ? '✓' : '✗';
+      // UNKNOWN IS ITS OWN STATE. /api/mail/dns-check reports `checked` per record; a lookup that
+      // timed out used to render the same red cross as a domain with no record at all, and the
+      // action this page then recommends - add a record - is exactly what produces a SECOND SPF
+      // entry and makes providers treat the whole domain as failing SPF.
+      function stateOf(rec, present) { return rec && rec.checked === false ? 'unknown' : (present ? 'pass' : 'fail'); }
+      function line(label, state, detail, note) {
+        var c = state === 'pass' ? '#6ee7b7' : state === 'unknown' ? '#fbbf24' : '#fca5a5';
+        var icon = state === 'pass' ? '✓' : state === 'unknown' ? '?' : '✗';
         return '<div style="padding:8px 12px;border-bottom:1px solid #1a1a1f;"><strong style="color:' + c + ';">' + icon + ' ' + label + '</strong> <span style="color:#d8d8de;">' + (detail || '') + '</span>' + (note ? '<div style="color:#fbbf24;margin-top:3px;font-size:10.5px;">' + note + '</div>' : '') + '</div>';
       }
       var html = '';
-      html += line('SPF', d.spf.present, d.spf.record || 'no v=spf1 record found', d.spf.note);
-      html += line('DMARC', d.dmarc.present, d.dmarc.record || 'no v=DMARC1 record found', d.dmarc.policy ? 'policy=' + d.dmarc.policy : null);
+      if (d.unchecked && d.unchecked.length) {
+        html += '<div style="padding:8px 12px;border-bottom:1px solid #1a1a1f;color:#fbbf24;">Some lookups did not complete, so they are shown as not checked rather than missing: ' + d.unchecked.join('; ') + '</div>';
+      }
+      html += line('SPF', stateOf(d.spf, d.spf.present), d.spf.record || (d.spf.checked === false ? 'the lookup did not complete' : 'no v=spf1 record found'), d.spf.note);
+      html += line('DMARC', stateOf(d.dmarc, d.dmarc.present), d.dmarc.record || (d.dmarc.checked === false ? 'the lookup did not complete' : 'no v=DMARC1 record found'), d.dmarc.policy ? 'policy=' + d.dmarc.policy : null);
       if (d.dkim.present) {
         html += '<div style="padding:8px 12px;border-bottom:1px solid #1a1a1f;"><strong style="color:#6ee7b7;">✓ DKIM</strong> <span style="color:#d8d8de;">selectors found: ' + d.dkim.selectors.map(function (s) { return s.selector; }).join(', ') + '</span></div>';
       } else {
-        html += line('DKIM', false, 'no DKIM record at common selectors', 'Get your selector + public key from your SMTP provider dashboard.');
+        html += line('DKIM', stateOf(d.dkim, false), d.dkim.checked === false ? 'the lookups did not complete' : ('no DKIM record at the selectors tried (' + (d.dkim.triedSelectors || []).join(', ') + ')'), 'Get your selector + public key from your SMTP provider dashboard. A provider using its own selector name will not appear above.');
       }
       if (d.mx && d.mx.length) {
         html += '<div style="padding:8px 12px;"><strong style="color:#6ee7b7;">✓ MX</strong> <span style="color:#d8d8de;">' + d.mx.map(function (m) { return m.priority + ' ' + m.host; }).join(', ') + '</span></div>';
       } else {
-        html += line('MX', false, 'no MX records found', 'Inbound mail has nowhere to land.');
+        html += line('MX', d.mxChecked === false ? 'unknown' : 'fail', d.mxChecked === false ? 'the lookup did not complete' : 'no MX records found', 'Inbound mail has nowhere to land.');
       }
       box.innerHTML = html;
     }).catch(function () {

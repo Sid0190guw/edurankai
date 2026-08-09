@@ -106,10 +106,32 @@ export async function reconcileOrder(orderId: string): Promise<{ reconciled: boo
   const pays = await fetchOrderPayments(orderId);
   const cap = pays.find((p: any) => p.status === 'captured' || p.status === 'authorized');
   if (!cap) return { reconciled: false };
+
+  // A REFUND AT RAZORPAY LEAVES THE PAYMENT ITSELF 'captured'. The refund is a separate object, so
+  // the test above is true forever after a refund, and only our own stored status records that the
+  // money went back. Two things followed from that:
+  //
+  //   - the guard listed 'refunded' but not 'partially_refunded', which /api/admin/payments/refund
+  //     and refund-manual.ts both write, so a part-refunded order could be written back to 'paid';
+  //   - applyPaidEffects() ran UNCONDITIONALLY underneath the guarded UPDATE, so even in the case
+  //     the write was correctly blocked the downstream effect re-applied — the account deactivated
+  //     after the refund approved again, the fee marked paid again.
+  //
+  // Today's callers only pass orders in created/attempted/authorized, so this is the closing of a
+  // shape rather than a live exploit; the shape is the same one /api/payments/verify was repaired
+  // for, and this is an exported function anything may call next month.
+  const priorRow = rows(await db.execute(sql`SELECT status FROM payments WHERE order_id = ${orderId} LIMIT 1`)
+    .catch((e: any) => { console.error('[payments] reconcileOrder could not read the stored status of', orderId, '-', e?.cause?.message || e?.message); return [] as any; }))[0] as any;
+  const priorStatus = String(priorRow?.status || '');
+  if (priorStatus === 'refunded' || priorStatus === 'partially_refunded') {
+    console.error('[payments] reconcileOrder refused a REFUNDED order', orderId, '- nothing was changed and no effect was applied');
+    return { reconciled: false };
+  }
+
   await db.execute(sql`
     UPDATE payments SET status = 'paid', razorpay_payment_id = COALESCE(${cap.id || null}, razorpay_payment_id), updated_at = NOW()
-    WHERE order_id = ${orderId} AND status NOT IN ('paid', 'refunded')
-  `).catch(() => {});
+    WHERE order_id = ${orderId} AND status NOT IN ('paid', 'refunded', 'partially_refunded')
+  `).catch((e: any) => console.error('[payments] reconcileOrder could not mark', orderId, 'paid -', e?.cause?.message || e?.message));
   const r = await applyPaidEffects(orderId, cap.id || null);
   return { reconciled: true, applicationId: (r && (r as any).applicationId) || undefined };
 }

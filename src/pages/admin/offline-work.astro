@@ -9,15 +9,39 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
+// SELF-BOOTSTRAP, ONCE PER PROCESS, NOT ONCE PER PAGE LOAD. The CREATE TABLE used to run inside the
+// read block on every request — a DDL round trip per view of an admin screen, and a bootstrap
+// failure that the same bare catch then hid. Additive and idempotent, never DROP: there are live
+// rows behind this table. The indexes are deliberately left to src/pages/api/offline/sync.ts, which
+// is the writer and already creates them; this side only has to guarantee the table is there to read.
+let offlineWorkEnsured: Promise<void> | null = null;
+function ensureOfflineWorkTable(): Promise<void> {
+  if (!offlineWorkEnsured) {
+    offlineWorkEnsured = db.execute(sql`CREATE TABLE IF NOT EXISTS offline_work (
+      client_id text PRIMARY KEY, user_id uuid, kind text, payload jsonb,
+      created_at timestamptz, synced_at timestamptz NOT NULL DEFAULT now()
+    )`).then(() => undefined).catch((e: any) => {
+      // Dropped from the cache so the next load retries rather than remembering a failure for ever.
+      offlineWorkEnsured = null;
+      throw e;
+    });
+  }
+  return offlineWorkEnsured;
+}
+
 const kind = (Astro.url.searchParams.get('kind') || '').trim();
 
 let items: any[] = [];
 let kinds: string[] = [];
+// A SWALLOWED READ AND AN EMPTY QUEUE LOOKED IDENTICAL, AND THE PAGE PICKED THE WRONG ONE.
+// This whole block used to end in `catch (_) {}`, so a database that refused the query rendered
+// "0 records" in the lede and "Nothing synced yet." in the body — two statements about what people
+// have done, made on the strength of a query that never came back. These rows are the offline queue
+// (src/lib/offline-sync / /api/offline/sync); some of them are worklog entries, which are pay
+// records, so "nothing here" is not a harmless thing to say wrongly.
+let readError = '';
 try {
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS offline_work (
-    client_id text PRIMARY KEY, user_id uuid, kind text, payload jsonb,
-    created_at timestamptz, synced_at timestamptz NOT NULL DEFAULT now()
-  )`);
+  await ensureOfflineWorkTable();
   kinds = rows(await db.execute(sql`SELECT DISTINCT kind FROM offline_work ORDER BY kind`)).map((r: any) => r.kind).filter(Boolean);
   const base = sql`SELECT w.client_id, w.kind, w.payload, w.created_at, w.synced_at, u.name AS user_name, u.email AS user_email
     FROM offline_work w LEFT JOIN users u ON u.id = w.user_id`;
@@ -25,7 +49,10 @@ try {
     ? sql`${base} WHERE w.kind = ${kind} ORDER BY w.created_at DESC LIMIT 300`
     : sql`${base} ORDER BY w.created_at DESC LIMIT 300`;
   items = rows(await db.execute(q));
-} catch (_) {}
+} catch (e: any) {
+  readError = e?.cause?.message || e?.message || 'the offline queue did not answer';
+  console.error('[admin/offline-work] read failed -', readError);
+}
 
 function fmt(d: any) { try { return d ? new Date(d).toLocaleString() : ''; } catch { return ''; } }
 function summarize(p: any): string {
@@ -37,7 +64,14 @@ function summarize(p: any): string {
 <AdminLayout title="Offline work" activeNav="">
   <div style="max-width:1000px;">
     <h1 style="font-size:24px;font-weight:700;margin:0 0 4px;">Offline work</h1>
-    <p style="font-size:14px;color:#8a8a94;margin:0 0 18px;">Work captured by users on their devices (with or without a connection) and synced here. {items.length} record{items.length === 1 ? '' : 's'}.</p>
+    <p style="font-size:14px;color:#8a8a94;margin:0 0 18px;">Work captured by users on their devices (with or without a connection) and synced here. {readError ? 'Record count unknown.' : items.length + ' record' + (items.length === 1 ? '' : 's') + '.'}</p>
+
+    {readError && (
+      <div style="border:1px solid rgba(232,196,106,0.35);background:rgba(232,196,106,0.06);border-radius:12px;padding:14px 16px;margin-bottom:16px;">
+        <p style="margin:0 0 4px;font-size:14px;font-weight:700;color:#8a6d1f;">The offline queue could not be read.</p>
+        <p style="margin:0;font-size:13px;color:#6b6455;line-height:1.6;">Nothing is shown below because the query failed, NOT because nobody has synced anything. Work sitting in a device queue is unaffected — it syncs to the same table when the read starts working. Reason: {readError}</p>
+      </div>
+    )}
 
     {kinds.length > 0 && (
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
@@ -49,7 +83,7 @@ function summarize(p: any): string {
     )}
 
     {items.length === 0 ? (
-      <p style="color:#8a8a94;font-size:14px;">Nothing synced yet.</p>
+      readError ? null : <p style="color:#8a8a94;font-size:14px;">Nothing synced yet.</p>
     ) : (
       <div style="overflow-x:auto;">
         <table style="width:100%;border-collapse:collapse;font-size:13px;">

@@ -43,15 +43,39 @@ const accessOk = course.access_type === 'public' || course.access_type === 'both
   (course.access_type === 'applicants' && !isEmployee);
 if (!accessOk) return Astro.redirect('/portal/courses');
 
+// AUTO-ENROLMENT, AND WHY THE SHAPE MATTERS.
+//
+// Opening a course enrols the reader. That was a SELECT, then a comparison in JavaScript, then an
+// unconditional INSERT and an unconditional `enrolled_count + 1`. Two loads arriving together — a
+// double tap on a phone, a link opened twice, a prefetch — both read "no enrolment", both inserted,
+// and the counter was bumped twice. training_enrollments carries no unique key this code can rely
+// on, so the result was two enrolment rows for one person on one course: progress written to
+// whichever one the next SELECT happened to return, and a published enrolment figure that has no way
+// back down.
+//
+// The test and the write are now ONE statement, and the counter is bumped only when that statement
+// actually created a row. HONEST LIMIT: without a unique constraint on (course_id, user_id) this
+// narrows the window rather than closing it — two statements can still pass NOT EXISTS at the same
+// instant. Adding that constraint is a migration for the founder to run against live data (it fails
+// if duplicates already exist), so it is not bootstrapped from a page load. NOT VERIFIED at runtime.
 try {
-  const r = await db.execute(sql`SELECT * FROM training_enrollments WHERE course_id = ${course.id} AND user_id = ${user.id} LIMIT 1`);
-  const rows = Array.isArray(r) ? r : (r?.rows || []);
-  if (rows.length > 0) { enrollment = rows[0]; }
-  else {
-    const e = await db.execute(sql`INSERT INTO training_enrollments (course_id, user_id, progress_pct) VALUES (${course.id}, ${user.id}, 0) RETURNING *`);
-    const er = Array.isArray(e) ? e : (e?.rows || []);
-    enrollment = er[0];
-    await db.execute(sql`UPDATE training_courses SET enrolled_count = enrolled_count + 1 WHERE id = ${course.id}`);
+  const made = await db.execute(sql`
+    INSERT INTO training_enrollments (course_id, user_id, progress_pct)
+    SELECT ${course.id}, ${user.id}, 0
+     WHERE NOT EXISTS (
+       SELECT 1 FROM training_enrollments
+        WHERE course_id = ${course.id} AND user_id = ${user.id}
+     )
+    RETURNING *`);
+  const madeRows = Array.isArray(made) ? made : (made as any)?.rows || [];
+  if (madeRows.length > 0) {
+    enrollment = madeRows[0];
+    await db.execute(sql`UPDATE training_courses SET enrolled_count = COALESCE(enrolled_count, 0) + 1 WHERE id = ${course.id}`);
+  } else {
+    // Already enrolled — read the existing row rather than assuming what it holds.
+    const r = await db.execute(sql`SELECT * FROM training_enrollments WHERE course_id = ${course.id} AND user_id = ${user.id} LIMIT 1`);
+    const rows = Array.isArray(r) ? r : (r?.rows || []);
+    enrollment = rows[0] || null;
   }
 } catch(e) { logFail('enrollment', e); }
 

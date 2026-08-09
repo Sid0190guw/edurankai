@@ -494,7 +494,10 @@ function buildWeekDays(weekStart: string, weekEnd: string, ctx: EmployeeContext,
   const days: WeekDay[] = [];
   for (const d of datesBetween(weekStart, weekEnd)) {
     // Nothing before somebody joined, and nothing after they left, is a day they owed anything on.
+    // Both ends matter: without the upper bound a leaver's final part-week would carry a full
+    // week's requirement across days their engagement had already ended on.
     if (ctx.startIso && d < ctx.startIso) continue;
+    if (ctx.endIso && d > ctx.endIso) continue;
 
     const a = raw.attendance.get(d);
     const status = String(a?.status || '');

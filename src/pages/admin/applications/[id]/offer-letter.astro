@@ -6,6 +6,9 @@ import { applications, offerLetters, users, applicationMessages } from '@/lib/db
 import { generateInternalHandle } from '@/lib/auth/handle';
 import { eq } from 'drizzle-orm';
 import { resolveEngagementPolicy, shortCommitment } from '@/lib/engagement-policy';
+// The funnel engine. applications.stage is never written by hand from here — advanceStage() owns the
+// column, its history table and the notification that goes with a move.
+import { advanceStage } from '@/lib/application-stages';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -20,6 +23,9 @@ let successMsg = '';
 // push is the only thing that tells a candidate an offer exists — and it sat inside a bare catch
 // while the page printed "Offer sent." A candidate who is never told has not been sent anything.
 let candidateNotTold = '';
+// The candidate's six-step tracker, reported separately from the letter itself. Declared here,
+// above the POST handler that assigns it.
+let stageNotMoved = '';
 
 const found = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
 if (found.length === 0) return Astro.redirect('/admin/applications');
@@ -117,6 +123,27 @@ if (Astro.request.method === 'POST') {
       // Milestone only: mark the application stage as "offer extended" without
       // sending the formal letter. The letter is a separate step below.
       await db.update(applications).set({ status: 'offer', updatedAt: new Date() }).where(eq(applications.id, id));
+      // The same omission as the letter branch below, on the milestone-only path: status moved and
+      // applications.stage did not, so the candidate's six-step tracker went on showing an earlier
+      // step after they had been told an offer was coming.
+      try {
+        const _moved = await advanceStage({
+          applicationId: id,
+          toStage: 'decision',
+          actorUserId: user.id,
+          actorName: user.name || user.email || 'People desk',
+          note: 'Offer extended. The formal letter follows.',
+        });
+        if (!_moved.ok) {
+          console.error('[offer-letter] tracker did not move for application', id, '-', _moved.error);
+          stageNotMoved = 'The offer stage is recorded, but the candidate’s six-step tracker did not move: '
+            + (_moved.error || 'unknown reason') + ' - they still see the previous step.';
+        }
+      } catch (e: any) {
+        console.error('[offer-letter] tracker did not move for application', id, '-', e?.cause?.message || e?.message);
+        stageNotMoved = 'The offer stage is recorded, but the candidate’s six-step tracker did not move: '
+          + (e?.cause?.message || e?.message || 'unknown reason') + ' - they still see the previous step.';
+      }
       try {
         await db.insert(applicationMessages).values({
           applicationId: id,
@@ -259,6 +286,32 @@ if (Astro.request.method === 'POST') {
               await db.update(applications).set({ status: 'offer', updatedAt: new Date() }).where(eq(applications.id, id));
               app.status = 'offer';
             }
+            // AND THE CANDIDATE'S OWN TRACKER MOVES WITH IT.
+            //
+            // Issuing the letter wrote applications.status and stopped. applications.stage — the six
+            // steps the candidate is actually shown on /portal/applications/[id] — was left where it
+            // was, so somebody holding an offer letter in their hand was still being told "01 ·
+            // Submitted: your application is in our queue". advanceStage() owns that column, its
+            // history and the notification; it reports rather than throwing, so a tracker that does
+            // not move never un-sends an offer that has.
+            try {
+              const _moved = await advanceStage({
+                applicationId: id,
+                toStage: 'decision',
+                actorUserId: user.id,
+                actorName: user.name || user.email || 'People desk',
+                note: 'Offer letter issued.',
+              });
+              if (!_moved.ok) {
+                console.error('[offer-letter] tracker did not move for application', id, '-', _moved.error);
+                stageNotMoved = 'The offer is issued, but the candidate’s six-step tracker did not move: '
+                  + (_moved.error || 'unknown reason') + ' - they still see the previous step.';
+              }
+            } catch (e: any) {
+              console.error('[offer-letter] tracker did not move for application', id, '-', e?.cause?.message || e?.message);
+              stageNotMoved = 'The offer is issued, but the candidate’s six-step tracker did not move: '
+                + (e?.cause?.message || e?.message || 'unknown reason') + ' - they still see the previous step.';
+            }
             // This was a no-op: pushNotify has no `offerSent` member (only offerSigned /
             // offerDeclined), so the guard was always false and the candidate was never told
             // their offer letter had been issued.
@@ -342,6 +395,32 @@ if (Astro.request.method === 'POST') {
             if (app.status !== 'hired' && app.status !== 'offer') {
               await db.update(applications).set({ status: 'offer', updatedAt: new Date() }).where(eq(applications.id, id));
               app.status = 'offer';
+            }
+            // AND THE CANDIDATE'S OWN TRACKER MOVES WITH IT.
+            //
+            // Issuing the letter wrote applications.status and stopped. applications.stage — the six
+            // steps the candidate is actually shown on /portal/applications/[id] — was left where it
+            // was, so somebody holding an offer letter in their hand was still being told "01 ·
+            // Submitted: your application is in our queue". advanceStage() owns that column, its
+            // history and the notification; it reports rather than throwing, so a tracker that does
+            // not move never un-sends an offer that has.
+            try {
+              const _moved = await advanceStage({
+                applicationId: id,
+                toStage: 'decision',
+                actorUserId: user.id,
+                actorName: user.name || user.email || 'People desk',
+                note: 'Offer letter issued.',
+              });
+              if (!_moved.ok) {
+                console.error('[offer-letter] tracker did not move for application', id, '-', _moved.error);
+                stageNotMoved = 'The offer is issued, but the candidate’s six-step tracker did not move: '
+                  + (_moved.error || 'unknown reason') + ' - they still see the previous step.';
+              }
+            } catch (e: any) {
+              console.error('[offer-letter] tracker did not move for application', id, '-', e?.cause?.message || e?.message);
+              stageNotMoved = 'The offer is issued, but the candidate’s six-step tracker did not move: '
+                + (e?.cause?.message || e?.message || 'unknown reason') + ' - they still see the previous step.';
             }
             // The common path: a brand-new letter being issued. Nothing here notified anyone
             // before, and this file sends no email either, so the candidate only found out if an
@@ -454,6 +533,7 @@ if (Astro.request.method === 'POST') {
   // letter IS sent and the token IS valid — but the one thing that reaches the candidate is now
   // reported separately when it did not happen.
   if (candidateNotTold) errorMsg = (errorMsg ? errorMsg + ' ' : '') + candidateNotTold;
+  if (stageNotMoved) errorMsg = (errorMsg ? errorMsg + ' ' : '') + stageNotMoved;
 
   const refresh = await db.select().from(offerLetters).where(eq(offerLetters.applicationId, id)).limit(1);
   existingOffer = refresh.length > 0 ? refresh[0] : null;

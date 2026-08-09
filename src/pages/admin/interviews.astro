@@ -9,6 +9,59 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 
 let okMsg = '', errorMsg = '';
 
+// =================================================================================================
+// MOVING SOMEBODY'S INTERVIEW WITHOUT TELLING THEM IS NOT MOVING IT
+// =================================================================================================
+//
+// All four actions here were a bare UPDATE whose result was never read, followed by an unconditional
+// success sentence. Two separate silences came out of that:
+//
+//   1. THE CANDIDATE WAS NEVER TOLD. Rescheduling put a new time in the database and cancelling put
+//      a reason in a column, and the person whose diary it is learned neither. They turn up for an
+//      interview that was cancelled last Tuesday, or miss one that was moved — the two outcomes this
+//      screen exists to prevent. Every other decision on an application goes to the candidate through
+//      notifyUser(); this screen was the one that did not.
+//   2. THE ADMIN WAS TOLD IT WORKED REGARDLESS. `WHERE id=${id}` matching no row — a stale list, a
+//      second click, an interview somebody else just cancelled — printed "Interview rescheduled."
+//      just the same.
+//
+// RETURNING fixes the second. The helper below fixes the first, and it is DECLARED ABOVE THE HANDLER
+// that calls it: `const` is not hoisted and a helper sitting under its first caller has taken pages
+// down on this project.
+//
+// The notification is best-effort BY DESIGN and never swallowed: the status is already committed, so
+// a push failure must not report the reschedule as having failed — but "the candidate was NOT told"
+// is exactly the fact this whole screen is about, so it is returned and shown, not logged and lost.
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+async function tellCandidate(
+  applicationId: string | null | undefined,
+  title: string,
+  body: string,
+): Promise<string> {
+  if (!applicationId) return 'this interview is not linked to an application, so the candidate could not be told';
+  try {
+    const who = rowsOf(await db.execute(
+      sql`SELECT applicant_user_id FROM applications WHERE id = ${applicationId} LIMIT 1`));
+    const uid = who[0]?.applicant_user_id;
+    if (!uid) return 'the candidate has no portal account, so they could not be told';
+    const { notifyUser } = await import('@/lib/notify');
+    await notifyUser(String(uid), {
+      title, body,
+      type: 'application',
+      // An EXISTING route. Their application tracker is where an interview is listed; a push to a
+      // page that does not exist is worse than no push at all.
+      actionUrl: '/portal/applications/' + applicationId,
+      entityType: 'application',
+      entityId: String(applicationId),
+    });
+    return '';
+  } catch (e: any) {
+    console.error('[interviews] the candidate was NOT told -', e?.cause?.message || e?.message);
+    return 'the candidate was NOT notified (' + (e?.cause?.message || e?.message || 'unknown reason') + ')';
+  }
+}
+
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
@@ -16,27 +69,91 @@ if (Astro.request.method === 'POST') {
     if (action === 'reschedule') {
       const id = fd.get('id') as string;
       const newTime = fd.get('scheduled_at') as string;
-      await db.execute(sql`UPDATE interview_rounds SET scheduled_at=${newTime}, status='rescheduled', updated_at=NOW() WHERE id=${id}`);
-      okMsg = 'Interview rescheduled.';
+      const changed = rowsOf(await db.execute(sql`
+        UPDATE interview_rounds SET scheduled_at=${newTime}, status='rescheduled', updated_at=NOW()
+         WHERE id=${id}
+        RETURNING id, application_id, scheduled_at`));
+      if (!changed.length) {
+        errorMsg = 'Nothing was changed — that interview is no longer on this list. Reload the page.';
+      } else {
+        const when = changed[0].scheduled_at
+          ? new Date(changed[0].scheduled_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+          : 'a new time';
+        const missed = await tellCandidate(
+          changed[0].application_id,
+          'Your interview has been moved',
+          'It is now on ' + when + ' (IST). Nothing else about your application has changed.',
+        );
+        okMsg = 'Interview rescheduled.' + (missed ? '' : ' The candidate has been told the new time.');
+        if (missed) errorMsg = 'The new time is saved, but ' + missed + '. Contact them directly.';
+      }
     } else if (action === 'cancel') {
       const id = fd.get('id') as string;
       const reason = fd.get('reason') as string;
-      await db.execute(sql`UPDATE interview_rounds SET status='cancelled', cancellation_reason=${reason}, updated_at=NOW() WHERE id=${id}`);
-      okMsg = 'Interview cancelled.';
+      const changed = rowsOf(await db.execute(sql`
+        UPDATE interview_rounds SET status='cancelled', cancellation_reason=${reason}, updated_at=NOW()
+         WHERE id=${id}
+        RETURNING id, application_id`));
+      if (!changed.length) {
+        errorMsg = 'Nothing was changed — that interview is no longer on this list. Reload the page.';
+      } else {
+        const why = String(reason || '').trim();
+        const missed = await tellCandidate(
+          changed[0].application_id,
+          'Your interview has been cancelled',
+          'This round will not go ahead' + (why ? ': ' + why : '.')
+            + ' Your application itself has not been closed by this.',
+        );
+        okMsg = 'Interview cancelled.' + (missed ? '' : ' The candidate has been told.');
+        if (missed) errorMsg = 'The cancellation is recorded, but ' + missed + '. They may still turn up — contact them directly.';
+      }
     } else if (action === 'mark_no_show') {
       const id = fd.get('id') as string;
-      await db.execute(sql`UPDATE interview_rounds SET status='no_show', updated_at=NOW() WHERE id=${id}`);
-      okMsg = 'Marked as no-show.';
+      // NOT NOTIFIED, DELIBERATELY. "You did not attend" is an accusation, and this screen has no
+      // field for the panel's side of it and no route for the candidate to answer back. It is an
+      // internal record for the recruiter; the consequence reaches the candidate through the
+      // application stage, which advanceStage() already announces.
+      const changed = rowsOf(await db.execute(sql`
+        UPDATE interview_rounds SET status='no_show', updated_at=NOW() WHERE id=${id} RETURNING id`));
+      okMsg = changed.length ? 'Marked as no-show.' : '';
+      if (!changed.length) errorMsg = 'Nothing was changed — that interview is no longer on this list. Reload the page.';
     } else if (action === 'mark_completed') {
       const id = fd.get('id') as string;
-      await db.execute(sql`UPDATE interview_rounds SET status='completed', updated_at=NOW() WHERE id=${id}`);
-      okMsg = 'Marked as completed. Please submit scorecard.';
+      const changed = rowsOf(await db.execute(sql`
+        UPDATE interview_rounds SET status='completed', updated_at=NOW() WHERE id=${id} RETURNING id`));
+      okMsg = changed.length ? 'Marked as completed. Please submit scorecard.' : '';
+      if (!changed.length) errorMsg = 'Nothing was changed — that interview is no longer on this list. Reload the page.';
     }
-  } catch(e: any) { errorMsg = e.message; }
+  } catch (e: any) {
+    // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    console.error('[interviews]', action, 'failed -', e?.cause?.message || e?.message);
+    errorMsg = 'That did not go through: ' + (e?.cause?.message || e?.message || 'unknown error');
+  }
 }
 
 const urlP = new URL(Astro.request.url);
 const filter = urlP.searchParams.get('filter') || 'upcoming';
+
+// =================================================================================================
+// "TODAY" IS THE COMPANY'S DAY, NOT THE SERVER'S
+// =================================================================================================
+//
+// This read `DATE(ir.scheduled_at) = CURRENT_DATE`. Both halves are cut in the DATABASE SESSION's
+// zone, and nothing in this codebase sets it — db/index.ts opens the pooled connection with no
+// SET TIME ZONE, so it resolves to UTC while every interviewer and every candidate is in IST.
+// Between 00:00 and 05:29 IST the Today tab therefore listed YESTERDAY's interviews and the Today
+// tile counted them, on the screen a recruiter opens first thing in the morning. An 08:00 IST
+// interview also falls on the previous UTC calendar day, so it went missing from Today entirely.
+//
+// Both sides are now converted to Asia/Kolkata before the date is taken.
+const IST_TODAY = sql`(NOW() AT TIME ZONE 'Asia/Kolkata')::date`;
+
+// A READ THAT COULD NOT RUN IS NOT AN EMPTY DIARY. Both queries below ended in `catch(e) {}`, so a
+// pooler timeout or a renamed column drew "No upcoming interviews" and four confident zeros — the
+// calmest state this page can be in and the most alarming one were the same screen. The failure is
+// now logged with the Postgres cause (e.message is only the failed SQL) and said on the page.
+let interviewsFailed = '';
+let statsFailed = '';
 
 let interviews: any[] = [];
 try {
@@ -44,7 +161,7 @@ try {
   if (filter === 'upcoming') {
     whereClause = sql`WHERE ir.scheduled_at >= NOW() AND ir.status IN ('scheduled','rescheduled')`;
   } else if (filter === 'today') {
-    whereClause = sql`WHERE DATE(ir.scheduled_at) = CURRENT_DATE AND ir.status IN ('scheduled','rescheduled')`;
+    whereClause = sql`WHERE (ir.scheduled_at AT TIME ZONE 'Asia/Kolkata')::date = ${IST_TODAY} AND ir.status IN ('scheduled','rescheduled')`;
   } else if (filter === 'completed') {
     whereClause = sql`WHERE ir.status = 'completed'`;
   } else if (filter === 'pending_feedback') {
@@ -65,13 +182,16 @@ try {
     LIMIT 100
   `);
   interviews = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+} catch (e: any) {
+  console.error('[interviews] list', filter, e?.cause?.message || e?.message);
+  interviewsFailed = 'The interview list could not be read, so nothing below is a statement about what is scheduled.';
+}
 
 let stats = { today: 0, upcoming: 0, pending: 0, completed: 0 };
 try {
   const r = await db.execute(sql`
     SELECT
-      (SELECT COUNT(*)::int FROM interview_rounds WHERE DATE(scheduled_at) = CURRENT_DATE AND status IN ('scheduled','rescheduled')) as today_count,
+      (SELECT COUNT(*)::int FROM interview_rounds WHERE (scheduled_at AT TIME ZONE 'Asia/Kolkata')::date = ${IST_TODAY} AND status IN ('scheduled','rescheduled')) as today_count,
       (SELECT COUNT(*)::int FROM interview_rounds WHERE scheduled_at >= NOW() AND status IN ('scheduled','rescheduled')) as upcoming_count,
       (SELECT COUNT(*)::int FROM interview_rounds WHERE status='pending_feedback') as pending_count,
       (SELECT COUNT(*)::int FROM interview_rounds WHERE status='completed') as completed_count
@@ -83,7 +203,10 @@ try {
     stats.pending = (rows[0] as any).pending_count || 0;
     stats.completed = (rows[0] as any).completed_count || 0;
   }
-} catch(e) {}
+} catch (e: any) {
+  console.error('[interviews] counts', e?.cause?.message || e?.message);
+  statsFailed = 'The counts on the tabs could not be read.';
+}
 
 const TYPE_COLORS: Record<string,string> = {
   screening:'#60a5fa', technical:'#a78bfa', culture_fit:'#10b981',
@@ -109,8 +232,14 @@ const TYPE_COLORS: Record<string,string> = {
   {errorMsg && <div style="margin:10px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
   {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
 
+  {(interviewsFailed || statsFailed) && (
+    <div style="margin:10px 16px;background:rgba(251,146,60,0.10);border:1px solid rgba(251,146,60,0.32);color:#fdba74;border-radius:8px;padding:10px 14px;font-size:13px;line-height:1.6;">
+      {interviewsFailed}{interviewsFailed && statsFailed ? ' ' : ''}{statsFailed} Nothing has been cancelled or moved &mdash; this is a read that did not answer. Reload, and if it persists check the server log.
+    </div>
+  )}
+
   <div style="padding:12px 16px;">
-    {interviews.length === 0 && (
+    {interviews.length === 0 && !interviewsFailed && (
       <div style="text-align:center;padding:40px;background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;color:#6e6e78;">
         <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="1.5" style="margin-bottom:12px;"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
         <p style="font-size:14px;font-weight:600;color:#fff;margin-bottom:4px;">No {filter} interviews</p>

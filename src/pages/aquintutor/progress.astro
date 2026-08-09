@@ -7,14 +7,43 @@ const user = Astro.locals.user;
 if (!user) return Astro.redirect('/aquintutor/login?next=' + encodeURIComponent('/aquintutor/progress'));
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
-async function safeRows(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
+
+// EVERY FIGURE ON THIS PAGE IS A STATEMENT ABOUT SOMEBODY'S OWN WORK, AND safeRows() USED TO
+// SWALLOW EVERY FAILURE INTO AN EMPTY ARRAY.
+//
+// An empty array does not stop here. It flows into totalCourses, avgProgress, the completion
+// ratio, the recency term and the streak, and out the other end as a "learning health score" of
+// about 10 labelled AT RISK — over a learner who may have finished six courses this month. The
+// heat map goes blank, the trend line goes flat, and nothing anywhere says a query failed.
+//
+// The array fallback stays, because a partial page is better than a crash on a personal dashboard.
+// What changes is that the failure is COUNTED and the page refuses to present the score as fact
+// when any of its inputs is missing.
+const readFailures: string[] = [];
+async function safeRows(label: string, q: any): Promise<any[]> {
+  try {
+    return rows(await db.execute(q));
+  } catch (e: any) {
+    console.error('[aquintutor/progress] ' + label + ':', e?.cause?.message || e?.message);
+    readFailures.push(label);
+    return [];
+  }
+}
 
 // XP + streak
 let xp: any = { totalXp: 0, level: 1, streakDays: 0, longestStreak: 0, xpToNextLevel: 100, levelProgress: 0 };
-try { const { getUserXp } = await import('@/lib/xp'); xp = await getUserXp(user.id); } catch (_) {}
+try {
+  const { getUserXp } = await import('@/lib/xp');
+  xp = await getUserXp(user.id);
+} catch (e: any) {
+  // A zero streak is not the same fact as an unreadable streak, and the health score weights the
+  // streak at 25%. Recorded rather than swallowed.
+  console.error('[aquintutor/progress] xp:', e?.cause?.message || e?.message);
+  readFailures.push('your XP and streak');
+}
 
 // Enrollments with progress
-const enrollments = await safeRows(sql`
+const enrollments = await safeRows('your enrolled courses', sql`
   SELECT e.progress_pct, e.enrolled_at, e.last_accessed_at,
     c.slug, c.title, c.subtitle, c.school, c.difficulty, c.category,
     (SELECT COUNT(*)::int FROM training_lessons WHERE course_id = c.id) AS total_lessons
@@ -22,11 +51,11 @@ const enrollments = await safeRows(sql`
   WHERE e.user_id = ${user.id} ORDER BY e.last_accessed_at DESC NULLS LAST, e.enrolled_at DESC LIMIT 12`);
 
 // Certificates
-let certs = await safeRows(sql`SELECT cert_number, course_title, issued_at, block_hash FROM course_certificates WHERE user_id = ${user.id} ORDER BY issued_at DESC LIMIT 12`);
+let certs = await safeRows('your certificates', sql`SELECT cert_number, course_title, issued_at, block_hash FROM course_certificates WHERE user_id = ${user.id} ORDER BY issued_at DESC LIMIT 12`);
 
 // Recommended (published, not enrolled)
 const enrolledSlugs = new Set(enrollments.map((e: any) => e.slug));
-let recommended = (await safeRows(sql`SELECT slug, title, subtitle, school, difficulty FROM training_courses WHERE is_published = true ORDER BY COALESCE(enrolled_count,0) DESC, created_at DESC LIMIT 16`))
+let recommended = (await safeRows('course recommendations', sql`SELECT slug, title, subtitle, school, difficulty FROM training_courses WHERE is_published = true ORDER BY COALESCE(enrolled_count,0) DESC, created_at DESC LIMIT 16`))
   .filter((c: any) => !enrolledSlugs.has(c.slug)).slice(0, 6);
 
 // ---- derived metrics ----
@@ -56,7 +85,7 @@ const competencies = Object.entries(catMap).map(([k, v]) => ({ name: k, pct: Mat
 // ---- daily activity (last 84 days) for heatmap + trend ----
 const DAYS = 84;
 // pull per-day counts from every signal we have; each guarded so a missing table just contributes nothing
-const aDaily = await safeRows(sql`SELECT to_char(created_at,'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM activity_events WHERE user_id = ${user.id} AND created_at > now() - interval '84 days' GROUP BY 1`);
+const aDaily = await safeRows('your activity history', sql`SELECT to_char(created_at,'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM activity_events WHERE user_id = ${user.id} AND created_at > now() - interval '84 days' GROUP BY 1`);
 // THE LESSON LINE ON THIS CHART WAS ALWAYS FLAT, FOR TWO SEPARATE REASONS.
 //   1. training_lesson_progress has no writer. The button a learner presses posts to
 //      /api/aquintutor/lesson-complete, which writes training_lesson_completions. So the primary
@@ -66,10 +95,10 @@ const aDaily = await safeRows(sql`SELECT to_char(created_at,'YYYY-MM-DD') AS d, 
 //      lesson_id, completed_at) — so it could only ever throw into safeRows and return nothing.
 // Both now read completed_at, and the live table is queried FIRST rather than as a fallback that
 // was gated on the empty one returning rows.
-const lDaily = await safeRows(sql`SELECT to_char(completed_at,'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM training_lesson_completions WHERE user_id = ${user.id} AND completed_at > now() - interval '84 days' GROUP BY 1`);
+const lDaily = await safeRows('your lesson completions', sql`SELECT to_char(completed_at,'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM training_lesson_completions WHERE user_id = ${user.id} AND completed_at > now() - interval '84 days' GROUP BY 1`);
 // Legacy rows written by the old path on a live database are real completions and still count.
-const lDaily2 = await safeRows(sql`SELECT to_char(completed_at,'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM training_lesson_progress WHERE user_id = ${user.id} AND completed_at IS NOT NULL AND completed_at > now() - interval '84 days' GROUP BY 1`);
-const certDaily = await safeRows(sql`SELECT to_char(issued_at,'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM course_certificates WHERE user_id = ${user.id} AND issued_at > now() - interval '84 days' GROUP BY 1`);
+const lDaily2 = await safeRows('your earlier lesson completions', sql`SELECT to_char(completed_at,'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM training_lesson_progress WHERE user_id = ${user.id} AND completed_at IS NOT NULL AND completed_at > now() - interval '84 days' GROUP BY 1`);
+const certDaily = await safeRows('your certificate history', sql`SELECT to_char(issued_at,'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM course_certificates WHERE user_id = ${user.id} AND issued_at > now() - interval '84 days' GROUP BY 1`);
 
 const activityMap: { [k: string]: number } = {};   // all signals — heatmap intensity
 const lessonMap: { [k: string]: number } = {};      // lesson completions only — trend + goal
@@ -235,13 +264,36 @@ const R = 70, CIRC = 2 * Math.PI * R, healthOffset = CIRC * (1 - health / 100);
     <h1 class="pg-h1">Where you stand, <em>{firstName}</em>.</h1>
   </div>
 
+  {/* THE SCORE IS WITHDRAWN WHEN ITS INPUTS ARE MISSING, not printed low. Every read on this page
+      used to fail into an empty array, and an empty array reaches the gauge as "At risk" — a
+      judgement about a person's effort, made because a query failed. */}
+  {readFailures.length > 0 && (
+    <div style="border:1px solid #a0421e; border-radius:14px; background:#fff; padding:16px 18px; margin:18px 0 0;">
+      <p style="font-family:'Fraunces',serif; font-size:1.05rem; font-weight:600; margin:0 0 6px;">Part of your record could not be read, so the figures below are incomplete.</p>
+      <p style="font-size:13.5px; line-height:1.65; color:var(--ink-500); margin:0 0 8px; max-width:66ch;">
+        This is a fault on our side. Nothing you have finished has been lost, and a low score here is
+        not a judgement about your work &mdash; it is missing data. Please reload in a moment.
+      </p>
+      <p style="font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--ink-500); margin:0;">Could not read: {readFailures.join('; ')}</p>
+    </div>
+  )}
+
   <div class="pg-top">
     {/* Gainsight-style health gauge */}
     <div class="pg-card pg-health">
       <h2 style="align-self:flex-start;">Learning health score</h2>
       <div class="pg-gauge">
-        <svg width="180" height="180"><circle cx="90" cy="90" r="70" fill="none" stroke="#EBE6DA" stroke-width="14"/><circle cx="90" cy="90" r="70" fill="none" stroke={healthBand.color} stroke-width="14" stroke-linecap="round" stroke-dasharray={CIRC} stroke-dashoffset={healthOffset}/></svg>
-        <div class="pg-gauge-num"><div class="pg-gauge-v" style={'color:' + healthBand.color}>{health}</div><div class="pg-gauge-l" style={'color:' + healthBand.color}>{healthBand.label}</div></div>
+        <svg width="180" height="180"><circle cx="90" cy="90" r="70" fill="none" stroke="#EBE6DA" stroke-width="14"/>{readFailures.length === 0 && <circle cx="90" cy="90" r="70" fill="none" stroke={healthBand.color} stroke-width="14" stroke-linecap="round" stroke-dasharray={CIRC} stroke-dashoffset={healthOffset}/>}</svg>
+        <div class="pg-gauge-num">
+          {readFailures.length > 0 ? (
+            <div class="pg-gauge-l" style="color:var(--ink-500); max-width:120px; text-align:center; line-height:1.5;">Not enough data to score</div>
+          ) : (
+            <Fragment>
+              <div class="pg-gauge-v" style={'color:' + healthBand.color}>{health}</div>
+              <div class="pg-gauge-l" style={'color:' + healthBand.color}>{healthBand.label}</div>
+            </Fragment>
+          )}
+        </div>
       </div>
       <div class="pg-health-bars">
         <div class="pg-hb"><label>Momentum</label><div class="pg-hb-track"><div class="pg-hb-fill" style={'width:' + sMomentum + '%'}></div></div><span>{sMomentum}</span></div>
@@ -454,7 +506,10 @@ const R = 70, CIRC = 2 * Math.PI * R, healthOffset = CIRC * (1 - health / 100);
       document.getElementById('pulseThanks').style.display = 'block';
       document.querySelectorAll('#pulse button').forEach(function (x) { x.style.opacity = '0.4'; });
       b.style.opacity = '1'; b.style.background = 'rgba(134,239,172,0.25)';
-      try { fetch('/api/activity/log', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: 'pulse', stage: 'learn', type: 'learning_pulse', detail: 'pulse=' + b.getAttribute('data-v') }) }); } catch (e) {}
+      // try/catch does not catch a rejected fetch — it only catches a synchronous throw — so this
+      // raised an unhandled rejection on every offline tap. The .catch is what actually handles it.
+      fetch('/api/activity/log', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: 'pulse', stage: 'learn', type: 'learning_pulse', detail: 'pulse=' + b.getAttribute('data-v') }) })
+        .catch(function (err) { console.error('[progress] pulse not recorded:', err && err.message); });
     });
   });
 </script>

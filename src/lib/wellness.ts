@@ -1837,25 +1837,11 @@ export async function listAssignedConsults(consultantUserId: string, limit = 50)
   }
 }
 
-/** One assigned request. value===null means "not yours / no such request", which is not a failure. */
-export async function getAssignedConsult(consultantUserId: string, id: string): Promise<WellnessRead<ConsultRow | null>> {
-  if (!(await isWellnessConsultant(consultantUserId))) return { ok: false, reason: 'not-in-pool' };
-  try {
-    const r = await db.execute(sql`
-      SELECT q.id, q.topic, q.urgency, q.message, q.status, q.response, q.created_at, q.answered_at,
-             NULL::text AS consultant_name
-      FROM wellness_consult_requests q
-      WHERE q.id = ${id}::uuid AND q.assigned_to = ${String(consultantUserId)}::uuid
-      LIMIT 1
-    `);
-    const row = rows(r)[0];
-    return { ok: true, value: row ? mapConsultRow(row) : null };
-  } catch (e: any) {
-    const reason = errText(e);
-    console.error('[wellness] getAssignedConsult:', reason);
-    return { ok: false, reason };
-  }
-}
+// getAssignedConsult() USED TO BE HERE and has been removed rather than kept "for completeness".
+// The consultant queue renders each assigned request in full from listAssignedConsults(), so a
+// single-request read had no caller — and a correct function nothing calls is the same shape as the
+// dead code this whole pass exists to remove. If a per-request page is ever built, the owner-scoped
+// query it needs is three lines of listAssignedConsults() with an id in the WHERE clause.
 
 /**
  * Write the reply, and tell her it arrived.

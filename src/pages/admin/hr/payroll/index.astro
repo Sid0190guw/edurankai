@@ -23,6 +23,9 @@ import { generateRun, computePay, listComponents, ensurePayrollSchema, MONTH_NAM
 // on this screen the second one, rendered as the first, invites somebody to generate a duplicate
 // month. clip/confirmAttr keep a long or apostrophe-bearing name from breaking a card or a prompt.
 import { safeRows, clip, confirmAttr, dbReason, pageParam } from '@/lib/page-safety';
+// Money is added and rounded in one place. `a + b + c` on binary doubles is how a gross salary
+// acquires a trailing 0.00000000001 and how a rounded total stops matching the sum of its parts.
+import { round2, sumMoney } from '@/lib/money';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -88,6 +91,22 @@ const civilNowParts = (() => {
 const currentMonth = civilNowParts.m;
 const currentYear = civilNowParts.y;
 
+// =================================================================================================
+// THE DAY A SALARY STRUCTURE TAKES EFFECT
+// =================================================================================================
+//
+// effective_from / effective_to were written from CURRENT_DATE. CURRENT_DATE is the database
+// SESSION's date, and nothing in this codebase sets that session's zone — src/lib/db/index.ts opens
+// postgres() with no timezone option and no SET TIME ZONE, so it inherits the server default, which
+// is UTC. IST is UTC+05:30, so a salary change recorded between 00:00 and 05:29 IST was dated the
+// PREVIOUS day: the outgoing structure was closed the day before yesterday and the new one starts
+// yesterday. The month figure two lines above is already cut in Asia/Kolkata for exactly this
+// reason; the effective dates were the half that had been left behind.
+//
+// Declared ABOVE the POST handler that reads it — `const` is not hoisted.
+const PAYROLL_TIME_ZONE = 'Asia/Kolkata';
+const EFFECTIVE_TODAY = sqlExpr`(NOW() AT TIME ZONE ${PAYROLL_TIME_ZONE})::date`;
+
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
@@ -118,15 +137,6 @@ if (Astro.request.method === 'POST') {
         if (run.failed.length) {
           parts.push(`${run.failed.length} employee${run.failed.length === 1 ? ' was' : 's were'} left out because their payslip could not be written: ${run.failed.join(', ')}. Nobody was paid a wrong amount — they simply have no payslip in this run.`);
         }
-        // PEOPLE THE RUN REFUSED TO PAY ARE NOT A FOOTNOTE ON A SUCCESS MESSAGE.
-        //
-        // generateRun() now declines to build a payslip out of a salary that was never recorded —
-        // the state a newly signed joiner is left in — because that payslip reads zero, reconciles
-        // (0 == 0), and is then marked paid and pushed to the person as "Salary credited ... 0".
-        // The refusal only helps if it is READ, so it goes in the error slot with the reason and a
-        // route, and it is written to the run as well: see the notices on each run card, which are
-        // still there on the day somebody presses Approve or Mark Paid.
-        const skippedSentences = run.skipped.map((sk) => sk.name + ' — ' + sk.reason);
         // THE REFUSALS GO IN THEIR OWN BLOCK, WITH A ROUTE TO EACH RECORD.
         //
         // generateRun() now declines to write a payslip for anybody who has no base salary and no
@@ -152,21 +162,10 @@ if (Astro.request.method === 'POST') {
         // bonus which never reached its ledger is the one class of failure in this run somebody has
         // to repair by hand: the loan balance stays high and the person is charged again next month,
         // or a one-off bonus pays a second time.
-        if (run.skipped.length || run.ledgerWarnings.length) {
-          const bits: string[] = [];
-          if (run.skipped.length) {
-            bits.push(run.skipped.length + ' employee'
-              + (run.skipped.length === 1 ? ' was' : 's were')
-              + ' NOT paid by this run and ' + (run.skipped.length === 1 ? 'has' : 'have')
-              + ' no payslip for this month: ' + skippedSentences.join(' ')
-              + ' Fix the record and pay them by hand — this month cannot be regenerated.');
-          }
-          if (run.ledgerWarnings.length) {
-            bits.push(run.ledgerWarnings.length + ' thing'
-              + (run.ledgerWarnings.length === 1 ? '' : 's')
-              + ' on this run need checking by hand. ' + run.ledgerWarnings.join(' '));
-          }
-          errorMsg = bits.join(' ');
+        if (run.ledgerWarnings.length) {
+          errorMsg = run.ledgerWarnings.length + ' thing'
+            + (run.ledgerWarnings.length === 1 ? '' : 's')
+            + ' on this run need checking by hand. ' + run.ledgerWarnings.join(' ');
         }
         successMsg = parts.join(' ');
       }
@@ -387,7 +386,10 @@ if (Astro.request.method === 'POST') {
       const tds = parseFloat(fd.get('tds') as string || '0');
       const currency = (fd.get('currency') as string || 'INR').trim();
 
-      const gross = basic + hra + da + specialAllowance + transportAllowance + medicalAllowance + otherAllowances;
+      // sumMoney() from src/lib/money.ts, not `a + b + c + ...` on binary doubles. Seven components
+      // added in floating point produce a gross like 82000.00000000001, which is then written into a
+      // NUMERIC salary column and copied onto hr_employees.base_salary as somebody's pay.
+      const gross = sumMoney([basic, hra, da, specialAllowance, transportAllowance, medicalAllowance, otherAllowances]);
 
       // THE THREE HARDCODED STATUTORY FORMULAS THAT USED TO SIT HERE ARE GONE. They were
       // `Math.min(basic * 0.12, 1800)`, `gross < 21000 ? gross * 0.0075 : 0` and a professional tax
@@ -400,8 +402,8 @@ if (Astro.request.method === 'POST') {
       const pfEmployee = 0;
       const esicEmployee = 0;
       const professionalTax = 0;
-      const totalDed = tds;
-      const net = gross - totalDed;
+      const totalDed = round2(tds);
+      const net = round2(gross - totalDed);
 
       // Capture what the salary WAS, so the audit entry records the change and not just the result.
       let prev: any = null;
@@ -411,29 +413,44 @@ if (Astro.request.method === 'POST') {
         prev = (Array.isArray(p) ? p : (p as any)?.rows || [])[0] || null;
       } catch (_) {}
 
-      // Close existing structure
-      await db.execute(sqlExpr`
-        UPDATE hr_salary_structures SET effective_to = CURRENT_DATE - INTERVAL '1 day'
-        WHERE employee_id = ${empId} AND effective_to IS NULL
-      `);
-
-      // Insert new structure
-      await db.execute(sqlExpr`
+      // ONE STATEMENT, SO A PERSON CANNOT END UP WITH NO SALARY.
+      //
+      // This was three separate round trips: close the open structure, insert the new one, then copy
+      // the gross onto hr_employees. Nothing wrapped them. If the INSERT failed — a constraint, a
+      // dropped pooled connection, a type error on one field — the first statement had already
+      // committed, and the employee was left with NO open salary structure at all. computePay()
+      // reads the latest structure, so the next run produced a payslip against nothing. Failing
+      // between the second and third left hr_employees.base_salary disagreeing with the structure
+      // that generates the payslip, which is the harder version to notice.
+      //
+      // Data-modifying CTEs run exactly once and always to completion, in one statement, so either
+      // all three writes land or none of them do. RETURNING says the structure exists rather than
+      // leaving "Salary structure updated." to be printed over a statement that wrote nothing.
+      const structIns = await db.execute(sqlExpr`
+        WITH closed AS (
+          UPDATE hr_salary_structures SET effective_to = ${EFFECTIVE_TODAY} - INTERVAL '1 day'
+           WHERE employee_id = ${empId} AND effective_to IS NULL
+          RETURNING id
+        ), emp AS (
+          UPDATE hr_employees SET base_salary = ${gross}, currency = ${currency}
+           WHERE id = ${empId}
+          RETURNING id
+        )
         INSERT INTO hr_salary_structures (
           employee_id, effective_from, currency,
           basic, hra, da, special_allowance, transport_allowance, medical_allowance,
           other_allowances, gross_salary, pf_employee, esic_employee,
           professional_tax, tds, total_deductions, net_salary, created_by
         ) VALUES (
-          ${empId}, CURRENT_DATE, ${currency},
+          ${empId}, ${EFFECTIVE_TODAY}, ${currency},
           ${basic}, ${hra}, ${da}, ${specialAllowance}, ${transportAllowance}, ${medicalAllowance},
           ${otherAllowances}, ${gross}, ${pfEmployee}, ${esicEmployee},
           ${professionalTax}, ${tds}, ${totalDed}, ${net}, ${user.id}
         )
+        RETURNING id
       `);
-
-      // Update base salary on employee
-      await db.execute(sqlExpr`UPDATE hr_employees SET base_salary = ${gross}, currency = ${currency} WHERE id = ${empId}`);
+      const structRows = Array.isArray(structIns) ? structIns : ((structIns as any)?.rows || []);
+      if (!structRows.length) throw new Error('The salary structure was not written.');
       await audit(user.id, 'hr.salary.updated', empId, {
         from: prev ? { gross: Number(prev.gross_salary || 0), net: Number(prev.net_salary || 0), currency: prev.currency } : null,
         to: { gross, net, currency },
@@ -652,6 +669,11 @@ function fmt(n: any) {
       <div style="margin-bottom:8px;color:#fde68a;">
         No payslip was written for them and no money has moved. Record their pay, then include them in
         the next period — this run cannot be regenerated.
+        {/* THIS MESSAGE IS THE RESPONSE TO ONE POST AND DIES WITH IT. Approve and Mark Paid are
+            pressed later, by somebody who may never have seen this screen, which is why the same
+            sentences are saved against the run and shown on its card. */}
+        This list is saved against the run: it is on the run's own card below, and beside Approve and
+        Mark Paid, on every later visit.
       </div>
       <ul style="margin:0;padding-left:18px;display:flex;flex-direction:column;gap:6px;">
         {skippedFromRun.map((s) => (

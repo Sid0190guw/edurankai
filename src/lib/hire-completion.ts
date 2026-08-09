@@ -693,14 +693,23 @@ export async function setOnboardingStatus(
     if (!updated.length) return { ok: false, error: 'No employee record was changed.' };
     const row = updated[0] as any;
 
-    if (status === 'complete' && row.user_id) {
+    // BOTH SETTLED STATES ARE TOLD TO THE PERSON IN THEM, not only the last one.
+    //
+    // 'verified' is a decision about somebody's bank, identity and emergency details that they
+    // submitted and are waiting on — being checked is the thing they cannot see from their side. It
+    // notified nothing, so a joiner whose details HR had read and accepted was left in exactly the
+    // silence 'complete' was built to end, one step earlier.
+    if ((status === 'complete' || status === 'verified') && row.user_id) {
       try {
         const { notifyUser } = await import('@/lib/notify');
         await notifyUser(String(row.user_id), {
-          title: 'Onboarding complete',
-          body: 'The people desk has signed off your joining details. Nothing further is outstanding.',
+          title: status === 'complete' ? 'Onboarding complete' : 'Your joining details have been checked',
+          body: status === 'complete'
+            ? 'The people desk has signed off your joining details. Nothing further is outstanding.'
+            : 'The people desk has read your bank, identity and emergency details and they are right. '
+              + 'Anything still outstanding is on your onboarding checklist.',
           type: 'hire',
-          actionUrl: '/portal/employee',
+          actionUrl: status === 'complete' ? '/portal/employee' : '/portal/employee/onboarding',
           entityType: 'hr_employee',
           entityId: id,
         });

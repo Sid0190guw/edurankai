@@ -17,14 +17,16 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { randomBytes } from 'node:crypto';
+import { ensureOnce } from '@/lib/ensure-once';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
-let ready: Promise<void> | null = null;
+// One ensure per process, through the shared guard, so a failure is not cached for the lifetime of
+// the process. The bare `catch (_) {}` that used to wrap the whole block meant a bootstrap that never
+// ran left no trace anywhere and every statement below then failed for a reason nobody could see.
 export function ensureCouponSchema(): Promise<void> {
-  if (ready) return ready;
-  ready = (async () => {
-    try {
+  return ensureOnce('fee_waiver_coupons', async () => {
+    {
       await db.execute(sql`CREATE TABLE IF NOT EXISTS fee_waiver_coupons (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         code VARCHAR(64) NOT NULL UNIQUE,
@@ -54,9 +56,8 @@ export function ensureCouponSchema(): Promise<void> {
       )`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS fwcr_coupon_idx ON fee_waiver_coupon_redemptions(coupon_id)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS fwcr_user_idx ON fee_waiver_coupon_redemptions(user_id)`);
-    } catch (_) {}
-  })();
-  return ready;
+    }
+  });
 }
 
 function randomCode(): string {
@@ -162,6 +163,21 @@ export async function previewCoupon(code: string, userId: string, intentId?: str
   };
 }
 
+/**
+ * CLAIM the coupon, before anything is given away for it.
+ *
+ * THE ORDER WAS WRONG AND THAT IS THE WHOLE FAULT. /api/portal/fee-waiver-coupons/redeem used to
+ * previewCoupon() -> materialiseFromIntent(waiverGranted: true) -> recordRedemption(). previewCoupon
+ * is a READ, so two applicants racing the last use of a code both saw it as valid, both had a free
+ * application created for them, and only then did one of them lose the atomic bump — the loser was
+ * shown a 500 while keeping an application whose fee had been waived against no coupon use at all.
+ *
+ * The bump IS the claim, so it happens FIRST. If what the claim pays for cannot then be delivered,
+ * releaseRedemption() hands the use back rather than burning it.
+ *
+ * `application_id` is filled in afterwards by attachApplication(), because the application does not
+ * exist yet at the moment the claim is made.
+ */
 export async function recordRedemption(opts: {
   couponId: string;
   userId: string;
@@ -169,7 +185,7 @@ export async function recordRedemption(opts: {
   applicationId?: string | null;
   ipAddress?: string | null;
   userAgent?: string | null;
-}): Promise<{ ok: boolean; error?: string }> {
+}): Promise<{ ok: boolean; redemptionId?: string; error?: string }> {
   await ensureCouponSchema();
   try {
     // Atomically bump used_count; the check on used_count<max_uses prevents races.
@@ -183,14 +199,49 @@ export async function recordRedemption(opts: {
       RETURNING id
     `));
     if (!upd[0]) return { ok: false, error: 'coupon no longer valid' };
-    await db.execute(sql`
+    const ins = rows(await db.execute(sql`
       INSERT INTO fee_waiver_coupon_redemptions (coupon_id, user_id, intent_id, application_id, ip_address, user_agent)
       VALUES (${opts.couponId}, ${opts.userId}, ${opts.intentId || null}, ${opts.applicationId || null}, ${opts.ipAddress || null}, ${opts.userAgent || null})
-    `);
-    return { ok: true };
+      RETURNING id
+    `));
+    if (!ins[0]) {
+      // The use is spent and nothing records who spent it. Give it back rather than leave a code
+      // one use short with no explanation on any screen.
+      await releaseUse(opts.couponId);
+      return { ok: false, error: 'the redemption could not be recorded' };
+    }
+    return { ok: true, redemptionId: String((ins[0] as any).id) };
   } catch (e: any) {
-    return { ok: false, error: e?.message || 'db error' };
+    // e.message on a postgres-js error is only the failed SQL; the reason is on e.cause. Logged,
+    // never returned — an applicant cannot act on a column name.
+    console.error('[fee-waiver-coupons] recordRedemption failed for coupon', opts.couponId, '-', e?.cause?.message || e?.message);
+    return { ok: false, error: 'that code could not be redeemed just now' };
   }
+}
+
+/** Hand a claimed use back. Guarded so it can never drive used_count below zero. */
+async function releaseUse(couponId: string): Promise<void> {
+  await db.execute(sql`
+    UPDATE fee_waiver_coupons SET used_count = used_count - 1
+     WHERE id = ${couponId} AND used_count > 0
+  `).catch((e: any) => console.error('[fee-waiver-coupons] could not release the claimed use on coupon', couponId, '-', e?.cause?.message || e?.message));
+}
+
+/**
+ * Undo a claim whose application could not be created. Both halves are attempted and both failures
+ * are logged: a use burned for nothing is a code an applicant is told is spent when it is not.
+ */
+export async function releaseRedemption(redemptionId: string, couponId: string): Promise<void> {
+  await db.execute(sql`DELETE FROM fee_waiver_coupon_redemptions WHERE id = ${redemptionId}`)
+    .catch((e: any) => console.error('[fee-waiver-coupons] could not remove redemption', redemptionId, '-', e?.cause?.message || e?.message));
+  await releaseUse(couponId);
+}
+
+/** Record which application the claimed use produced, once it exists. */
+export async function attachApplication(redemptionId: string, applicationId: string | null): Promise<void> {
+  if (!applicationId) return;
+  await db.execute(sql`UPDATE fee_waiver_coupon_redemptions SET application_id = ${applicationId} WHERE id = ${redemptionId}`)
+    .catch((e: any) => console.error('[fee-waiver-coupons] could not link redemption', redemptionId, 'to application', applicationId, '-', e?.cause?.message || e?.message));
 }
 
 export async function listCouponsByCreator(userId: string, limit = 50) {
@@ -205,10 +256,23 @@ export async function listCouponsByCreator(userId: string, limit = 50) {
   `));
 }
 
-export async function revokeCoupon(couponId: string, adminUserId: string) {
+/**
+ * Revoke a code. Returns whether a row actually moved — the admin page used to print "Coupon
+ * revoked." over a statement that had matched nothing (already revoked, or an id from a stale list),
+ * which reads as a code that can no longer be used when it still can.
+ */
+export async function revokeCoupon(couponId: string, adminUserId: string): Promise<{ ok: boolean; error?: string }> {
   await ensureCouponSchema();
-  await db.execute(sql`
-    UPDATE fee_waiver_coupons SET revoked_at = NOW()
-    WHERE id = ${couponId} AND revoked_at IS NULL
-  `);
+  try {
+    const r = rows(await db.execute(sql`
+      UPDATE fee_waiver_coupons SET revoked_at = NOW()
+      WHERE id = ${couponId} AND revoked_at IS NULL
+      RETURNING id
+    `));
+    if (!r.length) return { ok: false, error: 'That code was not revoked — it may already have been revoked, or it no longer exists.' };
+    return { ok: true };
+  } catch (e: any) {
+    console.error('[fee-waiver-coupons] revoke failed for', couponId, '-', e?.cause?.message || e?.message);
+    return { ok: false, error: 'That code could not be revoked just now. Nothing was changed.' };
+  }
 }

@@ -13,6 +13,19 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 
 await ensureMailGroupsSchema();
 function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+// EVERY WRITE ON THIS PAGE ANNOUNCED SUCCESS WITHOUT ASKING WHETHER IT HAPPENED.
+// "Member removed." over a DELETE that matched no row (a row another tab had already removed, a
+// bad id), "Group deleted." over the same, "All current applicants added to the group." over an
+// INSERT ... SELECT that added nobody. On a distribution list that is not cosmetic: the operator
+// walks away believing a list is what they just made it, and the next campaign goes to the wrong
+// people. Every statement below now carries RETURNING and the message states the count.
+//
+// Declared above the POST handler that uses them - `const` is not hoisted, and a handler reaching a
+// later declaration throws on its first line.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+const plural = (n: number, one: string, many: string) => n + ' ' + (n === 1 ? one : many);
 
 let okMsg = '', errMsg = '';
 if (Astro.request.method === 'POST') {
@@ -26,62 +39,96 @@ if (Astro.request.method === 'POST') {
       const hidden = fd.get('hidden_recipients') === 'on';
       if (!slug || !name) errMsg = 'Slug and name are required.';
       else {
-        await db.execute(sql`INSERT INTO mail_groups (slug, name, description, hidden_recipients, created_by_user_id) VALUES (${slug}, ${name}, ${description}, ${hidden}, ${user.id}) ON CONFLICT (slug) DO UPDATE SET name=EXCLUDED.name, description=EXCLUDED.description, hidden_recipients=EXCLUDED.hidden_recipients, updated_at=NOW()`);
-        okMsg = 'Group saved.';
+        const saved = rowsOf(await db.execute(sql`INSERT INTO mail_groups (slug, name, description, hidden_recipients, created_by_user_id) VALUES (${slug}, ${name}, ${description}, ${hidden}, ${user.id}) ON CONFLICT (slug) DO UPDATE SET name=EXCLUDED.name, description=EXCLUDED.description, hidden_recipients=EXCLUDED.hidden_recipients, updated_at=NOW() RETURNING id`));
+        if (saved.length === 0) errMsg = 'The group was not saved. Nothing has changed.';
+        else okMsg = 'Group saved.';
       }
     } else if (action === 'add_member') {
       const groupId = (fd.get('group_id') as string || '').trim();
       const emailInput = (fd.get('email') as string || '').trim().toLowerCase().slice(0, 255);
       const nameInput = (fd.get('name') as string || '').trim().slice(0, 200) || null;
-      if (!groupId || !emailInput || !/.+@.+\..+/.test(emailInput)) errMsg = 'Group ID + valid email required.';
+      if (!groupId || !UUID_RE.test(groupId)) errMsg = 'That group id is not valid, so nobody was added.';
+      else if (!emailInput || !/.+@.+\..+/.test(emailInput)) errMsg = 'A valid email address is required.';
       else {
         // Match against an existing user if possible so the membership is
         // tracked by user_id (auto-follows if the user updates their email).
         const u = rowsOf(await db.execute(sql`SELECT id, name FROM users WHERE LOWER(email) = ${emailInput} LIMIT 1`))[0] as any;
-        if (u) {
-          await db.execute(sql`INSERT INTO mail_group_members (group_id, user_id, added_by_user_id) VALUES (${groupId}, ${u.id}, ${user.id})`);
-        } else {
-          await db.execute(sql`INSERT INTO mail_group_members (group_id, external_email, external_name, added_by_user_id) VALUES (${groupId}, ${emailInput}, ${nameInput}, ${user.id})`);
-        }
-        okMsg = 'Member added.';
+        // ALREADY-A-MEMBER USED TO ADD A SECOND ROW. There is no unique constraint on
+        // mail_group_members, and this INSERT had no guard - unlike the two "add all" branches
+        // below, which have carried NOT EXISTS all along. Pressing Add twice, or adding somebody a
+        // colleague had already added, put the same person on the list twice: the member count
+        // over-reported the real reach of the list and the roster showed them twice. (The send path
+        // de-duplicates addresses, so nobody was ever mailed twice; the list was simply wrong about
+        // itself.) The guard is in the statement, so two operators pressing Add at the same instant
+        // cannot both win.
+        const ins = u
+          ? rowsOf(await db.execute(sql`
+              INSERT INTO mail_group_members (group_id, user_id, added_by_user_id)
+              SELECT ${groupId}::uuid, ${u.id}, ${user.id}
+               WHERE NOT EXISTS (SELECT 1 FROM mail_group_members m WHERE m.group_id = ${groupId}::uuid AND m.user_id = ${u.id})
+              RETURNING id`))
+          : rowsOf(await db.execute(sql`
+              INSERT INTO mail_group_members (group_id, external_email, external_name, added_by_user_id)
+              SELECT ${groupId}::uuid, ${emailInput}, ${nameInput}, ${user.id}
+               WHERE NOT EXISTS (SELECT 1 FROM mail_group_members m WHERE m.group_id = ${groupId}::uuid AND LOWER(m.external_email) = ${emailInput})
+              RETURNING id`));
+        if (ins.length === 0) okMsg = emailInput + ' is already on this list, so nothing was added.';
+        else okMsg = 'Member added.';
       }
     } else if (action === 'remove_member') {
       const id = (fd.get('id') as string || '').trim();
-      if (id) {
-        await db.execute(sql`DELETE FROM mail_group_members WHERE id = ${id}`);
-        okMsg = 'Member removed.';
+      if (!id || !UUID_RE.test(id)) errMsg = 'That membership id is not valid, so nothing was removed.';
+      else {
+        const gone = rowsOf(await db.execute(sql`DELETE FROM mail_group_members WHERE id = ${id}::uuid RETURNING id`));
+        if (gone.length === 0) errMsg = 'That member was not on the list, so nothing was removed. Somebody may have removed them already.';
+        else okMsg = 'Member removed.';
       }
     } else if (action === 'delete_group') {
       const id = (fd.get('id') as string || '').trim();
-      if (id) {
-        await db.execute(sql`DELETE FROM mail_groups WHERE id = ${id}`);
-        okMsg = 'Group deleted.';
+      if (!id || !UUID_RE.test(id)) errMsg = 'That group id is not valid, so nothing was deleted.';
+      else {
+        const gone = rowsOf(await db.execute(sql`DELETE FROM mail_groups WHERE id = ${id}::uuid RETURNING slug`));
+        if (gone.length === 0) errMsg = 'No group has that id, so nothing was deleted.';
+        else okMsg = 'Group "' + gone[0].slug + '" deleted.';
       }
     } else if (action === 'add_all_applicants') {
       // Convenience: drop every applicant user into the group in one shot.
       const groupId = (fd.get('group_id') as string || '').trim();
-      if (groupId) {
-        await db.execute(sql`
+      if (!groupId || !UUID_RE.test(groupId)) errMsg = 'That group id is not valid, so nobody was added.';
+      else {
+        const added = rowsOf(await db.execute(sql`
           INSERT INTO mail_group_members (group_id, user_id, added_by_user_id)
-          SELECT ${groupId}, u.id, ${user.id} FROM users u
+          SELECT ${groupId}::uuid, u.id, ${user.id} FROM users u
           WHERE u.role = 'applicant' AND u.is_active = true
-            AND NOT EXISTS (SELECT 1 FROM mail_group_members m WHERE m.group_id = ${groupId} AND m.user_id = u.id)
-        `);
-        okMsg = 'All current applicants added to the group.';
+            AND NOT EXISTS (SELECT 1 FROM mail_group_members m WHERE m.group_id = ${groupId}::uuid AND m.user_id = u.id)
+          RETURNING id
+        `));
+        okMsg = added.length === 0
+          ? 'Every active applicant was already on this list, so nobody was added.'
+          : plural(added.length, 'applicant', 'applicants') + ' added.';
       }
     } else if (action === 'add_all_admins') {
       const groupId = (fd.get('group_id') as string || '').trim();
-      if (groupId) {
-        await db.execute(sql`
+      if (!groupId || !UUID_RE.test(groupId)) errMsg = 'That group id is not valid, so nobody was added.';
+      else {
+        const added = rowsOf(await db.execute(sql`
           INSERT INTO mail_group_members (group_id, user_id, added_by_user_id)
-          SELECT ${groupId}, u.id, ${user.id} FROM users u
+          SELECT ${groupId}::uuid, u.id, ${user.id} FROM users u
           WHERE u.role != 'applicant' AND u.is_active = true
-            AND NOT EXISTS (SELECT 1 FROM mail_group_members m WHERE m.group_id = ${groupId} AND m.user_id = u.id)
-        `);
-        okMsg = 'All current admins added to the group.';
+            AND NOT EXISTS (SELECT 1 FROM mail_group_members m WHERE m.group_id = ${groupId}::uuid AND m.user_id = u.id)
+          RETURNING id
+        `));
+        okMsg = added.length === 0
+          ? 'Every active internal account was already on this list, so nobody was added.'
+          : plural(added.length, 'account', 'accounts') + ' added.';
       }
     }
-  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
+  } catch (e: any) {
+    // e.message on a postgres-js error is the failed SQL STATEMENT, not the reason - the reason is
+    // on e.cause, and it was going nowhere at all. Both are now put where they belong.
+    console.error('[admin/mail/groups] write failed:', reasonOf(e));
+    errMsg = 'That did not save: ' + reasonOf(e);
+  }
 }
 
 const groups = await listGroups();

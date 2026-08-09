@@ -1,6 +1,46 @@
 ---
+// /portal/enroll-face — the form-post door into face enrolment.
+//
+// =================================================================================================
+// WHAT WAS WRONG HERE, AND WHY IT WAS THE WORST KIND OF WRONG
+// =================================================================================================
+//
+// user_face_enrollments is not a preference. The descriptor in that row is simultaneously an
+// accepted FIRST factor at the sign-in surfaces, the 'face' SECOND factor in
+// src/lib/auth/two-factor.ts (verifyFaceSecondFactor reads exactly this row), and what
+// /api/portal/attendance/punch trusts when it marks somebody present.
+//
+// This page wrote it with:
+//   - `Array.isArray(parsed) && parsed.length === 128` as the only validation, so 128 strings, or
+//     128 zeros (which is face-api's "no face found" result, not a face), went straight into the
+//     jsonb column;
+//   - `ON CONFLICT (user_id) DO UPDATE SET face_descriptor = <whatever was posted>`, with nothing
+//     compared against anything. Any signed-in session — including a stolen one — could REPLACE the
+//     enrolled face outright by posting one form field. That is persistence which survives a
+//     password change, it hands the attacker a standalone sign-in method, it locks the real owner's
+//     face out, and it enables attendance fraud on somebody else's likeness.
+//
+// Both API doors into this same table were hardened for precisely this and this page was left as a
+// third, unguarded one: /api/auth/enroll-face measures the selfie against the government ID
+// server-side (and deliberately ignores a client-supplied matchDistance), and
+// /api/auth/enroll-face-selfie gates REPLACEMENT on matchEnrolledFace(). A guard that one surface
+// out of three skips is not a guard.
+//
+// THE RULE NOW, IDENTICAL TO /api/auth/enroll-face-selfie:
+//   - FIRST enrolment is unchanged. No active row, no obstacle. That is the daily path (middleware
+//     forces it on a first protected page load) and nobody loses it.
+//   - RE-ENROLMENT must match the face already on file. Re-capturing in better light, on a new
+//     phone, or after a haircut still passes; a genuinely different face does not, and the refusal
+//     points at the ID-match flow so somebody whose appearance really has changed is not dead-ended.
+//   - The stored template is never serialised anywhere near the response, and the measured distance
+//     is never returned — a numeric distance is a gradient an attacker can hill-climb toward the
+//     stored template one probe at a time.
+//
+// A read that could not run does NOT resolve to "not enrolled": that would invite somebody to
+// re-enrol over a working factor, and it is the one wrong answer a security screen must not give.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { matchEnrolledFace, parseLiveDescriptor, causeOf, DESCRIPTOR_DIMS } from '@/lib/auth/face';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
@@ -8,23 +48,54 @@ if (!user) return Astro.redirect('/portal/login');
 const isNew = new URL(Astro.request.url).searchParams.get('new') === '1';
 let okMsg = '', errorMsg = '';
 let enrolled = false;
+// Did the status read actually run? An unreadable row is not an absent one.
+let statusOk = true;
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
   if (action === 'enroll') {
-    const descriptor = fd.get('face_descriptor') as string;
-    try {
-      const parsed = JSON.parse(descriptor);
-      if (Array.isArray(parsed) && parsed.length === 128) {
-        await db.execute(sql`
-          INSERT INTO user_face_enrollments (user_id, face_descriptor, device_info, is_active)
-          VALUES (${user.id}, ${descriptor}, ${Astro.request.headers.get('user-agent') || null}, true)
-          ON CONFLICT (user_id) DO UPDATE SET face_descriptor = ${descriptor}, enrolled_at = NOW(), is_active = true
-        `);
-        return Astro.redirect('/portal?enrolled=1');
-      } else { errorMsg = 'Invalid face data. Try again.'; }
-    } catch(e: any) { errorMsg = e.message; }
+    // parseLiveDescriptor enforces what "a descriptor" means: exactly 128 finite numbers, not all
+    // zeros. `JSON.parse` + length 128 accepted strings and zero-vectors, both of which are stored
+    // credentials that can never match a real face again.
+    let posted: unknown = null;
+    try { posted = JSON.parse(String(fd.get('face_descriptor') || '')); } catch (_) { posted = null; }
+    const descriptor = parseLiveDescriptor(posted);
+
+    if (!descriptor) {
+      errorMsg = 'No usable face in that capture (we need ' + DESCRIPTOR_DIMS + ' numbers, and a face must be visible). Try again with better lighting.';
+    } else {
+      try {
+        // REPLACEMENT IS GATED. matchEnrolledFace() reads the stored template and compares on the
+        // server; `enrolled` is false when there is no active row, which is first enrolment and
+        // passes straight through. It THROWS rather than reporting a false negative when the
+        // database cannot be reached — an auth path must never turn "the database is down" into
+        // "your face is wrong" — and the catch below says so instead of enrolling anyway.
+        const existing = await matchEnrolledFace(String(user.id), descriptor);
+        if (existing.enrolled && !existing.matched) {
+          // The distance the SERVER measured stays in the log and out of the page.
+          console.warn('[portal/enroll-face] replacement refused for user ' + user.id + ' (distance ' + existing.distance.toFixed(4) + ')');
+          errorMsg = 'That does not look like the face already enrolled on this account, so nothing has been changed. '
+            + 'If your appearance has genuinely changed, re-verify with your identity document instead — that flow checks the document itself.';
+        } else {
+          await db.execute(sql`
+            INSERT INTO user_face_enrollments (user_id, face_descriptor, device_info, is_active)
+            VALUES (${user.id}, ${JSON.stringify(descriptor)}::jsonb, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500) || null}, true)
+            ON CONFLICT (user_id) DO UPDATE SET
+              face_descriptor = EXCLUDED.face_descriptor,
+              device_info = EXCLUDED.device_info,
+              enrolled_at = NOW(),
+              is_active = true
+          `);
+          return Astro.redirect('/portal?enrolled=1');
+        }
+      } catch (e: any) {
+        // The real Postgres reason is on e.cause; e.message is only the failed SQL, and it used to
+        // be printed at the person.
+        console.error('[portal/enroll-face] enroll', causeOf(e));
+        errorMsg = 'We could not save that enrolment just now. Nothing has been changed. Please try again in a moment.';
+      }
+    }
   } else if (action === 'skip') {
     return Astro.redirect('/portal');
   }
@@ -34,7 +105,10 @@ try {
   const r = await db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
   const rows = Array.isArray(r) ? r : (r?.rows || []);
   enrolled = rows.length > 0;
-} catch(e) {}
+} catch (e: any) {
+  statusOk = false;
+  console.error('[portal/enroll-face] status', causeOf(e));
+}
 ---
 <!doctype html>
 <html lang="en" style="background:#08080a;">
@@ -76,7 +150,16 @@ try {
   </div>
 
   <div class="card-body">
-    {errorMsg && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:14px;">{errorMsg}</div>}
+    {errorMsg && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:14px;line-height:1.55;">{errorMsg}</div>}
+
+    {/* A failed read is said out loud rather than rendered as "not enrolled" — that sentence invites
+        somebody to enrol over a working sign-in factor. */}
+    {!statusOk && (
+      <div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);color:#fbbf24;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:14px;line-height:1.55;">
+        We could not read whether your face is already enrolled. What is shown below is not your
+        current setup and nothing has been changed. Please reload in a moment.
+      </div>
+    )}
 
     <!-- Benefits -->
     {!enrolled && (
@@ -84,7 +167,7 @@ try {
         {[
           { icon: '&#128274;', text: 'No password to remember or forget' },
           { icon: '&#9889;', text: 'Log in in under 2 seconds' },
-          { icon: '&#128274;', text: 'Your face data never leaves your device' },
+          { icon: '&#128274;', text: 'No photo is stored - only a numeric face signature' },
         ].map(b => (
           <div class="benefit">
             <div class="benefit-icon"><span style="font-size:16px;" set:html={b.icon}></span></div>

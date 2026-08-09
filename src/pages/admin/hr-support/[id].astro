@@ -34,28 +34,48 @@ if (Astro.request.method === 'POST') {
         if (meetLink) {
           await db.execute(sql`UPDATE hr_application_support SET meet_link = ${meetLink}, meet_scheduled_at = COALESCE(meet_scheduled_at, NOW()), hr_rep_user_id = ${user.id}, updated_at = NOW() WHERE id = ${id}`);
         }
-        if (statusUpdate === 'completed') await db.execute(sql`UPDATE hr_application_support SET completed_at = NOW(), updated_at = NOW() WHERE id = ${id}`);
-        else if (statusUpdate === 'cancelled') await db.execute(sql`UPDATE hr_application_support SET payment_status = 'cancelled', updated_at = NOW() WHERE id = ${id}`);
-        else if (statusUpdate === 'refunded') await db.execute(sql`UPDATE hr_application_support SET payment_status = 'refunded', updated_at = NOW() WHERE id = ${id}`);
-        else if (statusUpdate === 'no_show' || statusUpdate === 'reschedule_pending') await db.execute(sql`UPDATE hr_application_support SET notes = COALESCE(notes,'') || ${'\n[' + statusUpdate + ']'}, updated_at = NOW() WHERE id = ${id}`);
+        // THE STATUS CHANGE RIDES ALONG WITH THE REPLY AND USED TO REPORT NOTHING OF ITS OWN.
+        // Each of these was a fire-and-forget UPDATE under a single 'Reply sent.' — so a request
+        // closed or removed in another tab took the reply and silently dropped the state change,
+        // and 'refunded' in particular is a finance field on a paid consult.
+        let statusApplied = true;
+        if (statusUpdate === 'completed') statusApplied = rows(await db.execute(sql`UPDATE hr_application_support SET completed_at = NOW(), updated_at = NOW() WHERE id = ${id} RETURNING id`)).length > 0;
+        else if (statusUpdate === 'cancelled') statusApplied = rows(await db.execute(sql`UPDATE hr_application_support SET payment_status = 'cancelled', updated_at = NOW() WHERE id = ${id} RETURNING id`)).length > 0;
+        else if (statusUpdate === 'refunded') statusApplied = rows(await db.execute(sql`UPDATE hr_application_support SET payment_status = 'refunded', updated_at = NOW() WHERE id = ${id} RETURNING id`)).length > 0;
+        else if (statusUpdate === 'no_show' || statusUpdate === 'reschedule_pending') statusApplied = rows(await db.execute(sql`UPDATE hr_application_support SET notes = COALESCE(notes,'') || ${'\n[' + statusUpdate + ']'}, updated_at = NOW() WHERE id = ${id} RETURNING id`)).length > 0;
         okMsg = 'Reply sent. Candidate sees it instantly in /portal/hr-support.';
+        if (!statusApplied) errMsg = 'The reply was posted, but the status was NOT changed to "' + statusUpdate + '" — that request no longer exists or was changed elsewhere. Reload before relying on the status shown.';
       }
     } else if (action === 'mark_paid') {
-      await db.execute(sql`UPDATE hr_application_support SET payment_status = 'paid', paid_at = COALESCE(paid_at, NOW()), updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Marked paid manually.';
+      const paid = rows(await db.execute(sql`UPDATE hr_application_support SET payment_status = 'paid', paid_at = COALESCE(paid_at, NOW()), updated_at = NOW() WHERE id = ${id} RETURNING id`));
+      if (paid.length) okMsg = 'Marked paid manually.';
+      else errMsg = 'Nothing was marked paid: that request no longer exists. Reload the queue.';
     } else if (action === 'modify_slot') {
       const newSlot = (fd.get('new_slot_iso') as string || '').trim();
       const newSlotLabel = (fd.get('new_slot_label') as string || '').trim().slice(0, 60);
-      if (newSlot) {
-        await db.execute(sql`UPDATE hr_application_support SET requested_slot_at = ${newSlot}::timestamptz, requested_slot_label = ${newSlotLabel || null}, updated_at = NOW() WHERE id = ${id}`);
-        okMsg = 'Slot modified.';
+      if (!newSlot) {
+        // The form used to accept a blank slot and answer with silence: no success box, no error,
+        // the page simply reloaded unchanged.
+        errMsg = 'Pick a new date and time. Nothing was changed.';
+      } else {
+        const moved = rows(await db.execute(sql`UPDATE hr_application_support SET requested_slot_at = ${newSlot}::timestamptz, requested_slot_label = ${newSlotLabel || null}, updated_at = NOW() WHERE id = ${id} RETURNING id`));
+        if (moved.length) okMsg = 'Slot modified.';
+        else errMsg = 'The slot was not changed: that request no longer exists. Reload the queue.';
       }
     } else if (action === 'edit_notes') {
       const notes = (fd.get('notes') as string || '').trim().slice(0, 10000);
-      await db.execute(sql`UPDATE hr_application_support SET notes = ${notes}, updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Internal notes updated.';
+      const noted = rows(await db.execute(sql`UPDATE hr_application_support SET notes = ${notes}, updated_at = NOW() WHERE id = ${id} RETURNING id`));
+      if (noted.length) okMsg = 'Internal notes updated.';
+      else errMsg = 'The notes were not saved: that request no longer exists. Copy your text before reloading.';
     }
-  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 240); }
+  } catch (e: any) {
+    // e.message on a drizzle error is only the failed SQL statement — table and column names handed
+    // to whoever posted — and the reason on e.cause was never read or logged at all.
+    const real = e?.cause?.message || e?.message || 'unknown reason';
+    console.error('[admin/hr-support]', id, 'action failed -', real);
+    okMsg = '';
+    errMsg = 'Nothing was changed. Reason: ' + real;
+  }
 }
 
 const r = rows(await db.execute(sql`SELECT * FROM hr_application_support WHERE id = ${id} LIMIT 1`))[0] as any;

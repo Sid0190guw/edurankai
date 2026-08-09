@@ -96,7 +96,9 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
     return json({ ok: true, waiverId, isNew });
   } catch (e: any) {
-    console.error('[fee-waivers/submit] error:', e);
-    return json({ ok: false, error: e?.message || 'submission failed' }, 500);
+    // `e` alone prints the failed SQL as the message and buries the reason on .cause; the applicant
+    // was then handed that same SQL. Log the reason, answer a sentence.
+    console.error('[fee-waivers/submit]', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'Your request could not be submitted just now. Nothing was saved — please try again in a moment.' }, 500);
   }
 };

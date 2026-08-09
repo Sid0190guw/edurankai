@@ -14,29 +14,107 @@ await ensureStudyAbroadSchema();
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
 let okMsg = '', errMsg = '';
+
+// =================================================================================================
+// A QUEUE WHOSE APPLICANT IS NEVER TOLD ANYTHING IS A QUEUE OF PEOPLE STILL WAITING
+// =================================================================================================
+//
+// Four actions, four bare UPDATEs whose results were never read, four unconditional success
+// sentences — and no message of any kind to the person who submitted the request. From their side of
+// /portal/study-abroad nothing happens: a counsellor is assigned and they do not know to expect
+// contact; the case is CANCELLED and they go on waiting for guidance nobody is going to give them.
+//
+// Declared above the handler that calls it. `const` is not hoisted.
+async function tellApplicant(requestId: string, title: string, body: string): Promise<string> {
+  try {
+    const who = rows(await db.execute(
+      sql`SELECT applicant_user_id FROM study_abroad_requests WHERE id = ${requestId} LIMIT 1`));
+    const uid = who[0]?.applicant_user_id;
+    if (!uid) return 'this request has no portal account attached, so the applicant could not be told';
+    const { notifyUser } = await import('@/lib/notify');
+    await notifyUser(String(uid), {
+      title, body,
+      type: 'info',
+      // An EXISTING route: src/pages/portal/study-abroad/index.astro. A push to a 404 is worse than
+      // no push.
+      actionUrl: '/portal/study-abroad',
+      entityType: 'study_abroad_request',
+      entityId: requestId,
+    });
+    return '';
+  } catch (e: any) {
+    console.error('[study-abroad] the applicant was NOT told about', requestId, '-', e?.cause?.message || e?.message);
+    return 'the applicant was NOT notified (' + (e?.cause?.message || e?.message || 'unknown reason') + ')';
+  }
+}
+
 if (Astro.request.method === 'POST') {
   try {
     const fd = await Astro.request.formData();
     const action = (fd.get('_action') as string || '').trim();
     const id = (fd.get('id') as string || '').trim();
+    // Every branch reads its own result now. An UPDATE matching nothing — a stale list, a second
+    // submit, a request somebody else just closed — used to print success all the same.
+    const gone = 'Nothing was changed — that request is no longer in this queue. Reload the page.';
     if (action === 'assign' && id) {
       const consultantId = (fd.get('consultant_id') as string || '').trim();
       if (!consultantId) errMsg = 'Pick a consultant.';
       else {
-        await db.execute(sql`UPDATE study_abroad_requests SET consultant_id = ${consultantId}, status = 'assigned', assigned_at = NOW(), assigned_by_user_id = ${user.id}, updated_at = NOW() WHERE id = ${id}`);
-        okMsg = 'Assigned.';
+        const changed = rows(await db.execute(sql`
+          UPDATE study_abroad_requests
+             SET consultant_id = ${consultantId}, status = 'assigned', assigned_at = NOW(),
+                 assigned_by_user_id = ${user.id}, updated_at = NOW()
+           WHERE id = ${id}
+          RETURNING id`));
+        if (!changed.length) errMsg = gone;
+        else {
+          const missed = await tellApplicant(id, 'A counsellor is now on your study-abroad request',
+            'Your request has been picked up and assigned. You will hear from your counsellor '
+            + 'directly, and your request page shows where it has got to.');
+          okMsg = 'Assigned.' + (missed ? '' : ' The applicant has been told.');
+          if (missed) errMsg = 'The assignment is saved, but ' + missed + '.';
+        }
       }
     } else if (action === 'mark_in_progress' && id) {
-      await db.execute(sql`UPDATE study_abroad_requests SET status = 'in_progress', updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Marked in progress.';
+      const changed = rows(await db.execute(sql`
+        UPDATE study_abroad_requests SET status = 'in_progress', updated_at = NOW()
+         WHERE id = ${id} RETURNING id`));
+      // No notification here on purpose: "in progress" is a queue state for the team, not news the
+      // applicant can act on, and they were already told when it was assigned.
+      okMsg = changed.length ? 'Marked in progress.' : '';
+      if (!changed.length) errMsg = gone;
     } else if (action === 'mark_completed' && id) {
-      await db.execute(sql`UPDATE study_abroad_requests SET status = 'completed', completed_at = NOW(), updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Marked completed.';
+      const changed = rows(await db.execute(sql`
+        UPDATE study_abroad_requests SET status = 'completed', completed_at = NOW(), updated_at = NOW()
+         WHERE id = ${id} RETURNING id`));
+      if (!changed.length) errMsg = gone;
+      else {
+        const missed = await tellApplicant(id, 'Your study-abroad request is closed',
+          'The team has marked your request complete. If something is still outstanding, open the '
+          + 'request and say so — closing it does not stop you replying.');
+        okMsg = 'Marked completed.' + (missed ? '' : ' The applicant has been told.');
+        if (missed) errMsg = 'It is marked complete, but ' + missed + '.';
+      }
     } else if (action === 'cancel' && id) {
-      await db.execute(sql`UPDATE study_abroad_requests SET status = 'cancelled', updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Cancelled.';
+      const changed = rows(await db.execute(sql`
+        UPDATE study_abroad_requests SET status = 'cancelled', updated_at = NOW()
+         WHERE id = ${id} RETURNING id`));
+      if (!changed.length) errMsg = gone;
+      else {
+        // THE ONE THAT MATTERED MOST. A cancelled request read as "still pending" forever from the
+        // applicant's side, so they waited on guidance nobody was going to give them.
+        const missed = await tellApplicant(id, 'Your study-abroad request was cancelled',
+          'It will not be taken forward, so nothing is waiting on you. You can submit a fresh request '
+          + 'at any time, or reply on this one to ask why.');
+        okMsg = 'Cancelled.' + (missed ? '' : ' The applicant has been told.');
+        if (missed) errMsg = 'The cancellation is recorded, but ' + missed + ' — they will go on waiting. Contact them directly.';
+      }
     }
-  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
+  } catch (e: any) {
+    // The real Postgres reason lives on e.cause; e.message is only the failed SQL.
+    console.error('[study-abroad] queue action failed -', e?.cause?.message || e?.message);
+    errMsg = 'That did not go through: ' + (e?.cause?.message || e?.message || 'unknown error');
+  }
 }
 
 const url = new URL(Astro.request.url);

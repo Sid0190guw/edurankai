@@ -27,7 +27,7 @@ WHAT YOU KNOW (the only things you should answer about):
    - Track all applications in one place
    - Direct messaging with hiring team
    - Face 2FA login for security (set up at /portal/enroll-face)
-   - TOTP / Google Authenticator support at /portal/totp-setup
+   - TOTP / Google Authenticator support at /portal/security
    - Free training courses at /portal/courses
    - Community discussion at /portal/discussion
    - Once employed, clock-in/payslips at /portal/employee

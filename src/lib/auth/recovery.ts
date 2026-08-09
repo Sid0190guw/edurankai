@@ -228,13 +228,37 @@ export function recoveryLink(origin: string, token: string): string {
 
 export type DeliveryOutcome = 'sent' | 'no-transport' | 'no-address';
 
+/** Minimal escaping for the one name and the one link this mail interpolates. */
+const escapeHtml = (v: string): string => String(v || '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
 /**
  * Mail the link. Returns what actually happened rather than a boolean dressed as success — a
  * recovery flow that reports "check your inbox" when no SMTP transport exists is the false-success
  * shape this codebase keeps paying for.
  *
- * The mail module is imported dynamically so that a build without a transport configured still
- * type-checks and still loads this file.
+ * THE MAIL HAD NO SENDER AND NO HTML PART, AND THAT IS WHY IT DID NOT ARRIVE.
+ *
+ * It called sendExternal({ to, subject, text }). SendExternalParams (src/lib/mail-transport.ts)
+ * requires `from` and `html`, and the dynamic import was typed `any`, so nothing caught it. With
+ * `from` undefined the whole From-normalisation block inside sendExternal is skipped — its regex
+ * matches an empty string, callerAddr comes out '', and the branch that rewrites the address to the
+ * configured from_address cannot fire — so nodemailer is handed `from: undefined`. It composes a
+ * message with NO From header and issues `MAIL FROM:<>`, a null return path, on an AUTHENTICATED
+ * submission connection. Providers enforce that the sender matches the account they authenticated
+ * (which is the documented reason that normalisation exists at all), so the send is refused,
+ * sendExternal answers ok:false, and this function reports 'no-transport'.
+ *
+ * That is the ONLY delivery path out of the entire recovery system: /api/auth/forgot-password,
+ * /api/auth/verify-by-questions and /api/auth/identity-setup all end in issueAndMailReset. Each of
+ * them is honest about the outcome — "We could not send the reset email just now", with a 503 —
+ * so this reads as a mail-server fault rather than a bug, and nobody who forgot their password has
+ * been able to get a link. src/lib/edu-notify.ts was repaired for the same omission.
+ *
+ * sendEmail() (src/lib/email.ts) resolves the sender the way every other transactional mail on this
+ * platform resolves it: from_address out of Mail Settings, falling back to EMAIL_FROM. Imported
+ * dynamically, as before, so a build with no transport configured still loads this file.
  */
 export async function sendRecoveryMail(
   to: string | null, name: string | null, link: string,
@@ -252,11 +276,20 @@ export async function sendRecoveryMail(
     'The link can be used once and then stops working.',
     'If this was not you, no action is needed — your password has not changed. Tell hr@edurankai.in so we can look at it.',
   ].join('\n');
+  const html = '<div style="font-family:system-ui,sans-serif;font-size:15px;line-height:1.6;color:#111;">'
+    + '<p>' + escapeHtml(greeting) + '</p>'
+    + '<p>Someone asked to reset the password on your EduRankAI account.</p>'
+    + '<p>If that was you, open this link within ' + RECOVERY_TTL_MINUTES + ' minutes and choose a new password:</p>'
+    + '<p><a href="' + escapeHtml(link) + '">' + escapeHtml(link) + '</a></p>'
+    + '<p>The link can be used once and then stops working.</p>'
+    + '<p>If this was not you, no action is needed &mdash; your password has not changed. Tell hr@edurankai.in so we can look at it.</p>'
+    + '</div>';
   try {
-    const mod: any = await import('@/lib/mail-transport');
-    const res = await mod.sendExternal({
+    const mod: any = await import('@/lib/email');
+    const res = await mod.sendEmail({
       to,
       subject: 'Reset your EduRankAI password',
+      html,
       text,
     });
     if (res?.ok) return 'sent';

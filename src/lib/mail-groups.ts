@@ -40,7 +40,16 @@ export function ensureMailGroupsSchema(): Promise<void> {
       )`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS mail_group_members_group_idx ON mail_group_members(group_id)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS mail_group_members_user_idx ON mail_group_members(user_id) WHERE user_id IS NOT NULL`);
-    } catch (_) {}
+    } catch (e: any) {
+      // NOT SWALLOWED, AND NOT CACHED AS DONE. `catch (_) {}` left `ready` resolved, so a boot that
+      // failed was never retried for the life of the process AND said nothing: every getGroupBySlug
+      // /listGroups/getGroupMembers after it threw "relation mail_groups does not exist" into the
+      // caller with no line anywhere explaining that the tables had never been created. The reason
+      // goes to the log, and the promise is dropped so the next call tries again — a transient
+      // pooler failure must not poison the process.
+      console.error('[mail-groups] schema boot failed:', e?.cause?.message || e?.message);
+      ready = null;
+    }
   })();
   return ready;
 }
@@ -85,10 +94,24 @@ export async function getGroupMembers(groupId: string): Promise<{ email: string;
 // Expand a To/Cc/Bcc list, replacing any "@group:slug" token with the group's
 // member emails. Returns { to, cc, bcc, anyHidden } so the caller can decide
 // to use BCC routing for hidden groups even if they were placed in To/Cc.
-export async function expandGroupTokens(opts: { to: string[]; cc: string[]; bcc: string[] }): Promise<{ to: string[]; cc: string[]; bcc: string[]; expandedGroups: { slug: string; count: number; hidden: boolean }[] }> {
+/**
+ * A GROUP THAT RESOLVES TO NOBODY IS REPORTED, NOT DROPPED.
+ *
+ * `if (!g) continue` used to delete the token and say nothing. So a composer that typed
+ * `@group:all-staf` (one letter short of a real slug) alongside one ordinary address sent the
+ * message to that one address, reported "Sent", and the operator believed a whole distribution
+ * list had received it. The same silence covered a group that exists but has no members left.
+ *
+ * Both cases now travel back to the caller in `unknownGroups` / `emptyGroups` so the send path can
+ * refuse the first and say the second out loud. This is the rule /api/mail/send already applies to
+ * attachment links one function away: "a link we refuse is REPORTED rather than quietly dropped".
+ */
+export async function expandGroupTokens(opts: { to: string[]; cc: string[]; bcc: string[] }): Promise<{ to: string[]; cc: string[]; bcc: string[]; expandedGroups: { slug: string; count: number; hidden: boolean }[]; unknownGroups: string[]; emptyGroups: string[] }> {
   await ensureMailGroupsSchema();
   const out = { to: [] as string[], cc: [] as string[], bcc: [] as string[] };
   const expanded: { slug: string; count: number; hidden: boolean }[] = [];
+  const unknownGroups: string[] = [];
+  const emptyGroups: string[] = [];
 
   async function expandList(list: string[], target: 'to' | 'cc' | 'bcc') {
     for (const raw of list || []) {
@@ -98,9 +121,10 @@ export async function expandGroupTokens(opts: { to: string[]; cc: string[]; bcc:
       if (m) {
         const slug = m[1].toLowerCase();
         const g = await getGroupBySlug(slug);
-        if (!g) continue;
+        if (!g) { if (!unknownGroups.includes(slug)) unknownGroups.push(slug); continue; }
         const members = await getGroupMembers(g.id);
         const emails = members.map(x => x.email).filter(Boolean);
+        if (emails.length === 0 && !emptyGroups.includes(g.slug)) emptyGroups.push(g.slug);
         // Hidden-recipients groups ALWAYS route to BCC regardless of target,
         // so external recipients never see each other's addresses.
         const finalTarget: 'to' | 'cc' | 'bcc' = g.hidden_recipients ? 'bcc' : target;
@@ -118,5 +142,5 @@ export async function expandGroupTokens(opts: { to: string[]; cc: string[]; bcc:
   await expandList(opts.cc || [], 'cc');
   await expandList(opts.bcc || [], 'bcc');
 
-  return { ...out, expandedGroups: expanded };
+  return { ...out, expandedGroups: expanded, unknownGroups, emptyGroups };
 }

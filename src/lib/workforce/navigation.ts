@@ -942,13 +942,16 @@ export const NAV_BACKLOG: readonly { key: string; reason: string }[] = [
   {
     key: 'totp-setup.duplicate',
     reason:
-      'A SECOND DOOR INTO ONE ROOM, AND IT IS THE ONE NOBODY LINKS. /portal/totp-setup exists and ' +
-      'NOTHING in src/ points at it — the only mention anywhere is a sentence inside an AI chat ' +
-      'prompt. Authenticator enrolment is done INLINE on /portal/employee/security through ' +
-      'TwoFactorPanel, which is the entry the Security destination above already opens. So the fix ' +
-      'is a DELETION or a redirect, not a nav entry: two doors into one room teaches people the two ' +
-      'behave differently. Left in place and reported rather than removed, because a page that may ' +
-      'still be linked from an old email is not something to delete inside a navigation pass.',
+      'CLOSED — /portal/totp-setup is now a redirect to /portal/security. It turned out to be worse ' +
+      'than a duplicate door: every statement on it wrote `user_totp_secrets`, a table NO sign-in ' +
+      'path reads (the real authenticator is `user_totp`, src/lib/auth/twofactor.ts), it activated ' +
+      'the factor on any six digits with no RFC 6238 check at all, and it cleared the factor on a ' +
+      'bare POST with no current code. So it told people their account was protected by an ' +
+      'authenticator while nothing anywhere consulted one. The URL is kept as a redirect rather ' +
+      'than deleted because it may still be sitting in an old email, and a 404 on a security link ' +
+      'reads as the whole feature having been withdrawn. Authenticator enrolment is done INLINE on ' +
+      '/portal/security and /portal/employee/security through TwoFactorPanel, which is the entry ' +
+      'the Security destination above already opens.',
   },
   {
     key: 'learner.surfaces',

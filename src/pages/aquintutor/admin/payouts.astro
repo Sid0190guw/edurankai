@@ -4,7 +4,11 @@ import { listAllPayouts, decidePayout, payoutTotals } from '@/lib/partner-payout
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login?next=/aquintutor/admin/payouts');
-const isSuper = user.role === 'admin' || user.role === 'super_admin';
+// The `'admin'` arm went and that removes access from NOBODY: 'admin' is not a value of
+// userRoleEnum (src/lib/db/schema.ts), so no account can hold it — TypeScript said so (ts2367, one
+// of this file's two check errors). The identical dead arm has already been removed from
+// /admin/credits and /admin/infra for the same reason.
+const isSuper = user.role === 'super_admin';
 // Partners must never see other partners' payouts.
 if (!isSuper) return Astro.redirect('/aquintutor/admin/partner');
 
@@ -16,33 +20,65 @@ if (Astro.request.method === 'POST') {
     const id = (fd.get('id') as string) || '';
     const note = ((fd.get('note') as string) || '').trim();
     const paidRef = ((fd.get('paid_ref') as string) || '').trim();
-    if (id && (action === 'approve' || action === 'paid' || action === 'rejected')) {
-      const r = await decidePayout(id, action as any, user.id, note || undefined, paidRef || undefined);
+    // THE BUTTON POSTED 'approve' AND THE LEDGER STORES 'approved'.
+    //
+    // The literal went into partner_payouts.status through an `as any`, so approving a payout wrote
+    // the string 'approve' — a state nothing else in the product knows. Every consequence pointed the
+    // same way: getPayoutSummary() counts pending as `status IN ('requested','approved')`, so an
+    // approved payout STOPPED being counted as committed and its money went straight back into the
+    // partner's available balance for them to request a second time; payoutTotals() dropped it out of
+    // the pending figure on this page; the 'approved' tab could never show it; the row's action cell
+    // tests for 'requested' or 'approved', so Mark paid and Reject both vanished and an approved
+    // payout could never be settled; and the push below fell through both ternary arms and told the
+    // partner their payout had been DECLINED.
+    //
+    // The form value is mapped to the ledger vocabulary here, once, and anything else is refused.
+    const DECISION: Record<string, 'approved' | 'paid' | 'rejected'> = { approve: 'approved', approved: 'approved', paid: 'paid', rejected: 'rejected' };
+    const decision = DECISION[action];
+    if (id && decision) {
+      const r = await decidePayout(id, decision, user.id, note || undefined, paidRef || undefined);
       okMsg = r.ok ? 'Updated.' : '';
       errMsg = r.ok ? '' : (r.error || 'Could not update.');
       if (r.ok && r.partnerUserId) {
         try {
           const { sendPushToUser } = await import('@/lib/push');
-          const verb = action === 'paid' ? 'paid' : action === 'approved' ? 'approved' : 'declined';
+          const verb = decision === 'paid' ? 'paid' : decision === 'approved' ? 'approved' : 'declined';
           await sendPushToUser(r.partnerUserId, {
-            type: 'partner_payout_' + action,
+            type: 'partner_payout_' + decision,
             title: 'Payout ' + verb,
             body: 'Your payout of Rs ' + ((r.amountPaise || 0) / 100).toLocaleString('en-IN') + ' was ' + verb + '.',
             url: '/aquintutor/admin/partner',
             tag: 'partner-payout',
           });
-        } catch (_) {}
+        } catch (e: any) {
+          // The decision is committed; only the telling failed. Say so rather than implying the
+          // partner has been informed.
+          console.error('[payouts] partner notification failed for', id, '-', e?.cause?.message || e?.message);
+          errMsg = 'The decision is recorded, but the partner could not be notified. Tell them directly.';
+        }
       }
+    } else if (id) {
+      errMsg = 'That is not a decision this ledger records, so nothing was changed.';
     }
-  } catch (_) { errMsg = 'Could not update.'; }
+  } catch (e: any) {
+    console.error('[payouts] decision failed -', e?.cause?.message || e?.message);
+    errMsg = 'Could not update.';
+  }
 }
 
 const url = new URL(Astro.request.url);
 const filter = url.searchParams.get('status') || 'all';
-const payouts = await listAllPayouts(filter);
+// A LEDGER THAT COULD NOT BE READ IS NOT AN EMPTY LEDGER. Both reads now carry their own reason, and
+// the page says which of the two it is looking at instead of drawing "No payouts in this view."
+const payoutList = await listAllPayouts(filter);
+const payouts = payoutList.rows;
 const totals = await payoutTotals();
+const readError = payoutList.error || totals.error;
 
-function inr(paise: any) { const n = Number(paise) || 0; return '₹' + (n / 100).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', maximumFractionDigits: 0 }); }
+// `timeZone` was passed to a NUMBER formatter, which has no such option — a number carries no zone.
+// TypeScript rejected it (ts2769, this file's other check error) and it never did anything; the
+// 'en-IN' locale, which is what produces the lakh/crore grouping, is the part that matters.
+function inr(paise: any) { const n = Number(paise) || 0; return '₹' + (n / 100).toLocaleString('en-IN', { maximumFractionDigits: 0 }); }
 function fmt(d: any) { try { return d ? new Date(d).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric' }) : '-'; } catch { return '-'; } }
 const TABS = ['all', 'requested', 'approved', 'paid', 'rejected'];
 function badge(s: string) {
@@ -73,9 +109,11 @@ function badge(s: string) {
       ))}
     </div>
 
+    {readError && <div style="background:#fffbeb;color:#92400e;border:1px solid #fde68a;border-radius:8px;padding:9px 13px;font-size:13px;margin-bottom:13px;">The payout ledger could not be read just now, so the figures above and the list below are incomplete. This is not a statement that no payouts exist.</div>}
+
     <div style="background:var(--ac-paper,#fff);border:1px solid rgba(0,0,0,0.08);border-radius:12px;overflow:hidden;">
       {payouts.length === 0 ? (
-        <p style="padding:30px;text-align:center;color:#8a8078;font-size:14px;">No payouts in this view.</p>
+        <p style="padding:30px;text-align:center;color:#8a8078;font-size:14px;">{readError ? 'The ledger could not be read, so nothing can be listed.' : 'No payouts in this view.'}</p>
       ) : (
         <div style="overflow-x:auto;">
           <table style="width:100%;border-collapse:collapse;font-size:13.5px;">

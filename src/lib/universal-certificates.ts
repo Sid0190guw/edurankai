@@ -155,13 +155,30 @@ export async function listUniversal(opts: { kind?: string; limit?: number; q?: s
   `));
 }
 
-export async function revokeUniversal(serial: string, byUserId: string, reason: string) {
+/**
+ * Revoke a certificate by serial. Answers whether a certificate was actually revoked.
+ *
+ * WAS a bare UPDATE returning nothing, and /admin/certificates printed
+ * 'Certificate <serial> revoked.' on the strength of the call not throwing. A serial typed one
+ * character wrong — these are hand-copied off a printed certificate — matched no row, the console
+ * said the credential was revoked, and the public verification page went on verifying it as valid.
+ * A withdrawn credential that still verifies is the one failure this whole module exists to prevent.
+ *
+ * `revoked = false` is in the WHERE as well, so a true answer means THIS call revoked it rather than
+ * a previous one, and the reason and the revoking user cannot be quietly overwritten on a
+ * certificate somebody else already withdrew.
+ */
+export async function revokeUniversal(serial: string, byUserId: string, reason: string): Promise<{ revoked: boolean; alreadyRevoked: boolean }> {
   await ensureUniversalCertSchema();
-  await db.execute(sql`
+  const done = rows(await db.execute(sql`
     UPDATE universal_certificates SET revoked = true, revoked_at = NOW(), revoked_by_user_id = ${byUserId},
       revocation_reason = ${reason.slice(0, 1000)}, updated_at = NOW()
-    WHERE serial = ${serial}
-  `);
+    WHERE serial = ${serial} AND revoked = false
+    RETURNING serial
+  `));
+  if (done.length > 0) return { revoked: true, alreadyRevoked: false };
+  const existing = rows(await db.execute(sql`SELECT revoked FROM universal_certificates WHERE serial = ${serial} LIMIT 1`));
+  return { revoked: false, alreadyRevoked: existing.length > 0 && !!existing[0].revoked };
 }
 
 export const UCERT_KIND_LABELS: Record<string, { label: string; accent: string; description: string }> = {

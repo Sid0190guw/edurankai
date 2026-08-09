@@ -185,6 +185,37 @@ export async function listLiveLocations(limit = 50): Promise<SafetyRead<LiveLoca
   }
 }
 
+/**
+ * The newest beacon this deployment has EVER recorded, regardless of age.
+ *
+ * WHY THIS EXISTS. listLiveLocations() windows to the last LIVE_LOCATION_MINUTES, so it returns
+ * nothing in two completely different situations: nobody is out sharing a location right now, or
+ * NOTHING CAN EVER WRITE ONE. Today it is the second — `/api/location/update` is answered at the
+ * edge of src/middleware.ts with 410 (the circuit breaker for the v5 watcher leak), so the only
+ * INSERT into user_locations is unreachable and the live map is structurally, permanently empty.
+ * The console rendered that as a calm "no beacon has reported in the last 10 minutes", which is a
+ * responder reading "nobody is out there" off a feature that is switched off.
+ *
+ * This deliberately reads EVIDENCE rather than asserting the middleware's state, so it stays true
+ * when the breaker is lifted: null means no beacon has ever been stored, and a very old timestamp
+ * means the beacon stopped at that moment.
+ */
+export async function latestBeaconAt(): Promise<{ ok: true; at: Date | null } | { ok: false; reason: string }> {
+  try {
+    await ensureSafetySchema();
+    const r = await db.execute(sql`SELECT MAX(updated_at) AS newest FROM user_locations`);
+    const row = toRows<{ newest: any }>(r)[0];
+    const raw = row?.newest;
+    if (!raw) return { ok: true, at: null };
+    const d = new Date(raw);
+    return { ok: true, at: isFinite(d.getTime()) ? d : null };
+  } catch (e: any) {
+    const reason = dbReason(e);
+    console.error('[safety] latest beacon lookup failed -', reason);
+    return { ok: false, reason };
+  }
+}
+
 export type ResolveResult =
   | { ok: true; status: SosStatus; subjectName: string }
   | { ok: false; reason: string };

@@ -85,6 +85,8 @@ export const POST: APIRoute = async ({ request, locals }) => {
       prefill: { name: reg.participant_name || user.name || '', email: reg.participant_email || user.email || '' },
     });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'server error' }, 500);
+    // The failed SQL is not an error message. The reason is on e.cause; it is logged, not returned.
+    console.error('[payments/start-event-level-fee]', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'We could not open checkout just now, so nothing was charged. Try again in a moment.' }, 500);
   }
 };

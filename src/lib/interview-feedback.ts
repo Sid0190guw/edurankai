@@ -67,6 +67,14 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
+// `WHERE id::text = ANY(${jsArray}::text[])` IS THE BUG src/lib/pg-array.ts WAS WRITTEN ABOUT.
+// postgres-js serialises a JS array as a RECORD literal, so Postgres answers "cannot cast type
+// record to text[]" and the statement never runs. Here it sat inside the catch below, so the ONE
+// path that resolves an interview panel from the Organization Graph threw the moment it found a
+// reviewer relationship, and the screen was told "The Organization Graph could not be read just
+// now" — an accusation against the graph for a fault in this line. The suggestion has therefore
+// never worked on any database that has reviewer edges recorded.
+import { uuidIn } from '@/lib/pg-array';
 import { logAudit } from '@/lib/audit';
 import {
   isInitialized,
@@ -255,7 +263,7 @@ export async function resolvePanelFromOrgGraph(applicationId: string): Promise<P
     const people = rows(await db.execute(sql`
       SELECT id::text AS employee_id, user_id::text AS user_id, full_name, designation
         FROM hr_employees
-       WHERE id::text = ANY(${reviewerIds}::text[])
+       WHERE id IN ${uuidIn(reviewerIds)}
        ORDER BY full_name ASC`));
     base.reviewers = people.map((p: any) => ({
       employeeId: String(p.employee_id),

@@ -44,6 +44,20 @@ import {
 // throws on that handler's first line — the failure that took down apply step 5 on this project.
 // -------------------------------------------------------------------------------------------------
 
+/**
+ * THE ZONE A CONTRACT DAY IS CUT ON. Declared at the top of the module, above every reader — `const`
+ * is not hoisted.
+ *
+ * An amendment that does not renew a fixed term starts "today", and that start date is written into
+ * hr_employment_contracts.start_date, which is the date the terms someone works under begin. It was
+ * CURRENT_DATE: the database SESSION's zone, which nothing in this codebase sets — db/index.ts opens
+ * postgres() with no timezone option and no SET TIME ZONE — so it resolves to UTC. IST is UTC+05:30,
+ * so an amendment applied between 00:00 and 05:29 IST was dated the PREVIOUS day, and the superseded
+ * contract's own end date then sat inside the new contract's term. src/lib/hr-lifecycle.ts and
+ * src/lib/attendance.ts name the same zone for the same reason.
+ */
+const CONTRACT_TIME_ZONE = 'Asia/Kolkata';
+
 /** postgres-js resolves to a PLAIN ARRAY. `r.rows[0]` is always a bug here. */
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
@@ -822,7 +836,7 @@ async function applyApprovedChange(change: ChangeRow, actorUserId: string | null
          terms_url, stipend_amount, stipend_currency, status, supersedes_contract_id, note,
          created_by_user_id)
       SELECT ${change.employeeId}::uuid, ${newType},
-             COALESCE(${startFrom}::date + 1, CURRENT_DATE),
+             COALESCE(${startFrom}::date + 1, (NOW() AT TIME ZONE ${CONTRACT_TIME_ZONE})::date),
              ${newEnd}::date, ${newRenewal}::date, ${newNotice}::int, ${newTerms}::text,
              ${newStipend}::numeric, ${old.stipendCurrency}, 'active',
              ${change.contractId}::uuid,

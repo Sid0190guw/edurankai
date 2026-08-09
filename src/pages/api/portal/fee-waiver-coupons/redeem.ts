@@ -3,7 +3,7 @@
 // Validates a coupon against the signed-in user + intent, materialises the
 // application with fee_waiver_granted=true, and records the redemption.
 import type { APIRoute } from 'astro';
-import { previewCoupon, recordRedemption } from '@/lib/fee-waiver-coupons';
+import { previewCoupon, recordRedemption, releaseRedemption, attachApplication } from '@/lib/fee-waiver-coupons';
 import { materialiseFromIntent } from '@/lib/fee-waiver';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
@@ -38,20 +38,44 @@ export const POST: APIRoute = async ({ request, locals }) => {
   const preview = await previewCoupon(code, user.id, intentId);
   if (!preview.ok || !preview.coupon) return json({ ok: false, error: preview.error || 'invalid code' }, 400);
 
-  const appId = intentId ? await materialiseFromIntent(intentId, { paid: false, waiverGranted: true, waiverReason: 'Fee waiver coupon: ' + preview.coupon.code + (preview.coupon.reason ? ' — ' + preview.coupon.reason : '') }) : null;
-  if (intentId && !appId) return json({ ok: false, error: 'could not finalise application' }, 500);
-
+  // =================================================================================================
+  // CLAIM THE USE BEFORE WAIVING THE FEE, NOT AFTER
+  // =================================================================================================
+  //
+  // The order used to be: preview (a READ) -> materialise the application with fee_waiver_granted =
+  // true -> recordRedemption (the atomic bump). previewCoupon cannot hold anything, so two applicants
+  // racing the last use of a code both passed it, both had a free application created for them, and
+  // only the second one was refused — by which time they already had the thing the coupon pays for.
+  // The refusal was a 500 and the application stayed, waived, against a coupon use that was never
+  // recorded.
+  //
+  // The bump is the claim, so it happens first. If the application then cannot be materialised, the
+  // use is HANDED BACK rather than burned, and the applicant is told to try again rather than being
+  // left with a code the ledger says is spent.
   const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || null;
   const ua = request.headers.get('user-agent') || null;
   const rec = await recordRedemption({
     couponId: preview.coupon.id,
     userId: user.id,
     intentId,
-    applicationId: appId,
+    applicationId: null,
     ipAddress: ip,
     userAgent: ua,
   });
-  if (!rec.ok) return json({ ok: false, error: rec.error || 'redemption failed' }, 500);
+  if (!rec.ok || !rec.redemptionId) return json({ ok: false, error: rec.error || 'redemption failed' }, 409);
+
+  let appId: string | null = null;
+  try {
+    appId = intentId ? await materialiseFromIntent(intentId, { paid: false, waiverGranted: true, waiverReason: 'Fee waiver coupon: ' + preview.coupon.code + (preview.coupon.reason ? ' — ' + preview.coupon.reason : '') }) : null;
+  } catch (e: any) {
+    console.error('[fee-waiver-coupons] materialise threw for intent', intentId, '-', e?.cause?.message || e?.message);
+    appId = null;
+  }
+  if (intentId && !appId) {
+    await releaseRedemption(rec.redemptionId, preview.coupon.id);
+    return json({ ok: false, error: 'We could not finish your application, so the code has not been used. Please try again.' }, 500);
+  }
+  await attachApplication(rec.redemptionId, appId);
 
   // Notify admins so they know a fee-waiver code was redeemed + a new application
   // landed in the funnel. Non-fatal — never break the redemption.

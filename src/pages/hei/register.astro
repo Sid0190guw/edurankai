@@ -8,8 +8,18 @@ import { setSessionCookie } from '@/lib/auth/cookie';
 import { eq, ilike, or, asc } from 'drizzle-orm';
 import { randomBytes } from 'node:crypto';
 
+// 'institution_admin' IS A LIVE ROLE VALUE THAT src/lib/db/schema.ts DOES NOT LIST.
+// scripts/fix-user-role-enum.mjs adds it to the Postgres `user_role` enum alongside recruiter /
+// reviewer / department_head / marketing, but userRoleEnum in schema.ts stops short of it — so
+// TypeScript types users.role as a union that cannot contain it and every comparison below reads as
+// dead code (ts2367) while working perfectly at runtime. Comparing as a string is the mechanism fix:
+// it changes nothing that executes and stops the type system asserting something untrue about the
+// data. Adding the value to userRoleEnum is the real repair, and it is NOT a mechanism change —
+// ROLE_LABELS, PERMS_BY_ROLE and ROLE_SECTIONS in src/lib/auth/permissions.ts are typed
+// Record<User['role'], ...>, so the compiler would immediately demand a decision about what an
+// institution admin may do inside the main admin panel. That is a policy call for a person.
 // If already logged in as institution user, send them to portal
-if (Astro.locals.user && Astro.locals.user.role === 'institution_admin') {
+if (Astro.locals.user && String(Astro.locals.user.role) === 'institution_admin') {
   return Astro.redirect('/hei/portal');
 }
 
@@ -78,15 +88,52 @@ if (Astro.request.method === 'POST') {
             const passwordHash = await hashPassword(password);
             const claimToken = randomBytes(20).toString('hex');
 
-            // 1. Create user with institution_admin role + institution_id
+            // 1. Create the account.
+            //
+            // `institutionId` USED TO BE PASSED HERE AND WENT NOWHERE. src/lib/db/schema.ts declares
+            // no institution_id column on `users` (it was added out-of-band by
+            // scripts/setup-institution-auth.mjs), and drizzle builds its INSERT from the columns it
+            // knows and silently drops every other key. So the one value that ties this account to an
+            // institution was discarded on the way in, and /hei/portal then read `user.institutionId`
+            // off the session — undefined, always — and answered 'No institution linked to this
+            // account' to every institution that ever registered.
+            //
+            // It is written below instead, additively and separately, so that a deployment where the
+            // column does not exist yet gains it rather than having every `users` query in the
+            // product start selecting a column that is not there. That distinction is not
+            // theoretical: naming a column the live table lacked is exactly what once denied /admin
+            // to every administrator (see src/lib/auth/admin-access.ts).
             const [newUser] = await db.insert(users).values({
               email,
               name,
               passwordHash,
               role: 'institution_admin' as any,
-              institutionId,
               isActive: true
             }).returning();
+
+            // The institution link. Additive, guarded, once per process, nothing dropped. Failure
+            // does NOT refuse the registration — the account and the claim already exist and
+            // refusing now would strand the applicant — but it is logged with the account id so the
+            // gap is findable instead of silent.
+            try {
+              const { sql } = await import('drizzle-orm');
+              const { ensureOnce } = await import('@/lib/ensure-once');
+              await ensureOnce('users_institution_id_v1', async () => {
+                await db.execute(sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS institution_id uuid`);
+              });
+              const linked = await db.execute(sql`
+                UPDATE users SET institution_id = ${institutionId}::uuid
+                 WHERE id = ${newUser.id}
+                RETURNING id`);
+              const got = Array.isArray(linked) ? linked : ((linked as any)?.rows || []);
+              if (!got.length) {
+                console.error('[hei/register] institution link NOT written for user', newUser.id, '- the update matched no row');
+              }
+            } catch (e: any) {
+              // The real Postgres reason is on e.cause; e.message is only the SQL that failed.
+              console.error('[hei/register] institution link NOT written for user', newUser.id, '-',
+                (e as any)?.cause?.message || (e as any)?.message);
+            }
 
             // 2. Create institution_claims row (status pending — admin verifies)
             await db.insert(institutionClaims).values({
@@ -100,19 +147,41 @@ if (Astro.request.method === 'POST') {
               status: 'pending'
             });
 
-            // 3. Create session + log them in
+            // 3. Create session + log them in.
+            //
+            // THIS LINE THREW ON EVERY REGISTRATION, AND THE CATCH BELOW MADE IT LOOK LIKE A REFUSAL.
+            //
+            // setSessionCookie's signature is (cookies: AstroCookies, token: string, expiresAt: Date)
+            // — src/lib/auth/cookie.ts — and every other caller in the codebase passes
+            // `Astro.cookies` (twelve of them: both logins, both signups, the passkey route, the
+            // middleware). This one passed the whole `Astro` object and no expiry, so the first thing
+            // the function did was call `.set` on something that has no `.set`. The throw landed in
+            // the catch, which printed 'Registration failed: ' + err.message.
+            //
+            // What made that worse than a plain error is the ORDER. The users row, the
+            // institution_claims row and the sessions row were all already written by the time it
+            // threw, so an institution that registered was told registration failed while its account
+            // existed — and their second attempt answered 'An account with this email already
+            // exists', which reads like the first one worked. Nobody was ever signed in, because the
+            // cookie is what carries the session and the cookie was never set.
             const sessionToken = generateSessionToken();
-            await createSession(sessionToken, newUser.id, {
+            const session = await createSession(sessionToken, newUser.id, {
               userAgent: Astro.request.headers.get('user-agent') || undefined,
               ipAddress: Astro.request.headers.get('x-forwarded-for') || undefined
             });
-            setSessionCookie(Astro, sessionToken);
+            setSessionCookie(Astro.cookies, sessionToken, session.expiresAt);
 
             matchedInstitution = inst;
             okMsg = 'Account created. Your institution claim is under editorial review (5-10 business days). You can submit data once verified.';
             step = 'done';
           } catch (err: any) {
-            errorMsg = 'Registration failed: ' + (err.message || 'Unknown error');
+            // NEVER RETURNED VERBATIM. On a drizzle failure err.message is the SQL statement that
+            // failed — table and column names handed to an unauthenticated caller — and the real
+            // Postgres reason sits unread on err.cause. The log gets the truth; the page gets a
+            // sentence, and it says plainly that an account may already exist, because the rows above
+            // are written before the session is and a retry will otherwise look like a fresh failure.
+            console.error('[hei/register]', err?.cause?.message || err?.message, err?.stack);
+            errorMsg = 'We could not finish creating that account. If you try again and are told the email is already registered, the account exists — sign in instead, or email hei@edurankai.in.';
             const found = await db.select().from(heiInstitutions).where(eq(heiInstitutions.id, institutionId)).limit(1);
             if (found.length > 0) { matchedInstitution = found[0]; step = 'form'; }
           }

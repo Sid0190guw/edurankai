@@ -26,7 +26,12 @@ if (Astro.request.method === 'POST') {
     else if (action === 'approve') {
       // Materialise the application from the intent, mark fee_paid=true +
       // fee_waiver_granted=true. Backfill the waiver row with application_id.
-      const row = ((Array.isArray(await db.execute(sql`SELECT intent_id, user_id FROM application_fee_waivers WHERE id = ${id}`)) ? await db.execute(sql`SELECT intent_id, user_id FROM application_fee_waivers WHERE id = ${id}`) : (await db.execute(sql`SELECT intent_id, user_id FROM application_fee_waivers WHERE id = ${id}`) as any)?.rows || []) as any[])[0];
+      // ONE ROUND TRIP, NOT THREE. This line used to inline `await db.execute(<the same SELECT>)`
+      // inside an Array.isArray() test and again inside each branch of the ternary, so looking up
+      // one waiver ran the identical statement two or three times per approval. rows() — the
+      // postgres-js normaliser this file already defines and uses ten lines further down — does the
+      // same job once.
+      const row = rows(await db.execute(sql`SELECT intent_id, user_id FROM application_fee_waivers WHERE id = ${id}`))[0];
       const intentId = row?.intent_id;
       const applicantUid = row?.user_id;
       let appId: string | null = null;
@@ -46,7 +51,21 @@ if (Astro.request.method === 'POST') {
             });
         }
       }
-      await db.execute(sql`UPDATE application_fee_waivers SET status='approved', reviewed_by_user_id=${user.id}, reviewed_at=NOW(), reject_reason=NULL, application_id=${appId} WHERE id=${id}`);
+      // THE DECISION IS READ BACK. It used to be a fire-and-forget UPDATE followed by "Waiver
+      // approved." — so a waiver id from a list rendered before another reviewer acted, or one
+      // withdrawn in between, printed a decision over a statement that had matched no row at all.
+      const decided = rows(await db.execute(sql`
+        UPDATE application_fee_waivers
+           SET status='approved', reviewed_by_user_id=${user.id}, reviewed_at=NOW(), reject_reason=NULL, application_id=${appId}
+         WHERE id=${id}
+        RETURNING id`).catch((e: any) => {
+          console.error('[fee-waivers] approval write failed for', id, '-', e?.cause?.message || e?.message);
+          return [] as any;
+        }));
+      if (!decided.length) {
+        errMsg = 'That waiver was not marked approved — it may have been decided or withdrawn already.'
+          + (appId ? ' An application (' + appId + ') was created before that was discovered, so check it by hand.' : '');
+      } else {
       // Post a decision message into the thread so the applicant sees the
       // outcome inside /portal/requests/fee-waiver/<id>. Without this the
       // thread stays empty after approval and the applicant has nothing
@@ -90,12 +109,24 @@ if (Astro.request.method === 'POST') {
       } else {
         okMsg += ' Decision posted into the thread and the applicant notified.';
       }
+      }
     } else if (action === 'reject') {
       const r0 = await db.execute(sql`SELECT user_id, intent_id FROM application_fee_waivers WHERE id=${id}`);
       const w0 = ((Array.isArray(r0) ? r0 : (r0 as any)?.rows || []) as any[])[0];
       const applicantUid = w0?.user_id;
       const intentId = w0?.intent_id;
-      await db.execute(sql`UPDATE application_fee_waivers SET status='rejected', reviewed_by_user_id=${user.id}, reviewed_at=NOW(), reject_reason=${reason} WHERE id=${id}`);
+      // Same read-back as the approval arm: a rejection nobody recorded must not print as one.
+      const rejected = rows(await db.execute(sql`
+        UPDATE application_fee_waivers
+           SET status='rejected', reviewed_by_user_id=${user.id}, reviewed_at=NOW(), reject_reason=${reason}
+         WHERE id=${id}
+        RETURNING id`).catch((e: any) => {
+          console.error('[fee-waivers] rejection write failed for', id, '-', e?.cause?.message || e?.message);
+          return [] as any;
+        }));
+      if (!rejected.length) {
+        errMsg = 'That waiver was not marked declined — it may have been decided or withdrawn already. Nothing was sent to the applicant.';
+      } else {
       // Post the decision into the thread so the applicant sees the reason
       // inside their portal thread, not just as a push notification.
       try {
@@ -138,6 +169,7 @@ if (Astro.request.method === 'POST') {
         errMsg = 'The rejection is recorded, but ' + missedEffects.join('; ') + '. The applicant does not know why they were refused — contact them directly.';
       } else {
         okMsg += ' Decision posted into the thread and the applicant notified.';
+      }
       }
     }
   } catch (e: any) {
@@ -270,10 +302,21 @@ function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { timeZone
     }).join('');
     box.scrollTop = box.scrollHeight;
   }
+  // A THREAD THAT COULD NOT BE LOADED USED TO SIT ON 'Loading thread...' FOR EVER. No .catch, no
+  // else: a 403, a 500, an HTML error page or a dropped connection ended the chain in silence, and
+  // the reviewer had no way to tell that from a slow query.
+  function threadNote(waiverId, text, color) {
+    var box = document.getElementById('thread-msgs-' + waiverId);
+    if (box) box.innerHTML = '<p style="color:' + color + ';font-size:12px;text-align:center;padding:14px 6px;line-height:1.6;">' + escapeHtml(text) + '</p>';
+  }
   function loadThread(waiverId) {
     fetch('/api/admin/fee-waivers/thread?id=' + encodeURIComponent(waiverId), { credentials: 'same-origin' })
-      .then(function (r) { return r.json(); })
-      .then(function (d) { if (d.ok) renderThread(waiverId, d.messages); });
+      .then(function (r) { return r.json().catch(function () { return { ok: false, error: 'the server answered ' + r.status + ' with something that is not JSON' }; }); })
+      .then(function (d) {
+        if (d && d.ok) renderThread(waiverId, d.messages);
+        else threadNote(waiverId, 'This thread could not be loaded, so it is not empty - it is unknown. ' + ((d && d.error) || ''), '#e8c46a');
+      })
+      .catch(function () { threadNote(waiverId, 'This thread could not be loaded: the request never reached the server.', '#e8c46a'); });
   }
   document.addEventListener('click', function (ev) {
     var btn = ev.target;
