@@ -61,15 +61,21 @@ export const POST: APIRoute = async ({ locals }) => {
   try {
     const { db } = await import('@/lib/db');
     const { sql } = await import('drizzle-orm');
+    // = ANY(${array}) fails here with "op ANY/ALL (array) requires array on right side": the driver
+    // sends a JS array as a plain parameter, not a typed text[]. An IN list built from individual
+    // placeholders is unambiguous and needs no cast.
+    const names = sql.join(EXPECTED.map((t) => sql`${t}`), sql`, `);
     const r: any = await db.execute(sql`
       SELECT table_name FROM information_schema.tables
-      WHERE table_schema = 'public' AND table_name = ANY(${EXPECTED})`);
+      WHERE table_schema = 'public' AND table_name IN (${names})`);
     const rows = Array.isArray(r) ? r : (r?.rows || []);
     present = rows.map((x: any) => String(x.table_name));
   } catch (e: any) {
     verifyError = e?.cause?.message || e?.message || 'unknown error';
   }
-  const missing = EXPECTED.filter((t) => !present.includes(t));
+  // Only meaningful when the check itself succeeded. A failed verification means we do not KNOW,
+  // and saying "still missing" would be the same false certainty this endpoint exists to remove.
+  const missing = verifyError === '' ? EXPECTED.filter((t) => !present.includes(t)) : [];
 
   const failed = results.filter((r) => !r.ok);
   return j({
