@@ -24,6 +24,7 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 const user = Astro.locals.user!;
 if (!user) return Astro.redirect('/admin/login');
@@ -32,19 +33,36 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 // Declared before the POST handler that uses them: `const` is not hoisted, and a handler reaching a
 // later declaration throws on its first line.
 function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+// The real Postgres reason is on e.cause; e.message is only the SQL that failed.
+const dbReason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+// Every id on this page goes into a uuid column. Bound blind, a stale or hand-edited value raised
+// 22P02, which reaches the operator as a database complaint about their own click.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Self-bootstrap so a fresh DB (or Supabase) has the table.
-await db.execute(sql`CREATE TABLE IF NOT EXISTS email_templates (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  template_key text NOT NULL,
-  subject text NOT NULL,
-  body_html text NOT NULL DEFAULT '',
-  body_text text,
-  description text,
-  is_active boolean NOT NULL DEFAULT true,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
-)`).catch(() => {});
+// ONCE PER PROCESS, AND NOT IN SILENCE. The CREATE used to run on EVERY load of this page, and
+// `.catch(() => {})` meant a bootstrap that failed left no trace at all while every statement after
+// it failed for a reason nobody could see. ensureOnce() drops a failed run from its cache, so a
+// transient hiccup is retried on the next request rather than poisoning the process; re-throwing
+// inside is what makes that happen, and the log line is what makes it investigable.
+await ensureOnce('mail.email_templates', async () => {
+  try {
+    // Additive, never DROP - live rows exist.
+    await db.execute(sql`CREATE TABLE IF NOT EXISTS email_templates (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      template_key text NOT NULL,
+      subject text NOT NULL,
+      body_html text NOT NULL DEFAULT '',
+      body_text text,
+      description text,
+      is_active boolean NOT NULL DEFAULT true,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )`);
+  } catch (e: any) {
+    console.error('[admin/mail/templates] schema bootstrap failed:', dbReason(e));
+    throw e;
+  }
+});
 
 function slugify(s: string) { return (s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60); }
 function htmlToText(h: string) { return (h || '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim(); }
@@ -64,23 +82,48 @@ if (Astro.request.method === 'POST') {
       if (!name || !subject || !bodyHtml) {
         errMsg = 'Name, subject and body are all required.';
       } else if (id) {
-        await db.execute(sql`UPDATE email_templates SET template_key=${slugify(name)}, subject=${subject}, body_html=${bodyHtml}, body_text=${bodyText}, description=${description}, updated_at=now() WHERE id=${id}`);
-        okMsg = 'Template updated.';
+        // RETURNING, FOR THE SAME REASON THE `duplicate` ARM BELOW ALREADY HAS ITS GUARD. This was a
+        // fire-and-forget UPDATE under an unconditional 'Template updated.', so an id from a list
+        // rendered before somebody else deleted the row reported an edit that changed nothing, and
+        // the operator left believing their new wording was what the composer would load.
+        if (!UUID_RE.test(id)) errMsg = 'That template id is not valid, so nothing was saved.';
+        else {
+          const wrote = rowsOf(await db.execute(sql`UPDATE email_templates SET template_key=${slugify(name)}, subject=${subject}, body_html=${bodyHtml}, body_text=${bodyText}, description=${description}, updated_at=now() WHERE id=${id} RETURNING id`));
+          if (wrote.length) okMsg = 'Template updated.';
+          else errMsg = 'Nothing was updated: that template no longer exists. Reload the list before editing again.';
+        }
       } else {
-        await db.execute(sql`INSERT INTO email_templates (template_key, subject, body_html, body_text, description) VALUES (${slugify(name)}, ${subject}, ${bodyHtml}, ${bodyText}, ${description})`);
-        okMsg = 'Template created.';
+        const made = rowsOf(await db.execute(sql`INSERT INTO email_templates (template_key, subject, body_html, body_text, description) VALUES (${slugify(name)}, ${subject}, ${bodyHtml}, ${bodyText}, ${description}) RETURNING id`));
+        if (made.length) okMsg = 'Template created.';
+        else errMsg = 'The template was not created. Nothing has been saved; try again.';
       }
     } else if (action === 'delete') {
-      await db.execute(sql`DELETE FROM email_templates WHERE id=${(fd.get('id') as string || '').trim()}`);
-      okMsg = 'Template deleted.';
+      const delId = (fd.get('id') as string || '').trim();
+      if (!UUID_RE.test(delId)) errMsg = 'That template id is not valid, so nothing was deleted.';
+      else {
+        const gone = rowsOf(await db.execute(sql`DELETE FROM email_templates WHERE id=${delId} RETURNING id`));
+        if (gone.length) okMsg = 'Template deleted.';
+        else errMsg = 'Nothing was deleted: that template is already gone. Reload the list.';
+      }
     } else if (action === 'toggle') {
-      await db.execute(sql`UPDATE email_templates SET is_active = NOT is_active, updated_at=now() WHERE id=${(fd.get('id') as string || '').trim()}`);
-      okMsg = 'Template visibility updated.';
+      // THE MOST LOAD-BEARING OF THE THREE. is_active is what MailClient reads to REFUSE a
+      // switched-off template in the composer, so 'Template visibility updated.' over an UPDATE that
+      // matched no row left an operator believing a template was available to send when it was not,
+      // or off when it was still live. The new state is now read back and named.
+      const togId = (fd.get('id') as string || '').trim();
+      if (!UUID_RE.test(togId)) errMsg = 'That template id is not valid, so nothing was changed.';
+      else {
+        const flipped = rowsOf(await db.execute(sql`UPDATE email_templates SET is_active = NOT is_active, updated_at=now() WHERE id=${togId} RETURNING id, is_active`));
+        if (flipped.length) okMsg = 'Template is now ' + ((flipped[0] as any).is_active ? 'active and available in the composer.' : 'switched off, so the composer will refuse it.');
+        else errMsg = 'Nothing was changed: that template no longer exists. Reload the list.';
+      }
     } else if (action === 'duplicate') {
       // `okMsg = 'Template duplicated.'` used to sit OUTSIDE the `if (t)`, so duplicating a template
       // that had just been deleted in another tab reported success having inserted nothing at all.
       const id = (fd.get('id') as string || '').trim();
-      const t = rowsOf(await db.execute(sql`SELECT template_key, subject, body_html, body_text, description FROM email_templates WHERE id=${id} LIMIT 1`))[0] as any;
+      const t = UUID_RE.test(id)
+        ? (rowsOf(await db.execute(sql`SELECT template_key, subject, body_html, body_text, description FROM email_templates WHERE id=${id} LIMIT 1`))[0] as any)
+        : null;
       if (t) {
         await db.execute(sql`INSERT INTO email_templates (template_key, subject, body_html, body_text, description) VALUES (${t.template_key + '_copy'}, ${t.subject}, ${t.body_html}, ${t.body_text}, ${t.description})`);
         okMsg = 'Template duplicated.';
@@ -88,7 +131,11 @@ if (Astro.request.method === 'POST') {
         errMsg = 'That template no longer exists, so nothing was copied.';
       }
     }
-  } catch (e: any) { errMsg = 'Failed: ' + (e?.cause?.message || e?.message || 'error'); }
+  } catch (e: any) {
+    okMsg = '';
+    console.error('[admin/mail/templates] write failed:', dbReason(e));
+    errMsg = 'Nothing was saved: ' + dbReason(e);
+  }
 }
 
 const templates = rowsOf(await db.execute(sql`SELECT id, template_key, subject, body_html, description, is_active, updated_at FROM email_templates ORDER BY updated_at DESC`));

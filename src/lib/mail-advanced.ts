@@ -30,6 +30,10 @@ export function ensureMailAdvancedSchema(): Promise<void> {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
     await ex(sql`CREATE INDEX IF NOT EXISTS mail_sched_due_idx ON mail_scheduled(status, scheduled_at)`);
+    // Additive, never DROP - live rows exist. Records WHEN a run took ownership of a queued message,
+    // so a run that dies mid-send does not strand the message in 'sending' for ever. See
+    // claimDueScheduled() below for why the claim exists at all.
+    await ex(sql`ALTER TABLE mail_scheduled ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`);
     await ex(sql`CREATE TABLE IF NOT EXISTS mail_labels (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL,
@@ -96,6 +100,53 @@ export async function scheduleMessage(opts: {
     RETURNING id`));
   return r[0]?.id;
 }
+/**
+ * TAKE OWNERSHIP of the messages that are due, in ONE statement, and return them.
+ *
+ * WHAT THIS REPLACES, AND WHY IT MATTERS MORE THAN IT LOOKS. dueScheduled() was a plain SELECT:
+ *
+ *     SELECT * FROM mail_scheduled WHERE status = 'scheduled' AND scheduled_at <= NOW() ...
+ *
+ * and /api/mail/scheduled-send read it, then looped sending. Nothing marked a row as taken until
+ * AFTER its send completed, so two runs overlapping by even a second - a cron retry, a manual hit of
+ * the URL while the scheduled one is in flight, two instances warm at once - both read the SAME
+ * rows and both delivered them. The recipient gets the message twice, two copies land in the
+ * sender's Sent folder, and nothing anywhere records that it happened twice. This is the read-modify-
+ * write shape with no guard, on a path whose effect leaves the building and cannot be recalled.
+ *
+ * The claim is the UPDATE itself. `FOR UPDATE SKIP LOCKED` means a second run racing this one takes
+ * the NEXT batch instead of blocking on or duplicating this one, and the RETURNING gives us exactly
+ * the rows we own. A message can therefore be picked up by one run and one run only.
+ *
+ * STUCK ROWS ARE RECLAIMED, NOT ABANDONED. If a run dies between the claim and markScheduled(), the
+ * row would sit in 'sending' for ever and the message would never go. Anything claimed more than 15
+ * minutes ago is treated as due again - comfortably longer than a batch of 50 sends, and far shorter
+ * than a person noticing their mail never left.
+ *
+ * The 'sending' state is deliberately visible: /admin/mail/rules lists it, and cancelScheduled()
+ * refuses it, which is correct - a message already handed to the transport cannot be called back,
+ * and that page now says so instead of claiming a cancellation.
+ */
+export async function claimDueScheduled(limit = 50): Promise<any[]> {
+  await ensureMailAdvancedSchema();
+  return rows(await db.execute(sql`
+    UPDATE mail_scheduled SET status = 'sending', claimed_at = NOW()
+     WHERE id IN (
+       SELECT id FROM mail_scheduled
+        WHERE scheduled_at <= NOW()
+          AND (status = 'scheduled'
+               OR (status = 'sending' AND claimed_at IS NOT NULL AND claimed_at < NOW() - INTERVAL '15 minutes'))
+        ORDER BY scheduled_at ASC
+        LIMIT ${limit}
+        FOR UPDATE SKIP LOCKED
+     )
+     RETURNING *`));
+}
+
+/**
+ * READ-ONLY view of what is due. Kept for anything that wants to LOOK at the queue without taking
+ * it; the sender must use claimDueScheduled(). Calling this and then sending is the bug above.
+ */
 export async function dueScheduled(limit = 50): Promise<any[]> {
   await ensureMailAdvancedSchema();
   return rows(await db.execute(sql`
@@ -109,8 +160,18 @@ export async function listScheduled(userId: string): Promise<any[]> {
   await ensureMailAdvancedSchema();
   return rows(await db.execute(sql`SELECT id, to_list, subject, scheduled_at, status, error FROM mail_scheduled WHERE user_id = ${userId} ORDER BY scheduled_at DESC LIMIT 100`));
 }
-export async function cancelScheduled(userId: string, id: string): Promise<void> {
-  await db.execute(sql`DELETE FROM mail_scheduled WHERE id = ${id} AND user_id = ${userId} AND status = 'scheduled'`);
+/**
+ * Cancel a queued message. Answers whether a row was actually removed.
+ *
+ * IT USED TO RETURN void, and /admin/mail/rules printed "Scheduled message cancelled - it will not
+ * be sent." on the strength of the call not throwing. The DELETE is narrowed by `status =
+ * 'scheduled'`, so a message that /api/mail/scheduled-send had already picked up matched NO ROW and
+ * the operator was told it had been stopped - while it went out. That is the one outcome on this
+ * screen that cannot be taken back afterwards.
+ */
+export async function cancelScheduled(userId: string, id: string): Promise<boolean> {
+  const gone = rows(await db.execute(sql`DELETE FROM mail_scheduled WHERE id = ${id} AND user_id = ${userId} AND status = 'scheduled' RETURNING id`));
+  return gone.length > 0;
 }
 
 // ---------- labels ----------
@@ -122,9 +183,14 @@ export async function createLabel(userId: string, name: string, color: string): 
   await ensureMailAdvancedSchema();
   await db.execute(sql`INSERT INTO mail_labels (user_id, name, color) VALUES (${userId}, ${name.slice(0, 80)}, ${color || '#67e8f9'}) ON CONFLICT (user_id, name) DO UPDATE SET color = EXCLUDED.color`);
 }
-export async function deleteLabel(userId: string, id: string): Promise<void> {
-  await db.execute(sql`DELETE FROM mail_message_labels WHERE label_id = ${id} AND user_id = ${userId}`).catch(() => {});
-  await db.execute(sql`DELETE FROM mail_labels WHERE id = ${id} AND user_id = ${userId}`);
+/** Remove a label. Answers whether a label row was actually removed, so the caller can say so. */
+export async function deleteLabel(userId: string, id: string): Promise<boolean> {
+  // mail_message_labels is the retired store (see setMessageLabel below); its removal is best-effort
+  // and now says so in the log rather than vanishing.
+  await db.execute(sql`DELETE FROM mail_message_labels WHERE label_id = ${id} AND user_id = ${userId}`)
+    .catch((e: any) => console.error('[mail-advanced] legacy label links not cleared:', e?.cause?.message || e?.message));
+  const gone = rows(await db.execute(sql`DELETE FROM mail_labels WHERE id = ${id} AND user_id = ${userId} RETURNING id`));
+  return gone.length > 0;
 }
 /**
  * Put a label on (or take it off) one message in one person's mailbox.
@@ -169,8 +235,10 @@ export async function createRule(userId: string, r: { matchField: string; matchO
   await db.execute(sql`INSERT INTO mail_rules (user_id, match_field, match_op, match_value, action, action_value)
     VALUES (${userId}, ${r.matchField}, ${r.matchOp}, ${r.matchValue}, ${r.action}, ${r.actionValue || null})`);
 }
-export async function deleteRule(userId: string, id: string): Promise<void> {
-  await db.execute(sql`DELETE FROM mail_rules WHERE id = ${id} AND user_id = ${userId}`);
+/** Remove a rule. Answers whether a row was actually removed - "Rule removed." was unconditional. */
+export async function deleteRule(userId: string, id: string): Promise<boolean> {
+  const gone = rows(await db.execute(sql`DELETE FROM mail_rules WHERE id = ${id} AND user_id = ${userId} RETURNING id`));
+  return gone.length > 0;
 }
 function ruleMatches(op: string, hay: string, needle: string): boolean {
   hay = (hay || '').toLowerCase(); needle = (needle || '').toLowerCase();
@@ -362,6 +430,14 @@ export async function recordClick(messageId: string, url: string, ip?: string, u
  * `= ANY(${ids})` is the parameter form campaignStats() below and the recipient/delivery reads on
  * that page already use. It is kept rather than "improved": this is a performance repair, and
  * changing how the array binds would be an unverified behaviour change riding along with it.
+ *
+ * THE SWALLOWED CATCHES ARE GONE, AND THAT IS THE POINT OF THE CHANGE. Both statements used to end
+ * in `.catch(() => [])`, which meant this function could never reject - so the `.catch()` its only
+ * caller wraps it in on /admin/mail/analytics (readFailures.push('Opens and clicks', ...)) was
+ * unreachable code, and a failed aggregate rendered "Opens 0, Clicks 0, open rate -" with the page's
+ * own "some of these figures could not be read" banner NOT shown. That page's header states as its
+ * whole purpose that a zero must be distinguishable from a broken read; this function was quietly
+ * defeating it. Failures now propagate to the caller that already knows how to report them.
  */
 export async function campaignStatsByMessage(messageIds: string[]): Promise<{ opens: Record<string, number>; clicks: Record<string, number> }> {
   await ensureMailAdvancedSchema();
@@ -369,10 +445,10 @@ export async function campaignStatsByMessage(messageIds: string[]): Promise<{ op
   const opens: Record<string, number> = {};
   const clicks: Record<string, number> = {};
   if (!ids.length) return { opens, clicks };
-  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_reads WHERE message_id = ANY(${ids}) GROUP BY message_id`).catch(() => [] as any))) {
+  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_reads WHERE message_id = ANY(${ids}) GROUP BY message_id`))) {
     opens[String(r.message_id)] = Number(r.c) || 0;
   }
-  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_link_clicks WHERE message_id = ANY(${ids}) GROUP BY message_id`).catch(() => [] as any))) {
+  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_link_clicks WHERE message_id = ANY(${ids}) GROUP BY message_id`))) {
     clicks[String(r.message_id)] = Number(r.c) || 0;
   }
   return { opens, clicks };

@@ -4,6 +4,7 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureStudyAbroadSchema, PROGRAMME_LEVELS, INTAKE_TERMS, BUDGET_BANDS, CURRENT_STAGES } from '@/lib/study-abroad';
+import { textArray } from '@/lib/pg-array';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/study-abroad/new'));
@@ -26,27 +27,53 @@ if (Astro.request.method === 'POST') {
     if (countries.length === 0 || !programme) {
       errMsg = 'At least one country and a programme level are required.';
     } else {
+      // A JS ARRAY INTERPOLATED STRAIGHT INTO A text[] COLUMN IS THE ONE BINDING THIS REPOSITORY HAS
+      // A WHOLE MODULE ABOUT. src/lib/pg-array.ts documents it: postgres-js serialises a JS array as
+      // a ROW/RECORD literal, so Postgres refuses the statement, and it had already broken four
+      // separate features here silently because every call sat inside a try/catch — which is exactly
+      // the shape of this handler. `countries` is the one required field on the form and the first
+      // thing both the applicant list and the admin queue print, so there is no degraded outcome:
+      // either the request is written with its countries or it is not written at all. textArray()
+      // sends the list as one ordinary text parameter and lets Postgres unpack it; do not add a
+      // ::text[] cast at the call site, the fragment is already text[]-typed.
       const ins = await db.execute(sql`
         INSERT INTO study_abroad_requests
           (applicant_user_id, countries, programme_level, intake_term, intake_year, budget_band, current_stage, notes, status)
-        VALUES (${user.id}, ${countries}, ${programme}, ${intakeTerm}, ${intakeYear}, ${budget}, ${stage}, ${notes}, 'pending')
+        VALUES (${user.id}, ${textArray(countries)}, ${programme}, ${intakeTerm}, ${intakeYear}, ${budget}, ${stage}, ${notes}, 'pending')
         RETURNING id
       `);
       const rs = (Array.isArray(ins) ? ins : ((ins as any)?.rows || []));
       createdId = rs[0]?.id;
-      try {
-        const { sendPushToAdmins } = await import('@/lib/push');
-        await sendPushToAdmins({
-          type: 'study_abroad_request',
-          title: 'New study-abroad request',
-          body: (user.name || user.email) + ' — ' + countries.join(', ') + ' · ' + programme,
-          url: '/admin/study-abroad',
-          tag: 'sa-' + createdId,
-        });
-      } catch (_) {}
-      return Astro.redirect('/portal/study-abroad');
+      // No RETURNING row means no request was written. Redirecting to the list on that would show
+      // the applicant a page with nothing on it and no reason, which reads as "it did not save" only
+      // if they happen to notice — say it instead.
+      if (!createdId) {
+        console.error('[portal/study-abroad] insert returned no row for user', user.id);
+        errMsg = 'Your request was NOT submitted — nothing was saved. Please try again in a moment.';
+      } else {
+        try {
+          const { sendPushToAdmins } = await import('@/lib/push');
+          await sendPushToAdmins({
+            type: 'study_abroad_request',
+            title: 'New study-abroad request',
+            body: (user.name || user.email) + ' — ' + countries.join(', ') + ' · ' + programme,
+            url: '/admin/study-abroad',
+            tag: 'sa-' + createdId,
+          });
+        } catch (e: any) {
+          // The request IS saved; only the alert to the consultancy desk failed. It must not fail the
+          // submission, but it must not vanish either — nobody is watching the queue for this one.
+          console.error('[portal/study-abroad] admins were NOT notified of request', createdId, '-', e?.cause?.message || e?.message);
+        }
+        return Astro.redirect('/portal/study-abroad?new=' + createdId);
+      }
     }
-  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
+  } catch (e: any) {
+    // e.message on a drizzle/postgres-js failure is the SQL STATEMENT — table and column names handed
+    // to the applicant. The database's real reason is on e.cause, and it belongs in the log.
+    console.error('[portal/study-abroad] submit', e?.cause?.message || e?.message);
+    errMsg = 'Your request was NOT submitted and nothing was saved. Please try again in a moment.';
+  }
 }
 ---
 <BaseLayout title="Study abroad support — EduRankAI" description="Get matched with a consultant for your study abroad plans.">

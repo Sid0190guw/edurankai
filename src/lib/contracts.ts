@@ -330,7 +330,13 @@ export async function contractsDueForRenewal(days = 60): Promise<ContractRow[]> 
         LEFT JOIN hr_employees e ON e.id = c.employee_id
        WHERE c.status = 'active'
          AND COALESCE(c.renewal_due_date, c.end_date) IS NOT NULL
-         AND COALESCE(c.renewal_due_date, c.end_date) <= CURRENT_DATE + (${window} * INTERVAL '1 day')
+         -- THE WINDOW OPENS ON THE COMPANY'S DAY. CURRENT_DATE is the database SESSION's date and
+         -- nothing in this codebase sets that session's zone, so it resolves to UTC while every
+         -- contract on this list is worked in IST. Between 00:00 and 05:29 IST the whole window was
+         -- a day short, and a contract falling due on the far edge of it dropped off the renewal
+         -- list on the very morning somebody would have acted on it. applyContractChange() in this
+         -- same file was moved onto Asia/Kolkata for the same reason.
+         AND COALESCE(c.renewal_due_date, c.end_date) <= (NOW() AT TIME ZONE 'Asia/Kolkata')::date + (${window} * INTERVAL '1 day')
        ORDER BY COALESCE(c.renewal_due_date, c.end_date) ASC
        LIMIT 100`);
     return rows(r).map(mapContract);

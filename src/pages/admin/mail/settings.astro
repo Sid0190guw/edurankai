@@ -17,6 +17,10 @@ if (!user) return Astro.redirect('/admin/login');
 if (!can(user as any, 'settings.edit')) return Astro.redirect('/admin/mail');
 
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
+// Declared BEFORE the POST handler that uses it — `const` is not hoisted, and a handler reaching a
+// later declaration throws on its first line. The real Postgres reason is on e.cause; e.message is
+// only the SQL that failed.
+const dbReason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 let okMsg = '', errMsg = '';
 
 if (Astro.request.method === 'POST') {
@@ -38,12 +42,18 @@ if (Astro.request.method === 'POST') {
       });
       // Auto-mint an inbound secret on first SMTP save so inbound mail isn't
       // silently blocked by an empty `mail_config.inbound_secret`.
+      // The auto-mint used to sit in `catch (_) {}`. If it failed, mail_config.inbound_secret stayed
+      // empty and /api/mail/inbound refuses every message with 403 — a silent inbound outage set up
+      // by a successful-looking save. Said out loud now, without failing the SMTP save that worked.
       try {
         const cur = rows(await db.execute(sql`SELECT inbound_secret FROM mail_config WHERE id = 1 LIMIT 1`))[0] as any;
         if (!cur?.inbound_secret) {
           await saveMailConfig({ inboundSecret: randomBytes(24).toString('hex') });
         }
-      } catch (_) {}
+      } catch (e: any) {
+        console.error('[admin/mail/settings] inbound secret auto-mint failed:', dbReason(e));
+        errMsg = 'SMTP was saved, but the inbound secret could not be minted (' + dbReason(e) + '). Generate one below before pointing an MTA at /api/mail/inbound.';
+      }
       okMsg = 'SMTP settings saved. Use "Verify connection" above the form to confirm the server accepts auth.';
     } else if (action === 'gen_inbound') {
       const secret = randomBytes(24).toString('hex');
@@ -57,7 +67,10 @@ if (Astro.request.method === 'POST') {
         await clearMailField('from_name');
         await clearMailField('from_address');
         okMsg = 'SMTP settings cleared. The mail system is now offline until you re-save.';
-      } catch (e: any) { errMsg = 'Clear failed: ' + (e?.message || 'error'); }
+      } catch (e: any) {
+        console.error('[admin/mail/settings] clear_smtp failed:', dbReason(e));
+        errMsg = 'Clear failed, and the settings are unchanged: ' + dbReason(e);
+      }
     } else if (action === 'use_imap_for_smtp') {
       // One click to sendable: your inbound mailbox already authenticates, so
       // reuse the same account for outbound. The SMTP server is derived from
@@ -99,12 +112,29 @@ if (Astro.request.method === 'POST') {
       });
       okMsg = 'IMAP settings saved. Click "Verify IMAP" to confirm, then "Check now" to fetch.';
     }
-  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'error'); }
+  } catch (e: any) {
+    // e.message on a drizzle/postgres-js error is the failed SQL STATEMENT, table and column names
+    // included, handed to the operator; the database's actual complaint sits unread on e.cause. And
+    // nothing was logged at all, so a save that never happened left no trace for anyone asked later.
+    console.error('[admin/mail/settings] ' + action + ' failed:', dbReason(e));
+    errMsg = 'Nothing was saved: ' + dbReason(e);
+  }
 }
 
 const cfg = await getMailConfig();
+// A BLANK FORM OVER A LIVE CONFIGURATION. This read ended in `catch (e) {}`, so a pooler timeout
+// rendered every field empty and every status dot red — host "(empty)", pass "(empty)", inbound
+// secret "(not generated yet)" — on the one screen that answers what the mail server is set to. The
+// reasonable act on seeing that is to retype credentials, or to press Generate secret and rotate the
+// one the forwarding MTA is already using. Stated instead, and the form is withheld while it holds.
 let raw: any = {};
-try { raw = rows(await db.execute(sql`SELECT smtp_host, smtp_port, smtp_user, smtp_secure, COALESCE(smtp_insecure, false) AS smtp_insecure, from_name, from_address, inbound_secret, (smtp_pass IS NOT NULL AND smtp_pass <> '') AS has_pass, (resend_api_key IS NOT NULL AND resend_api_key <> '') AS has_resend FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {}; } catch (e) {}
+let rawError = cfg.readError;
+try {
+  raw = rows(await db.execute(sql`SELECT smtp_host, smtp_port, smtp_user, smtp_secure, COALESCE(smtp_insecure, false) AS smtp_insecure, from_name, from_address, inbound_secret, (smtp_pass IS NOT NULL AND smtp_pass <> '') AS has_pass, (resend_api_key IS NOT NULL AND resend_api_key <> '') AS has_resend FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {};
+} catch (e: any) {
+  rawError = dbReason(e);
+  console.error('[admin/mail/settings] mail_config read failed:', rawError);
+}
 
 const imap = await getImapConfig();
 const origin = new URL(Astro.request.url).origin;
@@ -158,6 +188,14 @@ const imapHasPass = !!imap.pass;
 
     {okMsg && <div style="background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.28);color:#6ee7b7;font-size:12.5px;padding:11px 14px;border-radius:8px;margin-bottom:16px;">{okMsg}</div>}
     {errMsg && <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.28);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:8px;margin-bottom:16px;">{errMsg}</div>}
+
+    {rawError && (
+      <div style="background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.30);color:#fbbf24;font-size:12.5px;padding:11px 14px;border-radius:8px;margin-bottom:16px;">
+        <strong>The saved mail configuration could not be read, so nothing below describes it.</strong>
+        <span style="display:block;margin-top:5px;color:#e6d08a;">{rawError}</span>
+        <span style="display:block;margin-top:5px;">The fields are showing defaults, not your settings. Do not retype credentials and do not regenerate the inbound secret until this reads clean — the live values are almost certainly still there.</span>
+      </div>
+    )}
 
     <div class="admin-card" style="margin-bottom:16px;">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">

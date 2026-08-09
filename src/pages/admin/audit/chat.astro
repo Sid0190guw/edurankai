@@ -21,26 +21,51 @@ const reason = url.searchParams.get('reason') || '';
 let messages: any[] = [];
 let channel: any = null;
 let auditLogged = false;
+// Declared above the block that assigns them - `const`/`let` are not hoisted.
+let lookupError = '';
+let notFound = false;
+const dbReason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 
 if (channelSlug && reason && reason.length > 5) {
-  const ch = await db.select().from(chatChannels).where(eq(chatChannels.slug, channelSlug)).limit(1);
-  if (ch.length > 0) {
-    channel = ch[0];
-    messages = await db.select().from(chatMessages)
-      .where(eq(chatMessages.channelId, channel.id))
-      .orderBy(asc(chatMessages.createdAt))
-      .limit(500);
+  // THE ORDER HERE IS THE POINT OF THE PAGE. The 500-message SELECT used to run FIRST and the audit
+  // INSERT second, so the private conversation had already been fetched by the time anything
+  // recorded that somebody had asked for it. src/lib/legal-hold.ts states the house rule for exactly
+  // this shape - logAccess() must SUCCEED before anything renders - and a forensic surface is the
+  // last place to hold itself to a weaker one: if the audit table is unwritable, an investigator
+  // could read every channel in the product and leave no trace at all.
+  //
+  // Log first, and if the log will not take, do not read.
+  try {
+    const ch = await db.select().from(chatChannels).where(eq(chatChannels.slug, channelSlug)).limit(1);
+    if (ch.length === 0) {
+      // A channel that resolved to nothing used to produce total silence: no messages, no banner,
+      // no explanation, on a form that had just been submitted with a written reason.
+      notFound = true;
+    } else {
+      const candidate = ch[0];
+      await db.insert(chatAuditLog).values({
+        accessedByUserId: user.id,
+        accessedChannelId: candidate.id,
+        reason: reason,
+        action: 'view_channel',
+        ipAddress: Astro.request.headers.get('x-forwarded-for') || null,
+        userAgent: Astro.request.headers.get('user-agent') || null
+      });
+      auditLogged = true;
 
-    // Log the audit access
-    await db.insert(chatAuditLog).values({
-      accessedByUserId: user.id,
-      accessedChannelId: channel.id,
-      reason: reason,
-      action: 'view_channel',
-      ipAddress: Astro.request.headers.get('x-forwarded-for') || null,
-      userAgent: Astro.request.headers.get('user-agent') || null
-    });
-    auditLogged = true;
+      channel = candidate;
+      messages = await db.select().from(chatMessages)
+        .where(eq(chatMessages.channelId, channel.id))
+        .orderBy(asc(chatMessages.createdAt))
+        .limit(500);
+    }
+  } catch (e: any) {
+    console.error('[admin/audit/chat] access refused, could not complete lookup/log:', dbReason(e));
+    lookupError = dbReason(e);
+    // Fail closed: nothing is shown, because nothing can be recorded about it having been shown.
+    channel = null;
+    messages = [];
+    auditLogged = false;
   }
 }
 
@@ -63,6 +88,10 @@ const recentAudits = await db.select({
       <h1 class="admin-page-title">Chat Audit</h1>
       <p class="admin-page-sub">Every access on this page is permanently logged. Only use for confirmed misconduct investigations, with a documented reason.</p>
     </div>
+
+    {notFound && <div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);color:#fbbf24;padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:12px;">No channel with that name exists any more. Nothing was read and nothing was logged.</div>}
+
+    {lookupError && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:12px;">This access was refused because it could not be recorded: {lookupError}. No messages were read. Try again once the audit log is writable — a forensic read that leaves no trace is not one this page will perform.</div>}
 
     {auditLogged && <div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);color:#fbbf24;padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:12px;display:flex;align-items:center;gap:7px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><span>This access was logged for channel <strong>{channel?.name}</strong>. Reason: "{reason}"</span></div>}
 

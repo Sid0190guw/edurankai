@@ -9,11 +9,24 @@ const { slug } = Astro.params;
 let course: any = null;
 let threads: any[] = [];
 
-try {
+// FOUR READS ON THIS PAGE ENDED IN `catch (_) {}` AND EACH ONE TURNED A FAILURE INTO A STATEMENT
+// ABOUT THE COURSE. Declared before everything that uses them - `const` is not hoisted, and
+// postgres-js resolves to a plain array. The real Postgres reason is on e.cause; e.message is only
+// the SQL that failed, which is not something to print at a learner.
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const dbReason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+let threadsError = '';
+let repliesError = '';
+let activeThreadError = '';
+
+// The course lookup used to swallow its failure into `course = null`, and the next line redirects on
+// null - so a database hiccup bounced the reader to /portal/courses as though the course they had
+// just come from did not exist. A failure here now throws, which Astro answers as a 500: an error
+// page is a worse experience and a truer one than a silent redirect that blames the course.
+{
   const r = await db.execute(sql`SELECT id, title, slug FROM training_courses WHERE slug = ${slug} LIMIT 1`);
-  const rows = Array.isArray(r) ? r : (r?.rows || []);
-  course = rows[0] || null;
-} catch (_) {}
+  course = rowsOf(r)[0] || null;
+}
 
 if (!course) return Astro.redirect('/portal/courses');
 
@@ -28,8 +41,13 @@ try {
     ORDER BY d.is_pinned DESC, COALESCE(d.last_reply_at, d.created_at) DESC
     LIMIT 100
   `);
-  threads = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+  threads = rowsOf(r);
+} catch (e: any) {
+  // "No discussions yet - be the first to ask a question" is a claim about what a whole cohort has
+  // done. A failed query used to render it word for word.
+  threadsError = dbReason(e);
+  console.error('[portal/courses/discuss] thread list read failed for', slug, '-', threadsError);
+}
 
 // If viewing a specific thread
 const urlP = new URL(Astro.request.url).searchParams;
@@ -43,9 +61,13 @@ if (activeThreadId) {
       FROM course_discussions d JOIN users u ON d.user_id = u.id
       WHERE d.id = ${activeThreadId} AND d.course_id = ${course.id} LIMIT 1
     `);
-    const rows = Array.isArray(r) ? r : (r?.rows || []);
-    activeThread = rows[0] || null;
-  } catch (_) {}
+    activeThread = rowsOf(r)[0] || null;
+  } catch (e: any) {
+    // Swallowed, this dropped the reader back onto the thread LIST with no sign that the thread they
+    // clicked had not been opened.
+    activeThreadError = dbReason(e);
+    console.error('[portal/courses/discuss] thread read failed for', activeThreadId, '-', activeThreadError);
+  }
   if (activeThread) {
     try {
       const r = await db.execute(sql`
@@ -54,8 +76,13 @@ if (activeThreadId) {
         FROM course_discussion_replies r JOIN users u ON r.user_id = u.id
         WHERE r.discussion_id = ${activeThread.id} ORDER BY r.created_at ASC
       `);
-      replies = Array.isArray(r) ? r : (r?.rows || []);
-    } catch (_) {}
+      replies = rowsOf(r);
+    } catch (e: any) {
+      // THE ONE THAT COSTS SOMEBODY AN ANSWER. Swallowed, a failed read drew "0 replies" under a
+      // question that had been answered - so the learner concludes nobody helped and leaves.
+      repliesError = dbReason(e);
+      console.error('[portal/courses/discuss] replies read failed for', activeThread.id, '-', repliesError);
+    }
   }
 }
 
@@ -124,6 +151,11 @@ function timeAgo(d: any) {
   </nav>
 
   <main class="wrap">
+    {activeThreadError && (
+      <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.28);color:#fca5a5;border-radius:10px;padding:12px 14px;margin-bottom:14px;font-size:13px;line-height:1.5;">
+        That thread could not be opened just now. Nothing has been lost — reload in a moment. What you can see below is the thread list, not the thread you asked for.
+      </div>
+    )}
     {activeThread ? (
       <>
         <a href={'/portal/courses/' + slug + '/discuss'} style="font-size:11px;font-family:monospace;color:#6e6e78;text-decoration:none;display:inline-block;margin-bottom:14px;">&larr; All threads</a>
@@ -146,8 +178,14 @@ function timeAgo(d: any) {
         </div>
 
         <div style="margin:30px 0 10px;">
-          <p style="font-size:12.5px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;font-weight:700;">{replies.length} replies</p>
+          <p style="font-size:12.5px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;font-weight:700;">{repliesError ? 'Replies unavailable' : replies.length + ' replies'}</p>
         </div>
+
+        {repliesError && (
+          <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.28);color:#fca5a5;border-radius:10px;padding:12px 14px;margin-bottom:10px;font-size:13px;line-height:1.5;">
+            The replies to this question could not be read, so this is not a count of them. If somebody has answered you, their reply is still there — reload in a moment.
+          </div>
+        )}
 
         {replies.map((r: any) => (
           <div class="thread-card" style={r.is_accepted ? 'border-color:#10b981;' : ''}>
@@ -226,7 +264,12 @@ function timeAgo(d: any) {
           </script>
         </div>
 
-        {threads.length === 0 ? (
+        {threadsError ? (
+          <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.28);color:#fca5a5;border-radius:10px;padding:16px;font-size:13px;line-height:1.6;">
+            <strong style="display:block;color:#fecaca;margin-bottom:5px;">The discussion list could not be read.</strong>
+            This is not an empty board — it is a board this page cannot see right now. Reload in a moment before concluding nobody has posted.
+          </div>
+        ) : threads.length === 0 ? (
           <div style="text-align:center;padding:60px 20px;color:#6e6e78;">
             <p style="font-size:15px;color:#fff;margin-bottom:8px;font-weight:600;">No discussions yet</p>
             <p style="font-size:13px;margin-bottom:18px;">Be the first to ask a question or start a thread.</p>

@@ -10,7 +10,16 @@ export const POST: APIRoute = async ({ request, locals }) => {
   let id = '';
   try { id = ((await request.json())?.id || '').toString(); } catch { return json({ ok: false, error: 'Bad request' }, 400); }
   if (!id) return json({ ok: false, error: 'Missing id' }, 400);
-  try { await deletePasskey(user.id, id); return json({ ok: true }); }
+  try {
+    // The answer is what the DELETE matched, not the fact that it ran. Reporting a removal that did
+    // not happen is the one wrong thing this endpoint can say: the reader is deciding whether a lost
+    // device can still sign in.
+    const removed = await deletePasskey(user.id, id);
+    if (!removed) {
+      return json({ ok: false, error: 'That passkey is no longer on this account - it may already have been removed. Reload the page to see the current list.' }, 404);
+    }
+    return json({ ok: true });
+  }
   catch (e: any) {
     // e.message is only the SQL that failed and e.cause is the database's own words; neither is for
     // the caller. Logged here so a failed removal is findable rather than silent.

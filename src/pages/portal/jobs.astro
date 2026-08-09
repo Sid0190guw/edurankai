@@ -2,6 +2,7 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 function rows(r: any): any[] {
   return Array.isArray(r) ? r : (r?.rows || []);
@@ -16,9 +17,19 @@ const user = Astro.locals.user;
 // statement, not after it.
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/jobs'));
 
-// Self-bootstrap schema (idempotent)
-try {
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS jobs_board (
+// Self-bootstrap schema (idempotent).
+//
+// These two CREATE TABLEs used to run on EVERY load of the board, inside a bare `catch (_) {}` —
+// two round trips per page view for statements that can only matter once, and a bootstrap failure
+// that nothing anywhere could see. ensureOnce() memoises the work per process and the failure is
+// logged; the reads below already report rather than pretending the board is empty.
+//
+// ensureOnce() swallows the callback's rejection on the way out (src/lib/ensure-once.ts:24), so an
+// outer catch here would never fire. The reason is caught and logged INSIDE the callback and then
+// re-thrown, which is what drops the poisoned entry from the cache so the next request retries.
+await ensureOnce('portal_jobs_board', async () => {
+  try {
+    await db.execute(sql`CREATE TABLE IF NOT EXISTS jobs_board (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     slug VARCHAR(200) UNIQUE,
     posted_by_user_id UUID,
@@ -38,7 +49,7 @@ try {
     posted_at TIMESTAMPTZ DEFAULT NOW(),
     expires_at TIMESTAMPTZ
   )`);
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS job_applications (
+    await db.execute(sql`CREATE TABLE IF NOT EXISTS job_applications (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_id UUID,
     user_id UUID,
@@ -47,7 +58,11 @@ try {
     status VARCHAR(20) DEFAULT 'submitted',
     applied_at TIMESTAMPTZ DEFAULT NOW()
   )`);
-} catch (_) {}
+  } catch (e: any) {
+    console.error('[portal/jobs] schema bootstrap', e?.cause?.message || e?.message);
+    throw e;
+  }
+});
 
 // Handle POST: posting a new job (logged-in only)
 let postError: string | null = null;
@@ -91,7 +106,17 @@ if (Astro.request.method === 'POST' && user) {
 
     postSuccess = 'Listing posted. It is live on the board now.';
   } catch (e: any) {
-    postError = e?.message || 'Could not post listing. Try again.';
+    // The two validation failures above are thrown deliberately and carry a sentence written for the
+    // poster; those are shown as-is. Anything else is a database failure, where `.message` is only the
+    // SQL STATEMENT — table and column names handed to whoever pressed Post — and the real reason sits
+    // unread on `.cause`. That one is logged and answered with a sentence, not with schema.
+    const dbReason = e?.cause?.message;
+    if (dbReason) {
+      console.error('[portal/jobs] post listing', dbReason);
+      postError = 'The listing was NOT posted and nothing was saved. Please try again in a moment.';
+    } else {
+      postError = e?.message || 'Could not post listing. Try again.';
+    }
   }
 }
 
@@ -108,6 +133,8 @@ const fSince = qs.get('since') || 'all';
 // filter implementations, only one of them live, is how a filter quietly stops matching what the
 // page claims it does. The dead one is gone; the branches below are the only filter logic.
 
+// Declared before the try that sets it — const/let is not hoisted, and that has taken pages down here.
+let boardUnreadable = false;
 let jobList: any[] = [];
 try {
   // Use parameter binding via drizzle sql template for safety
@@ -129,8 +156,13 @@ try {
   } else if (fSalary === 'high') {
     jobList = jobList.filter(j => (j.stipend_inr_per_month && j.stipend_inr_per_month >= 50000));
   }
-} catch (_) {
+} catch (e: any) {
+  // "No roles match these filters." IS A CLAIM ABOUT THE BOARD. It used to be printed over a query
+  // that threw, so a pooler timeout or a renamed column read to every member as "there is no work
+  // here" — on the page whose entire purpose is telling people there is. The failure is named instead.
+  console.error('[portal/jobs] board read', e?.cause?.message || e?.message);
   jobList = [];
+  boardUnreadable = true;
 }
 
 const totalCount = jobList.length;
@@ -313,11 +345,16 @@ function initials(name: string): string {
   </form>
 
   <div class="jb-meta-row">
-    <div class="jb-count">{totalCount} {totalCount === 1 ? 'role' : 'roles'} listed</div>
+    <div class="jb-count">{boardUnreadable ? 'Listings could not be read' : totalCount + ' ' + (totalCount === 1 ? 'role' : 'roles') + ' listed'}</div>
     <div class="jb-sort">Sorted by most recent</div>
   </div>
 
-  {jobList.length === 0 ? (
+  {boardUnreadable ? (
+    <section class="jb-empty" style="border-color:#f0b49a;background:#fff5f0;">
+      <div class="jb-empty-title" style="color:#9a3412;">The board could not be read just now.</div>
+      <div class="jb-empty-sub">This is not a statement that there are no roles — the listings simply could not be loaded on this request. Please reload in a moment.</div>
+    </section>
+  ) : jobList.length === 0 ? (
     <section class="jb-empty">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/><line x1="2" y1="13" x2="22" y2="13"/></svg>
       <div class="jb-empty-title">No roles match these filters.</div>
