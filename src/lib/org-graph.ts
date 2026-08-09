@@ -69,7 +69,15 @@
 // "there is no data yet" from "there is data and this person has no manager". Those two render
 // completely differently and confusing them is how an org chart lies.
 
-import { db } from './db';
+// Resolved LAZILY. The organisation graph answers who is responsible for whom, so nearly every
+// module that resolves a relationship imports it — and its eager db import made src/lib/db throw
+// the moment any of them loaded. That is why arithmetic with no database in it could not be tested
+// without a production connection.
+let _db: any = null;
+async function database(): Promise<any> {
+  if (!_db) _db = (await import('./db')).db;
+  return _db;
+}
 import { sql } from 'drizzle-orm';
 import { ensureOrgGraphSchema } from './org-graph-schema';
 
@@ -345,7 +353,7 @@ function mapEdge(row: any): OrgEdge {
 export async function isInitialized(): Promise<boolean> {
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(
+    const r = await (await database()).execute(
       sql`SELECT 1 AS ok FROM org_relationships WHERE status = 'active' LIMIT 1`,
     );
     return rows(r).length > 0;
@@ -378,7 +386,7 @@ export async function getManager(
   try {
     await ensureOrgGraphSchema();
     // subject = the manager, object = the report. See ORG_RELATIONSHIP_TYPES for the sentence.
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT ${PERSON_COLS}
         FROM org_relationships r
         JOIN hr_employees e ON e.id = r.subject_employee_id
@@ -405,7 +413,7 @@ export async function getDirectReports(
   if (!at) return [];
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT ${PERSON_COLS}
         FROM org_relationships r
         JOIN hr_employees e ON e.id = r.object_employee_id
@@ -432,7 +440,7 @@ export async function isReportingManager(
   if (!at) return false;
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT 1 AS ok
         FROM org_relationships r
        WHERE r.type = 'reporting_manager'
@@ -464,7 +472,7 @@ export async function getDepartmentHead(
   if (!at) return null;
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT ${PERSON_COLS}
         FROM org_relationships r
         JOIN hr_employees e ON e.id = r.subject_employee_id
@@ -500,7 +508,7 @@ export async function isDepartmentHead(
   if (!at) return false;
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT 1 AS ok
         FROM org_relationships r
        WHERE r.type = 'department_head'
@@ -537,7 +545,7 @@ export async function getHeadedDepartmentIds(
   if (!at) return [];
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT DISTINCT r.scope_id AS scope_id
         FROM org_relationships r
        WHERE r.type = 'department_head'
@@ -613,7 +621,7 @@ export async function getProjectManagers(
   if (!at) return [];
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT ${PERSON_COLS}
         FROM org_relationships r
         JOIN hr_employees e ON e.id = r.subject_employee_id
@@ -648,7 +656,7 @@ export async function isProjectManager(
   if (!at) return false;
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT 1 AS ok
         FROM org_relationships r
        WHERE r.type = 'project_manager'
@@ -691,7 +699,7 @@ export async function getManagedProjectIds(
   if (!at) return [];
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT DISTINCT r.scope_id AS scope_id
         FROM org_relationships r
        WHERE r.type = 'project_manager'
@@ -726,7 +734,7 @@ export async function getMentor(
   if (!at) return null;
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT ${PERSON_COLS}
         FROM org_relationships r
         JOIN hr_employees e ON e.id = r.subject_employee_id
@@ -740,6 +748,130 @@ export async function getMentor(
   } catch (e: any) {
     logFail('getMentor', e);
     return null;
+  }
+}
+
+/**
+ * THE MENTORS OF MANY PEOPLE AT ONCE, as of a date.
+ *
+ * ADDED FOR THE INTERNSHIP CONSOLE, and added HERE rather than in the module that needed it, for the
+ * reason getReviewers() states a few lines below: the alternative is a second query against
+ * org_relationships written from outside this file, and two modules resolving one relationship is
+ * how they start disagreeing about it.
+ *
+ * BATCHED ON PURPOSE. "Mentor workload across the cohort" asked one person at a time is one query
+ * per intern on a page somebody opens every morning. The answer is a Map keyed by the MENTEE's
+ * employee id; a person with no mentor is simply absent from it, which the caller must read as
+ * "nobody is recorded" and not as "the read failed" — those are different facts and this function
+ * returns an empty Map for the second, having logged the real reason.
+ */
+export async function getMentorsFor(
+  employeeIds: readonly string[],
+  opts?: AsOfOptions,
+): Promise<Map<string, OrgPerson>> {
+  const out = new Map<string, OrgPerson>();
+  const ids = Array.from(new Set((employeeIds || []).filter((v) => isUuid(v)).map(String))).slice(0, 500);
+  if (!ids.length) return out;
+  const at = asOfIso(opts);
+  if (!at) return out;
+  try {
+    await ensureOrgGraphSchema();
+    const r = await (await database()).execute(sql`
+      SELECT r.object_employee_id AS mentee_id, ${PERSON_COLS}
+        FROM org_relationships r
+        JOIN hr_employees e ON e.id = r.subject_employee_id
+       WHERE r.type = 'mentor'
+         AND r.object_employee_id IN (${sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `)})
+         AND ${inForce('r', at)}
+       ORDER BY r.effective_from ASC`);
+    // Ascending, so a later edge overwrites an earlier one and the map ends up holding the most
+    // recently opened mentor for each person — the same answer getMentor() gives one at a time.
+    for (const row of rows(r)) {
+      const mentee = row?.mentee_id ? String(row.mentee_id) : '';
+      if (!mentee) continue;
+      out.set(mentee, mapPerson(row));
+    }
+    return out;
+  } catch (e: any) {
+    logFail('getMentorsFor', e);
+    return out;
+  }
+}
+
+/**
+ * THE REPORTING MANAGERS OF MANY PEOPLE AT ONCE, as of a date.
+ *
+ * getMentorsFor() for the `reporting_manager` edge, and here for the same reason: the internship
+ * console shows a cohort, and asking one person at a time is one query per intern on a page somebody
+ * opens every morning.
+ *
+ * ABSENCE FROM THE MAP MEANS NOBODY IS RECORDED, which is a real and important answer — it is the
+ * state in which a credit week or a proposed schedule HALTS with the sentence naming the missing
+ * link. A failed read also returns an empty Map, having logged the real Postgres reason, so a caller
+ * that must tell those two apart has to ask about the read rather than about the size of the Map.
+ * The console does exactly that and says "could not be read" instead of "nobody is recorded".
+ */
+export async function getManagersFor(
+  employeeIds: readonly string[],
+  opts?: AsOfOptions,
+): Promise<Map<string, OrgPerson>> {
+  const out = new Map<string, OrgPerson>();
+  const ids = Array.from(new Set((employeeIds || []).filter((v) => isUuid(v)).map(String))).slice(0, 500);
+  if (!ids.length) return out;
+  const at = asOfIso(opts);
+  if (!at) return out;
+  try {
+    await ensureOrgGraphSchema();
+    const r = await (await database()).execute(sql`
+      SELECT r.object_employee_id AS report_id, ${PERSON_COLS}
+        FROM org_relationships r
+        JOIN hr_employees e ON e.id = r.subject_employee_id
+       WHERE r.type = 'reporting_manager'
+         AND r.object_employee_id IN (${sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `)})
+         AND ${inForce('r', at)}
+       ORDER BY r.effective_from ASC`);
+    // Ascending, so the most recently opened edge wins — the same answer getManager() gives singly.
+    for (const row of rows(r)) {
+      const subject = row?.report_id ? String(row.report_id) : '';
+      if (!subject) continue;
+      out.set(subject, mapPerson(row));
+    }
+    return out;
+  } catch (e: any) {
+    logFail('getManagersFor', e);
+    return out;
+  }
+}
+
+/**
+ * THE PEOPLE THIS PERSON MENTORS. The `mentor` edge read from the subject side.
+ *
+ * Support, explicitly not authority: holding this edge confers nothing over the people it names —
+ * `mentor` is deliberately absent from RESPONSIBILITY_TYPES. What it answers is "whose work am I
+ * asked to look at", which is the question a verification queue is built from.
+ */
+export async function getMentees(
+  mentorEmployeeId: string,
+  opts?: AsOfOptions,
+): Promise<OrgPerson[]> {
+  if (!isUuid(mentorEmployeeId)) return [];
+  const at = asOfIso(opts);
+  if (!at) return [];
+  try {
+    await ensureOrgGraphSchema();
+    const r = await (await database()).execute(sql`
+      SELECT ${PERSON_COLS}
+        FROM org_relationships r
+        JOIN hr_employees e ON e.id = r.object_employee_id
+       WHERE r.type = 'mentor'
+         AND r.subject_employee_id = ${mentorEmployeeId}::uuid
+         AND ${inForce('r', at)}
+       ORDER BY e.full_name ASC
+       LIMIT 200`);
+    return rows(r).map(mapPerson);
+  } catch (e: any) {
+    logFail('getMentees', e);
+    return [];
   }
 }
 
@@ -766,7 +898,7 @@ export async function getReviewers(
   const scope = opts?.scopeId ? String(opts.scopeId).trim() : null;
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT ${PERSON_COLS}
         FROM org_relationships r
         JOIN hr_employees e ON e.id = r.subject_employee_id
@@ -797,7 +929,7 @@ export async function getReviewSubjects(
   const scope = opts?.scopeId ? String(opts.scopeId).trim() : null;
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT ${PERSON_COLS}
         FROM org_relationships r
         JOIN hr_employees e ON e.id = r.object_employee_id
@@ -840,7 +972,7 @@ export async function getApprovalOwner(
   const forEmployee = isUuid(opts?.employeeId) ? String(opts?.employeeId) : null;
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT ${PERSON_COLS},
              (r.object_employee_id IS NULL) AS is_org_wide
         FROM org_relationships r
@@ -882,7 +1014,7 @@ export async function getDelegates(
   if (!at) return [];
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT ${PERSON_COLS}
         FROM org_relationships r
         JOIN hr_employees e ON e.id = r.subject_employee_id
@@ -927,7 +1059,7 @@ export async function getReportingChain(
       : MAX_CHAIN_DEPTH;
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       WITH RECURSIVE chain AS (
         SELECT r.subject_employee_id AS manager_id,
                1 AS depth,
@@ -1000,7 +1132,7 @@ export async function isResponsibleFor(
   if (!at) return false;
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       WITH RECURSIVE chain AS (
         SELECT r.subject_employee_id AS manager_id,
                1 AS depth,
@@ -1080,7 +1212,7 @@ export async function getRelationshipHistory(employeeId: string): Promise<OrgEdg
   if (!isUuid(employeeId)) return [];
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT r.id, r.type, r.subject_employee_id, r.object_employee_id,
              r.scope_type, r.scope_id, r.effective_from, r.effective_to,
              r.status, r.created_by, r.created_at, r.note
@@ -1130,7 +1262,7 @@ export async function readEmployeeIdForUser(
 ): Promise<{ ok: boolean; employeeId: string | null }> {
   if (!isUuid(userId)) return { ok: true, employeeId: null };
   try {
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT id FROM hr_employees
        WHERE user_id = ${userId}::uuid
        ORDER BY is_active DESC, created_at ASC
@@ -1258,7 +1390,7 @@ async function legacyManager(employeeId: string): Promise<OrgPerson | null> {
     // hr_employees record. LEFT JOIN, so we still return them with employeeId null rather than
     // dropping the relationship entirely. db/org-graph-validate.sql counts exactly these, because
     // they are the rows the backfill cannot represent.
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       SELECT m.id            AS employee_id,
              u.id            AS user_id,
              COALESCE(m.full_name, u.name) AS full_name,
@@ -1343,7 +1475,7 @@ export async function openRelationship(input: OpenRelationshipInput): Promise<Or
 
   try {
     await ensureOrgGraphSchema();
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       INSERT INTO org_relationships
         (type, subject_employee_id, object_employee_id, scope_type, scope_id,
          effective_from, status, created_by, note)
@@ -1373,7 +1505,7 @@ export async function closeRelationship(
   if (!at) return { ok: false, error: 'Invalid closing date' };
   try {
     await ensureOrgGraphSchema();
-    await db.execute(sql`
+    await (await database()).execute(sql`
       UPDATE org_relationships
          SET effective_to = ${at}::timestamptz
        WHERE id = ${relationshipId}::uuid
@@ -1399,7 +1531,7 @@ export async function revokeRelationship(
   const why = reason ? String(reason).slice(0, 2000) : null;
   try {
     await ensureOrgGraphSchema();
-    await db.execute(sql`
+    await (await database()).execute(sql`
       UPDATE org_relationships
          SET status = 'revoked',
              note = COALESCE(note || ' | ', '') || COALESCE(${why}::text, 'revoked')
@@ -1445,7 +1577,7 @@ export async function supersedeReportingManager(
     await ensureOrgGraphSchema();
 
     if (!mgr) {
-      await db.execute(sql`
+      await (await database()).execute(sql`
         UPDATE org_relationships
            SET effective_to = ${at}::timestamptz
          WHERE type = 'reporting_manager'
@@ -1477,7 +1609,7 @@ export async function supersedeReportingManager(
     //   - open edge is somebody else  -> the CTE closes it, NOT EXISTS finds no open `mgr` edge, the
     //     new edge is inserted at the same instant. No gap, no overlap.
     // It also makes the operation idempotent, which is what a retried POST needs.
-    const r = await db.execute(sql`
+    const r = await (await database()).execute(sql`
       WITH closed AS (
         UPDATE org_relationships
            SET effective_to = ${at}::timestamptz
@@ -1511,5 +1643,84 @@ export async function supersedeReportingManager(
   } catch (e: any) {
     logFail('supersedeReportingManager', e);
     return { ok: false, error: e?.cause?.message || e?.message || 'Could not change the reporting line' };
+  }
+}
+
+/**
+ * CHANGE WHO MENTORS SOMEBODY: close the open `mentor` edge and open the new one at the same
+ * instant. Passing null closes the line without opening a replacement, which is how a mentor
+ * stepping away is recorded.
+ *
+ * THIS IS supersedeReportingManager() FOR A DIFFERENT EDGE, and it is written out rather than
+ * generalised into it on purpose: that function carries a fix whose comment is longer than the
+ * statement, and rewriting it to serve two callers is how a fix gets lost. The one thing carried
+ * across verbatim is the exclusion in the CTE — `AND subject_employee_id <> mentor` — because
+ * without it, saving the SAME mentor twice closes the edge and inserts nothing, leaving the intern
+ * with no mentor while the caller is told it succeeded. An enrolment screen where somebody presses
+ * Save twice is exactly where that would happen.
+ *
+ * MENTOR IS SUPPORT, NOT AUTHORITY. It is deliberately absent from RESPONSIBILITY_TYPES, so opening
+ * one grants nothing: it answers "whose work am I asked to look at", and every write that depends on
+ * it asks the graph again at the write.
+ */
+export async function supersedeMentor(
+  employeeId: string,
+  newMentorEmployeeId: string | null,
+  opts?: AsOfOptions & { createdByUserId?: string | null; note?: string | null },
+): Promise<OrgWriteResult> {
+  if (!isUuid(employeeId)) return { ok: false, error: 'Invalid employee id' };
+  const mentor = isUuid(newMentorEmployeeId) ? String(newMentorEmployeeId) : null;
+  if (mentor && mentor === employeeId) return { ok: false, error: 'Nobody can be their own mentor' };
+  const at = asOfIso(opts);
+  if (!at) return { ok: false, error: 'Invalid effective date' };
+  const createdBy = isUuid(opts?.createdByUserId) ? String(opts?.createdByUserId) : null;
+  const note = opts?.note ? String(opts.note).slice(0, 2000) : null;
+
+  try {
+    await ensureOrgGraphSchema();
+
+    if (!mentor) {
+      await (await database()).execute(sql`
+        UPDATE org_relationships
+           SET effective_to = ${at}::timestamptz
+         WHERE type = 'mentor'
+           AND object_employee_id = ${employeeId}::uuid
+           AND status = 'active'
+           AND effective_to IS NULL
+           AND effective_from < ${at}::timestamptz`);
+      return { ok: true };
+    }
+
+    const r = await (await database()).execute(sql`
+      WITH closed AS (
+        UPDATE org_relationships
+           SET effective_to = ${at}::timestamptz
+         WHERE type = 'mentor'
+           AND object_employee_id = ${employeeId}::uuid
+           AND status = 'active'
+           AND effective_to IS NULL
+           AND effective_from < ${at}::timestamptz
+           AND subject_employee_id <> ${mentor}::uuid
+        RETURNING id
+      )
+      INSERT INTO org_relationships
+        (type, subject_employee_id, object_employee_id, effective_from, status, created_by, note)
+      SELECT 'mentor', ${mentor}::uuid, ${employeeId}::uuid,
+             ${at}::timestamptz, 'active', ${createdBy}::uuid, ${note}::text
+      WHERE NOT EXISTS (
+        SELECT 1 FROM org_relationships x
+         WHERE x.type = 'mentor'
+           AND x.object_employee_id = ${employeeId}::uuid
+           AND x.subject_employee_id = ${mentor}::uuid
+           AND x.status = 'active'
+           AND x.effective_to IS NULL
+      )
+      RETURNING id`);
+    const list = rows(r);
+    // Zero rows means this person already had exactly this mentor and nothing needed to change.
+    return list.length ? { ok: true, id: String(list[0].id) } : { ok: true };
+  } catch (e: any) {
+    logFail('supersedeMentor', e);
+    return { ok: false, error: e?.cause?.message || e?.message || 'Could not change the mentor' };
   }
 }

@@ -288,6 +288,29 @@ export const WORKFLOW_DOMAINS = [
   // than as the named approver.
   // ---------------------------------------------------------------------------------------------
   'credit',
+  // ---------------------------------------------------------------------------------------------
+  // THE WEEK AN INTERN PROPOSES FOR THEMSELVES. src/lib/eims-schedule.ts.
+  //
+  // This is the FORWARD-LOOKING half of the internship record, and it is the opposite of a roster:
+  // the intern says which activities they will do, on which days, for how many hours, and the
+  // reporting manager agrees to it. Interns are university students, so any day of the week and any
+  // distribution is legitimate; what is not legitimate is a week that commits more than the weekly
+  // ceiling, which the module refuses before this domain is ever reached.
+  //
+  // ONE RUNG, THE REPORTING MANAGER, resolved per row from the Organization Graph. A plan for next
+  // week that needs three signatures is a plan nobody signs, and the week simply passes.
+  //
+  // capability: null, DELIBERATELY, and unlike `credit`. Standing authority over somebody's weekly
+  // credit exists because HR owns the completion letter that prints it. Nothing in permissions.ts
+  // means "may agree what another person will work on next week" — that is the relationship the org
+  // graph names, or nobody. Where it names nobody the request HALTS carrying the sentence that says
+  // which link is missing, and escalateStep() reaches the person above them without a second chain.
+  //
+  // A MAKE-UP SCHEDULE IS THE SAME DOMAIN, not a second one: it is the same act (an intern proposing
+  // hours, a manager agreeing) for a different reason, and splitting it would mean two chains that
+  // eventually disagree about who plans an intern's week.
+  // ---------------------------------------------------------------------------------------------
+  'schedule',
 ] as const;
 
 export type WorkflowDomain = (typeof WORKFLOW_DOMAINS)[number];
@@ -993,6 +1016,29 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
     escalateAfterHours: 120,
     approvalUrl: '/portal/employee/credits/approvals',
     requesterUrl: '/portal/employee/credits',
+  },
+
+  // ===============================================================================================
+  // A WEEK AN INTERN HAS PROPOSED FOR THEMSELVES. See the note in WORKFLOW_DOMAINS.
+  //
+  // ONE RUNG, and a SHORT clock: 48 hours. Unlike a credit week, which is a question about days that
+  // have already happened and can wait, this is a plan for days that have not. A schedule approved
+  // after the week it covers has started is worth less every hour it sits, so it becomes eligible for
+  // escalation quickly — escalateStep() is still a person pressing a button, never automatic.
+  //
+  // BOTH URLs ARE PORTAL PATHS, deliberately. The approver is the intern's reporting manager, very
+  // often an ordinary employee with no admin access at all; sending them to /admin would send them
+  // to a redirect. requesterUrl is the intern's own schedule screen, which is the only place the
+  // decision they were just told about can actually be read.
+  // ===============================================================================================
+  schedule: {
+    key: 'schedule',
+    label: 'Weekly schedule',
+    capability: null,
+    route: [{ step: 1, via: 'reporting_manager' }],
+    escalateAfterHours: 48,
+    approvalUrl: '/portal/employee/schedule/approvals',
+    requesterUrl: '/portal/employee/schedule',
   },
 };
 

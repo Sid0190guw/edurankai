@@ -1,4 +1,11 @@
-import { db } from '@/lib/db';
+// Resolved LAZILY. A top-level db import makes src/lib/db throw DATABASE_URL is not set the moment
+// any importer loads, which puts every pure function in this module — and in anything that imports
+// it — out of reach of a test that needs no database at all.
+let _db: any = null;
+async function database(): Promise<any> {
+  if (!_db) _db = (await import('@/lib/db')).db;
+  return _db;
+}
 import { sql } from 'drizzle-orm';
 import { auditLog } from '@/lib/db/schema';
 import { ensureOnce } from '@/lib/ensure-once';
@@ -24,10 +31,10 @@ import { ensureOnce } from '@/lib/ensure-once';
  */
 export function ensureAuditIndexes(): Promise<void> {
   return ensureOnce('audit_log:indexes', async () => {
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_log (created_at)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS audit_user_idx ON audit_log (user_id)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS audit_entity_idx ON audit_log (entity, entity_id)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS audit_action_idx ON audit_log (action)`);
+    await (await database()).execute(sql`CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_log (created_at)`);
+    await (await database()).execute(sql`CREATE INDEX IF NOT EXISTS audit_user_idx ON audit_log (user_id)`);
+    await (await database()).execute(sql`CREATE INDEX IF NOT EXISTS audit_entity_idx ON audit_log (entity, entity_id)`);
+    await (await database()).execute(sql`CREATE INDEX IF NOT EXISTS audit_action_idx ON audit_log (action)`);
   });
 }
 

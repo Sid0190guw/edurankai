@@ -445,6 +445,46 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     group: 'People',
     description: 'Assign a course to any employee with a due date, and schedule or cancel anything on the training calendar. A manager assigns to their own reports through the reporting line; this is the version that reaches the whole organization. EduRankAI is the technology platform — accredited partners award the credentials.',
   },
+  'provenance.verify': {
+    label: 'Verify a record about anyone',
+    group: 'People',
+    description: 'Record that a stated claim on any person record was checked, naming what it was checked against, why and when, anywhere in the organization and with no relationship. A manager, mentor or reviewer verifies their own people through the reporting line, resolved per row. Verification is the only way a value becomes something a decision may rest on, so this key also carries the authority to withdraw one, which puts the value back to the claim it was.',
+    sensitive: true,
+  },
+  // ---------------------------------------------------------------------------------------------
+  // THE PERSON SPINE. Four keys, four surfaces, and each description says what the holder will
+  // actually be looking at. None of them decides anything about anybody: hiring, rejection,
+  // promotion, discipline and pay are not reachable from any of these screens, and none of them
+  // moves an application through the funnel.
+  // ---------------------------------------------------------------------------------------------
+  'people.view_360': {
+    label: 'Open the assembled record for one person',
+    group: 'People',
+    description: 'Open one human as one record: which login, application and employee record are the same person and how each of those links was established, the employment values somebody typed, the skills they have recorded with a checked level shown differently from a stated one, the certificates this platform issued, and the reporting line resolved from the Organization Graph. It adds no data anybody with the people desk cannot already open one screen at a time — what it adds is the join and the labelling. It never reads wellness, pay, bank details, date of birth or gender, and there is no score, rating or prediction about a person anywhere behind it.',
+  },
+  'skills.administer': {
+    label: 'Maintain the skill graph and person identity',
+    group: 'People',
+    description: 'Say that two skills are related — one is a specific case of another, they are the same skill, or holding one suggests some capability in the other — and merge two skills into one. Also state that a login, an application or an employee record belongs to a named person, and withdraw such a statement with a reason that stays on the record. A merge rewrites rows on other people\'s records, so it is offered only behind a preview naming every affected person before the button exists, it retires the losing skill rather than deleting it, and it is audited. It cannot record a skill level for anybody: that is the catalogue key, and the level itself is always a person\'s statement.',
+    sensitive: true,
+  },
+  'match.run': {
+    label: 'Open the coverage view for a job',
+    group: 'People',
+    description: 'Map a job description\'s free-text skill list onto the skill catalogue, one confirmed line at a time, and then read candidates and employees against those requirements — requirement by requirement, each row saying whether it is evidenced, stated but not demonstrated, covered only by a related skill, or nothing on record, with the evidence chain behind it. Where a weighted coverage figure is shown, it never appears on its own: it always arrives with what was concluded, why, the evidence behind each part, what was assumed, what is uncertain and what could not be assessed at all. A capability nobody has evidence for is listed as a gap in words and is never rounded into that figure, and a keyword somebody typed on a form adds nothing to it. A keyword is never treated as proof of competence. Nothing behind this key decides anything: a human decides, and may disagree with every line of it.',
+  },
+  'match.override': {
+    label: 'Record a decision against a coverage view',
+    group: 'People',
+    description: 'Write down what a human decided after reading the coverage view for one person against one job — worth taking further, not for this role now, or the evidence is stronger or weaker than the page shows — with a reason that is required and kept beside the record. It moves nobody through the funnel, starts no approval and changes nothing on the person\'s own record; it is the recorded exercise of human authority over an advisory view, which is what a human retaining authority has to mean if it is to mean anything.',
+    sensitive: true,
+  },
+  'match.weights.manage': {
+    label: 'Change how much each part of a job counts',
+    group: 'People',
+    description: 'Change the stored weighting a reading is produced under — how much the capabilities a job requires count for against the ones it prefers, and how little sharing a department counts for. It applies to every person read against every job from that moment on, so a weighting must name an owner before it can be saved, and the change is written to the audit log. It cannot add anything to the list of things that count: the dimensions are a fixed, named set, and a saved weighting mentioning anything outside it is refused by name rather than quietly ignored. No holder of this key can introduce culture fit, potential, engagement or any other unmeasured judgement about a person.',
+    sensitive: true,
+  },
   'learning.progress.view': {
     label: 'See the whole learning record',
     group: 'People',
@@ -585,6 +625,44 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     label: 'Take down a recognition',
     group: 'People',
     description: 'Remove a thank-you one colleague sent another, with a reason that is kept on the row. Nothing is deleted — "somebody removed a recognition about me" is a thing the person it was about is entitled to have a record of. It grants NO wider read: a recognition sent to one team stays visible to that team only, including to whoever holds this, and the aggregate console shows counts plus only the ones the sender already made company-wide. SENDING recognition needs no permission and this is not one; anybody with an employee record may thank anybody else, in any direction, and there is no check anywhere that the sender is senior to the recipient.',
+  },
+
+  // ---------------------------------------------------------------------------------------------
+  // THE INTERNSHIP MANAGEMENT SYSTEM. Three keys, and NOT ONE OF THEM ASSESSES AN INTERN. Whether a
+  // person may assess an outcome or score a rubric for somebody is resolved per ROW from the
+  // Organization Graph at the write (mentor edge, reporting-manager edge, or the chain above them).
+  // A key that conferred that would make every holder the assessor of every intern in the company.
+  //
+  // The full derivation of the grant sets is written above PERMS_BY_ROLE in permissions.ts.
+  // ---------------------------------------------------------------------------------------------
+  'eims.outcomes.manage': {
+    label: 'Define internship learning outcomes',
+    group: 'People',
+    description: 'Write the learning outcomes an internship programme is measured against, and map activities — tasks, learning assignments, project deliverables, records, holistic development — onto them. An activity may serve several outcomes and an outcome is normally reached through several activities. It grants no sight of any individual assessment and no authority to record one: a mentor assessment is written by whoever the Organization Graph names as that person\'s mentor or reporting manager, and this key does not make anybody either of those.',
+  },
+  'eims.credit.configure': {
+    label: 'Own the credit conversion and grading rubric',
+    group: 'People',
+    description: 'Decide, per programme, how many credits the internship is represented as, which components credit is considered against and at what weights, the grade bands, and the rubric criteria a mentor scores. This is what a credit MEANS on a document an accredited partner reads, which is why the configuration is a versioned record with a named owner rather than a setting, and why granting this must be provably on the record. It cannot make credit depend on attendance or login time in any configuration: a component naming attendance, presence, login, clock time or punctuality is refused at the save, for every holder. EduRankAI computes and evidences; an accredited partner awards.',
+    sensitive: true,
+  },
+  'eims.record.issue': {
+    label: 'Issue the final internship record',
+    group: 'People',
+    description: 'Freeze a person\'s internship record — hours, outcomes with their evidence, projects, assessments, holistic participation, mentor evaluation, grade and recommended credits — and issue the certificate for it in the existing credential ledger, with its public verification page. Also withdraws one, which revokes the certificate with it. Issuing a record that carries known gaps additionally needs an explicit acknowledgement and a written reason, and both are printed on the record. It does not award a qualification and cannot be made to: the platform computes and evidences, an accredited partner awards.',
+    sensitive: true,
+  },
+  'eims.programme.configure': {
+    label: 'Configure internship programmes',
+    group: 'People',
+    description: 'Decide which internship programmes this platform runs, and for each one: the weekly ceiling on recognised hours, the total hours the programme requires, the kind of work its evidence types are drawn from, the accredited partner it is run with, and whether it is open to enrol into. SENSITIVE because those two hour figures are the ones a completion record is measured against — the ceiling caps what may ever be recognised in a week and the required total is what "complete" is compared to — so they decide much of what the record says about a person before any work is done. Every change is written to the audit log with who made it and when. It cannot raise a ceiling above the statutory weekly maximum, cannot put holistic development outside the ceiling as an extra allowance, and cannot make anything depend on attendance: those are refused for every holder. It is deliberately not the same key as the credit conversion — one decides how long a week may be, the other decides what a credit means.',
+    sensitive: true,
+  },
+  'eims.enrolment.manage': {
+    label: 'Enrol interns and record their mentor and manager',
+    group: 'People',
+    description: 'Put a named person onto an internship programme with a start date and an end date, record which mentor and which reporting manager the Organization Graph should name for them, and close the enrolment as completed or withdrawn with a written reason. SENSITIVE because an enrolment is what binds a person to a rule set — the ceiling, the required hours, the credit conversion and the rubric they will be measured under — so moving somebody between programmes changes what their record will say without touching a single hour. It confers NO authority over anybody: the mentor and manager edges it records are rows in the Organization Graph, and every later question — may this person verify these hours, approve this week, assess this outcome — is answered per row from that graph at the write, never from this key. It verifies no hours, grades nobody, and awards nothing.',
+    sensitive: true,
   },
 };
 

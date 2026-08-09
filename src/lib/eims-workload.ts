@@ -59,7 +59,14 @@
 // EduRankAI is the technology platform. Hours recognised here are a record of work done on this
 // platform; accredited partners award credentials, and nothing in this file confers one.
 
-import { db } from '@/lib/db';
+// Resolved LAZILY. A top-level db import makes src/lib/db throw DATABASE_URL is not set the moment
+// any importer loads, which puts every pure function in this module — and in anything that imports
+// it — out of reach of a test that needs no database at all.
+let _db: any = null;
+async function database(): Promise<any> {
+  if (!_db) _db = (await import('@/lib/db')).db;
+  return _db;
+}
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 import { logAudit } from '@/lib/audit';
@@ -132,7 +139,7 @@ export function ensureWorkloadSchema(): Promise<void> {
 }
 
 async function createWorkloadTables(): Promise<void> {
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS eims_workload_policy (
+  await (await database()).execute(sql`CREATE TABLE IF NOT EXISTS eims_workload_policy (
     programme_key TEXT PRIMARY KEY,
     label TEXT NOT NULL,
     ceiling_hours NUMERIC(5,2) NOT NULL DEFAULT 40,
@@ -147,7 +154,7 @@ async function createWorkloadTables(): Promise<void> {
     'ALTER TABLE eims_workload_policy ADD COLUMN IF NOT EXISTS updated_by_user_id UUID',
     'ALTER TABLE eims_workload_policy ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()',
   ]) {
-    await db.execute(sql.raw(stmt));
+    await (await database()).execute(sql.raw(stmt));
   }
 
   // Seeded, never overwritten: an administrator's change to a ceiling must survive a deploy.
@@ -172,7 +179,7 @@ async function createWorkloadTables(): Promise<void> {
       },
     ];
     for (const s of seeds) {
-      await db.execute(sql`
+      await (await database()).execute(sql`
         INSERT INTO eims_workload_policy (programme_key, label, ceiling_hours, note)
         VALUES (${s.key}, ${s.label}, ${DEFAULT_WEEKLY_CEILING_HOURS}, ${s.note})
         ON CONFLICT (programme_key) DO NOTHING`);
@@ -203,7 +210,7 @@ export async function listProgrammeCeilings(): Promise<{ ok: boolean; programmes
   }];
   try {
     await ensureWorkloadSchema();
-    const list = rows(await db.execute(sql`
+    const list = rows(await (await database()).execute(sql`
       SELECT programme_key, label, ceiling_hours, note
         FROM eims_workload_policy
        ORDER BY (programme_key = ${DEFAULT_PROGRAMME_KEY}) DESC, label ASC
@@ -258,7 +265,7 @@ export async function setProgrammeCeiling(input: {
 
   try {
     await ensureWorkloadSchema();
-    await db.execute(sql`
+    await (await database()).execute(sql`
       INSERT INTO eims_workload_policy (programme_key, label, ceiling_hours, note, updated_by_user_id)
       VALUES (${key}, ${label}, ${round2(hours)}, ${note}, ${actorId}::uuid)
       ON CONFLICT (programme_key) DO UPDATE SET
@@ -325,14 +332,14 @@ async function readEmployee(employeeId: string): Promise<EmployeeRow | null> {
     isActive: !(r.is_active === false || r.is_active === 'f'),
   });
   try {
-    const r = rows(await db.execute(sql`
+    const r = rows(await (await database()).execute(sql`
       SELECT e.id::text AS id, e.full_name, e.employment_type, e.designation, e.weekly_hours, e.is_active
         FROM hr_employees e WHERE e.id = ${employeeId}::uuid LIMIT 1`))[0];
     return r ? map(r) : null;
   } catch (e: any) {
     logFail('readEmployee weekly_hours', e);
     try {
-      const r = rows(await db.execute(sql`
+      const r = rows(await (await database()).execute(sql`
         SELECT e.id::text AS id, e.full_name, e.employment_type, e.designation,
                NULL AS weekly_hours, e.is_active
           FROM hr_employees e WHERE e.id = ${employeeId}::uuid LIMIT 1`))[0];
@@ -348,7 +355,7 @@ async function programmeCeilingFor(programmeKey: string): Promise<{ hours: numbe
   const key = normaliseKey(programmeKey);
   try {
     await ensureWorkloadSchema();
-    const r = rows(await db.execute(sql`
+    const r = rows(await (await database()).execute(sql`
       SELECT programme_key, label, ceiling_hours FROM eims_workload_policy
        WHERE lower(programme_key) IN (${key}, ${DEFAULT_PROGRAMME_KEY})
        ORDER BY (lower(programme_key) = ${key}) DESC
@@ -751,7 +758,7 @@ export async function allocateActivity(input: {
     await ensureActivitySchema();
 
     if (existingId) {
-      const r = rows(await db.execute(sql`
+      const r = rows(await (await database()).execute(sql`
         UPDATE employee_tasks
            SET title = ${title},
                description = ${description},
@@ -798,7 +805,7 @@ export async function allocateActivity(input: {
     // The INSERT ... SELECT evaluates the target's own row in the same statement, so there is no
     // read-then-write gap in which an employee could be deactivated. Authority was resolved from the
     // Organization Graph above; this clause is existence and activity, not authorisation.
-    const r = rows(await db.execute(sql`
+    const r = rows(await (await database()).execute(sql`
       INSERT INTO employee_tasks (
         employee_id, assigned_by_user_id, title, description, priority, status, due_on,
         activity_type, allocated_hours, allocated_by_user_id, allocated_at,

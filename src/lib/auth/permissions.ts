@@ -476,6 +476,13 @@ export type Permission =
   // Assign a course to anybody in the organization, and schedule the training calendar. A manager
   // assigns to their own reports through the graph; this is the org-wide version.
   | 'learning.assign'
+  // Record a VERIFICATION against anybody's record, with no relationship: say that a stated claim
+  // was checked, name what it was checked against, and sign it. See src/lib/provenance.ts, which is
+  // the only place assertion = 'verified' comes into existence. A manager, a mentor or a reviewer
+  // verifies their own people through the Organization Graph, per row, and needs none of this; this
+  // is the organization-wide desk. It is SENSITIVE because the whole product treats a verified
+  // element as something a decision may rest on, and an unverification is equally consequential.
+  | 'provenance.verify'
 
   // =============================================================================================
   // LEARNING ADMINISTRATION. Four keys behind /admin/learning/*, and the derivation for each.
@@ -602,7 +609,208 @@ export type Permission =
   // to a holder of this key — the aggregate console shows counts and lists only the ones the sender
   // already made company-wide, because reading a team-scoped one on an HR screen would quietly widen
   // the audience the sender chose after the fact. A moderator acts on what they can already see.
-  | 'recognition.moderate';
+  | 'recognition.moderate'
+
+  // =============================================================================================
+  // THE PERSON SPINE. Four keys behind the surfaces that assemble one human out of the four records
+  // this product keeps about them (src/lib/person-spine.ts, person-360.ts, skill-graph.ts,
+  // capability-coverage.ts).
+  //
+  // NONE OF THEM DECIDES ANYTHING ABOUT ANYBODY. Hiring, rejection, promotion, discipline and pay
+  // are not reachable from any of these screens, and no key here moves an application's stage —
+  // that is src/lib/application-stages.ts, which keeps its own actor history and is the only thing
+  // allowed to move a candidate through the funnel.
+  //
+  // NO PRIOR POPULATION TO PRESERVE: none of these screens existed. So the settled rule for that
+  // case applies — GRANT TO THE NARROWEST DEFENSIBLE HOLDER AND WRITE DOWN WHY — and that is
+  // super_admin + hr, the two accounts that already read every employee record one at a time
+  // through `employee.manage` and `skills.manage`. All four are ENFORCED at every call site from
+  // the day they ship, and every write behind them is re-checked where it binds.
+  //
+  // NONE OF THEM CAN BE SPELLED BY A LEGACY SECTION ROW. customRoleKeys() derives keys as
+  // `<page_key>.<action>` with action fixed to view/edit/delete/export; `view_360`, `administer`,
+  // `run` and `override` are none of those. They are asked for with can(), which reads
+  // PERMS_BY_ROLE alone.
+  // =============================================================================================
+
+  // READ THE ASSEMBLED PERSON RECORD: /admin/people and /admin/people/[id]. One human's identity
+  // links, employment record, recorded skills, platform certificates and reporting line on one
+  // screen, each panel carrying how it is known.
+  //
+  // IT WIDENS NO READ AND IT IS NOT A SUPER-PROFILE. Every panel is assembled from records the
+  // holders of `employee.manage` already open one screen at a time. What it adds is the JOIN and
+  // the labelling, not new data — and what it deliberately never reads is wellness, pay, bank
+  // details, date of birth, gender, or any surveillance signal. src/lib/person-360.ts contains no
+  // import of src/lib/wellness.ts and must never contain one: a 360 that quietly included a
+  // wellness panel would contradict the entire premise of that system on the screen most likely to
+  // be shown to a room.
+  //
+  // NOT SENSITIVE, because it changes nothing. Creating a person root, linking a record to one and
+  // withdrawing a link are changes to a record about a person and each is re-checked at the write
+  // against the SENSITIVE key below.
+  | 'people.view_360'
+  // MAINTAIN THE PERSON SPINE AND THE SKILL GRAPH: /admin/skills/ontology, and the identity writes
+  // on /admin/people/[id]. Create a person root, state that a login, an application or an employee
+  // record is that person, withdraw such a statement, add a skill to the catalogue, record a
+  // relation between two skills, and merge two skills into one.
+  //
+  // SENSITIVE, and the derivation is the merge. A merge REWRITES ROWS ON OTHER PEOPLE'S RECORDS:
+  // recorded levels move between skills, and where somebody holds both, one of their two rows is
+  // kept and the other is not. It is offered only behind a preview that names every affected
+  // person before the button exists, it never deletes the retired skill, and it is audited — but
+  // the authority to run it must be provably on the record too.
+  //
+  // AN IDENTITY LINK IS THE OTHER HALF OF THE SAME REASON. Saying "this application is this
+  // employee" makes a candidate's history readable from an employee record and vice versa. It is a
+  // statement about who somebody IS, it requires a written basis that is stored verbatim, and
+  // getting it wrong joins two humans into one record.
+  //
+  // WHAT IT STILL CANNOT DO: assert a skill LEVEL for anybody (that is `skills.manage` through
+  // src/lib/skills.ts, which re-reads any evidence reference through the module that owns it and
+  // refuses one that does not confirm), and make anybody anybody's manager.
+  | 'skills.administer'
+  // OPEN THE COVERAGE VIEW: /admin/match and /admin/match/[jobId]. Candidates and employees against
+  // one job's requirements, requirement by requirement, each row carrying its own evidence chain.
+  //
+  // THERE IS NO BARE MATCH SCORE BEHIND THIS KEY AND THERE WILL NOT BE ONE, and the two modules
+  // behind it draw that line in two different places. Read both before granting it.
+  //
+  // src/lib/capability-coverage.ts returns counts per status and REFUSES TO TOTAL THEM AT ALL,
+  // because a single number would have to average a checked certificate against a keyword somebody
+  // typed on a form.
+  //
+  // src/lib/match.ts does produce a weighted coverage figure, and the constraints on it are what
+  // make it a different thing from a match score. It is unreachable except as one field of a
+  // MatchExplanation, a type no other module can construct — so there is no function anywhere that
+  // returns a number about a person on its own. It reports alongside itself how much of the
+  // weighting could be assessed at all, so the parts nobody can measure are never read as agreement.
+  // A claimed keyword contributes exactly nothing to it and can never lift it. And a GAP is never
+  // folded into it: gaps are a separate list, and a gap against a REQUIRED capability is restated in
+  // words as a decision blocker, where no arithmetic can round it away.
+  //
+  // A keyword is never treated as proof of competence in either module: a claimed capability is
+  // labelled as claimed, wherever it appears.
+  //
+  // It also authors the job's requirements — mapping the job description's free-text skill list onto
+  // the skill catalogue, one confirmed line at a time. That is not sensitive on its own: it says what
+  // a JOB asks for, not what a PERSON has, and src/lib/capability-coverage.ts refuses outright any
+  // requirement naming a protected or sensitive attribute, whoever is saving it.
+  | 'match.run'
+  // RECORD A HUMAN'S DECISION AGAINST WHAT THE COVERAGE VIEW SHOWED, with a written reason that is
+  // required and kept: worth taking further, not for this role now, or the evidence is stronger or
+  // weaker than this page shows.
+  //
+  // SENSITIVE. It is the recorded exercise of human authority over an advisory view about a named
+  // person, it is kept beside that person's record, and it is read later by whoever is deciding.
+  //
+  // IT DECIDES NOTHING BY ITSELF, and that separation is deliberate: it does not move the
+  // application's stage (src/lib/application-stages.ts owns the funnel and keeps its own actor
+  // history), it starts no approval (src/lib/workflow.ts is the only approval engine in this
+  // product), and it changes nothing on the person's own record. A recorded override with no reason
+  // is an opaque decision with a timestamp on it, so the reason is refused when it is blank.
+  | 'match.override'
+  // CHANGE THE WEIGHTING EVERY READING IS PRODUCED UNDER: the stored profile in
+  // match_weight_profiles that src/lib/match.ts reads before it compares anybody to anything.
+  //
+  // SENSITIVE, and the derivation is that it is a POLICY ABOUT PEOPLE rather than a setting. Moving
+  // required capabilities from fifty-five to eighty changes how every candidate and every employee
+  // reads against every job, retrospectively as far as anybody re-runs a comparison, and it does so
+  // without appearing on any one person's record. That is precisely the kind of change that must
+  // have a name attached, which is why saveWeightProfile() refuses a profile with no owner and
+  // writes the change to the audit log.
+  //
+  // WHAT IT CANNOT DO, STRUCTURALLY: add a dimension. The weights are a CLOSED UNION of seven named
+  // dimensions and a key outside it is refused BY NAME rather than ignored, so a holder cannot
+  // introduce "culture fit", "potential" or "engagement" by saving a profile that mentions one. The
+  // authority here is over how much the recorded dimensions count, never over what may be counted.
+  | 'match.weights.manage'
+
+  // =============================================================================================
+  // THE INTERNSHIP MANAGEMENT SYSTEM: learning outcomes, the credit conversion, the grading rubric,
+  // and the final internship record (src/lib/eims-outcomes.ts, src/lib/eims-credit.ts).
+  //
+  // THREE KEYS, AND NOT ONE OF THEM ASSESSES ANYBODY. Whether a person may assess an intern's
+  // outcome or score their rubric is a per-ROW question answered by the Organization Graph — the
+  // mentor edge, the reporting-manager edge, or the chain above them — resolved at the write in
+  // mayAssessOutcome(). A key that granted assessment authority would hand every holder the power to
+  // grade every intern in the company, which is the exact widening Phase 1 removed everywhere else.
+  //
+  // NO PRIOR POPULATION TO PRESERVE: none of these objects existed. So the settled rule for that case
+  // applies — GRANT TO THE NARROWEST DEFENSIBLE HOLDER AND WRITE DOWN WHY — and that is super_admin +
+  // hr, the two who already hold `employee.manage` and therefore already own the completion letter
+  // these records replace. All three are ENFORCED at every call site from the day they ship.
+  //
+  // NONE OF THEM CAN BE SPELLED BY A LEGACY SECTION ROW. customRoleKeys() derives keys as
+  // `<page_key>.<action>` with action fixed to view/edit/delete/export, and these end in `.manage`,
+  // `.configure` and `.issue`. They are still asked for with can() rather than hasPermission(), for
+  // the reason stated above the catalogue: can() reads PERMS_BY_ROLE alone.
+  // =============================================================================================
+
+  // DEFINING WHAT AN INTERNSHIP IS FOR: the learning-outcome catalogue for a programme, and the
+  // mapping of activities onto those outcomes. It grants no sight of anybody's assessment and no
+  // authority to record one.
+  | 'eims.outcomes.manage'
+  // OWNING THE CREDIT CONVERSION AND THE GRADING RUBRIC for a programme: how many credits the
+  // programme is represented as, what components credit is considered against and at what weights,
+  // the grade bands, and the rubric criteria.
+  //
+  // SENSITIVE, and this is the reason: whoever holds it decides WHAT A CREDIT MEANS on a document an
+  // accredited partner reads. The configuration is a versioned record with a named owner rather than
+  // a setting, precisely so that decision is attributable — and a grant of the power to make it must
+  // be provably on the record too.
+  //
+  // WHAT IT STILL CANNOT DO: condition credit on attendance or login time. validateCreditConfig()
+  // refuses a component whose key, label or note names attendance, presence, login, clock time or
+  // punctuality, whoever is saving it. That is not a permission question and no grant relaxes it.
+  | 'eims.credit.configure'
+  // ISSUING AND WITHDRAWING THE FINAL INTERNSHIP RECORD, together with the certificate in the
+  // existing credential ledger and its public verification page.
+  //
+  // SENSITIVE: it puts a credential into the world under this platform's name, and takes one back.
+  // Issuing a record that carries known gaps additionally requires an explicit acknowledgement and a
+  // written reason, both of which are frozen into the document — the key opens the act, it does not
+  // excuse the record.
+  //
+  // IT DOES NOT AWARD ANYTHING. EduRankAI computes and evidences; an accredited partner awards. The
+  // decision type carries `awarded: false` as a literal type, so no holder of this key — and no code
+  // path at all — can record this platform as the awarding body.
+  | 'eims.record.issue'
+
+  // OWNING THE PROGRAMME ITSELF: what internships this platform runs, the weekly ceiling on each of
+  // them, the total hours the programme requires, the role whose evidence types it offers, and
+  // whether it is open to enrol into at all.
+  //
+  // SENSITIVE, and the derivation is the same one that made `eims.credit.configure` sensitive. The
+  // ceiling is the number recognised hours are capped AT and the required-hours total is the number
+  // a completion record is measured AGAINST — so the two figures on the final record that most
+  // determine what it says about a person are set here. A change to them is audited with who and
+  // when, and the key is on the record too.
+  //
+  // WHAT IT STILL CANNOT DO: raise a ceiling above the statutory weekly maximum (setProgrammeCeiling
+  // refuses it for every holder), put holistic development outside the ceiling as an extra allowance,
+  // or make anything conditional on attendance. None of those is a permission question.
+  //
+  // IT IS NOT `eims.credit.configure`, and keeping them apart is deliberate: one decides how long a
+  // week may be, the other decides what a credit means. They are held by the same two roles today,
+  // which is a fact about this company rather than a reason to spell them as one key.
+  | 'eims.programme.configure'
+
+  // ENROLLING A PERSON INTO A PROGRAMME, and closing that enrolment as completed or withdrawn.
+  //
+  // SENSITIVE. Enrolment is what BINDS a named person to a rule set — the ceiling, the required
+  // hours, the credit conversion and the rubric they will be measured under. Moving somebody between
+  // programmes therefore changes what their record of achievement will say without touching a single
+  // hour, which is exactly the kind of act that must be attributable rather than quiet.
+  //
+  // IT ASSIGNS NO AUTHORITY OVER ANYBODY. The mentor and reporting-manager edges an enrolment screen
+  // records are written into the Organization Graph, and every later question — may this person
+  // verify these hours, approve this week, assess this outcome — is answered per ROW from that graph
+  // at the write. Holding this key makes nobody anybody's mentor and lets nobody verify an hour.
+  //
+  // IT VERIFIES NOTHING, GRADES NOTHING AND AWARDS NOTHING. Those were considered as keys of their
+  // own and deliberately not created: verification and grading are per-row relationships, not a
+  // standing power over a cohort, and awarding is not something this platform does at all.
+  | 'eims.enrolment.manage';
 
 // Exported so a read-only console can SHOW the matrix instead of a second, hand-typed copy of it
 // drifting away from the real one (/admin/access-preview). Nothing outside this file may decide
@@ -857,6 +1065,11 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // comments already claims. Nobody but super_admin gains anything, and super_admin is unrestricted
     // in the section filter these pages also sit behind.
     'performance.manage', 'skills.manage', 'learning.assign',
+    // PROVENANCE. The organization-wide verification desk — the same population as the three
+    // keys above, and for the same reason: these are the only accounts that read every employee
+    // record today. It makes nobody anybody's manager; a relationship out of the Organization
+    // Graph is what lets a manager verify their own people, resolved per row.
+    'provenance.verify',
     // LEARNING ADMINISTRATION. The same population as `learning.assign` on the line above, because
     // the derivation is the same one: super_admin and hr are the only accounts that reach the
     // learning desk or the course catalogue today. Two of the four are SENSITIVE in the registry —
@@ -873,7 +1086,23 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // matching `knowledge.manage`: the key that already decides what the whole company is asked to
     // read. Neither approves anything, neither widens a read: an announcement's audience is applied
     // in the WHERE clause, and a team-scoped recognition stays team-scoped for the holder too.
-    'announcements.publish', 'recognition.moderate'
+    'announcements.publish', 'recognition.moderate',
+    // THE PERSON SPINE. Narrowest defensible holders, matching `employee.manage` and `skills.manage`
+    // on the lines above: super_admin and `hr` are the only accounts that read every employee record
+    // and maintain the skill catalogue today, and the 360 assembles nothing they cannot already open
+    // one screen at a time. None of the four makes the founder anybody's manager, and none of them
+    // moves an application through the funnel.
+    'people.view_360', 'skills.administer', 'match.run', 'match.override', 'match.weights.manage',
+    // THE INTERNSHIP MANAGEMENT SYSTEM. Narrowest defensible holders, matching `employee.manage`:
+    // the desk that already owns /admin/hr/completion/[id], which is the document these records
+    // replace. None of the three assesses anybody — a mentor's authority over one intern is a per-row
+    // edge in the Organization Graph and no grant on this line can create one.
+    //
+    // The programme and enrolment keys join them on the same line and for the same reason: deciding
+    // which internships exist and who is on one is the same desk that already decides what the
+    // completion document says. Neither of them verifies an hour or grades anybody.
+    'eims.outcomes.manage', 'eims.credit.configure', 'eims.record.issue',
+    'eims.programme.configure', 'eims.enrolment.manage'
   ],
   hr: [
     'admin.access',
@@ -921,6 +1150,11 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // is the only non-super_admin role that reaches /admin/hr/performance and /admin/hr/training
     // today. Exact population, named instead of spelled — nobody gains and nobody loses.
     'performance.manage', 'skills.manage', 'learning.assign',
+    // PROVENANCE. The organization-wide verification desk — the same population as the three
+    // keys above, and for the same reason: these are the only accounts that read every employee
+    // record today. It makes nobody anybody's manager; a relationship out of the Organization
+    // Graph is what lets a manager verify their own people, resolved per row.
+    'provenance.verify',
     // LEARNING ADMINISTRATION. Same population and same derivation as the line above: `hr` already
     // holds the learning desk and the training section, and already reads every employee record.
     // What these four add is the ability to CORRECT the record — mark a completion, revoke one,
@@ -971,7 +1205,26 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // confers no approval and no wider sight of anything: a notice's audience is applied in the
     // query, and a recognition sent to one team is not readable on this desk because it was not sent
     // to it. Sending recognition needs no key at all and this is not one — it only takes one down.
-    'announcements.publish', 'recognition.moderate'
+    'announcements.publish', 'recognition.moderate',
+    // THE PERSON SPINE. Same population and same derivation as the super_admin line: `hr` already
+    // holds `employee.manage` and `skills.manage`, so it already reads every employee record and
+    // already maintains the catalogue these four surfaces are assembled from. What they add is the
+    // JOIN between a login, an application and an employee record — and the labelling that keeps a
+    // stated skill from ever looking like a checked one.
+    'people.view_360', 'skills.administer', 'match.run', 'match.override', 'match.weights.manage',
+    // THE INTERNSHIP MANAGEMENT SYSTEM. `hr` holds `employee.manage`, which is what gates
+    // /admin/hr/completion/[id] — the completion letter these records replace — so owning the
+    // outcome catalogue, the credit conversion and the issuing of the final record is authority this
+    // desk has in substance today, written down instead of spelled. It confers nothing over any one
+    // intern: who may assess them is a mentor or reporting-manager edge in the Organization Graph,
+    // resolved per row at the write.
+    //
+    // Running the programmes and enrolling people into them is the same desk again: HR already keys
+    // employment type, weekly hours and the completion letter for exactly these people. Recording
+    // that here replaces the implicit version of the same authority rather than widening it, and the
+    // mentor and manager edges an enrolment records are org-graph rows, not grants.
+    'eims.outcomes.manage', 'eims.credit.configure', 'eims.record.issue',
+    'eims.programme.configure', 'eims.enrolment.manage'
   ],
   recruiter: [
     'admin.access',
@@ -1089,7 +1342,16 @@ export const DEPARTMENT_SCOPED_ROLES: User['role'][] = ['department_head', 'revi
 // PERMS_BY_ROLE matrix above. Existing pages keep using can(); new pages
 // can opt into userCanAccess() for fine-grained, admin-configurable perms.
 
-import { db } from '@/lib/db';
+// Resolved LAZILY. This module is imported by almost everything, and a top-level db import made
+// src/lib/db throw DATABASE_URL is not set the moment ANY importer loaded — which put every pure
+// function reachable through it, including credit arithmetic that touches no database, permanently
+// out of reach of a test. can() and the capability union are pure; only the role lookups below need
+// a connection, and they ask for one when they run.
+let _db: any = null;
+async function database(): Promise<any> {
+  if (!_db) _db = (await import('@/lib/db')).db;
+  return _db;
+}
 import { userRoleAssignments, rolePermissions } from '@/lib/db/schema';
 import { eq, and, inArray } from 'drizzle-orm';
 
@@ -1100,13 +1362,13 @@ export type PermissionAction = 'view' | 'edit' | 'delete' | 'export';
  * If user has no custom roles, returns false (caller can fall through to legacy can()).
  */
 export async function userCanAccess(userId: string, pageKey: string, action: PermissionAction): Promise<boolean> {
-  const userRolesRows = await db.select({ roleId: userRoleAssignments.roleId })
+  const userRolesRows = await (await database()).select({ roleId: userRoleAssignments.roleId })
     .from(userRoleAssignments)
     .where(eq(userRoleAssignments.userId, userId));
   if (userRolesRows.length === 0) return false;
 
   const roleIds = userRolesRows.map(r => r.roleId);
-  const perms = await db.select().from(rolePermissions)
+  const perms = await (await database()).select().from(rolePermissions)
     .where(and(inArray(rolePermissions.roleId, roleIds), eq(rolePermissions.pageKey, pageKey)));
 
   for (const p of perms) {
@@ -1199,12 +1461,12 @@ export function defaultSectionKeysForRole(role: string): Set<string> | null {
 export async function getViewableSectionKeys(user: { id: string; role: string } | null): Promise<Set<string> | null> {
   if (!user) return new Set();
   if (user.role === 'super_admin') return null;
-  const assigns = await db.select({ roleId: userRoleAssignments.roleId })
+  const assigns = await (await database()).select({ roleId: userRoleAssignments.roleId })
     .from(userRoleAssignments)
     .where(eq(userRoleAssignments.userId, user.id));
   if (assigns.length > 0) {
     const roleIds = assigns.map(r => r.roleId);
-    const perms = await db.select({ pageKey: rolePermissions.pageKey, canView: rolePermissions.canView })
+    const perms = await (await database()).select({ pageKey: rolePermissions.pageKey, canView: rolePermissions.canView })
       .from(rolePermissions)
       .where(inArray(rolePermissions.roleId, roleIds));
     const set = new Set<string>(['dashboard']);
@@ -1241,7 +1503,7 @@ export async function canAccessSection(
   if (user.role === 'applicant') return false;
 
   try {
-    const assigns = await db.select({ roleId: userRoleAssignments.roleId })
+    const assigns = await (await database()).select({ roleId: userRoleAssignments.roleId })
       .from(userRoleAssignments)
       .where(eq(userRoleAssignments.userId, user.id));
     if (assigns.length > 0) {

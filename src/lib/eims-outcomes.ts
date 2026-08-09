@@ -73,7 +73,14 @@
 //   - Relationships come from src/lib/org-graph.ts, never from users.role.
 //   - Every const is declared before the function that reads it. const is not hoisted.
 
-import { db } from '@/lib/db';
+// Resolved LAZILY. A top-level db import makes src/lib/db throw DATABASE_URL is not set the moment
+// any importer loads, which puts every pure function in this module — and in anything that imports
+// it — out of reach of a test that needs no database at all.
+let _db: any = null;
+async function database(): Promise<any> {
+  if (!_db) _db = (await import('@/lib/db')).db;
+  return _db;
+}
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 import { can } from '@/lib/auth/permissions';
@@ -610,7 +617,11 @@ export function summariseCoverage(
     covered,
     uncovered: list.length - covered,
     verified,
-    coverageFraction: list.length ? round2(evidenced / list.length) : null,
+    // NOT rounded. This fraction is multiplied by hours on the way to academic credit, so two
+    // decimals is a real loss: one outcome of three stored as 0.33 instead of 0.3333... understates
+    // the credit by a third of a percent, and the error compounds over a programme. Round for
+    // DISPLAY at the point of display; never in the value a calculation reads.
+    coverageFraction: list.length ? evidenced / list.length : null,
     attainmentFraction: attainment,
     assessedCount: assessed.length,
     activities: facts.activities,
@@ -644,7 +655,7 @@ export function ensureOutcomeSchema(): Promise<void> {
 }
 
 async function createOutcomeTables(): Promise<void> {
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS eims_outcomes (
+  await (await database()).execute(sql`CREATE TABLE IF NOT EXISTS eims_outcomes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     programme_key TEXT NOT NULL DEFAULT 'default',
     code TEXT NOT NULL,
@@ -657,7 +668,7 @@ async function createOutcomeTables(): Promise<void> {
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
-  await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS eims_outcomes_prog_code
+  await (await database()).execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS eims_outcomes_prog_code
     ON eims_outcomes (programme_key, code)`);
 
   // THE MANY-TO-MANY. An activity may serve several outcomes and an outcome is normally reached
@@ -667,7 +678,7 @@ async function createOutcomeTables(): Promise<void> {
   // (employee_tasks, project_deliverables), and a composite key tomorrow (a daily report is
   // employee + date). Storing it as text keeps this table honest about being a REFERENCE rather
   // than a foreign key into six tables at once.
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS eims_outcome_links (
+  await (await database()).execute(sql`CREATE TABLE IF NOT EXISTS eims_outcome_links (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     outcome_id UUID NOT NULL,
     source TEXT NOT NULL,
@@ -677,16 +688,16 @@ async function createOutcomeTables(): Promise<void> {
     created_by_user_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
-  await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS eims_outcome_links_key
+  await (await database()).execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS eims_outcome_links_key
     ON eims_outcome_links (outcome_id, source, activity_id)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS eims_outcome_links_emp
+  await (await database()).execute(sql`CREATE INDEX IF NOT EXISTS eims_outcome_links_emp
     ON eims_outcome_links (employee_id)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS eims_outcome_links_activity
+  await (await database()).execute(sql`CREATE INDEX IF NOT EXISTS eims_outcome_links_activity
     ON eims_outcome_links (source, activity_id)`);
 
   // ONE ROW PER PERSON PER OUTCOME, and it carries the assessor's name — not their role. Who may
   // write it is resolved per row from the Organization Graph at the write, never from users.role.
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS eims_outcome_assessments (
+  await (await database()).execute(sql`CREATE TABLE IF NOT EXISTS eims_outcome_assessments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     employee_id UUID NOT NULL,
     outcome_id UUID NOT NULL,
@@ -697,7 +708,7 @@ async function createOutcomeTables(): Promise<void> {
     assessed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
-  await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS eims_outcome_assessments_key
+  await (await database()).execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS eims_outcome_assessments_key
     ON eims_outcome_assessments (employee_id, outcome_id)`);
 }
 
@@ -729,10 +740,10 @@ export async function listOutcomes(
   try {
     await ensureOutcomeSchema();
     const r = opts.includeInactive
-      ? await db.execute(sql`
+      ? await (await database()).execute(sql`
           SELECT * FROM eims_outcomes WHERE programme_key = ${key}
            ORDER BY sort_order ASC, code ASC LIMIT ${MAX_OUTCOMES}`)
-      : await db.execute(sql`
+      : await (await database()).execute(sql`
           SELECT * FROM eims_outcomes WHERE programme_key = ${key} AND active = true
            ORDER BY sort_order ASC, code ASC LIMIT ${MAX_OUTCOMES}`);
     return rows(r).map(mapOutcome);
@@ -746,7 +757,7 @@ export async function getOutcome(id: string): Promise<OutcomeRow | null> {
   if (!isUuid(id)) return null;
   try {
     await ensureOutcomeSchema();
-    const r = rows(await db.execute(sql`SELECT * FROM eims_outcomes WHERE id = ${id}::uuid LIMIT 1`));
+    const r = rows(await (await database()).execute(sql`SELECT * FROM eims_outcomes WHERE id = ${id}::uuid LIMIT 1`));
     return r.length ? mapOutcome(r[0]) : null;
   } catch (e: any) {
     logFail('getOutcome', e);
@@ -797,7 +808,7 @@ export async function upsertOutcome(
     await ensureOutcomeSchema();
     let written: any[];
     if (id) {
-      written = rows(await db.execute(sql`
+      written = rows(await (await database()).execute(sql`
         UPDATE eims_outcomes
            SET code = ${code}, statement = ${statement}, detail = ${detail},
                category = ${category}, sort_order = ${sortOrder}, active = ${active},
@@ -806,7 +817,7 @@ export async function upsertOutcome(
         RETURNING id`));
       if (!written.length) return { ok: false, error: 'That outcome no longer exists. Nothing was changed.' };
     } else {
-      written = rows(await db.execute(sql`
+      written = rows(await (await database()).execute(sql`
         INSERT INTO eims_outcomes
           (programme_key, code, statement, detail, category, sort_order, active, created_by_user_id)
         VALUES (${key}, ${code}, ${statement}, ${detail}, ${category}, ${sortOrder}, ${active},
@@ -896,7 +907,7 @@ export async function seedDefaultOutcomes(
   try {
     await ensureOutcomeSchema();
     for (const o of DEFAULT_OUTCOMES) {
-      const w = rows(await db.execute(sql`
+      const w = rows(await (await database()).execute(sql`
         INSERT INTO eims_outcomes
           (programme_key, code, statement, detail, category, sort_order, created_by_user_id)
         VALUES (${key}, ${o.code}, ${o.statement}, ${o.detail}, ${o.category}, ${o.sortOrder},
@@ -969,11 +980,11 @@ export async function setActivityOutcomes(
 
   try {
     await ensureOutcomeSchema();
-    await db.execute(sql`
+    await (await database()).execute(sql`
       DELETE FROM eims_outcome_links WHERE source = ${src} AND activity_id = ${activityId}`);
     let linked = 0;
     for (const outcomeId of wanted) {
-      const w = rows(await db.execute(sql`
+      const w = rows(await (await database()).execute(sql`
         INSERT INTO eims_outcome_links
           (outcome_id, source, activity_id, activity_label, employee_id, created_by_user_id)
         VALUES (${outcomeId}::uuid, ${src}, ${activityId}, ${label}, ${employeeId}, ${actorId})
@@ -1002,7 +1013,7 @@ export async function outcomesForActivity(source: string, activityId: string): P
   if (!isActivitySource(src) || !id) return [];
   try {
     await ensureOutcomeSchema();
-    return rows(await db.execute(sql`
+    return rows(await (await database()).execute(sql`
       SELECT * FROM eims_outcome_links WHERE source = ${src} AND activity_id = ${id}
        LIMIT ${MAX_LINKS}`)).map(mapLink);
   } catch (e: any) {
@@ -1020,7 +1031,7 @@ export async function linksForEmployee(employeeId: string, programmeKey: string)
   const key = programmeKeyOf(programmeKey);
   try {
     await ensureOutcomeSchema();
-    return rows(await db.execute(sql`
+    return rows(await (await database()).execute(sql`
       SELECT l.* FROM eims_outcome_links l
         JOIN eims_outcomes o ON o.id = l.outcome_id
        WHERE o.programme_key = ${key}
@@ -1136,7 +1147,7 @@ export async function assessOutcome(
 
   try {
     await ensureOutcomeSchema();
-    const w = rows(await db.execute(sql`
+    const w = rows(await (await database()).execute(sql`
       INSERT INTO eims_outcome_assessments
         (employee_id, outcome_id, attainment, comment, assessed_by_user_id, assessed_by_name)
       VALUES (${employeeId}::uuid, ${outcomeId}::uuid, ${level}, ${comment}, ${actorId}, ${actorName})
@@ -1165,7 +1176,7 @@ export async function assessmentsFor(employeeId: string): Promise<OutcomeAssessm
   if (!isUuid(employeeId)) return [];
   try {
     await ensureOutcomeSchema();
-    return rows(await db.execute(sql`
+    return rows(await (await database()).execute(sql`
       SELECT * FROM eims_outcome_assessments WHERE employee_id = ${employeeId}::uuid
        LIMIT ${MAX_OUTCOMES}`)).map(mapAssessment);
   } catch (e: any) {
@@ -1276,7 +1287,7 @@ export function deriveLinksFromHints(
 async function wellbeingTypeKeys(): Promise<Set<string>> {
   const out = new Set<string>();
   try {
-    const r = rows(await db.execute(sql`
+    const r = rows(await (await database()).execute(sql`
       SELECT key FROM eims_activity_types WHERE wellbeing = true LIMIT 100`));
     for (const t of r) out.add(String(t.key || '').toLowerCase());
   } catch (e: any) {
@@ -1303,7 +1314,7 @@ async function readEvidence(employeeId: string): Promise<{
   const byActivity = new Map<string, EvidenceFact[]>();
   const byEvidenceId = new Map<string, EvidenceFact>();
   try {
-    const r = rows(await db.execute(sql`
+    const r = rows(await (await database()).execute(sql`
       SELECT e.id::text AS id, e.title, e.url, e.type_key, e.status, e.reviewed_at,
              l.activity_kind, l.activity_id
         FROM eims_evidence e
@@ -1381,7 +1392,7 @@ export async function readActivityFacts(
   let ledgerRows: any[] = [];
   let ledgerHasHours = true;
   try {
-    ledgerRows = rows(await db.execute(sql`
+    ledgerRows = rows(await (await database()).execute(sql`
       SELECT id::text AS id, title, status, due_on, completed_at, activity_type,
              allocated_hours, reported_hours, verified_hours, verified_at, learning_outcomes
         FROM employee_tasks
@@ -1393,7 +1404,7 @@ export async function readActivityFacts(
     logFail('readActivityFacts ledger columns', e);
     ledgerHasHours = false;
     try {
-      ledgerRows = rows(await db.execute(sql`
+      ledgerRows = rows(await (await database()).execute(sql`
         SELECT id::text AS id, title, status, due_on, completed_at,
                NULL AS activity_type, NULL AS allocated_hours, NULL AS reported_hours,
                NULL AS verified_hours, NULL AS verified_at, NULL AS learning_outcomes
@@ -1443,7 +1454,7 @@ export async function readActivityFacts(
   const learningIds = (idsBySource.get('learning') || []).filter(isUuid);
   if (learningIds.length) {
     try {
-      const r = rows(await db.execute(sql`
+      const r = rows(await (await database()).execute(sql`
         SELECT la.id::text AS id, la.status, la.due_on, c.title AS course_title
           FROM hr_learning_assignments la
           LEFT JOIN training_courses c ON c.id = la.course_id
@@ -1486,7 +1497,7 @@ export async function readActivityFacts(
   const deliverableIds = (idsBySource.get('project') || []).filter(isUuid);
   if (deliverableIds.length) {
     try {
-      const r = rows(await db.execute(sql`
+      const r = rows(await (await database()).execute(sql`
         SELECT id::text AS id, name, link_url, status, due_on, accepted_on
           FROM project_deliverables
          WHERE id::text = ANY(${deliverableIds})
@@ -1535,7 +1546,7 @@ export async function readActivityFacts(
   const reportIds = (idsBySource.get('report') || []).filter(isUuid);
   if (reportIds.length) {
     try {
-      const r = rows(await db.execute(sql`
+      const r = rows(await (await database()).execute(sql`
         SELECT id::text AS id, report_date, report_url, reviewed_at
           FROM hr_daily_reports
          WHERE employee_id = ${employeeId}::uuid AND id::text = ANY(${reportIds})
@@ -1608,7 +1619,7 @@ export async function readActivityFacts(
   const assessmentIds = (idsBySource.get('assessment') || []).filter(isUuid);
   if (assessmentIds.length) {
     try {
-      const ur = rows(await db.execute(sql`
+      const ur = rows(await (await database()).execute(sql`
         SELECT user_id FROM hr_employees WHERE id = ${employeeId}::uuid LIMIT 1`))[0];
       const userId = ur?.user_id ? String(ur.user_id) : '';
       if (!userId) {
@@ -1619,7 +1630,7 @@ export async function readActivityFacts(
             + 'cannot be read. That is a missing link, not a missing attempt.',
         });
       } else {
-        const r = rows(await db.execute(sql`
+        const r = rows(await (await database()).execute(sql`
           SELECT a.test_id::text AS test_id, COUNT(*)::int AS attempts,
                  MAX(a.percentage) AS best, MAX(a.created_at) AS latest
             FROM test_attempts a
