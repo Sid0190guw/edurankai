@@ -1,4 +1,19 @@
 ---
+/**
+ * /admin/mail/analytics - delivery, opens and clicks for what this account has sent.
+ *
+ * EVERY NUMBER ON THIS PAGE COULD BE A ZERO THAT MEANT "THE QUERY FAILED". Five reads sat behind
+ * `.catch(() => [])`: the send list, the per-message recipient counts, the delivery-status roll-up
+ * and the open/click aggregates. A failure in any one of them produced the identical screen to a
+ * genuinely quiet mailbox - "Recipients 0", "Delivered 0", "Nothing sent yet" - and the operator's
+ * reasonable conclusion from that screen ("the campaign went nowhere") is the opposite of the truth
+ * it was actually reporting ("this page cannot see"). A dashboard that cannot tell an empty result
+ * from a broken read is worse than no dashboard, because it is believed.
+ *
+ * The catches stay - one broken aggregate must not blank the whole page - but each one now RECORDS
+ * that it failed and why, the banner names the affected figures, and the "nothing sent yet" empty
+ * state is withheld whenever a read did not answer.
+ */
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { ensureMailSchema, getMailboxAddress } from '@/lib/mail';
 import { campaignStatsByMessage } from '@/lib/mail-advanced';
@@ -9,7 +24,18 @@ const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 
 await ensureMailSchema();
+// Declared before everything that uses them: `const` is not hoisted.
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+const readFailures: { source: string; reason: string }[] = [];
+function noteFailure(source: string) {
+  return (e: any) => {
+    readFailures.push({ source, reason: reasonOf(e) });
+    console.error('[admin/mail/analytics] ' + source + ' read failed:', reasonOf(e));
+    return [] as any;
+  };
+}
 
 const myAddress = await getMailboxAddress(user.id).catch(() => '');
 
@@ -19,7 +45,7 @@ const sends = rows(await db.execute(sql`
   FROM mail_messages
   WHERE from_user_id = ${user.id} AND direction = 'outbound'
   ORDER BY created_at DESC LIMIT 400
-`).catch(() => [] as any));
+`).catch(noteFailure('Messages sent')));
 
 const allIds: string[] = sends.map((s: any) => s.id);
 
@@ -27,10 +53,10 @@ const allIds: string[] = sends.map((s: any) => s.id);
 const recipMap: Record<string, number> = {};
 const deliv: Record<string, number> = { sent: 0, failed: 0, other: 0 };
 if (allIds.length) {
-  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_recipients WHERE message_id = ANY(${allIds}) GROUP BY message_id`).catch(() => [] as any))) {
+  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_recipients WHERE message_id = ANY(${allIds}) GROUP BY message_id`).catch(noteFailure('Recipient counts')))) {
     recipMap[r.message_id] = Number(r.c) || 0;
   }
-  for (const r of rows(await db.execute(sql`SELECT status, COUNT(*)::int AS c FROM email_logs WHERE message_id = ANY(${allIds}) GROUP BY status`).catch(() => [] as any))) {
+  for (const r of rows(await db.execute(sql`SELECT status, COUNT(*)::int AS c FROM email_logs WHERE message_id = ANY(${allIds}) GROUP BY status`).catch(noteFailure('Delivery status')))) {
     const s = (r.status || '').toLowerCase();
     if (s === 'sent') deliv.sent += Number(r.c) || 0;
     else if (s === 'failed' || s === 'no_transport') deliv.failed += Number(r.c) || 0;
@@ -59,7 +85,11 @@ const campaigns = Array.from(campMap.values()).sort((a, b) => new Date(b.lastAt)
 // aggregates once for every message on the page and the roll-up is done here in memory. The
 // arithmetic is identical: opens/clicks are sums of per-message counts, and openedMsgs/clickedMsgs
 // are the number of the campaign's messages that appear in the map at all.
-const perMessage = await campaignStatsByMessage(allIds).catch(() => ({ opens: {}, clicks: {} } as { opens: Record<string, number>; clicks: Record<string, number> }));
+const perMessage = await campaignStatsByMessage(allIds).catch((e: any) => {
+  readFailures.push({ source: 'Opens and clicks', reason: reasonOf(e) });
+  console.error('[admin/mail/analytics] open/click read failed:', reasonOf(e));
+  return { opens: {}, clicks: {} } as { opens: Record<string, number>; clicks: Record<string, number> };
+});
 const stats: any[] = [];
 let tOpens = 0, tClicks = 0, tOpenedMsgs = 0, tClickedMsgs = 0;
 for (const c of campaigns) {
@@ -88,6 +118,13 @@ function fmt(d: any): string { return d ? new Date(d).toLocaleDateString('en-IN'
       <p class="sub">Delivery, opens and clicks for everything sent from <span class="mono">{myAddress}</span>. <a href="/admin/mail">Back to inbox</a></p>
     </div>
 
+    {readFailures.length > 0 && (
+      <div class="readfail">
+        <p class="readfail-t">Some of these figures could not be read, so the zeros below are not necessarily real.</p>
+        {readFailures.map((f: any) => (<p class="readfail-r">{f.source}: {f.reason}</p>))}
+      </div>
+    )}
+
     <div class="kpis">
       <div class="kpi"><span class="kn">{totalSends}</span><span class="kl">Messages sent</span></div>
       <div class="kpi"><span class="kn">{totalRecipients}</span><span class="kl">Recipients</span></div>
@@ -99,7 +136,9 @@ function fmt(d: any): string { return d ? new Date(d).toLocaleDateString('en-IN'
 
     <div class="card">
       <div class="card-head"><h2>By campaign (grouped by subject)</h2><span class="muted">latest 30</span></div>
-      {stats.length === 0 ? (
+      {stats.length === 0 && readFailures.length > 0 ? (
+        <p class="empty">This list could not be read. It is not a statement that nothing was sent.</p>
+      ) : stats.length === 0 ? (
         <p class="empty">Nothing sent yet. Compose and send from the <a href="/admin/mail">inbox</a> to start tracking.</p>
       ) : (
         <div class="table-wrap">
@@ -156,5 +195,8 @@ function fmt(d: any): string { return d ? new Date(d).toLocaleDateString('en-IN'
     .dim { color: #a99e94; font-size: 0.78rem; }
     .rate { font-weight: 700; color: #100b08; }
     .hint { font-size: 0.74rem; color: #a99e94; margin: 12px 0 0; line-height: 1.5; }
+    .readfail { background: rgba(220,38,38,0.07); border: 1px solid rgba(220,38,38,0.3); border-radius: 12px; padding: 12px 15px; margin-bottom: 16px; }
+    .readfail-t { font-size: 0.82rem; font-weight: 700; color: #991b1b; margin: 0 0 4px; line-height: 1.5; }
+    .readfail-r { font-size: 0.76rem; color: #991b1b; margin: 2px 0 0; line-height: 1.5; overflow-wrap: anywhere; }
   </style>
 </AdminLayout>

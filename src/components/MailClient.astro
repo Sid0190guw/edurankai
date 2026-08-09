@@ -107,6 +107,47 @@ if (threadId && dbReady) {
     : ((last.recipients || []).find((r: any) => (r.email || '').toLowerCase() !== myEmail)?.email || last.from_email || '');
 }
 
+// ------------------------------------------------------------------------------------------------
+// TEMPLATE PREFILL - the missing half of /admin/mail/templates.
+//
+// That page authors rows in `email_templates` and its own copy says to "load a template into the
+// composer". Nothing in the repository read that table: not this component, not /api/mail/send, not
+// mail.ts. The whole screen - the editor, the live preview, the active/off toggle, the Duplicate
+// button - wrote to a table with no reader, which is a feature that cannot be used, only maintained.
+// `?template=<id>` is the reader.
+//
+// SCOPED TO THE ADMIN MOUNT. This component is also mounted at /portal/employee/mail for people who
+// hold a mailbox but not the mail console; templates are console content and are not published to
+// that mount.
+//
+// AN INACTIVE TEMPLATE IS REFUSED, WITH A REASON. That is what makes the "active / off" toggle on
+// the templates page mean something: before this, `is_active` was a column nothing consulted.
+let templateSubject = '';
+let templateHtml = '';
+let templateNote = '';
+const templateId = (url.searchParams.get('template') || '').trim();
+if (templateId && basePath === '/admin/mail') {
+  try {
+    const { db } = await import('@/lib/db');
+    const { sql } = await import('drizzle-orm');
+    const tr = await db.execute(sql`
+      SELECT template_key, subject, body_html, is_active
+        FROM email_templates WHERE id = ${templateId} LIMIT 1`);
+    const t = ((Array.isArray(tr) ? tr : ((tr as any)?.rows || [])) as any[])[0];
+    if (!t) templateNote = 'That template no longer exists.';
+    else if (!t.is_active) templateNote = 'Template "' + t.template_key + '" is switched off, so it was not loaded. Turn it on in Email Templates first.';
+    else {
+      templateSubject = String(t.subject || '');
+      templateHtml = String(t.body_html || '');
+      templateNote = 'Template "' + t.template_key + '" loaded. It will be sent as HTML exactly as written - nothing substitutes {{...}} placeholders, so replace them by hand before sending.';
+    }
+  } catch (e: any) {
+    // NOT SWALLOWED, and NOT rendered as an empty composer that silently dropped the template.
+    templateNote = 'That template could not be loaded: ' + String(e?.cause?.message || e?.message || 'unknown error');
+    console.error('[MailClient] template load failed:', templateNote);
+  }
+}
+
 function stripTags(s: string) { return String(s || '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); }
 function bodyToText(m: any) { return m.body_text || stripTags(m.body_html); }
 function initialOf(s: string) { return (s || '?').trim().charAt(0).toUpperCase() || '?'; }
@@ -349,6 +390,7 @@ const folderLinks = [
         </div>
         <p style="font-size:11px;color:#6b7280;margin:-8px 0 4px;padding:0 2px;">Tip: type <code style="font-family:monospace;background:#f3f4f6;padding:1px 5px;border-radius:3px;">@group:slug</code> in any field to send to a saved group. Hidden-recipient groups auto-BCC. <a href="/admin/mail/groups" style="color:#FF4F00;text-decoration:none;">Manage groups</a></p>
         <div class="mc-field"><label>Subject</label><input type="text" id="mcSubject" placeholder="Subject" /></div>
+        <p id="mcTplNote" hidden style="font-size:11px;color:#fbbf24;margin:-4px 0 6px;padding:0 2px;line-height:1.5;"></p>
         <textarea id="mcBody" rows="9" placeholder="Write your message..."></textarea>
         <div class="mc-field"><label>Attach URL</label><input type="text" id="mcAttUrl" placeholder="https://drive... link (optional)" /></div>
         <div class="mc-att-list" id="mcAttList"></div>
@@ -493,7 +535,7 @@ const folderLinks = [
 }
 </style>
 
-<script is:inline define:vars={{ basePath, myAddress, openMessageIds: (thread || []).filter((m: any) => m.from_user_id !== user.id).map((m: any) => m.id) }}>
+<script is:inline define:vars={{ basePath, myAddress, templateSubject, templateHtml, templateNote, openMessageIds: (thread || []).filter((m: any) => m.from_user_id !== user.id).map((m: any) => m.id) }}>
 (function(){
   // Log an "open" event for every message the current user did NOT author
   // when a thread is shown - server logs it with IP + geolocation.
@@ -516,7 +558,12 @@ const folderLinks = [
   const $ = function(id){ return document.getElementById(id); };
   function openModal(title){ $('mcModalTitle').textContent = title || 'New message'; modal.hidden = false; $('mcTo').focus(); }
   function closeModal(){ modal.hidden = true; $('mcStatus').textContent=''; }
-  function clearForm(){ ['mcTo','mcCc','mcBcc','mcSubject','mcBody','mcAttUrl','mcThreadId','mcInReplyTo'].forEach(function(id){ $(id).value=''; }); if($('mcSchedule'))$('mcSchedule').value=''; if($('mcSig'))$('mcSig').checked=true; attachments=[]; renderAtts(); }
+  // htmlMode is set ONLY by a loaded template. A hand-typed message keeps the plain-text path it has
+  // always had (send.ts wraps it and escapes it); a template body is HTML the author wrote on
+  // purpose, so it is sent as bodyHtml rather than escaped into visible tags.
+  let htmlMode = false;
+  function setTplNote(text){ const n = $('mcTplNote'); if (!n) return; n.textContent = text || ''; n.hidden = !text; }
+  function clearForm(){ ['mcTo','mcCc','mcBcc','mcSubject','mcBody','mcAttUrl','mcThreadId','mcInReplyTo'].forEach(function(id){ $(id).value=''; }); if($('mcSchedule'))$('mcSchedule').value=''; if($('mcSig'))$('mcSig').checked=true; attachments=[]; htmlMode=false; setTplNote(''); renderAtts(); }
 
   let attachments = [];
   function renderAtts(){
@@ -536,6 +583,20 @@ const folderLinks = [
 
   const composeBtn = $('mcComposeBtn');
   if (composeBtn) composeBtn.addEventListener('click', function(){ clearForm(); openModal('New message'); });
+
+  // Arrived from /admin/mail/templates with ?template=<id>. The refusal cases (missing, switched
+  // off, unreadable) carry a note and NO body, so the composer opens saying why rather than opening
+  // blank and letting somebody send an empty message believing the template was in it.
+  if (templateNote) {
+    clearForm();
+    if (templateHtml || templateSubject) {
+      $('mcSubject').value = templateSubject || '';
+      $('mcBody').value = templateHtml || '';
+      htmlMode = !!templateHtml;
+    }
+    setTplNote(templateNote);
+    openModal(htmlMode ? 'New message from template' : 'New message');
+  }
   const closeBtn = $('mcClose'); if (closeBtn) closeBtn.addEventListener('click', closeModal);
   modal.addEventListener('click', function(e){ if(e.target===modal) closeModal(); });
 
@@ -564,6 +625,9 @@ const folderLinks = [
       threadId: $('mcThreadId').value || null, attachments: attachments,
       signature: $('mcSig') ? $('mcSig').checked : true,
     };
+    // A template body IS markup. Sent as `body` it would be escaped by send.ts and the recipient
+    // would read the tags; sent as `bodyHtml` it renders, and send.ts derives the text part itself.
+    if (htmlMode) { p.bodyHtml = $('mcBody').value; p.body = ''; }
     var sched = $('mcSchedule') && $('mcSchedule').value;
     if (sched) { var dt = new Date(sched); if (!isNaN(dt.getTime())) p.scheduledAt = dt.toISOString(); }
     return p;

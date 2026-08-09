@@ -20,10 +20,16 @@ const POST_KINDS = ['discussion', 'announcement', 'question'];
 let okMsg = '', errMsg = '';
 let isMember = false;
 
+// Whether the membership probe RAN. `isMember = false` after a failed read is the same screen as
+// "you are not in this club", and it is the screen that offers a Join button to somebody who is.
+let membershipKnown = true;
 try {
   const m = rows(await db.execute(sql`SELECT 1 AS x FROM club_members WHERE club_id = ${club.id} AND user_id = ${user.id} LIMIT 1`));
   isMember = m.length > 0;
-} catch (_) {}
+} catch (e: any) {
+  membershipKnown = false;
+  console.error('[portal/clubs] membership read failed -', e?.cause?.message || e?.message);
+}
 
 if (Astro.request.method === 'POST') {
   try {
@@ -31,16 +37,25 @@ if (Astro.request.method === 'POST') {
     const action = (fd.get('action') as string || '').trim();
 
     if (action === 'join') {
-      const before = rows(await db.execute(sql`SELECT 1 AS x FROM club_members WHERE club_id = ${club.id} AND user_id = ${user.id} LIMIT 1`));
-      if (before.length === 0) {
-        await db.execute(sql`INSERT INTO club_members (club_id, user_id, role) VALUES (${club.id}, ${user.id}, 'member') ON CONFLICT DO NOTHING`);
+      // READ-MODIFY-WRITE, GONE. This SELECTed for an existing membership, then INSERTed ... ON
+      // CONFLICT DO NOTHING, then bumped member_count UNCONDITIONALLY. Two taps arriving together
+      // both saw no membership and both incremented, while ON CONFLICT quietly discarded the second
+      // insert - so the club's member count climbed past the number of members it had, permanently,
+      // with nothing anywhere able to reconcile it. The counter now moves if and only if the insert
+      // returned a row, which is a fact the database supplied rather than one this page assumed.
+      const joined = rows(await db.execute(sql`
+        INSERT INTO club_members (club_id, user_id, role)
+        VALUES (${club.id}, ${user.id}, 'member')
+        ON CONFLICT DO NOTHING
+        RETURNING club_id
+      `));
+      if (joined.length > 0) {
         await db.execute(sql`UPDATE clubs SET member_count = member_count + 1 WHERE id = ${club.id}`);
-        isMember = true;
         okMsg = 'Welcome to the club.';
         club = await getClub(slug as string);
-      } else {
-        isMember = true;
       }
+      isMember = true;
+      membershipKnown = true;
     } else if (action === 'post') {
       const title = (fd.get('title') as string || '').trim();
       const body = (fd.get('body') as string || '').trim();
@@ -50,17 +65,31 @@ if (Astro.request.method === 'POST') {
       else {
         await db.execute(sql`INSERT INTO club_posts (club_id, user_id, title, body, kind) VALUES (${club.id}, ${user.id}, ${title || null}, ${body}, ${kind})`);
         await db.execute(sql`UPDATE clubs SET post_count = post_count + 1 WHERE id = ${club.id}`);
-        // Ensure the poster is also a member
-        if (!isMember) {
-          await db.execute(sql`INSERT INTO club_members (club_id, user_id, role) VALUES (${club.id}, ${user.id}, 'member') ON CONFLICT DO NOTHING`);
+        // Ensure the poster is also a member. Same rule as Join: increment on the insert's own
+        // answer, never on this page's belief about whether they were a member a moment ago -
+        // `isMember` may simply be the default left behind by a probe that failed.
+        const alsoJoined = rows(await db.execute(sql`
+          INSERT INTO club_members (club_id, user_id, role)
+          VALUES (${club.id}, ${user.id}, 'member')
+          ON CONFLICT DO NOTHING
+          RETURNING club_id
+        `));
+        if (alsoJoined.length > 0) {
           await db.execute(sql`UPDATE clubs SET member_count = member_count + 1 WHERE id = ${club.id}`);
-          isMember = true;
         }
+        isMember = true;
+        membershipKnown = true;
         okMsg = 'Posted.';
         club = await getClub(slug as string);
       }
     }
-  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 240); }
+  } catch (e: any) {
+    // e.message is only the SQL that failed - it was being printed at the reader, which taught them
+    // nothing and put the query text on a public-ish page. The real reason is on e.cause, and it
+    // goes to the log.
+    console.error('[portal/clubs] post/join failed -', e?.cause?.message || e?.message);
+    errMsg = 'That did not go through. Nothing was changed - try again in a moment.';
+  }
 }
 
 const posts = await listClubPosts(club.id);
@@ -73,11 +102,17 @@ if (authorIds.length > 0) {
     const ph = authorIds.map((id) => sql`${id}`);
     let frag: any = ph[0];
     for (let i = 1; i < ph.length; i++) frag = sql`${frag}, ${ph[i]}`;
-    const r = rows(await db.execute(sql`SELECT id, display_name, email FROM users WHERE id IN (${frag})`));
+    // users has `name`. There is no `display_name` column - it is declared nowhere in
+    // src/lib/db/schema.ts and this was the only read of it in the repository - so this statement
+    // threw on every club page that had a single post, the catch ate it, and EVERY author was
+    // rendered as "member" with an "M" avatar. The names were in the database the whole time.
+    const r = rows(await db.execute(sql`SELECT id, name, email FROM users WHERE id IN (${frag})`));
     for (const u of r) {
-      authorMap[u.id] = u.display_name || (u.email ? String(u.email).split('@')[0] : 'member');
+      authorMap[u.id] = u.name || (u.email ? String(u.email).split('@')[0] : 'member');
     }
-  } catch (_) {}
+  } catch (e: any) {
+    console.error('[portal/clubs] author names read failed -', e?.cause?.message || e?.message);
+  }
 }
 
 function relTime(d: any) {
@@ -116,16 +151,20 @@ const kindStyle = (k: string) => {
       <h1 class="font-display text-[clamp(2.2rem,4.5vw,3.4rem)] font-semibold text-ink leading-[1.05]">{club.name}</h1>
       {club.tagline && <p class="text-[1.05rem] text-ink-2 font-light leading-[1.7] mt-2">{club.tagline}</p>}
     </div>
-    {!isMember ? (
-      <form method="POST" class="m-0">
-        <input type="hidden" name="action" value="join"/>
-        <button type="submit" class="bg-burn text-white px-5 py-2.5 rounded-xl font-bold font-mono text-[0.75rem] uppercase tracking-wider">+ Join club</button>
-      </form>
-    ) : (
+    {/* Three states, not two. "Member" and "+ Join club" are both claims about this account; when
+        the membership probe did not run, neither may be made. Join stays offered because it is
+        idempotent (ON CONFLICT DO NOTHING, and the counter only moves on a real insert), but it is
+        labelled honestly rather than asserting they are outside the club. */}
+    {isMember ? (
       <span class="inline-flex items-center gap-1.5 bg-leaf-bg border border-leaf-border text-leaf font-mono text-[0.72rem] uppercase tracking-wider px-3 py-1.5 rounded-full">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
         Member
       </span>
+    ) : (
+      <form method="POST" class="m-0">
+        <input type="hidden" name="action" value="join"/>
+        <button type="submit" class="bg-burn text-white px-5 py-2.5 rounded-xl font-bold font-mono text-[0.75rem] uppercase tracking-wider">{membershipKnown ? '+ Join club' : '+ Join club (membership unread)'}</button>
+      </form>
     )}
   </div>
 

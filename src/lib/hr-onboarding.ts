@@ -116,10 +116,29 @@ export async function removeDoc(userId: string, id: number): Promise<boolean> {
   const r = rows(await db.execute(sql`DELETE FROM hr_onboarding_documents WHERE id = ${id} AND user_id = ${userId} AND status <> 'verified' RETURNING id`));
   return r.length > 0;
 }
-/** HR review. Verified documents are locked from further edits by the hire. */
-export async function reviewDoc(id: number, status: DocStatus, by: string, note?: string): Promise<void> {
+/**
+ * HR review. Verified documents are locked from further edits by the hire.
+ *
+ * IT RETURNS WHETHER ANYTHING WAS ACTUALLY REVIEWED, and it did not. This was `Promise<void>`: the
+ * UPDATE's own answer was read only to decide whether to send a notification, and the caller
+ * (/api/portal/onboarding/documents) answered `{ ok: true }` whatever happened. So a stale review
+ * queue — a document the hire withdrew, an id that never existed, a second click on a row somebody
+ * else had already actioned — printed "Saved. Reloading…" over an UPDATE that matched no row, and
+ * the reviewer believed a credential had been verified when nothing anywhere said so.
+ */
+export async function reviewDoc(id: number, status: DocStatus, by: string, note?: string): Promise<{ ok: boolean; error?: string }> {
+  if (!Number.isInteger(id) || id <= 0) {
+    return { ok: false, error: 'That is not a document on the review queue, so nothing was changed.' };
+  }
   const { db, sql } = await ctx();
   const changed = rows(await db.execute(sql`UPDATE hr_onboarding_documents SET status = ${status}, review_note = ${note || null}, reviewed_by = ${by}, reviewed_at = now() WHERE id = ${id} RETURNING user_id, doc_type, title`));
+  if (!changed.length) {
+    return {
+      ok: false,
+      error: 'That document is no longer on the review queue — the hire may have withdrawn it, or '
+        + 'somebody else has already actioned it. Nothing was changed. Reload the list.',
+    };
+  }
 
   // THE PERSON WHOSE DOCUMENT IT IS GETS TOLD.
   //
@@ -165,6 +184,8 @@ export async function reviewDoc(id: number, status: DocStatus, by: string, note?
     // record could vanish with nothing anywhere noting that it had.
     console.error('[hr-onboarding] the audit record for document', id, 'review by', by, 'was NOT written -', e?.cause?.message || e?.message);
   }
+
+  return { ok: true };
 }
 /** Everything awaiting HR, newest first, with who submitted it. */
 export async function pendingForReview(limit = 100): Promise<any[]> {

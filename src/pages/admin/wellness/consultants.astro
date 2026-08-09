@@ -1,0 +1,458 @@
+---
+/**
+ * /admin/wellness/consultants — appointing the wellness consultant pool.
+ *
+ * WHY IT IS A SEPARATE PAGE FROM /admin/wellness.
+ * That page is aggregate-only by design and says so at the top: no query on it returns a row per
+ * person. A consultant list IS a row per person, so it lives here instead of quietly breaking that
+ * promise. What this page shows is an appointment — a name, a stated qualification, and whether the
+ * appointment is active. It is administrative information about a job, not health information about
+ * anybody.
+ *
+ * WHAT APPOINTING SOMEBODY DOES AND DOES NOT DO.
+ * It writes a row in wellness_consultants. That row is what src/lib/wellness.ts checks, on the
+ * server, on every consultant call, before it will return a single request. It does NOT give the
+ * administrator who made the appointment any ability to read a request: there is no screen in this
+ * console that shows one, and adding yourself to the pool would put your name on the requester's
+ * form as the person who is about to read her note. The act is visible to the person it affects.
+ *
+ * WHY 'audit.view'. It is the existing oversight permission (super_admin only) and it is what
+ * /admin/wellness already asks for, so the pool is administered by exactly the accounts that
+ * already administer the programme. Inventing a new permission key here would evaluate to false for
+ * every role including super_admin and make this page unreachable — a mistake this repository has
+ * already shipped once.
+ *
+ * NO JAVASCRIPT. Three forms, all posting to this URL, all redirecting after a successful write.
+ */
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import '@/styles/wellness.css';
+import Card from '@/components/wellness/Card.astro';
+import Notice from '@/components/wellness/Notice.astro';
+import EmptyState from '@/components/wellness/EmptyState.astro';
+import {
+  listConsultants,
+  upsertConsultant,
+  setConsultantActive,
+  findAccountForConsultant,
+  type ConsultantRow,
+} from '@/lib/wellness';
+
+// --- constants, declared above the POST handler that uses them ---------------------------------
+
+const PAGE_PATH = '/admin/wellness/consultants';
+const MAX_NAME = 200;
+const MAX_CREDENTIALS = 200;
+const MAX_FOCUS = 500;
+
+const currentUser = Astro.locals.user;
+if (!currentUser) return Astro.redirect('/admin/login');
+if (!can(currentUser, 'audit.view')) return Astro.redirect('/admin');
+
+// --- POST --------------------------------------------------------------------------------------
+let errMsg = '';
+let keptEmail = '';
+let keptName = '';
+let keptCredentials = '';
+let keptFocus = '';
+
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const intent = String(fd.get('intent') || '');
+
+    if (intent === 'set_active') {
+      const targetId = String(fd.get('user_id') || '').trim();
+      const active = String(fd.get('active') || '') === '1';
+      const res = await setConsultantActive(targetId, active);
+      if (res.ok) return Astro.redirect(PAGE_PATH + (active ? '?reactivated=1' : '?stood_down=1'));
+      errMsg = 'That change did not save. The appointment is unchanged.';
+    } else if (intent === 'appoint') {
+      keptEmail = String(fd.get('email') || '').trim();
+      keptName = String(fd.get('display_name') || '').trim().slice(0, MAX_NAME);
+      keptCredentials = String(fd.get('credentials') || '').trim().slice(0, MAX_CREDENTIALS);
+      keptFocus = String(fd.get('focus') || '').trim().slice(0, MAX_FOCUS);
+
+      // The account is resolved from the address typed here, never from a user id in the form body:
+      // an id in a request body is the account-takeover shape this project has already shipped once.
+      const found = await findAccountForConsultant(keptEmail);
+      if (!found.ok) {
+        errMsg = 'We could not look that address up just now, so nothing has been appointed. Reason recorded: ' + found.reason;
+      } else if (!found.value) {
+        errMsg = 'No account on this system uses that email address. A consultant needs an account here first, because the appointment is attached to it.';
+      } else {
+        const res = await upsertConsultant({
+          userId: found.value.id,
+          displayName: keptName || found.value.name || found.value.email,
+          credentials: keptCredentials || null,
+          focus: keptFocus || null,
+          isActive: true,
+        });
+        if (res.ok) return Astro.redirect(PAGE_PATH + '?appointed=' + encodeURIComponent(found.value.email));
+        errMsg = res.error || 'That did not save. Nobody has been appointed.';
+      }
+    }
+  } catch (e: any) {
+    // Never swallowed: this is a write path.
+    console.error('[admin/wellness/consultants]', e?.cause?.message || e?.message);
+    errMsg = 'That did not save. Please try once more.';
+  }
+}
+
+// --- GET ---------------------------------------------------------------------------------------
+const appointed = (Astro.url.searchParams.get('appointed') || '').trim();
+const stoodDown = Astro.url.searchParams.get('stood_down') === '1';
+const reactivated = Astro.url.searchParams.get('reactivated') === '1';
+
+// activeOnly = false: standing somebody down must not make them disappear from the screen that
+// stood them down, or nobody can ever put them back.
+const poolRead = await listConsultants(false);
+const pool: ConsultantRow[] = poolRead.ok ? poolRead.value : [];
+const poolFailed = !poolRead.ok;
+const poolReason = poolRead.ok ? '' : poolRead.reason;
+const activeCount = pool.filter((c) => c.isActive).length;
+---
+
+<AdminLayout title="Wellness consultants" activeNav="wellness">
+  <main class="wa" data-module="therapy">
+    <div class="wa-inner">
+
+      <a class="wa-back" href="/admin/wellness">Back to programme oversight</a>
+
+      <header class="wa-head">
+        <p class="wa-eyebrow">Wellness programme</p>
+        <h1 class="wa-title">The consultant pool</h1>
+        <p class="wa-lede">
+          Who may read a consultation request. Membership of this pool is the only thing in the system
+          that opens one, it is checked on the server on every read, and it is not implied by any
+          role or by administering this page.
+        </p>
+      </header>
+
+      <Notice kind="info" title="What this page can and cannot do">
+        <p class="wa-p">
+          Appointing somebody records a name and a stated qualification against their account. It
+          shows no cycle, no symptom, no request and no reply, and it gives the administrator making
+          the appointment no ability to read any of those. A consultant's name appears on the request
+          form, so the woman writing knows who is about to read her note.
+        </p>
+      </Notice>
+
+      {errMsg && (
+        <Notice kind="urgent" title="That did not go through" class="wa-still">
+          <p class="wa-p">{errMsg}</p>
+        </Notice>
+      )}
+
+      {appointed && !errMsg && (
+        <Notice kind="info" title="Appointed">
+          <p class="wa-p">{appointed} is now an active member of the pool and can open the consultant queue.</p>
+        </Notice>
+      )}
+
+      {stoodDown && !errMsg && (
+        <Notice kind="info" title="Stood down">
+          <p class="wa-p">
+            That appointment is no longer active. Requests already routed to them stay routed; move
+            them on from the consultant queue if somebody else should answer.
+          </p>
+        </Notice>
+      )}
+
+      {reactivated && !errMsg && (
+        <Notice kind="info" title="Reactivated">
+          <p class="wa-p">That appointment is active again.</p>
+        </Notice>
+      )}
+
+      <section class="wa-section" aria-labelledby="pool-h">
+        <h2 class="wa-section-h" id="pool-h">Appointed consultants</h2>
+
+        {poolFailed ? (
+          <Card module="therapy" padding="lg" as="section" class="wa-still">
+            <h3 class="wa-card__title">The pool could not be read</h3>
+            <p class="wa-p">
+              We cannot tell you who is appointed right now, so we are not going to show an empty
+              list and let you conclude that nobody is. Appointing somebody while this is failing
+              would be appointing them blind.
+            </p>
+            <p class="wa-p wa-muted">Reason recorded: {poolReason}</p>
+          </Card>
+        ) : pool.length === 0 ? (
+          <EmptyState
+            module="therapy"
+            title="Nobody is appointed"
+            body="Until at least one consultant is appointed and active, a request sent from the consultation form cannot be read or answered by anyone."
+            headingLevel={3}
+          />
+        ) : (
+          <ul class="wa-list">
+            {pool.map((c) => (
+              <li class="wa-item">
+                <Card module="therapy" padding="lg" as="article">
+                  <div class="wa-item-head">
+                    <h3 class="wa-card__title">{c.displayName}</h3>
+                    <span class="wa-status">{c.isActive ? 'Active' : 'Stood down'}</span>
+                  </div>
+                  {c.credentials && <p class="wa-p">{c.credentials}</p>}
+                  {c.focus && <p class="wa-p wa-muted">{c.focus}</p>}
+                  <form method="POST" class="wa-inline">
+                    <input type="hidden" name="intent" value="set_active" />
+                    <input type="hidden" name="user_id" value={c.userId} />
+                    <input type="hidden" name="active" value={c.isActive ? '0' : '1'} />
+                    <button class="wa-quiet" type="submit">
+                      {c.isActive ? 'Stand this appointment down' : 'Make this appointment active again'}
+                    </button>
+                  </form>
+                </Card>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {!poolFailed && pool.length > 0 && activeCount === 0 && (
+          <Notice kind="urgent" title="Nobody in the pool is active" class="wa-still">
+            <p class="wa-p">
+              Every appointment is stood down, so a request sent right now cannot be read or answered
+              by anybody. The consultation form is still open and still accepts notes.
+            </p>
+          </Notice>
+        )}
+      </section>
+
+      <section class="wa-section" aria-labelledby="appoint-h">
+        <h2 class="wa-section-h" id="appoint-h">Appoint somebody</h2>
+
+        <Card module="therapy" padding="lg" as="section">
+          <form method="POST" class="wa-form">
+            <input type="hidden" name="intent" value="appoint" />
+
+            <div class="wa-field">
+              <label class="wa-label" for="email">Their email address on this system</label>
+              <input class="wa-input" type="email" id="email" name="email" value={keptEmail} required aria-describedby="email-hint" />
+              <p class="wa-hint" id="email-hint">
+                The account must already exist here. The appointment is attached to that account, and
+                an address that matches nothing is refused rather than creating anybody.
+              </p>
+            </div>
+
+            <div class="wa-field">
+              <label class="wa-label" for="display_name">The name to show her</label>
+              <input class="wa-input" type="text" id="display_name" name="display_name" value={keptName} maxlength={MAX_NAME} aria-describedby="name-hint" />
+              <p class="wa-hint" id="name-hint">
+                Shown on the consultation form next to "who should read it". Left blank, the name on
+                the account is used.
+              </p>
+            </div>
+
+            <div class="wa-field">
+              <label class="wa-label" for="credentials">Qualification, as it should be stated</label>
+              <input class="wa-input" type="text" id="credentials" name="credentials" value={keptCredentials} maxlength={MAX_CREDENTIALS} aria-describedby="cred-hint" />
+              <p class="wa-hint" id="cred-hint">
+                Printed to the woman choosing who reads her note, so state what is true and nothing
+                more. This system does not verify it.
+              </p>
+            </div>
+
+            <div class="wa-field">
+              <label class="wa-label" for="focus">What they handle</label>
+              <input class="wa-input" type="text" id="focus" name="focus" value={keptFocus} maxlength={MAX_FOCUS} />
+            </div>
+
+            <button class="wa-submit" type="submit">Appoint to the pool</button>
+          </form>
+        </Card>
+      </section>
+    </div>
+  </main>
+</AdminLayout>
+
+<style>
+  /* Tokens from src/styles/wellness.css. No literal colours. */
+
+  .wa {
+    background-color: var(--w-ground);
+    color: var(--w-ink);
+    font-family: var(--w-font-text);
+    font-size: var(--w-text-base);
+    line-height: var(--w-leading-relaxed);
+  }
+
+  .wa-inner {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: var(--w-container-readable);
+    margin: 0 auto;
+    padding: var(--w-space-5) var(--w-space-4) var(--w-space-10);
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-space-5);
+  }
+
+  .wa-back {
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--w-tap-min);
+    color: var(--w-ink-3);
+    font-size: var(--w-text-caption);
+    text-decoration: none;
+  }
+  .wa-back:hover { color: var(--w-ink); }
+  .wa-back:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: var(--w-focus-offset);
+    border-radius: var(--w-radius-xs);
+  }
+
+  .wa-head { margin: 0; }
+
+  .wa-eyebrow {
+    margin: 0 0 var(--w-space-2);
+    font-size: var(--w-text-label);
+    font-weight: var(--w-weight-semibold);
+    letter-spacing: var(--w-tracking-wide);
+    text-transform: uppercase;
+    color: var(--w-ink-3);
+  }
+
+  .wa-title {
+    margin: 0 0 var(--w-space-3);
+    font-family: var(--w-font-display);
+    font-size: var(--w-text-h1);
+    font-weight: var(--w-weight-regular);
+    line-height: var(--w-leading-tight);
+    letter-spacing: var(--w-tracking-tight);
+    color: var(--w-ink);
+  }
+
+  .wa-lede { margin: 0; color: var(--w-ink-2); text-wrap: pretty; }
+
+  .wa-section { display: flex; flex-direction: column; gap: var(--w-space-4); }
+
+  .wa-section-h {
+    margin: 0;
+    font-family: var(--w-font-display);
+    font-size: var(--w-text-h2);
+    font-weight: var(--w-weight-regular);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink);
+  }
+
+  .wa-card__title {
+    margin: 0;
+    font-size: var(--w-text-h3);
+    font-weight: var(--w-weight-medium);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink);
+    overflow-wrap: anywhere;
+  }
+
+  .wa-p { margin: var(--w-space-2) 0 0; color: var(--w-ink-2); overflow-wrap: anywhere; }
+  .wa-muted { color: var(--w-ink-3); }
+  .wa-still { animation: none; transition: none; }
+
+  .wa-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-space-3);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .wa-item { min-width: 0; }
+
+  .wa-item-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--w-space-2);
+  }
+
+  .wa-status {
+    flex: 0 0 auto;
+    padding: var(--w-space-1) var(--w-space-3);
+    background-color: var(--w-surface-sunk);
+    border-radius: var(--w-radius-pill);
+    font-size: var(--w-text-caption);
+    color: var(--w-ink-2);
+  }
+
+  .wa-inline { margin-top: var(--w-space-3); }
+
+  .wa-form { display: flex; flex-direction: column; gap: var(--w-space-5); }
+  .wa-field { display: block; }
+
+  .wa-label {
+    display: block;
+    margin: 0 0 var(--w-space-2);
+    font-size: var(--w-text-base);
+    font-weight: var(--w-weight-medium);
+    color: var(--w-ink);
+  }
+
+  .wa-hint {
+    margin: var(--w-space-2) 0 0;
+    font-size: var(--w-text-caption);
+    line-height: var(--w-leading-normal);
+    color: var(--w-ink-3);
+  }
+
+  .wa-input {
+    box-sizing: border-box;
+    display: block;
+    width: 100%;
+    min-height: var(--w-tap-min);
+    padding: var(--w-space-3);
+    background-color: var(--w-surface-sunk);
+    color: var(--w-ink);
+    border: var(--w-border-width) solid var(--w-hairline-strong);
+    border-radius: var(--w-radius-sm);
+    font-family: var(--w-font-text);
+    font-size: var(--w-text-base);
+  }
+  .wa-input:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: 1px;
+  }
+
+  .wa-submit {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    align-self: flex-start;
+    min-height: var(--w-tap-min);
+    padding: var(--w-space-3) var(--w-space-6);
+    background-color: var(--w-module-text);
+    color: var(--w-ink-on-fill);
+    border: 0;
+    border-radius: var(--w-radius-pill);
+    font-family: var(--w-font-text);
+    font-size: var(--w-text-base);
+    font-weight: var(--w-weight-medium);
+    cursor: pointer;
+  }
+  .wa-submit:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: 3px;
+  }
+
+  .wa-quiet {
+    min-height: var(--w-tap-min);
+    padding: 0;
+    background: none;
+    border: 0;
+    color: var(--w-ink-2);
+    font-family: var(--w-font-text);
+    font-size: var(--w-text-caption);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+  .wa-quiet:hover { color: var(--w-ink); }
+  .wa-quiet:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: var(--w-focus-offset);
+    border-radius: var(--w-radius-xs);
+  }
+</style>

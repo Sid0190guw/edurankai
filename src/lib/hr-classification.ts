@@ -47,13 +47,17 @@ export const CLASSIFICATIONS = {
   volunteer:   { label: 'Volunteer / unpaid',    risk: 'high', description: 'Unpaid contributor. Use sparingly; check local labour law.' },
 };
 
+// NO REAL COMPANY IS NAMED HERE. Two of these descriptions listed named Employer-of-Record vendors
+// and named talent marketplaces. They are not rendered today — the register draws `label` only — but
+// they sit one `{v.description}` away from being user-facing copy, and this codebase's rule is that
+// no competitor and no real company is named on any surface. Described by what they are instead.
 export const ENGAGEMENT_VIAS = {
   direct_payroll:   { label: 'Direct payroll',    description: 'We pay them directly through our entity' },
-  eor_partner:      { label: 'EOR partner',       description: 'Our Employer-of-Record (e.g. Remote / Deel / Velocity) employs them' },
+  eor_partner:      { label: 'EOR partner',       description: 'An Employer-of-Record partner employs them in their own country and handles local payroll and compliance' },
   staffing_agency:  { label: 'Staffing agency',   description: 'Third-party agency provides the worker' },
   intern_programme: { label: 'Intern programme',  description: 'Paid intern via our intern-to-FT pipeline' },
   contractor_direct:{ label: 'Direct contractor', description: 'Invoiced contractor with their own entity' },
-  marketplace:      { label: 'Talent marketplace',description: 'Engaged via Toptal / Upwork / similar' },
+  marketplace:      { label: 'Talent marketplace',description: 'Engaged through a third-party freelance marketplace' },
 };
 
 export const COUNTRY_CODES = [

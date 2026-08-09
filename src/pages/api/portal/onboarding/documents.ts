@@ -35,7 +35,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
       const allowed = await canAccessSection(user, 'employees', 'edit').catch(() => false);
       if (!allowed) return json({ ok: false, error: 'Not allowed.' }, 403);
       const status = b.status === 'verified' ? 'verified' : b.status === 'rejected' ? 'rejected' : 'submitted';
-      await reviewDoc(Number(b.id), status as any, uid, b.note ? String(b.note).slice(0, 300) : undefined);
+      // THE REVIEW'S OWN ANSWER IS RETURNED. This was `await reviewDoc(...); return json({ ok: true })`,
+      // so an UPDATE that matched no row — a withdrawn document, a stale queue, a second click on a
+      // row somebody else had already actioned — came back as a success the console printed as
+      // "Saved. Reloading…". reviewDoc() now says which happened; this says it out loud.
+      const done = await reviewDoc(Number(b.id), status as any, uid, b.note ? String(b.note).slice(0, 300) : undefined);
+      if (!done.ok) return json({ ok: false, error: done.error || 'Nothing was changed.' }, 409);
       return json({ ok: true });
     }
     return json({ ok: false, error: 'unknown action' }, 400);

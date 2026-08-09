@@ -3,6 +3,7 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { can } from '@/lib/auth/permissions';
+import { ensureOnce } from '@/lib/ensure-once';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
@@ -29,7 +30,11 @@ let okMsg = '';
 let errMsg = '';
 
 // --- self-bootstrap schema ---
-try {
+// Once per process, not twice per page load, and the reason for a failure reaches the log instead of
+// an empty catch. When the DDL does not run, the four reads below fail and SAY they failed; they no
+// longer print "No upcoming classes" over a table that was never created.
+await ensureOnce('live_classes_v1', async () => {
+ try {
   await db.execute(sql`
     CREATE TABLE IF NOT EXISTS live_classes (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -55,7 +60,11 @@ try {
       PRIMARY KEY(class_id, user_id)
     )
   `);
-} catch (_) {}
+ } catch (e: any) {
+  console.error('[portal/liveclass] schema bootstrap failed -', e?.cause?.message || e?.message);
+  throw e;
+ }
+});
 
 // --- POST handlers (enroll / unenroll) ---
 if (Astro.request.method === 'POST') {
@@ -64,25 +73,49 @@ if (Astro.request.method === 'POST') {
   const classId = (fd.get('class_id') as string) || '';
   try {
     if (action === 'enroll' && classId) {
-      // capacity check
-      const cap = rows(await db.execute(sql`
-        SELECT capacity, enrolled_count FROM live_classes WHERE id = ${classId} LIMIT 1
-      `))[0];
-      if (cap && Number(cap.enrolled_count) >= Number(cap.capacity)) {
-        errMsg = 'This class is full.';
+      // THE SEAT IS TAKEN IN ONE STATEMENT, AND THE ENROLMENT IS WRITTEN ONLY IF THERE WAS ONE.
+      //
+      // The capacity test used to be a SELECT, a comparison in JavaScript, and then an unconditional
+      // increment. Two people reserving the last seat together both read enrolled_count < capacity
+      // and both were enrolled - a room of 50 sold 51 seats, and nothing afterwards could tell which
+      // of them was the extra. It also failed OPEN: when the class row could not be read at all,
+      // `cap` was undefined, the test was skipped, and the seat was granted regardless.
+      //
+      // The condition now lives inside the UPDATE, so the row is locked while it is evaluated and
+      // exactly one caller wins the last seat. Zero rows back is the refusal - either the class is
+      // full or it does not exist - and it is reported rather than assumed away.
+      const already = rows(await db.execute(sql`
+        SELECT 1 AS x FROM live_class_enrollments WHERE class_id = ${classId} AND user_id = ${user.id} LIMIT 1
+      `));
+      if (already.length > 0) {
+        okMsg = 'You already have a seat in this class.';
       } else {
-        const ins = await db.execute(sql`
-          INSERT INTO live_class_enrollments (class_id, user_id)
-          VALUES (${classId}, ${user.id})
-          ON CONFLICT DO NOTHING
-          RETURNING class_id
-        `);
-        if (rows(ins).length > 0) {
-          await db.execute(sql`
-            UPDATE live_classes SET enrolled_count = enrolled_count + 1 WHERE id = ${classId}
-          `);
+        const seat = rows(await db.execute(sql`
+          UPDATE live_classes
+             SET enrolled_count = COALESCE(enrolled_count, 0) + 1
+           WHERE id = ${classId}
+             AND COALESCE(enrolled_count, 0) < COALESCE(capacity, 0)
+          RETURNING id
+        `));
+        if (seat.length === 0) {
+          errMsg = 'This class is full, or it is no longer listed. Nothing was reserved.';
+        } else {
+          const ins = rows(await db.execute(sql`
+            INSERT INTO live_class_enrollments (class_id, user_id)
+            VALUES (${classId}, ${user.id})
+            ON CONFLICT DO NOTHING
+            RETURNING class_id
+          `));
+          if (ins.length > 0) {
+            okMsg = 'Enrolled. See you in class.';
+          } else {
+            // The seat was counted a moment ago and no enrolment row followed it. Give it back:
+            // a counter that drifts above the seats actually held turns into a room that refuses
+            // people while it is half empty.
+            await db.execute(sql`UPDATE live_classes SET enrolled_count = GREATEST(0, COALESCE(enrolled_count, 0) - 1) WHERE id = ${classId}`);
+            okMsg = 'You already have a seat in this class.';
+          }
         }
-        okMsg = 'Enrolled. See you in class.';
       }
     } else if (action === 'unenroll' && classId) {
       const del = await db.execute(sql`
@@ -144,13 +177,21 @@ let upcoming: any[] = [];
 let liveNow: any[] = [];
 let past: any[] = [];
 let myEnrollments = new Set<string>();
+// "There are no classes" is a claim about the timetable. Over a read that threw it is a false one,
+// and it was being made three times a page from three empty catches. Each read now records whether
+// it happened, and the tab says so.
+let classesError: string | null = null;
+let enrolmentsKnown = true;
 
 try {
   const enr = rows(await db.execute(sql`
     SELECT class_id FROM live_class_enrollments WHERE user_id = ${user.id}
   `));
   for (const e of enr) myEnrollments.add(e.class_id);
-} catch (_) {}
+} catch (e: any) {
+  enrolmentsKnown = false;
+  console.error('[portal/liveclass] enrolment read failed -', e?.cause?.message || e?.message);
+}
 
 try {
   const r = rows(await db.execute(sql`
@@ -162,7 +203,10 @@ try {
     LIMIT 50
   `));
   upcoming = r;
-} catch (_) {}
+} catch (e: any) {
+  classesError = String(e?.cause?.message || e?.message || 'unknown database error');
+  console.error('[portal/liveclass] upcoming read failed -', classesError);
+}
 
 try {
   const r = rows(await db.execute(sql`
@@ -175,7 +219,10 @@ try {
     LIMIT 20
   `));
   liveNow = r;
-} catch (_) {}
+} catch (e: any) {
+  classesError = String(e?.cause?.message || e?.message || 'unknown database error');
+  console.error('[portal/liveclass] liveNow read failed -', classesError);
+}
 
 try {
   const r = rows(await db.execute(sql`
@@ -188,7 +235,10 @@ try {
     LIMIT 40
   `));
   past = r;
-} catch (_) {}
+} catch (e: any) {
+  classesError = String(e?.cause?.message || e?.message || 'unknown database error');
+  console.error('[portal/liveclass] past read failed -', classesError);
+}
 
 function timeUntil(d: any): string {
   if (!d) return '';
@@ -334,7 +384,15 @@ const listForTab = tab === 'live' ? liveNow : tab === 'past' ? past : upcoming;
     </a>
   </div>
 
-  {listForTab.length === 0 ? (
+  {listForTab.length === 0 && classesError ? (
+    <div class="lc-empty">
+      {/* The timetable could not be read. Saying "No classes here yet" over that is the one thing
+          this screen must not do: it is a statement about the schedule, and the schedule was never
+          seen. The reason is in the log, not on the page. */}
+      <strong>The timetable could not be read</strong>
+      This is not the same as there being nothing scheduled. Reload in a moment; if it keeps happening, tell us and quote the time.
+    </div>
+  ) : listForTab.length === 0 ? (
     <div class="lc-empty">
       <strong>No classes here yet</strong>
       {tab === 'upcoming' && (canHost
@@ -344,6 +402,14 @@ const listForTab = tab === 'live' ? liveNow : tab === 'past' ? past : upcoming;
       {tab === 'past' && 'A class moves here once its scheduled end time has passed. Its recording appears only if a host records one against it.'}
     </div>
   ) : (
+    <div>
+    {!enrolmentsKnown && (
+      /* Which seats this person already holds could not be read, so every card below shows
+         "Reserve seat" - including for classes they are already in. Say so, rather than let the
+         button imply they have none. Pressing it is harmless either way: the handler checks for an
+         existing seat before it touches the counter. */
+      <p class="lc-empty" style="padding:14px 16px;text-align:left;margin-bottom:12px;">Your own reservations could not be read just now, so the buttons below do not show which classes you are already in.</p>
+    )}
     <div class="lc-grid">
       {listForTab.map((c: any) => {
         const cap = Number(c.capacity || 50);
@@ -440,6 +506,7 @@ const listForTab = tab === 'live' ? liveNow : tab === 'past' ? past : upcoming;
           </div>
         );
       })}
+    </div>
     </div>
   )}
 </main>
