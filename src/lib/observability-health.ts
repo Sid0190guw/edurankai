@@ -326,10 +326,26 @@ export async function bootstrapStatus(): Promise<{ module: string; table: string
   const names = BOOTSTRAP_MODULES.map((m) => m.table);
   try {
     const { db, sql } = await ctx();
-    const r = rows(await db.execute(sql`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ANY(${names})`));
+    // = ANY(${jsArray}) FAILS against this driver: the array arrives as a plain parameter, not a
+    // typed text[], and Postgres answers "op ANY/ALL (array) requires array on right side". So this
+    // query threw on EVERY call, the catch below turned that into present:false for all ten, and
+    // /api/health reported "10 module table(s) not yet created" as a fact — for weeks, while never
+    // once having looked. The founder pressed the repair button repeatedly against a check that
+    // could not have noticed if it worked.
+    //
+    // An IN list of individual placeholders is unambiguous and needs no cast.
+    const placeholders = sql.join(names.map((t) => sql`${t}`), sql`, `);
+    const r = rows(await db.execute(sql`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name IN (${placeholders})`));
     const present = new Set(r.map((x: any) => String(x.table_name)));
     return BOOTSTRAP_MODULES.map((m) => ({ ...m, present: present.has(m.table) }));
-  } catch {
+  } catch (e: any) {
+    // STILL fails closed — an unreadable check must not report health — but no longer silently.
+    // A swallowed catch is what let a permanently broken query masquerade as a finding about the
+    // database, and the real reason lives on e.cause, never on e.message.
+    console.error('[health] bootstrapStatus could not read information_schema:',
+      e?.cause?.message || e?.message || 'unknown error');
     return BOOTSTRAP_MODULES.map((m) => ({ ...m, present: false }));
   }
 }
