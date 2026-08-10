@@ -336,6 +336,23 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     gate: 'requireEmployee (workspace.astro:45); every query narrowed by employeeFilter(ws) in the WHERE clause.',
   },
   {
+    // DELEGATION LIVES IN THE PORTAL because it is not something done TO a person: it is a person
+    // deciding somebody may act for them while they are away. The one who decides is the one whose
+    // authority it is, so the screen belongs beside their leave, not in a console they never open.
+    //
+    // Ranked below the daily surfaces on purpose. Handing authority over is a considered act
+    // performed occasionally, not a thing anybody needs on the bar; it lives behind More, where a
+    // person goes when they are already thinking about being away.
+    key: 'delegation',
+    label: 'Acting for each other',
+    href: '/portal/employee/delegation',
+    icon: 'user',
+    group: 'account',
+    bar: 22,
+    audience: keptAny('leave.mine', 'leave.balance', 'clock.today', 'attendance.month'),
+    gate: 'Page: signed in, then its own employeeIdForUser lookup. The principal is always the signed-in person and is never a form field, so no request can give away somebody else authority.',
+  },
+  {
     key: 'leave',
     label: 'Leave',
     href: '/portal/employee/leave',

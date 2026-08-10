@@ -1,0 +1,312 @@
+---
+// /portal/employee/delegation — HAND SOMETHING OVER, AND TAKE IT BACK.
+//
+// =================================================================================================
+// WHY THIS IS IN THE PORTAL AND NOT THE ADMIN CONSOLE
+// =================================================================================================
+//
+// Delegation is not an administrative act performed upon somebody. It is a person deciding that
+// while they are away, or busy, or travelling, another person may act for them. The one who decides
+// is the one whose authority it is — so the screen belongs where that person already is, next to
+// their leave and their attendance, and not in a console most of them never open.
+//
+// It also means the founder can hand their approval queue to an assistant from a phone, which is
+// the thing actually being asked for. What it is NOT is an admin console in the portal: there is
+// one implementation of delegation (src/lib/delegation.ts) and one of the graph write it performs
+// (openRelationship), and this page calls them rather than repeating them.
+//
+// =================================================================================================
+// WHAT THE PAGE REFUSES TO LET SOMEBODY DO BY ACCIDENT
+// =================================================================================================
+//
+// An end date is REQUIRED and capped. The commonest way a temporary authority becomes a permanent
+// one is that nobody ever switches it off, so there is nothing here to switch off: it expires.
+//
+// The things that can never be handed over are listed ON THE PAGE, not hidden in a module. Somebody
+// granting authority is entitled to see the edge of it. A person who cannot see the limit assumes
+// there is none.
+//
+// Ending a delegation is one press, always available, and never asks for confirmation. Withdrawing
+// authority must be cheaper than granting it, or people hesitate at the moment they should not.
+//
+// const BEFORE THE HANDLER — `const` is not hoisted and that has taken pages down here.
+// MOBILE FIRST: 360px, 44px targets.
+// =================================================================================================
+
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import {
+  DELEGABLE_DOMAINS, DOMAIN_LABELS, NEVER_DELEGABLE, MAX_DELEGATION_DAYS,
+  checkGrant, grantDelegation, endDelegation, delegationsGrantedBy, delegationsHeldBy,
+  type DelegableDomain,
+} from '@/lib/delegation';
+import { employeeIdForUser } from '@/lib/org-graph';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+
+const CARD = 'background:var(--surface,#fff);border:1px solid rgba(0,0,0,0.10);border-radius:14px;padding:16px 18px;';
+const HD = "font-size:10.5px;text-transform:uppercase;letter-spacing:0.12em;font-weight:700;opacity:0.6;margin:0 0 10px;";
+
+let notice = '';
+let problems: string[] = [];
+
+/** Resolved once. Every read and write below is scoped to this person and nobody else. */
+let myEmployeeId: string | null = null;
+let lookupFailed = '';
+try {
+  myEmployeeId = await employeeIdForUser(String(user.id));
+} catch (e: any) {
+  lookupFailed = e?.cause?.message || e?.message || 'unknown error';
+}
+
+if (Astro.request.method === 'POST' && myEmployeeId) {
+  const form = await Astro.request.formData().catch(() => null);
+  const action = String(form?.get('action') || '');
+
+  if (action === 'grant') {
+    const domains = (form?.getAll('domains') || []).map(String) as DelegableDomain[];
+    const input = {
+      // The principal is ALWAYS the signed-in person. It is not a form field, so no request can
+      // grant away somebody else's authority by naming them.
+      principalEmployeeId: myEmployeeId,
+      delegateEmployeeId: String(form?.get('delegate') || ''),
+      domains,
+      from: String(form?.get('from') || ''),
+      until: String(form?.get('until') || ''),
+      reason: String(form?.get('reason') || ''),
+      actorUserId: String(user.id),
+    };
+    const pre = checkGrant(input as any);
+    if (!pre.ok) {
+      problems = pre.problems;
+    } else {
+      const res = await grantDelegation(input as any);
+      if (res.ok) {
+        notice = res.error
+          ? 'Delegation created. ' + res.error
+          : 'Done. They can act for you until the date you set, and not after it.';
+      } else {
+        problems = [res.error || 'The delegation could not be created.'];
+      }
+    }
+  }
+
+  if (action === 'end') {
+    const res = await endDelegation(
+      String(form?.get('id') || ''), String(user.id), String(form?.get('reason') || 'Ended by the principal'));
+    if (res.ok) notice = 'Ended. They can no longer act for you.';
+    else problems = [res.error || 'It could not be ended.'];
+  }
+}
+
+// Read AFTER any write, so the page shows the result of what just happened.
+const granted = myEmployeeId ? await delegationsGrantedBy(myEmployeeId) : { rows: [], error: null };
+const held = myEmployeeId ? await delegationsHeldBy(myEmployeeId) : { rows: [], error: null };
+
+/** Roster for the picker: colleagues this person could hand something to. */
+let roster: { id: string; name: string }[] = [];
+let rosterError = '';
+try {
+  const { db } = await import('@/lib/db');
+  const { sql } = await import('drizzle-orm');
+  const r: any = await db.execute(sql`
+    SELECT id, full_name FROM hr_employees
+    WHERE is_active = true AND id <> ${myEmployeeId}
+    ORDER BY full_name ASC LIMIT 300`);
+  const rows = Array.isArray(r) ? r : (r?.rows || []);
+  roster = rows.map((x: any) => ({ id: String(x.id), name: String(x.full_name || 'Unnamed') }));
+} catch (e: any) {
+  rosterError = e?.cause?.message || e?.message || 'unknown error';
+}
+
+const today = new Date().toISOString().slice(0, 10);
+const defaultUntil = new Date(Date.now() + 14 * 86_400_000).toISOString().slice(0, 10);
+---
+
+<BaseLayout title="Acting for each other">
+  <main style="max-width:760px;margin:0 auto;padding:20px 16px 64px;">
+
+    <p style={HD}>Portal</p>
+    <h1 style="font-size:1.45rem;margin:0 0 6px;">Acting for each other</h1>
+    <p style="opacity:0.75;line-height:1.55;margin:0 0 20px;">
+      You can let somebody act for you for a set period — clearing what is waiting on you, keeping
+      things moving while you are away. They sign in as themselves and everything they do is
+      recorded as theirs, done on your authority. Nobody uses your account.
+    </p>
+
+    {notice !== '' && (
+      <div style={CARD + 'border-color:rgba(0,140,60,0.35);margin-bottom:16px;'}>
+        <p style="margin:0;">{notice}</p>
+      </div>
+    )}
+    {problems.length > 0 && (
+      <div style={CARD + 'border-color:rgba(190,40,40,0.4);margin-bottom:16px;'}>
+        <p style="margin:0 0 8px;font-weight:600;">That could not be done:</p>
+        <ul style="margin:0;padding-left:18px;line-height:1.6;">
+          {problems.map((p) => (<li>{p}</li>))}
+        </ul>
+      </div>
+    )}
+
+    {lookupFailed !== '' && (
+      <div style={CARD + 'border-color:rgba(190,40,40,0.4);margin-bottom:16px;'}>
+        <p style="margin:0;">
+          Your employee record could not be read, so this page cannot show or change anything.
+          The reason given was: {lookupFailed}
+        </p>
+      </div>
+    )}
+
+    {lookupFailed === '' && myEmployeeId === null && (
+      <div style={CARD + 'margin-bottom:16px;'}>
+        <p style="margin:0;">
+          You do not have an employee record yet, so there is nothing to hand over. This appears once
+          somebody has been added to the organization.
+        </p>
+      </div>
+    )}
+
+    {myEmployeeId !== null && (
+      <section style={CARD + 'margin-bottom:18px;'}>
+        <p style={HD}>Let somebody act for you</p>
+
+        {rosterError !== '' ? (
+          <p style="margin:0;">
+            The list of colleagues could not be read, so nobody can be chosen right now.
+            The reason given was: {rosterError}
+          </p>
+        ) : roster.length === 0 ? (
+          <p style="margin:0;">
+            There is nobody else on the organization yet, so there is nobody to hand anything to.
+          </p>
+        ) : (
+          <form method="POST" style="display:grid;gap:12px;">
+            <input type="hidden" name="action" value="grant" />
+
+            <label style="display:block;">
+              <span style="display:block;font-size:0.82rem;margin-bottom:4px;">Who</span>
+              <select name="delegate" required
+                      style="width:100%;min-height:44px;padding:8px 10px;border-radius:9px;border:1px solid rgba(0,0,0,0.2);">
+                <option value="">Choose a person</option>
+                {roster.map((p) => (<option value={p.id}>{p.name}</option>))}
+              </select>
+            </label>
+
+            <fieldset style="border:1px solid rgba(0,0,0,0.12);border-radius:10px;padding:10px 12px;margin:0;">
+              <legend style="font-size:0.82rem;padding:0 4px;">What they may do</legend>
+              {DELEGABLE_DOMAINS.map((d) => (
+                <label style="display:flex;gap:10px;align-items:center;min-height:44px;">
+                  <input type="checkbox" name="domains" value={d} style="width:20px;height:20px;" />
+                  <span>{DOMAIN_LABELS[d]}</span>
+                </label>
+              ))}
+            </fieldset>
+
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+              <label style="display:block;">
+                <span style="display:block;font-size:0.82rem;margin-bottom:4px;">From</span>
+                <input type="date" name="from" required value={today}
+                       style="width:100%;min-height:44px;padding:8px 10px;border-radius:9px;border:1px solid rgba(0,0,0,0.2);" />
+              </label>
+              <label style="display:block;">
+                <span style="display:block;font-size:0.82rem;margin-bottom:4px;">Until</span>
+                <input type="date" name="until" required value={defaultUntil}
+                       style="width:100%;min-height:44px;padding:8px 10px;border-radius:9px;border:1px solid rgba(0,0,0,0.2);" />
+              </label>
+            </div>
+            <p style="margin:-4px 0 0;font-size:0.8rem;opacity:0.7;line-height:1.5;">
+              An end date is required, and it can be at most {MAX_DELEGATION_DAYS} days away. This
+              ends by itself — there is nothing to remember to switch off.
+            </p>
+
+            <label style="display:block;">
+              <span style="display:block;font-size:0.82rem;margin-bottom:4px;">Why</span>
+              <input name="reason" required maxlength="200" placeholder="Away at a conference"
+                     style="width:100%;min-height:44px;padding:8px 10px;border-radius:9px;border:1px solid rgba(0,0,0,0.2);" />
+            </label>
+
+            <button type="submit"
+                    style="min-height:46px;border-radius:10px;border:0;background:#FF4F00;color:#fff;font-weight:600;cursor:pointer;">
+              Let them act for me
+            </button>
+          </form>
+        )}
+      </section>
+    )}
+
+    {/* The limit, stated where the authority is granted. Somebody handing power over is entitled to
+        see its edge; a person who cannot see a limit assumes there is none. */}
+    <section style={CARD + 'margin-bottom:18px;'}>
+      <p style={HD}>What nobody can hand over</p>
+      <p style="margin:0 0 10px;line-height:1.55;opacity:0.8;">
+        These stay with the person they belong to, whatever anyone chooses. Each one is protected by
+        the fact that a named person had to do it themselves.
+      </p>
+      <ul style="margin:0;padding-left:18px;line-height:1.7;">
+        {NEVER_DELEGABLE.map((n) => (<li>{n.why}</li>))}
+      </ul>
+    </section>
+
+    <section style={CARD + 'margin-bottom:18px;'}>
+      <p style={HD}>People acting for you</p>
+      {granted.error ? (
+        <p style="margin:0;">This could not be read, so it is not known whether anyone is acting for
+          you. The reason given was: {granted.error}</p>
+      ) : granted.rows.length === 0 ? (
+        <p style="margin:0;">Nobody is acting for you.</p>
+      ) : (
+        <div style="display:grid;gap:10px;">
+          {granted.rows.map((d) => (
+            <div style="border:1px solid rgba(0,0,0,0.10);border-radius:10px;padding:10px 12px;">
+              <p style="margin:0 0 4px;font-weight:600;">
+                {roster.find((p) => p.id === d.delegateEmployeeId)?.name || 'Somebody'}
+                {d.inForce ? '' : ' (not in force)'}
+              </p>
+              <p style="margin:0 0 6px;font-size:0.85rem;opacity:0.8;">
+                {d.domains.map((x) => DOMAIN_LABELS[x] || x).join(' · ') || 'Nothing named'}
+              </p>
+              <p style="margin:0 0 8px;font-size:0.8rem;opacity:0.7;">
+                Until {d.until ? d.until.slice(0, 10) : 'unknown'} — {d.reason}
+              </p>
+              <form method="POST">
+                <input type="hidden" name="action" value="end" />
+                <input type="hidden" name="id" value={d.id} />
+                <input type="hidden" name="reason" value="Ended by the principal" />
+                <button type="submit"
+                        style="min-height:44px;padding:0 14px;border-radius:9px;border:1px solid rgba(0,0,0,0.25);background:transparent;cursor:pointer;">
+                  End this now
+                </button>
+              </form>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+
+    <section style={CARD}>
+      <p style={HD}>People you are acting for</p>
+      {held.error ? (
+        <p style="margin:0;">This could not be read. The reason given was: {held.error}</p>
+      ) : held.rows.length === 0 ? (
+        <p style="margin:0;">You are not acting for anybody.</p>
+      ) : (
+        <div style="display:grid;gap:10px;">
+          {held.rows.map((d) => (
+            <div style="border:1px solid rgba(0,0,0,0.10);border-radius:10px;padding:10px 12px;">
+              <p style="margin:0 0 4px;font-weight:600;">
+                Standing in until {d.until ? d.until.slice(0, 10) : 'unknown'}
+              </p>
+              <p style="margin:0;font-size:0.85rem;opacity:0.8;">
+                {d.domains.map((x) => DOMAIN_LABELS[x] || x).join(' · ') || 'Nothing named'}
+              </p>
+              <p style="margin:6px 0 0;font-size:0.8rem;opacity:0.7;">
+                Anything you do here is recorded as yours, done on their authority.
+              </p>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+
+  </main>
+</BaseLayout>
