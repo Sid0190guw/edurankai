@@ -1972,6 +1972,124 @@ export async function stepsAwaitingEscalation(limit = 50): Promise<PendingApprov
   }
 }
 
+/**
+ * HOW MANY DECISIONS ARE SITTING WITH EACH APPROVER, ACROSS THE WHOLE ORGANIZATION, IN ONE QUERY.
+ *
+ * WHY IT LIVES HERE RATHER THAN ON A SURFACE. pendingForApprover() answers "what is waiting on THIS
+ * person" and costs a round trip each time it is asked; a load view over a roster of forty-two people
+ * would ask it forty-two times, and the honest alternative — a fresh SELECT over workflow_steps
+ * written on the page that needed it — would be a second idea of what "pending" means, one status
+ * rename away from disagreeing with the queue it claims to summarise. So the aggregate is written
+ * once, here, from the same three clauses pendingForApprover() uses: decision = 'pending',
+ * i.state = 'pending', and s.step_no = i.current_step. A step that is not the current step of a
+ * pending instance is not waiting on anybody.
+ *
+ * IT IS A COUNT, NOT A QUEUE, AND IT AUTHORISES NOTHING. It returns no instance, no subject, no
+ * summary and no amount — only how many decisions name each approver. Whether a person may decide
+ * any of them is still mayAct()'s answer, asked per step by decideStep(), and nothing here is a
+ * substitute for calling it.
+ *
+ * IT IS NOT SCOPED, AND THAT IS DELIBERATE. There is no viewer argument: the only caller is a
+ * founder-gated console assembling a whole-organization load view, and inventing a scope argument
+ * here would have meant inventing a second scope resolver beside the ones Layer 2 already owns. Any
+ * new caller must establish for itself that its viewer may see the whole organization before asking.
+ *
+ * TWO KEYS, BECAUSE A STEP CARRIES TWO. Routing writes approver_employee_id when it resolved a person
+ * through the graph and approver_user_id when it resolved an account, and either may be null. Both
+ * are returned unchanged so a caller joins on whichever it holds, rather than this function guessing
+ * which one a roster is keyed by.
+ *
+ * DELEGATION IS NOT FOLLOWED. pendingForApprover() adds the steps a person is standing in for, which
+ * it resolves per step against the graph; that is a per-person question and cannot be answered in a
+ * GROUP BY. A delegated step is therefore counted against the person it was ROUTED to, which is who
+ * the row names. Say so on any surface that renders this beside a stand-in.
+ *
+ * LEAVE IS EXCLUDED, BY THE SAME RULE routedApprovals() STATES. A leave request exists twice — as an
+ * hr_leave_request row and as a workflow step — so counting the step as well would show one person's
+ * Tuesday as two waiting decisions. The excluded domains come back on the view so a caller can print
+ * which ones, rather than describing the number from memory.
+ *
+ * ok:false ON FAILURE, NEVER AN EMPTY LIST. "Nobody is sitting on anything" and "we could not read
+ * what anybody is sitting on" are opposite facts.
+ */
+export interface PendingStepCount {
+  /** hr_employees.id the step was routed to, or null when it was routed to an account instead. */
+  approverEmployeeId: string | null;
+  /** users.id the step was routed to, or null when it was routed to an employee record instead. */
+  approverUserId: string | null;
+  /** Display only, and null when the employee row could not be named. Never used to decide anything. */
+  approverName: string | null;
+  pending: number;
+  /** Of those, the ones whose due_at has passed. A step with no due_at is never late. */
+  overdue: number;
+  /** When the oldest of them started waiting. Rendered as "waiting since", never as a deadline. */
+  oldestSince: string | null;
+}
+
+export interface PendingStepCountsView {
+  /** False means the read did not happen — never render "nothing is waiting on anyone" on this. */
+  ok: boolean;
+  rows: PendingStepCount[];
+  /** Domains deliberately left out of the count, by name, so a surface can say which. */
+  excludedDomains: string[];
+  /** The result hit the ceiling and was cut. Say so rather than shortening quietly. */
+  truncated: boolean;
+  error?: string;
+}
+
+/** Left out of pendingStepCountsByApprover(), for the reason stated above it. */
+export const PENDING_COUNT_EXCLUDED_DOMAINS: readonly string[] = ['leave'];
+
+export async function pendingStepCountsByApprover(limit = 500): Promise<PendingStepCountsView> {
+  const lim = Math.min(Math.max(Number(limit) || 500, 1), 1000);
+  const excludedDomains = [...PENDING_COUNT_EXCLUDED_DOMAINS];
+  try {
+    await ensureWorkflowSchema();
+    const r = await db.execute(sql`
+      SELECT s.approver_employee_id::text AS approver_employee_id,
+             s.approver_user_id::text     AS approver_user_id,
+             MAX(ae.full_name)            AS approver_name,
+             COUNT(*)::int                AS pending,
+             COUNT(*) FILTER (WHERE s.due_at IS NOT NULL AND s.due_at < NOW())::int AS overdue,
+             MIN(s.created_at)::text      AS oldest_since
+        FROM workflow_steps s
+        JOIN workflow_instances i ON i.id = s.instance_id
+        LEFT JOIN hr_employees ae ON ae.id = s.approver_employee_id
+       WHERE s.decision = 'pending'
+         AND i.state = 'pending'
+         AND s.step_no = i.current_step
+         AND i.domain <> 'leave'
+         AND (s.approver_employee_id IS NOT NULL OR s.approver_user_id IS NOT NULL)
+       GROUP BY s.approver_employee_id, s.approver_user_id
+       ORDER BY COUNT(*) DESC
+       LIMIT ${lim + 1}`);
+    const list = rows(r);
+    const truncated = list.length > lim;
+    return {
+      ok: true,
+      truncated,
+      excludedDomains,
+      rows: list.slice(0, lim).map((row) => ({
+        approverEmployeeId: row.approver_employee_id ? String(row.approver_employee_id) : null,
+        approverUserId: row.approver_user_id ? String(row.approver_user_id) : null,
+        approverName: row.approver_name ? String(row.approver_name) : null,
+        pending: Number(row.pending) || 0,
+        overdue: Number(row.overdue) || 0,
+        oldestSince: row.oldest_since ? String(row.oldest_since) : null,
+      })),
+    };
+  } catch (e: any) {
+    logFail('pendingStepCountsByApprover', e);
+    return {
+      ok: false,
+      rows: [],
+      excludedDomains,
+      truncated: false,
+      error: String(e?.cause?.message || e?.message || 'unknown database error'),
+    };
+  }
+}
+
 // -------------------------------------------------------------------------------------------------
 // NOTIFICATION AND AUDIT HOOKS — THE EXISTING ONES. No second notifier, no second audit log.
 // -------------------------------------------------------------------------------------------------

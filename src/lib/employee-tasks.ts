@@ -1167,6 +1167,94 @@ export async function taskCounts(employeeId: string): Promise<TaskCounts> {
   }
 }
 
+/** One person's line on a load view: what they are still carrying, and how much of it is late. */
+export interface TaskLoadRow extends TaskCounts {
+  employeeId: string;
+  /** open + inProgress + blocked. Everything still owed, in one number a column can sort on. */
+  active: number;
+}
+
+export interface TaskLoadView {
+  /** False means the read did not happen. An empty `rows` with ok:true means genuinely no tasks. */
+  ok: boolean;
+  rows: TaskLoadRow[];
+  /** The same objects, keyed by employee id, so a caller joining to a roster does no scanning. */
+  byEmployee: Record<string, TaskLoadRow>;
+}
+
+/**
+ * THE SAME COUNTS AS taskCounts(), FOR A BATCH OF PEOPLE, IN ONE QUERY.
+ *
+ * WHY IT LIVES HERE. A load view over a whole roster needs one row per person, and the only two ways
+ * to get that were N calls to taskCounts() — forty-two round trips for forty-two employees — or a
+ * fresh SELECT over employee_tasks written on the surface that needed it. The second is the one that
+ * costs: it would be a FIFTH reader of these rows with its own idea of what "open" and "overdue"
+ * mean, and the day CANON gains a status the surface would go on filing it somewhere else. So the
+ * aggregate is written once, here, beside CANON and IS_OVERDUE, from the SAME two fragments
+ * readTaskCounts() uses. There is one definition of a late task in this codebase and this shares it.
+ *
+ * IT IS NOT SCOPED, AND THAT IS THE CALLER'S JOB. taskCounts() takes an employeeId the session
+ * already established; this takes a LIST, so the list is the scope. Every caller must pass ids it has
+ * already established the viewer may see — the same contract allocationFor() states in projects.ts —
+ * and an empty list returns an empty answer rather than everybody.
+ *
+ * ok:false ON FAILURE, NEVER AN EMPTY ROSTER. "Nobody has any work" and "we could not read the work"
+ * are opposite facts, and a load view that renders the second as the first tells a founder their
+ * whole company is idle.
+ */
+export async function taskLoadFor(employeeIds: string[]): Promise<TaskLoadView> {
+  const ids = Array.from(
+    new Set((employeeIds || []).map((v) => String(v || '').trim()).filter((v) => UUID_RE.test(v))),
+  );
+  if (ids.length === 0) return { ok: true, rows: [], byEmployee: {} };
+
+  try {
+    await ensureTaskSchema();
+    // Individual placeholders, never = ANY($jsArray): postgres-js rejects a JS array on the right of
+    // ANY on this driver ("op ANY/ALL (array) requires array on right side").
+    const idList = sql.join(ids.map((v) => sql`${v}`), sql`, `);
+    const list = rows(await db.execute(sql`
+      SELECT t.employee_id::text AS employee_id,
+             COUNT(*) FILTER (WHERE ${CANON} IN ('draft', 'assigned', 'accepted'))::int           AS open_count,
+             COUNT(*) FILTER (WHERE ${CANON} IN ('in_progress', 'under_review', 'approved'))::int AS in_progress_count,
+             COUNT(*) FILTER (WHERE ${CANON} = 'blocked')::int                                    AS blocked_count,
+             COUNT(*) FILTER (WHERE ${CANON} = 'completed')::int                                  AS done_count,
+             COUNT(*) FILTER (WHERE ${IS_OVERDUE})::int                                           AS overdue_count,
+             COUNT(*)::int AS total_count
+        FROM employee_tasks t
+       WHERE t.employee_id::text IN (${idList})
+       GROUP BY t.employee_id`));
+
+    const byEmployee: Record<string, TaskLoadRow> = {};
+    // Every id asked for gets a row, including the ones with no tasks at all. A person missing from
+    // the GROUP BY has nothing assigned, and that is a fact worth rendering, not a row to drop.
+    for (const id of ids) {
+      byEmployee[id] = { ...EMPTY_COUNTS, employeeId: id, active: 0 };
+    }
+    for (const r of list) {
+      const id = String(r.employee_id || '').trim();
+      if (!byEmployee[id]) continue;
+      const open = Number(r.open_count) || 0;
+      const inProgress = Number(r.in_progress_count) || 0;
+      const blocked = Number(r.blocked_count) || 0;
+      byEmployee[id] = {
+        employeeId: id,
+        open,
+        inProgress,
+        blocked,
+        done: Number(r.done_count) || 0,
+        overdue: Number(r.overdue_count) || 0,
+        total: Number(r.total_count) || 0,
+        active: open + inProgress + blocked,
+      };
+    }
+    return { ok: true, rows: ids.map((id) => byEmployee[id]), byEmployee };
+  } catch (e: any) {
+    logFail('taskLoadFor', e);
+    return { ok: false, rows: [], byEmployee: {} };
+  }
+}
+
 /**
  * Comments on one task, for anyone who may see the task: the assignee, the assigner, a collaborator
  * of any role, or the department lead. Anyone else gets an empty list.

@@ -1431,6 +1431,87 @@ export async function pendingLeaveForApprover(
   }
 }
 
+/**
+ * HOW MANY PENDING LEAVE REQUESTS ARE SITTING WITH EACH MANAGER, IN ONE QUERY.
+ *
+ * WHY IT EXISTS. pendingLeaveForApprover() answers "what may THIS person decide" and costs a round
+ * trip per person, so a load view over a whole roster would ask it once per manager. This is the
+ * same rows, counted, grouped by the column that decides who they are waiting on.
+ *
+ * IT IS THE MANAGER ARM ONLY, AND THAT IS THE POINT. pendingLeaveForApprover() has two branches: a
+ * holder of `leave.approve` sees EVERY pending request in the company, and everybody else sees the
+ * requests of employees whose reporting_manager_id is their own users id. A per-person load column
+ * built on the first branch would credit every standing-authority holder with the entire company's
+ * leave queue, which says nothing about what that person is personally holding up. This counts the
+ * second branch only — the requests routed to somebody BY the reporting line — and a surface that
+ * also shows a standing-authority queue must label the two differently.
+ *
+ * NOTHING ABOUT A REQUEST LEAVES THIS QUERY. No dates, no type, no reason, no name: a count per
+ * manager and nothing else. Leave reasons are never read or aggregated anywhere in this module and
+ * they are not read here either.
+ *
+ * reporting_manager_id HOLDS A USERS ID, not an hr_employees id — the same column and the same
+ * comparison approverRole() and pendingLeaveForApprover() make. Compared as text because it is a
+ * UUID in one schema file and a slug elsewhere, and ::uuid would throw on the latter.
+ *
+ * ok:false ON FAILURE, NEVER AN EMPTY MAP. A manager with a fortnight of requests behind a broken
+ * read must not be rendered as a manager with nothing waiting.
+ */
+export interface PendingLeaveCount {
+  /** users.id of the manager the request routes to, per the reporting column. */
+  managerUserId: string;
+  pending: number;
+}
+
+export interface PendingLeaveCountsView {
+  /** False means the read did not happen — never render "nothing is waiting" on this. */
+  ok: boolean;
+  rows: PendingLeaveCount[];
+  /** The same counts keyed by manager, so a caller joining to a roster does no scanning. */
+  byManagerUserId: Record<string, number>;
+  /**
+   * Pending requests whose employee has NO reporting manager recorded on the column. They are
+   * waiting on nobody in particular, and they are invisible on every manager's queue — which is
+   * exactly the kind of zero that looks like an empty queue and is not.
+   */
+  unrouted: number;
+  error?: string;
+}
+
+export async function pendingLeaveCountsByManager(): Promise<PendingLeaveCountsView> {
+  await ensureLeaveSchema();
+  try {
+    const list = rows(await db.execute(sql`
+      SELECT e.reporting_manager_id::text AS manager_user_id, COUNT(*)::int AS n
+        FROM hr_leave_request l
+        JOIN hr_employees e ON e.id = l.employee_id
+       WHERE l.status = 'pending'
+       GROUP BY e.reporting_manager_id`));
+
+    const byManagerUserId: Record<string, number> = {};
+    const out: PendingLeaveCount[] = [];
+    let unrouted = 0;
+    for (const row of list) {
+      const id = String(row?.manager_user_id || '').trim();
+      const n = Number(row?.n) || 0;
+      if (!id) { unrouted += n; continue; }
+      byManagerUserId[id] = n;
+      out.push({ managerUserId: id, pending: n });
+    }
+    out.sort((a, b) => b.pending - a.pending);
+    return { ok: true, rows: out, byManagerUserId, unrouted };
+  } catch (e: any) {
+    logFail('pendingLeaveCountsByManager', e);
+    return {
+      ok: false,
+      rows: [],
+      byManagerUserId: {},
+      unrouted: 0,
+      error: String(e?.cause?.message || e?.message || 'unknown database error'),
+    };
+  }
+}
+
 // -------------------------------------------------------------------------------------------------
 // DECIDING
 // -------------------------------------------------------------------------------------------------
