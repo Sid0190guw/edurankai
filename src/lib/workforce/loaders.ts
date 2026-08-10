@@ -469,6 +469,12 @@ export interface RoutedApprovalsView {
   ok: boolean;
   rows: RoutedApprovalRow[];
   count: number;
+  /** THE ROWS ARE REAL BUT THE LIST IS SHORT. Set when the read half-succeeded — today that means
+   *  the delegation resolution inside pendingForApprover() failed, so requests addressed to somebody
+   *  this person is standing in for are missing while the directly-routed ones came back. `ok` stays
+   *  true so the count and the link to the queue survive; a surface must render the caveat beside
+   *  them, because a number that is quietly short is worse than no number at all. */
+  partial?: boolean;
 }
 
 /**
@@ -500,9 +506,16 @@ export interface RoutedApprovalsView {
 export async function routedApprovals(userId: string | null, limit = 50): Promise<RoutedApprovalsView> {
   const uid = String(userId || '').trim();
   if (!uid) return { ok: true, rows: [], count: 0 };
+  // THE READ THAT COULD NEVER REPORT A FAILURE. pendingForApprover() fails closed and returns [] —
+  // it does not reject — so this try/catch had nothing to catch and `ok` was true whatever happened
+  // downstream. /portal/employee reads `!routed.ok` into `routedFailed` and renders the honest
+  // "we could not read this" card from it; that card was therefore unreachable, and a refused read
+  // silently rendered as a clear queue. The reader now reports through onError; the returned list is
+  // unchanged and still fail-closed.
+  let readFailed = false;
   try {
     const { pendingForApprover, domainLabel } = await import('@/lib/workflow');
-    const pending = await pendingForApprover(uid);
+    const pending = await pendingForApprover(uid, { onError: () => { readFailed = true; } });
     const list = (Array.isArray(pending) ? pending : [])
       .filter((p: any) => String(p?.instance?.domain || '') !== 'leave');
     const out: RoutedApprovalRow[] = list
@@ -523,7 +536,12 @@ export async function routedApprovals(userId: string | null, limit = 50): Promis
         dueAt: String(p?.step?.dueAt || ''),
       }))
       .filter((r) => !!r.stepId);
-    return { ok: true, rows: out, count: list.length };
+    // TWO DIFFERENT FAILURES, TWO DIFFERENT ANSWERS. Nothing came back AND something broke: there is
+    // no queue to show and no claim to make, so ok:false and the card prints the honest sentence.
+    // Rows came back AND something broke: the delegation half failed, the directly-routed rows are
+    // genuine and still decidable, and hiding them behind a failure notice would strand real
+    // requests. Those stay visible with `partial` set so the surface can say the list is short.
+    return { ok: !(readFailed && list.length === 0), rows: out, count: list.length, partial: readFailed && list.length > 0 };
   } catch (e: any) {
     logFail('routedApprovals', e);
     return { ok: false, rows: [], count: 0 };

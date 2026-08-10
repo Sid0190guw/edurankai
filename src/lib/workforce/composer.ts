@@ -48,6 +48,9 @@ import {
   type WidgetDefinition, type WorkspaceContext, type Engagement, type SectionRequirement, type WidgetGate,
   type WidgetQuickAction,
 } from '@/lib/workforce/widgets';
+// THE ELEVATED DOORS. Imported for their section QUESTIONS only — the module holds no action, no
+// query and no answer. See step 8b for why the answers are resolved here rather than in the nav.
+import { ELEVATED_SECTION_PAIRS, mayOpenConsole } from '@/lib/workforce/elevation';
 
 // postgres-js resolves to a plain array, never a { rows } object. Declared at the top, above
 // everything that uses it: `const` is not hoisted, and a handler reaching a later declaration has
@@ -644,6 +647,31 @@ async function compose(
   for (const w of candidates) {
     for (const s of w.requiresSection || []) neededSections.set(s.key + ':' + s.action, s);
   }
+
+  // ---- 8b. THE ELEVATED DOORS' SECTIONS, resolved in the SAME round trip ---------------------------
+  //
+  // WHY HERE AND NOT IN THE NAVIGATION. src/lib/workforce/navigation.ts is a pure projection that
+  // performs no query — that property is what stops it becoming a second authorization engine. But
+  // an elevated entry pointing at /admin/hr/leave must mirror BOTH tests src/middleware.ts applies:
+  // canOpenAdmin, and the section key its PATH_SECTION table resolves for that path. The second is a
+  // query. So elevation.ts declares the QUESTION, this answers it through canAccessSection — the
+  // same function the admin side uses, one implementation — and the nav only reads the answer off
+  // ctx.grantedSection(). An entry mirroring only canOpenAdmin would render a link that bounces
+  // every restricted admin to /admin?denied=<section>, which is rule 1 of navigation.ts broken.
+  //
+  // ONLY FOR SOMEBODY WHO COULD OPEN THE CONSOLE AT ALL. mayOpenConsole is the composed-context
+  // mirror of canOpenAdmin's two live tests, and it is asked BEFORE the pairs are added, so an
+  // ordinary employee's composition adds no queries whatsoever. For the handful of accounts that do
+  // pass it, these ride along in the Promise.all below rather than costing a second round trip — and
+  // a super_admin costs nothing even then, because canAccessSection short-circuits on that role.
+  //
+  // NOTE what this deliberately does NOT do: it does not add anything to the widget filter below.
+  // `afterSections` tests each widget against its OWN requiresSection, so extra grants in the set
+  // cannot keep a widget that did not ask for them.
+  if (mayOpenConsole(context)) {
+    for (const s of ELEVATED_SECTION_PAIRS) neededSections.set(s.key + ':' + s.action, s);
+  }
+
   if (neededSections.size > 0) {
     const actor = { id: userId, role };
     const pairs = [...neededSections.entries()];

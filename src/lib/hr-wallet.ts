@@ -53,9 +53,15 @@ async function notifyEmployeeOfMoney(
  * reassuring message. Note that getBalance() still reports ₹0 on a failed read — that is a wrong
  * number shown to an employee, so the reason is at least on the log now instead of nowhere.
  */
-async function safe(q: any): Promise<any[]> {
+// `onError` is how a caller finds out that the no-rows it just received is not a fact about money.
+// This helper swallows every read failure in the module and returns [], so the caller's own
+// try/catch never fires — pendingWithdrawalsForApprover's catch below is unreachable for a query
+// error, and "no withdrawals waiting" was printed over a database that had refused to answer.
+// Optional, so no existing call site changes; it must not throw, and a throw from it is contained.
+async function safe(q: any, onError?: (e: unknown) => void): Promise<any[]> {
   try { return rows(await db.execute(q)); } catch (e: any) {
     console.error('[hr-wallet] read failed, returning no rows:', e?.cause?.message || e?.message);
+    try { onError?.(e); } catch { /* a broken reporter must not break the read */ }
     return [];
   }
 }
@@ -574,7 +580,14 @@ export async function listWithdrawals(opts: { employeeId?: string; status?: stri
  * id. decideWithdrawal() still re-checks through approverRole() — this decides what to show, never
  * what may be done.
  */
-export async function pendingWithdrawalsForApprover(user: any): Promise<any[]> {
+export async function pendingWithdrawalsForApprover(
+  user: any,
+  opts?: { onError?: (e: unknown) => void },
+): Promise<any[]> {
+  // Declared before the branches that use it. `const` is not hoisted.
+  const reportError = (e: unknown): void => {
+    try { opts?.onError?.(e); } catch { /* a broken reporter must not break the read */ }
+  };
   if (!user?.id) return [];
   await ensureWalletSchema();
 
@@ -597,7 +610,7 @@ export async function pendingWithdrawalsForApprover(user: any): Promise<any[]> {
           LEFT JOIN hr_employees e ON e.id = w.employee_id
          WHERE w.status = 'pending'
          ORDER BY w.requested_at ASC
-         LIMIT 120`);
+         LIMIT 120`, reportError);
     }
     return await safe(sql`
       SELECT w.*, e.full_name, e.employee_code
@@ -606,9 +619,10 @@ export async function pendingWithdrawalsForApprover(user: any): Promise<any[]> {
        WHERE w.status = 'pending'
          AND e.reporting_manager_id::text = ${String(user.id)}
        ORDER BY w.requested_at ASC
-       LIMIT 120`);
+       LIMIT 120`, reportError);
   } catch (e: any) {
     console.error('[hr-wallet] pendingWithdrawalsForApprover', e?.cause?.message || e?.message);
+    reportError(e);
     return [];
   }
 }

@@ -1351,8 +1351,26 @@ export async function readLeave(
  *
  * Deciding is still re-checked by decideLeave() through approverRole(). This function decides what
  * to SHOW; it is never the permission itself. A list is not an authorisation.
+ *
+ * `onError` — WHY AN EMPTY LIST NEEDED A SECOND CHANNEL. The catch below fails closed, which is
+ * right, and returns [] — which is indistinguishable from a manager with nothing to decide. Both
+ * /portal/approvals and /portal/employee were written to tell those two apart and neither could,
+ * because this function never rejects: the try/catch on the page and the allSettled around it had
+ * nothing to catch. So a refused read printed "Nothing is waiting on you" over real leave requests,
+ * and the people in them waited for an answer that nobody knew they owed.
+ *
+ * It changes no behaviour and no visibility. The return is still [], still fail-closed; the callback
+ * only lets a caller learn that the [] it is holding is not a fact about leave. It must not throw,
+ * and a throw from it is swallowed rather than promoted into a failed read.
  */
-export async function pendingLeaveForApprover(user: any): Promise<any[]> {
+export async function pendingLeaveForApprover(
+  user: any,
+  opts?: { onError?: (e: unknown) => void },
+): Promise<any[]> {
+  // Declared before the branches that use it. `const` is not hoisted.
+  const reportError = (e: unknown): void => {
+    try { opts?.onError?.(e); } catch { /* a broken reporter must not break the read */ }
+  };
   if (!user?.id) return [];
   await ensureLeaveSchema();
 
@@ -1406,8 +1424,9 @@ export async function pendingLeaveForApprover(user: any): Promise<any[]> {
        LIMIT 120`));
   } catch (e: any) {
     // Fail closed: an approver seeing nothing is a missed notification; an approver seeing everyone
-    // else's leave is a data leak.
+    // else's leave is a data leak. Fail closed, but SAY SO — see the note on onError above.
     logFail('pendingLeaveForApprover', e);
+    reportError(e);
     return [];
   }
 }

@@ -13,9 +13,26 @@ import { eq, sql } from 'drizzle-orm';
 // there.
 import { safeRows } from '@/lib/page-safety';
 import DayOne from '@/components/admin/DayOne.astro';
+// WHO HEADS THIS DEPARTMENT — a per-ROW fact about the department, which is why it belongs on the
+// department's own record rather than on a person's.
+//
+// THERE IS NO COLUMN FOR IT ANYWHERE. `departments` has no head field in either schema file and
+// hr_employees has no is_head flag, so the graph edge IS the record — nothing to mirror and nothing
+// that can drift. The only other signal in the product is the pair users.role = 'department_head' +
+// users.assigned_department_id, and the leadership half of that is a ROLE NAME: read as a
+// relationship it would make every head a head of everything, which is the regression Phase 1
+// removed. Nothing on this page reads users.role.
+import { getDepartmentHead } from '@/lib/org-graph';
+import { setDepartmentHead } from '@/lib/org-assignment';
 
 const user = Astro.locals.user!;
 const canEdit = can(user, 'roles.edit');
+// A DIFFERENT POWER, SO A DIFFERENT KEY. Renaming a department is editorial; naming its head is an
+// authority change that decides who approves work across it. `employee.manage` is the people-desk
+// capability already gating /admin/hr/reconciliation and the org-writing screens, and it already
+// exists in the union in src/lib/auth/permissions.ts — a key outside that union is a permanent 403,
+// so no new one is invented here.
+const canSetHead = can(user, 'employee.manage');
 
 const { id } = Astro.params;
 if (!id) return Astro.redirect('/admin/departments');
@@ -32,11 +49,46 @@ let okMsg = '';
 
 // NO WRITE ON A RECORD WE DID NOT READ. Without `current` the update below would build its payload
 // from `current.id` and throw, and the delete would audit a name it does not have.
-if (Astro.request.method === 'POST' && canEdit && current) {
+if (Astro.request.method === 'POST' && current) {
   const fd = await Astro.request.formData();
   const intent = fd.get('_intent');
 
-  if (intent === 'delete') {
+  if (intent === 'set_department_head') {
+    // SUPERSEDES, NEVER OVERWRITES. setDepartmentHead() closes the incumbent's edge with an
+    // effective_to at the same instant the new one opens, so a decision taken under the previous
+    // head stays explicable afterwards. It refuses — with a sentence — rather than guessing: a head
+    // who has left, or who has an employee record but no linked sign-in, would read as headed on
+    // this screen while every permission check answered no.
+    if (!canSetHead) {
+      errorMsg = 'You can read this department, but naming its head decides who approves work across '
+        + 'it, and that needs the people-desk capability. Nothing was changed.';
+    } else {
+      const headEmployeeId = (fd.get('headEmployeeId') as string || '').trim();
+      const res = await setDepartmentHead({
+        departmentId: String(current.id),
+        headEmployeeId: headEmployeeId || null,
+        actorUserId: user.id,
+        note: 'Set on /admin/departments/' + current.id,
+      });
+      if (!res.ok) {
+        errorMsg = res.error || 'The department head was not changed.';
+      } else if (!headEmployeeId) {
+        okMsg = 'This department now has no recorded head. Anything that routes to a department head '
+          + 'will resolve to nobody until one is named. The edge held by the previous head was closed, not '
+          + 'deleted, so past approvals still read correctly.';
+      } else {
+        okMsg = res.edgeWritten
+          ? res.headName + ' is now recorded as the head of ' + current.name + ' in the Organization '
+            + 'Graph. Any edge held by a previous head was closed at the same instant, not deleted.'
+          : res.headName + ' was already the recorded head of ' + current.name + '. Nothing needed to change.';
+      }
+    }
+  } else if (!canEdit) {
+    // Previously a POST from somebody without `roles.edit` fell through and did nothing at all,
+    // which reads on screen as a save that worked. Saying so grants nobody anything new.
+    errorMsg = 'You can read this department, but changing it needs edit rights on roles and '
+      + 'departments. Nothing was changed.';
+  } else if (intent === 'delete') {
     // THE GUARD REFUSES WHEN IT CANNOT ANSWER. This was `inUse[0].count`, which throws on a read
     // that failed and on a driver that returned no row — an unexplained 500 in a DESTRUCTIVE path.
     // The failure is not swallowed: it is reported to the person pressing the button and logged with
@@ -104,6 +156,39 @@ const roleCountRes = await safeRows<any>('[departments] role count for one depar
 // "unknown" keeps the screen and the guard telling the same story.
 const roleCount: number | null = roleCountRes.ok ? Number(roleCountRes.rows[0]?.count ?? 0) : null;
 const roleCountWords = roleCount === null ? 'role count unknown' : roleCount + ' role(s)';
+
+// =================================================================================================
+// THE DEPARTMENT HEAD. Read AFTER the POST handler, so what is shown is what was just written.
+// =================================================================================================
+//
+// getDepartmentHead() asks the graph for the in-force `department_head` edge scoped to this
+// department. It returns null both when there is no head and when the read failed, which is why the
+// list below is read separately and its own failure is reported: an empty picker over an unread
+// employee register would read as "nobody here can be a head".
+const currentHead = current ? await getDepartmentHead(String(current.id)) : null;
+
+// WHO CAN BE A HEAD: an ACTIVE employee with a linked sign-in.
+//
+// Both halves are load-bearing. The graph is keyed on hr_employees.id, so somebody with no employee
+// record cannot be an edge at all; and userIsDepartmentHead() resolves a session user id to an
+// employee id before asking the graph, so a head with no linked login can never be matched to a
+// signed-in session — the department would read as headed while every permission check answered no.
+// setDepartmentHead() refuses both cases as well, so a posted id cannot get round this list.
+const headCandidatesRes = current && canSetHead
+  ? await safeRows<any>('[departments] employees who could head a department', () => db.execute(sql`
+      SELECT id, full_name, designation, employee_code
+        FROM hr_employees
+       WHERE is_active = true AND user_id IS NOT NULL
+       ORDER BY full_name ASC
+       LIMIT 500`))
+  : { ok: true, rows: [] as any[], error: null };
+const headCandidates = headCandidatesRes.rows;
+const currentHeadEmployeeId = currentHead?.employeeId ? String(currentHead.employeeId) : '';
+// The head already on file might not be on the list above — they may have been deactivated since.
+// Offering them, labelled, keeps the record from reading as "nobody is set"; setDepartmentHead()
+// still refuses to re-record a departed head, which is the correct refusal to make out loud.
+const headOnFileMissing = !!currentHeadEmployeeId
+  && !headCandidates.some((e: any) => String(e.id) === currentHeadEmployeeId);
 ---
 <AdminLayout title={current ? 'Edit · ' + current.name : 'Department could not be read'} activeNav="departments">
   <div class="admin-page" style="max-width:680px;">
@@ -169,6 +254,70 @@ const roleCountWords = roleCount === null ? 'role count unknown' : roleCount + '
         </div>
       )}
     </form>
+    )}
+
+    {current && (
+    <div class="admin-card" style="margin-top:24px;">
+      <div class="admin-card-title">Department head</div>
+      <p style="font-size:12.5px;color:#8a8a94;line-height:1.7;margin:8px 0 14px;">
+        The head is recorded as a relationship in the Organization Graph, scoped to this department.
+        It is what resolves the approver for anything routed to a department rather than to a named
+        person. Changing it supersedes: the previous head is closed off with an effective date rather
+        than overwritten, so a decision taken under them still reads correctly.
+      </p>
+
+      <p style="font-size:12.5px;color:#d8d8de;line-height:1.7;margin:0 0 14px;">
+        {currentHead && currentHead.fullName
+          ? 'Currently ' + currentHead.fullName + (currentHead.designation ? ' (' + currentHead.designation + ')' : '') + '.'
+          : 'No head is recorded for this department, so anything that routes to a department head resolves to nobody.'}
+      </p>
+
+      {canSetHead && !headCandidatesRes.ok && (
+        <p style="font-size:12.5px;color:#fca5a5;line-height:1.7;margin:0 0 14px;">
+          The employee register could not be read, so this page cannot offer anybody to name:
+          {' ' + (headCandidatesRes.error || 'unknown database error')}. Nothing here has changed.
+        </p>
+      )}
+
+      {canSetHead && headCandidatesRes.ok && (
+        <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+          <input type="hidden" name="_intent" value="set_department_head" />
+          <div>
+            <label class="rolefield-label" for="headEmployeeId">Head of this department</label>
+            <select id="headEmployeeId" name="headEmployeeId" class="rolefield-input" style="min-height:44px;">
+              <option value="" selected={!currentHeadEmployeeId}>No recorded head</option>
+              {headOnFileMissing && (
+                <option value={currentHeadEmployeeId} selected>
+                  {(currentHead && currentHead.fullName ? currentHead.fullName : 'The head on file') + ' (no longer an active employee)'}
+                </option>
+              )}
+              {headCandidates.map((e: any) => (
+                <option value={String(e.id)} selected={String(e.id) === currentHeadEmployeeId}>
+                  {String(e.full_name || 'Unnamed record')
+                    + (e.designation ? ' — ' + String(e.designation) : '')
+                    + (e.employee_code ? ' · ' + String(e.employee_code) : '')}
+                </option>
+              ))}
+            </select>
+          </div>
+          <p style="font-size:11.5px;color:#6e6e78;line-height:1.6;margin:0;">
+            Only active employees with a linked sign-in are listed. Somebody with no employee record
+            cannot hold a relationship at all, and somebody with no sign-in could never be matched to
+            a session, so the department would read as headed while every check answered no.
+          </p>
+          <div style="display:flex;justify-content:flex-end;">
+            <button type="submit" class="admin-btn admin-btn-primary" style="min-height:44px;">Save department head</button>
+          </div>
+        </form>
+      )}
+
+      {!canSetHead && (
+        <p style="font-size:11.5px;color:#6e6e78;line-height:1.6;margin:0;">
+          Naming a head decides who approves work across this department, so it needs the people-desk
+          capability. Ask whoever administers roles for it.
+        </p>
+      )}
+    </div>
     )}
 
     {current && canEdit && (

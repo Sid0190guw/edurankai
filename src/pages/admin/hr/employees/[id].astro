@@ -7,6 +7,19 @@ import { ensureOnce } from '@/lib/ensure-once';
 import { civilToday } from '@/lib/page-safety';
 // OPENING A PERSON'S RECORD AND REWRITING IT ARE NOT THE SAME POWER. See the gate below.
 import { canAccessSection } from '@/lib/auth/permissions';
+// THE REPORTING LINE IS NO LONGER A COLUMN ON THIS FORM.
+//
+// This handler used to write hr_employees.reporting_manager_id and nothing else — which made this
+// screen, the ordinary path an administrator uses, the single biggest source of drift between the
+// legacy column and the Organization Graph. Every other consequence followed from it: the graph
+// stayed empty, about twenty-five approval screens printed "Organization Graph not yet initialized",
+// and leave, transfers, claims and procurement had no approver.
+//
+// setReportingLine() writes BOTH records or NEITHER, superseding rather than overwriting so last
+// March's approval still resolves to the manager who was in force last March. It is the same
+// function src/lib/hr-lifecycle.ts (transfer) and src/lib/hr-separation.ts (exit) call, so the three
+// paths cannot disagree about the sequence.
+import { setReportingLine, reportingLineCoverage } from '@/lib/org-assignment';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -345,31 +358,82 @@ if (Astro.request.method === 'POST') {
       if (refusal) {
         errorMsg = refusal;
       } else {
-        await db.execute(sqlExpr`
-          UPDATE hr_employees SET
-            designation = ${designation || null},
-            department_id = ${departmentIdInput || null},
-            employment_type = ${employmentType || null},
-            work_mode = ${workMode || null},
-            joining_date = ${joiningDate || null},
-            confirmation_date = ${confirmationDate || null},
-            probation_end_date = ${probationEndDate || null},
-            base_salary = ${baseSalary ? parseFloat(baseSalary) : null},
-            currency = ${currency},
-            pan_number = ${panNumber || null},
-            aadhaar_number = ${aadhaarNumber || null},
-            reporting_manager_id = ${reportingManagerId || null},
-            updated_at = NOW()
-          WHERE id = ${id}
-        `);
-        // Say what is still missing rather than only what was saved. The two org fields are what
-        // every department list and every approval chain is built from, and a plain "updated" on a
-        // record that still has neither reads as finished.
-        const gaps: string[] = [];
-        if (!departmentIdInput) gaps.push('no department');
-        if (!reportingManagerId) gaps.push('no reporting manager');
-        successMsg = 'Employment details updated.'
-          + (gaps.length ? ' Still ' + gaps.join(' and ') + ' on this record.' : '');
+        // -------------------------------------------------------------------------------------
+        // THE REPORTING LINE FIRST, AND ON ITS OWN. Not a column in the UPDATE below.
+        //
+        // WHY IT GOES FIRST. It is the only field on this form that grants authority over another
+        // person, and it is the one that has to land in two records at once. If the graph write
+        // fails, nothing at all is saved — designation and salary are not written either — because a
+        // form that saved ten fields and silently skipped the eleventh is how this record came to
+        // disagree with the graph in the first place. setReportingLine() never throws; it comes
+        // back with the reason and the record is left exactly as it was.
+        //
+        // The value posted here is a USERS id (see the select), which is the id space the legacy
+        // column holds. setReportingLine() resolves it to the hr_employees id the graph is keyed on
+        // and refuses if that resolution has no answer, rather than writing half of it.
+        // -------------------------------------------------------------------------------------
+        const line = await setReportingLine({
+          employeeId: id,
+          managerUserId: reportingManagerId || null,
+          actorUserId: user.id,
+          note: 'Employment tab, /admin/hr/employees/' + id,
+        });
+
+        if (!line.ok) {
+          errorMsg = line.error || 'The reporting line could not be changed, so nothing was saved.';
+        } else {
+          await db.execute(sqlExpr`
+            UPDATE hr_employees SET
+              designation = ${designation || null},
+              department_id = ${departmentIdInput || null},
+              employment_type = ${employmentType || null},
+              work_mode = ${workMode || null},
+              joining_date = ${joiningDate || null},
+              confirmation_date = ${confirmationDate || null},
+              probation_end_date = ${probationEndDate || null},
+              base_salary = ${baseSalary ? parseFloat(baseSalary) : null},
+              currency = ${currency},
+              pan_number = ${panNumber || null},
+              aadhaar_number = ${aadhaarNumber || null},
+              updated_at = NOW()
+            WHERE id = ${id}
+          `);
+          // Say what is still missing rather than only what was saved. The two org fields are what
+          // every department list and every approval chain is built from, and a plain "updated" on a
+          // record that still has neither reads as finished.
+          const gaps: string[] = [];
+          if (!departmentIdInput) gaps.push('no department');
+          if (!reportingManagerId) gaps.push('no reporting manager');
+
+          // HOW FAR BEHIND EVERYBODY ELSE IS, said out loud on the screen that just wrote an edge.
+          //
+          // The first edge written flips org-graph's isInitialized() to true for the WHOLE product —
+          // it asks only whether any active row exists, of any type — so about twenty-five screens
+          // stop saying "Organization Graph not yet initialized" and start saying "no reporting
+          // manager on record" for everyone who has not been saved through this form yet. That
+          // second message is honest about the graph and wrong about the company. The count is only
+          // read when a manager was actually recorded, and a read that fails says nothing at all
+          // rather than a reassuring zero.
+          let coverageNote = '';
+          if (reportingManagerId) {
+            const cover = await reportingLineCoverage();
+            if (cover.ok && cover.columnOnly > 0) {
+              coverageNote = ' ' + (cover.columnOnly === 1
+                ? '1 other active employee still has'
+                : cover.columnOnly + ' other active employees still have')
+                + ' a manager on the older field with no edge in the Organization Graph, so their'
+                + ' approvals still resolve through the compatibility layer.';
+            }
+          }
+
+          successMsg = 'Employment details updated.'
+            + (reportingManagerId
+              ? ' The reporting line is recorded in the Organization Graph'
+                + (line.edgeWritten ? '.' : ' and was already exactly this.')
+              : '')
+            + (gaps.length ? ' Still ' + gaps.join(' and ') + ' on this record.' : '')
+            + coverageNote;
+        }
       }
     } else if (action === 'update_bank') {
       const bankAccountNumber = (fd.get('bankAccountNumber') as string || '').trim();

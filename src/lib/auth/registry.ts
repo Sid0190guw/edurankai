@@ -572,6 +572,12 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     group: 'Content',
     description: 'Write and publish knowledge-base articles and company policies - the answers the helpdesk offers somebody before they raise a ticket. Publishing a CHANGED policy starts a new version, and because acknowledgements are recorded against a version, that re-opens the acknowledgement for everybody: this key decides what the whole company is asked to read. It does NOT widen what the holder may read. An article names the capability that unlocks it and that is applied in the query, so a knowledge manager can publish an article restricted to payroll and still be unable to open it afterwards. Reading needs no permission of its own.',
   },
+  'ask.logs.view': {
+    label: 'Read the assistant question log',
+    group: 'Content',
+    description: 'Read what people asked the workplace assistant and the public one, what it searched, and whether anything it retrieved actually answered them. AGGREGATE ONLY, and the queries behind it do not select who asked - the asker column is absent from the select list rather than filtered out afterwards, and no read behind this key joins to users or to employee records. A visitor question is stored with no identity at all. What it is FOR is the unanswered question: a question nothing could answer names a policy nobody has written down, and this is the list of them. It is not, and must never become, a way to see what one named person has been worrying about.',
+    sensitive: true,
+  },
   'documents.manage': {
     label: 'Curate the document library',
     group: 'Content',

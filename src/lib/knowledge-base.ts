@@ -72,6 +72,11 @@ import { mdLite } from '@/lib/content-render';
 import { BUILTIN_PERMISSION_KEYS } from '@/lib/auth/registry';
 import { TICKET_CATEGORIES, categoryLabel } from '@/lib/helpdesk';
 import { textArray } from '@/lib/pg-array';
+// ONE RANKER FOR THE WHOLE PRODUCT. rankResults() is search-index.ts's pure token-overlap function
+// (title matches weigh 3x body matches), already unit-tested, and used here to order the passages of
+// an ALREADY-FETCHED article. Importing it costs nothing at module scope: search-index.ts reaches
+// the database only through a dynamic import inside its own functions.
+import { rankResults } from '@/lib/search-index';
 
 // -------------------------------------------------------------------------------------------------
 // MODULE CONSTANTS — every one declared ABOVE the functions that read it. `const` is not hoisted,
@@ -494,6 +499,166 @@ export function excerpt(article: KbArticle, max = 180): string {
 }
 
 // -------------------------------------------------------------------------------------------------
+// PASSAGES — THE UNIT A CITATION CAN POINT AT
+// -------------------------------------------------------------------------------------------------
+//
+// searchArticles() returns WHOLE ARTICLES and `why` names the field that matched. That is the right
+// shape for a result list and the wrong one for a cited answer: an assistant that answers "what is
+// the notice period" by attaching a sixty-kilobyte leave policy has not cited anything, it has
+// handed over the filing cabinet. A citation has to point at the sentences that actually said it.
+//
+// SO THE SPLIT HAPPENS HERE, in the module that already owns the corpus, the visibility clause and
+// excerpt(). A passage is a slice of an article THAT WAS ALREADY FETCHED — there is no second query,
+// no second index and no second audience model. Nothing reaches these functions that
+// visibilityClause() did not already allow through, which is why they can be pure.
+//
+// The ranking is rankResults() from search-index.ts, the same pure token-overlap function the
+// learner catalogue is ranked with, so the two searches agree about what a word is and what a title
+// match is worth. One ranker, imported, not a second one written here.
+
+/** Longest passage worth quoting. Beyond this a reader is being handed a page, not an answer. */
+const PASSAGE_MAX = 700;
+
+/** Shortest passage worth quoting. A four-word fragment cites nothing. */
+const PASSAGE_MIN = 40;
+
+/** A hard ceiling, so one enormous article cannot become a thousand candidate passages. */
+const MAX_PASSAGES = 40;
+
+export interface KbPassage {
+  articleId: string;
+  slug: string;
+  /** The article's title. */
+  title: string;
+  /** The markdown heading this passage sits under, in the article's own words. '' when there is none. */
+  heading: string;
+  /** 1-based position in the article, so a citation can say which part of the document it came from. */
+  ordinal: number;
+  /** The words themselves, markdown flattened to plain text. Never empty. */
+  text: string;
+}
+
+/** Markdown to plain sentences. Fenced code is dropped: it is never the prose that answers a policy question. */
+function flattenMarkdown(s: string): string {
+  return String(s || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/[#>*_`|]/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .trim();
+}
+
+/**
+ * SPLIT ONE ARTICLE INTO CITABLE PASSAGES.
+ *
+ * Headings start a new passage, because a heading is the author's own statement about where one
+ * subject ends and the next begins. Between headings, paragraphs are PACKED rather than emitted one
+ * at a time: a single sentence quoted out of a four-sentence rule is how a caveat gets separated
+ * from the thing it qualifies.
+ *
+ * An article with no body at all still yields one passage from its summary, so a citation to it is
+ * still a citation to written text and never to nothing.
+ */
+export function articlePassages(article: KbArticle): KbPassage[] {
+  const body = String(article?.body || '');
+  const out: KbPassage[] = [];
+  let heading = '';
+  let buf: string[] = [];
+  let bufLen = 0;
+
+  const push = (): void => {
+    const text = flattenMarkdown(buf.join(' '));
+    buf = [];
+    bufLen = 0;
+    if (text.length < PASSAGE_MIN) return;
+    if (out.length >= MAX_PASSAGES) return;
+    out.push({
+      articleId: String(article?.id || ''),
+      slug: String(article?.slug || ''),
+      title: String(article?.title || ''),
+      heading,
+      ordinal: out.length + 1,
+      text: text.length > PASSAGE_MAX ? text.slice(0, PASSAGE_MAX - 1).trimEnd() + '…' : text,
+    });
+  };
+
+  for (const raw of body.split(/\r?\n/)) {
+    const line = raw.trim();
+    const h = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (h) {
+      push();
+      heading = flattenMarkdown(h[2]).slice(0, 120);
+      continue;
+    }
+    if (!line) {
+      if (bufLen >= PASSAGE_MAX) push();
+      continue;
+    }
+    buf.push(line);
+    bufLen += line.length + 1;
+    if (bufLen >= PASSAGE_MAX * 2) push();
+  }
+  push();
+
+  if (out.length === 0) {
+    const fallback = flattenMarkdown(article?.summary || article?.body || '');
+    if (fallback) {
+      out.push({
+        articleId: String(article?.id || ''),
+        slug: String(article?.slug || ''),
+        title: String(article?.title || ''),
+        heading: '',
+        ordinal: 1,
+        text: fallback.length > PASSAGE_MAX ? fallback.slice(0, PASSAGE_MAX - 1).trimEnd() + '…' : fallback,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * THE PASSAGES OF ONE ARTICLE THAT ACTUALLY BEAR ON THE QUESTION, best first.
+ *
+ * Pure, and deliberately so: it re-reads nothing. With no query it returns the opening of the
+ * article, which is the honest "here is what this document is" answer rather than a guess at which
+ * paragraph was wanted.
+ */
+export function bestPassages(article: KbArticle, query: string, max = 2): KbPassage[] {
+  const all = articlePassages(article);
+  const cap = Math.min(Math.max(Number(max) || 1, 1), 5);
+  if (all.length === 0) return [];
+  const q = String(query || '').trim();
+  if (!q) return all.slice(0, cap);
+  const ranked = rankResults(
+    q,
+    all.map((p, i) => ({
+      id: String(i),
+      type: 'kb-passage',
+      title: p.heading || String(article?.title || ''),
+      body: p.text,
+    })),
+  );
+  const picked = ranked.slice(0, cap).map((d) => all[Number(d.id)]).filter(Boolean);
+  // A query that matched the TAGS of an article matches none of its passages. Returning nothing
+  // there would drop a legitimately retrieved article out of the answer entirely, so the opening
+  // passage stands in — and it is still text from the document, which is what a citation needs.
+  return picked.length ? picked : all.slice(0, 1);
+}
+
+/** How a passage names itself in a citation. Never just the article title when a heading exists. */
+export function passageLabel(p: KbPassage): string {
+  const title = String(p?.title || 'Untitled article');
+  return p?.heading ? title + ' — ' + p.heading : title;
+}
+
+/** Where a reader opens the article this passage came from. The route already accepts `a=<slug>`. */
+export function articleHref(slugOrArticle: string | KbArticle): string {
+  const slug = typeof slugOrArticle === 'string' ? slugOrArticle : String(slugOrArticle?.slug || '');
+  return '/portal/employee/knowledge?a=' + encodeURIComponent(slug);
+}
+
+// -------------------------------------------------------------------------------------------------
 // READS. Every one of them takes a viewer, and every one of them pastes the visibility clause.
 // -------------------------------------------------------------------------------------------------
 
@@ -588,8 +753,29 @@ export interface KbHit {
  * article in a result list leaks exactly the sentence somebody wanted hidden.
  */
 export async function searchArticles(viewer: KbViewer, query: string, limit = 20): Promise<KbHit[]> {
+  return (await searchArticlesRead(viewer, query, limit)).hits;
+}
+
+/**
+ * THE SAME SEARCH, WITH "NOTHING MATCHED" AND "THE SEARCH DID NOT RUN" KEPT APART.
+ *
+ * searchArticles() catches and returns [] — correct for the library page, which has other things on
+ * it, and a lie on a surface whose whole output is the answer to one question. An assistant that
+ * says "the handbook does not cover this" over a query that never completed has invented a fact
+ * about the company: it has told somebody a policy does not exist. That is the single failure this
+ * whole module is trying not to have, so the caller gets to say which of the two happened.
+ *
+ * `read: 'unreadable'` is NOT an empty corpus and must never be rendered as one. `corpus: 'empty'`
+ * means the query ran and this viewer can see no published article AT ALL, which is a third thing
+ * again — a handbook nobody has written yet, not a handbook that does not mention notice periods.
+ */
+export async function searchArticlesRead(
+  viewer: KbViewer,
+  query: string,
+  limit = 20,
+): Promise<{ read: 'ok' | 'unreadable'; hits: KbHit[]; reason: string | null }> {
   const q = String(query || '').trim().slice(0, SEARCH_MAX);
-  if (q.length < 2) return [];
+  if (q.length < 2) return { read: 'ok', hits: [], reason: null };
   const cap = Math.min(Math.max(Number(limit) || 20, 1), 50);
   try {
     await ensureKnowledgeSchema();
@@ -610,17 +796,110 @@ export async function searchArticles(viewer: KbViewer, query: string, limit = 20
          ${visibilityClause(viewer)}
        ORDER BY score DESC, a.updated_at DESC
        LIMIT ${cap}`));
-    return r.map((row) => ({
-      article: mapArticle(row),
-      why: row?.hit_title ? 'matched the title'
-        : row?.hit_summary ? 'matched the summary'
-        : row?.hit_tag ? 'matched a tag'
-        : 'matched the text of the article',
-    }));
+    return {
+      read: 'ok',
+      reason: null,
+      hits: r.map((row) => ({
+        article: mapArticle(row),
+        why: row?.hit_title ? 'matched the title'
+          : row?.hit_summary ? 'matched the summary'
+          : row?.hit_tag ? 'matched a tag'
+          : 'matched the text of the article',
+      })),
+    };
   } catch (e: any) {
     logFail('searchArticles', e);
-    return [];
+    return { read: 'unreadable', hits: [], reason: e?.cause?.message || e?.message || 'unknown database error' };
   }
+}
+
+/**
+ * IS THERE A HANDBOOK AT ALL, FOR THIS PERSON? Three answers, kept apart.
+ *
+ * Nothing in this repository seeds kb_articles — saveArticle() is its only writer — so on a fresh
+ * deployment the honest answer to every policy question is "nobody has written one yet", and that is
+ * a completely different sentence from "the handbook does not say". A surface that cannot tell them
+ * apart tells a new employee their company has no leave policy.
+ *
+ * The visibility clause is applied here too, so the count is of what THIS person may open, and a
+ * restricted article they cannot read does not inflate it into "there are articles, yours just did
+ * not match".
+ */
+export async function articleCorpusRead(
+  viewer: KbViewer,
+): Promise<{ read: 'ok' | 'unreadable'; published: number; reason: string | null }> {
+  try {
+    await ensureKnowledgeSchema();
+    const r = rows(await db.execute(sql`
+      SELECT COUNT(*)::int AS n
+        FROM kb_articles a
+       WHERE a.status = 'published' ${visibilityClause(viewer)}`));
+    return { read: 'ok', published: Number(r[0]?.n) || 0, reason: null };
+  } catch (e: any) {
+    logFail('articleCorpusRead', e);
+    return { read: 'unreadable', published: 0, reason: e?.cause?.message || e?.message || 'unknown database error' };
+  }
+}
+
+/**
+ * THE SENTENCES IN THIS ARTICLE THAT ANSWER THIS QUESTION — a citation somebody can check.
+ *
+ * WHY THIS IS NOT excerpt(). excerpt() returns the OPENING of an article, which is the right thing
+ * on a card and the wrong thing under an answer: quoting the first line of a sixty-kilobyte leave
+ * policy as the source for a notice-period claim shows the reader nothing they can verify. This
+ * finds the passage the words actually appear in.
+ *
+ * IT ADDS NO AUTHORIZATION OF ITS OWN AND MUST NOT BE GIVEN ANY. It only ever receives an article
+ * that a visibility-clause read already returned, so there is no second visibility model here to
+ * fall out of step with the first. It is pure string work on text the caller may already read.
+ *
+ * IT NEVER PARAPHRASES. Every character it returns is a character of the stored body, with markdown
+ * punctuation flattened for reading. A citation that has been reworded is not a citation.
+ */
+export function passageFor(article: KbArticle, query: string, max = 320): string {
+  const flat = String(article?.body || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/[#>*_`]/g, ' ')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!flat) return excerpt(article, max);
+
+  // Sentence-ish units. Splitting on the end punctuation keeps a quoted passage readable, which a
+  // fixed character window around the match does not.
+  const parts = flat.split(/(?<=[.!?])\s+/).filter((p) => p.trim().length > 0);
+  const words = String(query || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length > 2)
+    .slice(0, 8);
+
+  let bestIndex = -1;
+  let bestScore = 0;
+  parts.forEach((p, i) => {
+    const low = p.toLowerCase();
+    let score = 0;
+    for (const w of words) if (low.indexOf(w) >= 0) score += 1;
+    if (score > bestScore) { bestScore = score; bestIndex = i; }
+  });
+
+  // NOTHING IN THE BODY MATCHED. The hit came from the title, the summary or a tag, and saying so is
+  // better than quoting a random paragraph as though it were the reason.
+  if (bestIndex < 0) return excerpt(article, max);
+
+  let passage = parts[bestIndex];
+  // One neighbour on each side, while it fits — a sentence quoted with no context reads as a trap.
+  let before = bestIndex - 1;
+  let after = bestIndex + 1;
+  while (passage.length < max - 60) {
+    const nextAfter = after < parts.length ? parts[after] : null;
+    const nextBefore = before >= 0 ? parts[before] : null;
+    if (nextAfter && passage.length + nextAfter.length + 1 <= max) { passage = passage + ' ' + nextAfter; after += 1; continue; }
+    if (nextBefore && passage.length + nextBefore.length + 1 <= max) { passage = nextBefore + ' ' + passage; before -= 1; continue; }
+    break;
+  }
+  const trimmed = passage.length > max ? passage.slice(0, max - 1).trimEnd() + '…' : passage;
+  return (before >= 0 ? '…' : '') + trimmed;
 }
 
 export interface SuggestOptions {

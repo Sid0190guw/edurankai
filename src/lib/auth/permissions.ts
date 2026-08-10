@@ -339,6 +339,27 @@ export type Permission =
   // cannot open it afterwards. That is deliberate — the audience is a property of the article, not a
   // privilege of the author.
   | 'knowledge.manage'
+  // READING THE ASSISTANT'S QUESTION LOG (src/lib/ask/log.ts): the questions people put to
+  // /portal/ask and /ask, what the assistant searched, and whether anything it retrieved actually
+  // answered them.
+  //
+  // WHY IT IS A KEY AT ALL. The single most useful row in that table is a question NOBODY could
+  // answer, because it names a policy that has never been written down. Somebody has to be able to
+  // read those. But the same table, read the other way, is a list of what individual people are
+  // worried about, and "who asked about their notice period last week" is not a question this
+  // company should be able to answer about one of its own employees.
+  //
+  // SO THE KEY BUYS AN AGGREGATE, AND THE QUERY BEHIND IT CANNOT RETURN ANYTHING ELSE. The reads in
+  // src/lib/ask/log.ts that this key gates do not SELECT the asker column at all — it is absent from
+  // the select list, not filtered out afterwards — and there is no join to users or hr_employees
+  // anywhere in the module. A visitor question is stored with no identity in the first place. The
+  // asker is recorded for signed-in people for exactly one purpose, myRecentAsks(), which narrows on
+  // the session's own user id and is not gated on this key because it is nobody else's business
+  // either.
+  //
+  // POPULATION: super_admin + hr — the same two roles that hold `knowledge.manage`, because the
+  // action this log leads to is WRITING THE MISSING ARTICLE, and those are the people who can.
+  | 'ask.logs.view'
   // =============================================================================================
   // WORKING TIME AND AGGREGATE REPORTING (src/lib/attendance.ts, src/lib/analytics-workforce.ts).
   //
@@ -1125,6 +1146,9 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // staff handbook the helpdesk deflects tickets to. Reading is scoped by the article's own
     // audience in the WHERE clause, so this key widens nobody's sight of anything.
     'helpdesk.manage', 'assets.manage', 'documents.manage', 'knowledge.manage',
+    // The assistant's unanswered-question log. Aggregate only, and it names the gaps in the
+    // handbook these same holders write. No asker identity is selectable behind it.
+    'ask.logs.view',
     // WORKING TIME AND AGGREGATE REPORTING. Narrowest defensible holders, matching whoever already
     // administers attendance and whoever already reads every employee record one at a time. Neither
     // key approves anything: an attendance correction routes per row from the Organization Graph.
@@ -1297,6 +1321,9 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // `knowledge.manage` sits with them: the people desk already writes these answers out by hand in
     // reply to the same five questions, and this is where those answers go instead.
     'helpdesk.manage', 'assets.manage', 'documents.manage', 'knowledge.manage',
+    // The assistant's unanswered-question log. Aggregate only, and it names the gaps in the
+    // handbook these same holders write. No asker identity is selectable behind it.
+    'ask.logs.view',
     // WORKING TIME AND AGGREGATE REPORTING. `hr` is the only built-in role holding the `attendance`
     // section in ROLE_SECTIONS below, so it is already the role that administers attendance; and it
     // holds employee.manage, so it can already read every employee record one at a time. Both keys

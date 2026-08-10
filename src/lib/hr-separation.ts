@@ -10,9 +10,13 @@ import {
   getManager,
   getRelationshipHistory,
   closeRelationship,
-  supersedeReportingManager,
   isInitialized as orgGraphInitialized,
 } from '@/lib/org-graph';
+// ONE WRITER FOR THE REPORTING LINE, shared with the Employment tab and with hr-lifecycle.ts. It
+// supersedes the graph edge and mirrors the legacy column in one call, or does neither and says why.
+// This file held its own copy of that pair of statements; the copy is gone so the three paths cannot
+// drift apart in how they order them.
+import { setReportingLine } from '@/lib/org-assignment';
 import { startWorkflow, getInstance } from '@/lib/workflow';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
@@ -818,9 +822,9 @@ export async function exitReadiness(separationId: string): Promise<ExitReadiness
  * explanation anyone can trace back to this exit.
  *
  * WHAT IT WRITES, IN ORDER, AND WHY:
- *   1. Each direct report is moved onto the new manager with supersedeReportingManager() — one
- *      statement per person that closes the old edge and opens the new at the SAME instant. Their
- *      legacy reporting_manager_id (a USERS id) is brought into step behind it.
+ *   1. Each direct report is moved onto the new manager with setReportingLine() — one call per
+ *      person that closes the old edge and opens the new at the SAME instant, and brings their
+ *      legacy reporting_manager_id (a USERS id) into step behind it. Both records or neither.
  *   2. The leaver's own remaining open edges are CLOSED with effective_to — never deleted, never
  *      revoked. revokeRelationship() means "this row should never have existed"; a person who worked
  *      here and left is the opposite of that, and revoking would erase their approvals from history.
@@ -896,9 +900,11 @@ export async function completeSeparation(opts: {
       for (const report of readiness.directReports) {
         if (!report.employeeId) continue;
         if (report.employeeId === reassignTo) continue; // nobody manages themselves
-        const moved = await supersedeReportingManager(report.employeeId, reassignTo, {
+        const moved = await setReportingLine({
+          employeeId: report.employeeId,
+          managerEmployeeId: reassignTo,
           asOf: closeAt,
-          createdByUserId: actor,
+          actorUserId: actor,
           note: 'Reassigned on the exit of ' + (sep.employee_name || 'their manager') + ' (separation ' + separationId + ')',
         });
         if (!moved.ok) {
@@ -912,14 +918,10 @@ export async function completeSeparation(opts: {
               + ' (' + reassigned + ' of ' + readiness.directReports.length + ' moved before this failed).',
           };
         }
+        // The compatibility column moved with the edge inside setReportingLine(), or neither did.
+        // The separate UPDATE that used to live here could succeed on its own after a graph write
+        // that had not, which is the disagreement this refactor removes.
         reassigned += 1;
-
-        // The compatibility column, in step. It holds a USERS id.
-        await db.execute(sql`
-          UPDATE hr_employees
-             SET reporting_manager_id = (SELECT m.user_id FROM hr_employees m WHERE m.id = ${reassignTo}::uuid),
-                 updated_at = NOW()
-           WHERE id = ${report.employeeId}::uuid`);
       }
     }
 

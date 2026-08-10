@@ -10,11 +10,12 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 import { logAudit } from '@/lib/audit';
-import {
-  getManager,
-  supersedeReportingManager,
-  isInitialized as orgGraphInitialized,
-} from '@/lib/org-graph';
+import { getManager } from '@/lib/org-graph';
+// ONE WRITER FOR THE REPORTING LINE, shared with the Employment tab and with hr-separation.ts. It
+// supersedes the graph edge and mirrors the legacy column in one call, or does neither and says why.
+// This file used to hold its own copy of that sequence; two copies of a rule is one copy away from a
+// third that gets it wrong.
+import { setReportingLine } from '@/lib/org-assignment';
 import { startWorkflow, getInstance, type WorkflowInstanceView } from '@/lib/workflow';
 // THE CIVIL DATE IN THE COMPANY'S ZONE. `new Date()` in this process is UTC on this deployment, five
 // and a half hours behind the zone the working day actually turns over in, so every date this module
@@ -1349,13 +1350,16 @@ async function markMoveHalted(kind: 'transfer' | 'promotion', id: string, why: s
  * THE ORG GRAPH WRITE. Close the old reporting edge, open the new one, at the transfer's effective
  * date — and bring the legacy column into step behind it.
  *
- * ORDER MATTERS AND IS DELIBERATE:
+ * ORDER MATTERS AND IS DELIBERATE, and it now lives in ONE place — setReportingLine() in
+ * src/lib/org-assignment.ts, which this path, the Employment tab and the exit reassignment all call:
  *   1. The GRAPH first. It is the record of who reported to whom and it is the one that must be
  *      right; if it fails, nothing else is written and the request stays approved-but-not-applied,
  *      visible on the console with the reason.
- *   2. The legacy column and department second, as the COMPATIBILITY layer. A failure here is
- *      reported, not swallowed — every screen still reading the column would otherwise disagree with
- *      the graph and nobody would know which was right.
+ *   2. The legacy column second, as the COMPATIBILITY layer. A failure there is reported, not
+ *      swallowed — every screen still reading the column would otherwise disagree with the graph and
+ *      nobody would know which was right.
+ * The department move stays here, because it is a property of the transfer rather than of the
+ * reporting line.
  *
  * NO IN-PLACE MANAGER UPDATE ANYWHERE. hr_employees.reporting_manager_id is written only to mirror
  * the edge the graph already holds, and the graph keeps the closed edge with its effective_to so
@@ -1363,24 +1367,30 @@ async function markMoveHalted(kind: 'transfer' | 'promotion', id: string, why: s
  */
 async function applyApprovedTransfer(t: TransferRow, actorUserId: string | null): Promise<MoveResult> {
   try {
-    // A transfer that changes the manager needs a graph to write into. Saying so is the honest
-    // answer; writing the column alone would look like it worked and lose the history.
-    if (t.toManagerEmployeeId && !(await orgGraphInitialized())) {
-      return {
-        ok: false,
-        error:
-          'The reporting line for ' + (t.employeeName || 'this person')
-          + ' was not changed: the Organization Graph is not yet initialized, so there is no history to supersede. '
-          + 'Run the graph backfill first — nothing was written.',
-      };
-    }
-
+    // THE "RUN THE BACKFILL FIRST" REFUSAL IS GONE, AND ITS PREMISE WITH IT.
+    //
+    // It read: a transfer that changes the manager needs a graph to write into, so refuse while
+    // isInitialized() is false. That was true only while NOTHING in the product opened a reporting
+    // edge — and it made this the screen that could not populate the very graph it demanded. A
+    // person's approved transfer sat unapplied because a SQL file had not been run by hand.
+    //
+    // Superseding into an empty graph is exactly correct: there is no open edge to close, so the new
+    // one is simply opened, and the edge is the first true statement the graph holds about this
+    // person. Nothing is lost — the legacy column was never the history, it only ever held today's
+    // answer, so there was no past to preserve here in the first place. setReportingLine() below
+    // still refuses on any real failure and reports the Postgres reason, which is the guard that
+    // actually protects this write.
     let relationshipId: string | null = null;
 
     if (t.toManagerEmployeeId) {
-      const moved = await supersedeReportingManager(t.employeeId, t.toManagerEmployeeId, {
+      // GRAPH FIRST, LEGACY COLUMN SECOND, OR NEITHER. The sequence lives in one place now
+      // (src/lib/org-assignment.ts) so this path, the Employment tab and the exit reassignment
+      // cannot drift apart in how they order the two writes.
+      const moved = await setReportingLine({
+        employeeId: t.employeeId,
+        managerEmployeeId: t.toManagerEmployeeId,
         asOf: t.effectiveDate || undefined,
-        createdByUserId: actorUserId,
+        actorUserId,
         note: 'Transfer ' + t.id + ': ' + t.reason,
       });
       if (!moved.ok) {
@@ -1389,19 +1399,10 @@ async function applyApprovedTransfer(t: TransferRow, actorUserId: string | null)
           error: 'The reporting line was not changed, so nothing was applied: ' + (moved.error || 'unknown reason'),
         };
       }
-      relationshipId = moved.id || null;
-    }
-
-    // THE COMPATIBILITY LAYER. reporting_manager_id holds a USERS id — resolved from the new
-    // manager's employee row, never assumed to be the employee id.
-    if (t.toManagerEmployeeId) {
-      await db.execute(sql`
-        UPDATE hr_employees
-           SET reporting_manager_id = (
-                 SELECT m.user_id FROM hr_employees m WHERE m.id = ${t.toManagerEmployeeId}::uuid
-               ),
-               updated_at = NOW()
-         WHERE id = ${t.employeeId}::uuid`);
+      // The edge id is recorded on the transfer row so the applied transfer can be traced back to
+      // the exact edge. It is null when the graph already held precisely this line and nothing
+      // needed to be written, which is a success and not a gap.
+      relationshipId = moved.edgeId;
     }
 
     // department_id as TEXT. Never ::uuid — see the header.

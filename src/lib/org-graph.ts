@@ -1724,3 +1724,109 @@ export async function supersedeMentor(
     return { ok: false, error: e?.cause?.message || e?.message || 'Could not change the mentor' };
   }
 }
+
+/**
+ * CHANGE WHO HEADS A DEPARTMENT: close the open `department_head` edge for that department and open
+ * the new one at the same instant. Passing null closes the line without opening a replacement.
+ *
+ * WHY THIS EXISTS AT ALL. Until this function there was no writer for a department head anywhere in
+ * the product, and no data column to seed one from either: `departments` carries no head in
+ * src/lib/db/schema.ts and none in db/hr-schema.sql, and hr_employees has no is_head flag. The only
+ * signal that ever existed was the pair `users.role = 'department_head'` + `users.assigned_department_id`
+ * — and the leadership half of that pair is a ROLE NAME, which is precisely what this module must
+ * never read. So a head has to be ENTERED by a person on a screen. This is the write behind that
+ * screen; /admin/org/graph is the screen.
+ *
+ * THE SHAPE, and it is not the same shape as a reporting line:
+ *   subject_employee_id = the head           object_employee_id = NULL
+ *   scope_type = 'department'                scope_id = departments.id AS TEXT
+ * A head heads a DEPARTMENT, not one named person. `scope_id` is TEXT and is NEVER cast to ::uuid —
+ * the same logical value is a varchar(50) slug in one schema file and a UUID in the other.
+ *
+ * ONE STATEMENT, for the same reason supersedeReportingManager() is one statement: two statements
+ * can half-succeed, and a department left with the old head closed and no new head opened is a
+ * department whose learning, progress and department-scoped approvals resolve to nobody while the
+ * caller was told it worked.
+ *
+ * THE EXCLUSION IN THE CTE — `AND subject_employee_id <> head` — IS CARRIED ACROSS VERBATIM AND IS
+ * LOAD-BEARING. Postgres runs a data-modifying CTE always and to completion while the main query's
+ * NOT EXISTS reads the statement-start snapshot. Without the exclusion, re-saving the SAME head
+ * closes their edge and inserts nothing: the department silently loses its head and this returns
+ * ok. Somebody pressing Save twice on a form is all it takes. Written out rather than generalised
+ * with supersedeReportingManager() on purpose — rewriting that function to serve two callers is how
+ * a fix whose comment is longer than the statement gets lost.
+ *
+ * THE DATABASE IS THE REAL BACKSTOP: org_relationships_one_open_dept_head_uq permits exactly one
+ * open head per department, so a second code path cannot get around this either.
+ *
+ * IT GRANTS NOTHING. Heading a department is a relationship, not a capability. What the head may
+ * then DO still comes from src/lib/auth/permissions.ts.
+ */
+export async function supersedeDepartmentHead(
+  departmentId: string,
+  newHeadEmployeeId: string | null,
+  opts?: AsOfOptions & { createdByUserId?: string | null; note?: string | null },
+): Promise<OrgWriteResult> {
+  // TEXT, trimmed, never ::uuid. An empty department id would scope the edge to nothing at all and
+  // the row would answer for every department and none of them.
+  const dept = String(departmentId || '').trim();
+  if (!dept) return { ok: false, error: 'Choose a department.' };
+  const head = isUuid(newHeadEmployeeId) ? String(newHeadEmployeeId) : null;
+  const at = asOfIso(opts);
+  if (!at) return { ok: false, error: 'Invalid effective date' };
+  const createdBy = isUuid(opts?.createdByUserId) ? String(opts?.createdByUserId) : null;
+  const note = opts?.note ? String(opts.note).slice(0, 2000) : null;
+
+  try {
+    await ensureOrgGraphSchema();
+
+    if (!head) {
+      await (await database()).execute(sql`
+        UPDATE org_relationships
+           SET effective_to = ${at}::timestamptz
+         WHERE type = 'department_head'
+           AND scope_type = 'department'
+           AND scope_id = ${dept}::text
+           AND status = 'active'
+           AND effective_to IS NULL
+           AND effective_from < ${at}::timestamptz`);
+      return { ok: true };
+    }
+
+    const r = await (await database()).execute(sql`
+      WITH closed AS (
+        UPDATE org_relationships
+           SET effective_to = ${at}::timestamptz
+         WHERE type = 'department_head'
+           AND scope_type = 'department'
+           AND scope_id = ${dept}::text
+           AND status = 'active'
+           AND effective_to IS NULL
+           AND effective_from < ${at}::timestamptz
+           AND subject_employee_id <> ${head}::uuid
+        RETURNING id
+      )
+      INSERT INTO org_relationships
+        (type, subject_employee_id, object_employee_id, scope_type, scope_id,
+         effective_from, status, created_by, note)
+      SELECT 'department_head', ${head}::uuid, NULL::uuid, 'department', ${dept}::text,
+             ${at}::timestamptz, 'active', ${createdBy}::uuid, ${note}::text
+      WHERE NOT EXISTS (
+        SELECT 1 FROM org_relationships x
+         WHERE x.type = 'department_head'
+           AND x.scope_type = 'department'
+           AND x.scope_id = ${dept}::text
+           AND x.subject_employee_id = ${head}::uuid
+           AND x.status = 'active'
+           AND x.effective_to IS NULL
+      )
+      RETURNING id`);
+    const list = rows(r);
+    // Zero rows means this department already had exactly this head and nothing needed to change.
+    // True only because of the exclusion in the CTE above.
+    return list.length ? { ok: true, id: String(list[0].id) } : { ok: true };
+  } catch (e: any) {
+    logFail('supersedeDepartmentHead', e);
+    return { ok: false, error: e?.cause?.message || e?.message || 'Could not change the department head' };
+  }
+}

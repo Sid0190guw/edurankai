@@ -1782,9 +1782,35 @@ export interface PendingApproval {
  *
  * Fails closed to an empty list: an approver seeing nothing is a missed notification, an approver
  * seeing everyone else's requests is a data leak.
+ *
+ * ...AND THAT IS EXACTLY WHY `onError` EXISTS. Failing closed is right; failing SILENTLY is not.
+ * Every caller of this function received [] whether the queue was genuinely empty or the database
+ * had refused the read, so `routedApprovals()` in src/lib/workforce/loaders.ts could only ever
+ * return ok:true, `routedFailed` on /portal/employee could only ever be false, and the allSettled
+ * machinery on /portal/approvals — written specifically so one dead reader could not print the
+ * all-clear — could never observe a rejection because this function never rejects. A manager with a
+ * fortnight of requests behind a broken read was told "Nothing is waiting on you", which is the one
+ * sentence this whole queue exists to stop being wrong.
+ *
+ * `onError` changes NOTHING about the return value or about who sees what: the list is still [],
+ * still fail-closed, and every existing call site is untouched. It only lets a caller that cares
+ * find out that the answer it is holding is not an answer. It fires for a partial read too — if the
+ * delegation resolution below fails, the routed rows still come back but they are missing everything
+ * this person is standing in for, and a caller must be able to say so.
+ *
+ * The callback is invoked inside this function's own try/catch discipline: it must not throw, and a
+ * throw from it is contained rather than turned into a failed read.
  */
-export async function pendingForApprover(userId: string): Promise<PendingApproval[]> {
+export async function pendingForApprover(
+  userId: string,
+  opts?: { onError?: (e: unknown) => void },
+): Promise<PendingApproval[]> {
   const uid = String(userId || '').trim();
+  // Declared before every branch that uses it — `const` is not hoisted and a reporting-error helper
+  // that throws on its first line would turn an honest degradation into an outage.
+  const reportError = (e: unknown): void => {
+    try { opts?.onError?.(e); } catch { /* a broken reporter must not break the read */ }
+  };
   if (!isUuid(uid)) return [];
   try {
     await ensureWorkflowSchema();
@@ -1818,6 +1844,10 @@ export async function pendingForApprover(userId: string): Promise<PendingApprova
         }
       } catch (e: any) {
         logFail('pendingForApprover.delegates', e);
+        // A PARTIAL ANSWER IS NOT A COMPLETE ONE. The routed rows below will still be returned, but
+        // anything addressed to somebody this person is standing in for is now invisible. Reported
+        // so the surface can say the list is incomplete instead of presenting it as the whole queue.
+        reportError(e);
         delegatedFor = [];
       }
     }
@@ -1877,6 +1907,7 @@ export async function pendingForApprover(userId: string): Promise<PendingApprova
     }));
   } catch (e: any) {
     logFail('pendingForApprover', e);
+    reportError(e);
     return [];
   }
 }
