@@ -49,11 +49,17 @@ import {
 export const DELEGABLE_DOMAINS = [
   'approvals.queue',      // decide what the graph routed to the principal
   'calendar.manage',      // meetings, sessions, scheduling
-  'correspondence.draft', // draft mail and messages, never send as the principal
-  'recruitment.progress', // move candidates along a pipeline
-  'onboarding.chase',     // nudge and track a joiner's outstanding steps
-  'documents.file',       // organise and file, never sign
-  'tasks.assign',         // put work on somebody's board
+  'correspondence.send',  // write and SEND mail and messages on the principal behalf
+  'recruitment.progress', // move candidates along a pipeline, including making an offer
+  'onboarding.chase',     // nudge and track a joiner outstanding steps
+  'documents.file',       // organise, file and share documents
+  'tasks.assign',         // put work on anybody board
+  'people.manage',        // employee records, departments, teams, org structure
+  'learning.manage',      // courses, assignments, enrolments
+  'finance.operate',      // expenses, claims, invoices, purchase decisions
+  'payroll.operate',      // run and approve payroll within the structure already set
+  'platform.configure',   // settings, templates, policies, holidays, module configuration
+  'everything.else',      // any remaining act the principal may perform themselves
 ] as const;
 
 export type DelegableDomain = (typeof DELEGABLE_DOMAINS)[number];
@@ -61,11 +67,17 @@ export type DelegableDomain = (typeof DELEGABLE_DOMAINS)[number];
 export const DOMAIN_LABELS: Readonly<Record<DelegableDomain, string>> = Object.freeze({
   'approvals.queue': 'Decide approvals routed to me',
   'calendar.manage': 'Manage my calendar and sessions',
-  'correspondence.draft': 'Draft mail and messages for me',
-  'recruitment.progress': 'Move candidates through hiring',
+  'correspondence.send': 'Write and send mail and messages for me',
+  'recruitment.progress': 'Run hiring, including extending offers',
   'onboarding.chase': 'Chase outstanding onboarding steps',
-  'documents.file': 'File and organise documents',
-  'tasks.assign': 'Assign tasks on my behalf',
+  'documents.file': 'File, organise and share documents',
+  'tasks.assign': 'Assign work to anybody',
+  'people.manage': 'Manage employee records and the org structure',
+  'learning.manage': 'Manage courses, enrolments and assignments',
+  'finance.operate': 'Expenses, claims, invoices and purchases',
+  'payroll.operate': 'Run and approve payroll',
+  'platform.configure': 'Configure settings, templates and policies',
+  'everything.else': 'Anything else I could do myself',
 });
 
 /**
@@ -83,14 +95,35 @@ export const DOMAIN_LABELS: Readonly<Record<DelegableDomain, string>> = Object.f
  *    what the principal could not reach.
  *  - LEGAL HOLD. Requires an open numbered matter and a written reason from the person accessing it.
  */
+/*
+ * NARROWED, DELIBERATELY, ON THE FOUNDER'S INSTRUCTION.
+ *
+ * The first version of this list withheld pay, employment status, records of achievement and much
+ * else. That was too cautious, and for this organization it was actively counterproductive: the
+ * executive assistant already holds super_admin and can perform those acts AS THEMSELVES.
+ * Withholding them from DELEGATION did not prevent anything — it only meant the same act happened
+ * under the assistant's own authority instead of visibly on the founder's, which is a worse audit
+ * trail rather than a safer one. Delegation should widen what the record says, never narrow what a
+ * person can already do.
+ *
+ * Two remain, and only two, because each protects something a wider grant cannot reach:
+ *
+ *   document.sign — a signature is a claim that a NAMED PERSON assented. A contract or offer letter
+ *     signed by somebody standing in may not hold, and the person harmed by that is whoever relied
+ *     on it. This is a fact about how signatures work, not a preference.
+ *
+ *   authority.grant — this one OUTLIVES its own delegation. Every other act here stops when the
+ *     delegation expires; access granted does not, because the access remains afterwards. It is the
+ *     single limit that keeps every other grant genuinely revocable, and it is what stops a
+ *     compromised assistant account from making itself permanent.
+ *
+ * Wellness and legal-hold records are absent from this list not because they were relaxed but
+ * because they were never the principal's to give: a delegation cannot convey what the principal
+ * cannot do, and CLAUDE.md places individual health data beyond everyone, the founder included.
+ */
 export const NEVER_DELEGABLE: readonly { id: string; why: string }[] = Object.freeze([
-  { id: 'authority.grant', why: 'Granting access or capability. Delegating this would dissolve every other limit on this list.' },
-  { id: 'pay.change', why: 'Changing pay, a salary structure or a payroll run.' },
-  { id: 'employment.status', why: 'Hiring, terminating, promoting or reclassifying a person.' },
-  { id: 'achievement.record', why: 'Issuing, revoking or altering a credential, grade or verified skill.' },
-  { id: 'document.sign', why: 'Signing anything. A signature says a specific person assented.' },
-  { id: 'wellness.read', why: 'Individual health or wellness data. Nobody may read it, including the principal.' },
-  { id: 'legalhold.access', why: 'Legal-hold records, which need an open matter and a written reason from the reader.' },
+  { id: 'document.sign', why: 'Signing. A signature is a claim that a named person assented, and one signed by somebody else may not hold — which harms whoever relied on it.' },
+  { id: 'authority.grant', why: 'Granting access or capability. Access outlives the delegation that granted it, so this is the one limit that keeps every other grant revocable.' },
 ]);
 
 /** A delegation with no end date is the failure mode this whole design exists to prevent. */

@@ -100,23 +100,37 @@ describe('the things no delegation carries', () => {
     }
   });
 
-  it('keeps the power to grant power on the forbidden list', () => {
-    // This is the one that makes every other exclusion enforceable: if granting authority could be
-    // delegated, each remaining limit could be routed around in two moves.
+  it('keeps granting authority on the forbidden list', () => {
+    // THE LOAD-BEARING ONE. Every other delegated act stops when the delegation expires. Access
+    // granted does not — it remains afterwards. So this is the single limit that keeps every other
+    // grant genuinely revocable, and it is what stops a compromised assistant account from making
+    // itself permanent. The list was deliberately narrowed to two; if this ever leaves, the word
+    // "temporary" stops meaning anything.
     expect(NEVER_DELEGABLE.some((n) => n.id === 'authority.grant')).toBe(true);
   });
 
-  it('keeps pay, employment status and achievement records off the table', () => {
-    const ids = NEVER_DELEGABLE.map((n) => n.id);
-    expect(ids.includes('pay.change')).toBe(true);
-    expect(ids.includes('employment.status')).toBe(true);
-    expect(ids.includes('achievement.record')).toBe(true);
+  it('keeps signing on the forbidden list', () => {
+    // A signature is a claim that a NAMED person assented. A contract signed by somebody standing
+    // in may not hold, and the person harmed is whoever relied on it — a candidate who resigned
+    // elsewhere on the strength of an offer letter. A fact about signatures, not a preference.
+    expect(NEVER_DELEGABLE.some((n) => n.id === 'document.sign')).toBe(true);
   });
 
-  it('keeps wellness and legal hold unreachable, since the principal cannot reach them either', () => {
-    const ids = NEVER_DELEGABLE.map((n) => n.id);
-    expect(ids.includes('wellness.read')).toBe(true);
-    expect(ids.includes('legalhold.access')).toBe(true);
+  it('holds the list to exactly those two', () => {
+    // The founder asked for everything else to be delegable, and it is. This test exists so that a
+    // later well-meaning pass cannot quietly re-tighten the list without someone deciding to: an
+    // assistant who already holds super_admin performs the withheld act under their OWN authority
+    // instead, which is a worse audit trail, not a safer one.
+    expect(NEVER_DELEGABLE.length).toBe(2);
+  });
+
+  it('delegates the operational domains the founder asked for', () => {
+    const d = DELEGABLE_DOMAINS as readonly string[];
+    expect(d.includes('people.manage')).toBe(true);
+    expect(d.includes('payroll.operate')).toBe(true);
+    expect(d.includes('finance.operate')).toBe(true);
+    expect(d.includes('platform.configure')).toBe(true);
+    expect(d.includes('everything.else')).toBe(true);
   });
 
   it('gives a reason for every exclusion', () => {
