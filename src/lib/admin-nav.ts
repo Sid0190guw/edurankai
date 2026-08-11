@@ -206,6 +206,10 @@ export const ADMIN_NAV: AdminNavEntry[] = [
     ],
   },
   // NEWLY MAPPED. A messaging surface, gated like the other one (DMs).
+  // The page that fills the organization graph. Registered HERE because the sidebar now renders from
+  // this catalogue — a page added anywhere else is a page nobody can find, which is the defect that
+  // buried about fifty surfaces until the layout was changed to read this list.
+  { id: 'org-graph', label: 'Organization graph', href: '/admin/org/graph', icon: 'users', section: 'employees' },
   { id: 'threads', label: 'All Threads', href: '/admin/threads', icon: 'chat', section: 'dms' },
   { id: 'infra', label: 'Infrastructure', href: '/admin/infra', icon: 'shield', section: 'settings' },
   {

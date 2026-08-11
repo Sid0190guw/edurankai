@@ -1,0 +1,299 @@
+---
+// /admin/org/graph — FILL THE ORGANIZATION GRAPH FROM THE RECORDS THAT ALREADY DESCRIBE IT.
+//
+// =================================================================================================
+// WHY THIS PAGE HAD TO EXIST
+// =================================================================================================
+//
+// org_relationships is empty in production. Everything approval-shaped in this product reads it, so
+// while it is empty: leave routes to nobody and sits pending until somebody thinks to open a
+// company-wide list; the task board offers no one to assign to; roughly fifteen admin screens print
+// "Organization Graph not yet initialized"; and an employee who files a request is told to wait,
+// with no cause given, indefinitely. One of them asked in a group chat why nothing had happened.
+//
+// The data to fix it has been sitting in hr_employees.reporting_manager_id the whole time — typed in
+// by an administrator on the Employment tab. src/lib/org-graph-backfill.ts turns that column into
+// graph edges. Until now the only way to run it was a raw SQL file executed by hand against
+// production, and no screen offered it or reported whether it had ever run.
+//
+// =================================================================================================
+// PREVIEW WRITES NOTHING, AND THE PROBLEMS ARE THE VALUABLE HALF
+// =================================================================================================
+//
+// previewBackfill() reads and plans; applyBackfill() writes. Both are in the library, and this page
+// is only the two buttons — so what you see before pressing is produced by the same code that runs
+// after, and the two cannot disagree.
+//
+// Every problem is named BY PERSON. With 42 employees, "three problems" is useless and "Priya's
+// reporting manager points at a deleted account" is actionable. A blocking problem means no edge is
+// created for that person; a non-blocking one means the edge is created and flagged. Both are shown,
+// separately, because they need different responses.
+//
+// APPLYING IS NOT ALL-OR-NOTHING. One bad row must never stop forty-one good ones, so the outcome
+// reports created, failed and skipped separately and `partial` is never hidden behind an ok.
+//
+// const BEFORE THE HANDLER — const is not hoisted, and that has taken pages down here.
+// MOBILE FIRST: 360px, 44px targets.
+// =================================================================================================
+
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { previewBackfill, applyBackfill } from '@/lib/org-graph-backfill';
+import { can } from '@/lib/auth/permissions';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=/admin/org/graph');
+
+// Populating the graph decides who may approve what, so it is gated on the key that governs the
+// organization structure rather than on a role name.
+const mayRun = can(user as any, 'employee.manage');
+if (!mayRun) return Astro.redirect('/admin?denied=employees');
+
+const CARD = 'background:var(--o-bg2);border:1px solid var(--o-stroke);border-radius:14px;padding:16px 18px;margin-bottom:16px;';
+const HD = "font-size:10.5px;text-transform:uppercase;letter-spacing:0.12em;font-weight:700;color:var(--o-low);margin:0 0 10px;";
+const BTN = 'min-height:46px;padding:0 20px;border-radius:10px;border:0;background:#FF4F00;color:#fff;font-weight:600;cursor:pointer;font-size:0.95rem;';
+const BTN2 = 'min-height:46px;padding:0 20px;border-radius:10px;border:1px solid var(--o-stroke);background:transparent;color:var(--o-hi);font-weight:600;cursor:pointer;font-size:0.95rem;';
+
+let applied: Awaited<ReturnType<typeof applyBackfill>> | null = null;
+let actionError = '';
+
+if (Astro.request.method === 'POST') {
+  const form = await Astro.request.formData().catch(() => null);
+  if (String(form?.get('action') || '') === 'apply') {
+    try {
+      applied = await applyBackfill({
+        createdByUserId: String(user.id),
+        // Both on: the SQL separates them so they CAN be skipped, and the honest default for a first
+        // run is to do the whole translation rather than leave half the graph described.
+        closeLeavers: true,
+        includeAssignments: true,
+      });
+    } catch (e: any) {
+      actionError = e?.cause?.message || e?.message || 'unknown error';
+    }
+  }
+}
+
+// Read AFTER the write, so the page shows the state that now exists rather than the one that did.
+let preview: Awaited<ReturnType<typeof previewBackfill>> | null = null;
+let previewError = '';
+try {
+  preview = await previewBackfill();
+} catch (e: any) {
+  previewError = e?.cause?.message || e?.message || 'unknown error';
+}
+
+const sc = preview?.schema || null;
+const schemaMissing: string[] = sc ? [
+  sc.orgRelationships ? '' : 'the org_relationships table',
+  sc.orgAssignments ? '' : 'the org_employee_assignments table',
+  sc.hrEmployees ? '' : 'the hr_employees table',
+  sc.managerColumn ? '' : 'the reporting_manager_id column',
+].filter((x) => x !== '') : [];
+
+const plan = preview?.plan || null;
+const blocking = (plan?.problems || []).filter((p) => p.blocking);
+const flagged = (plan?.problems || []).filter((p) => !p.blocking);
+const toCreate = plan?.edgesToCreate?.length || 0;
+const already = plan?.edgesAlreadyPresent?.length || 0;
+---
+
+<AdminLayout title="Organization graph" activeNav="org-structure">
+  <div style="max-width:900px;">
+
+    <p style={HD}>HR · Organization</p>
+    <h1 style="font-size:1.5rem;margin:0 0 6px;color:var(--o-hi);">Fill the organization graph</h1>
+    <p style="margin:0 0 20px;color:var(--o-mid);line-height:1.6;max-width:62ch;">
+      Every approval in this product asks the graph who is responsible for whom. While it is empty,
+      leave has no approver, work cannot be assigned, and requests wait with no cause given. The
+      answers are already on the employee records — this writes them into the graph.
+    </p>
+
+    {/* ---- WHAT JUST HAPPENED, if anything ---- */}
+    {actionError !== '' && (
+      <div style={CARD + 'border-color:rgba(190,40,40,0.45);'}>
+        <p style="margin:0;color:var(--o-hi);">
+          Nothing was written. The reason given was: {actionError}
+        </p>
+      </div>
+    )}
+
+    {applied && (
+      <div style={CARD + (applied.partial ? 'border-color:rgba(230,120,0,0.45);' : 'border-color:rgba(0,150,70,0.45);')}>
+        <p style={HD}>Result</p>
+        <p style="margin:0 0 10px;color:var(--o-hi);font-weight:650;">
+          {applied.createdEdges.length} reporting {applied.createdEdges.length === 1 ? 'line' : 'lines'} written
+          {applied.createdAssignments.length > 0 ? ', ' + applied.createdAssignments.length + ' department assignments' : ''}
+          {applied.closedEdges.length > 0 ? ', ' + applied.closedEdges.length + ' closed for leavers' : ''}.
+        </p>
+        {applied.partial && (
+          <p style="margin:0 0 10px;color:var(--o-mid);line-height:1.6;">
+            Some of what the preview promised did not happen. That is reported rather than hidden, and
+            the rest still went through — one bad row does not stop the others.
+          </p>
+        )}
+        {applied.failedEdges.length > 0 && (
+          <div style="margin:0 0 10px;">
+            <p style="margin:0 0 6px;color:var(--o-hi);font-weight:600;">Could not be written:</p>
+            <ul style="margin:0;padding-left:18px;line-height:1.7;color:var(--o-mid);">
+              {applied.failedEdges.map((f) => (
+                <li>{f.employeeName} to {f.managerName} — {f.error}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {applied.error && (
+          <p style="margin:0;color:var(--o-mid);">{applied.error}</p>
+        )}
+      </div>
+    )}
+
+    {/* ---- THE STATE ---- */}
+    {previewError !== '' ? (
+      <div style={CARD + 'border-color:rgba(190,40,40,0.45);'}>
+        <p style="margin:0;color:var(--o-hi);">
+          The graph could not be read, so nothing here is known — including whether it needs filling.
+          The reason given was: {previewError}
+        </p>
+      </div>
+    ) : !preview || !preview.ok ? (
+      <div style={CARD + 'border-color:rgba(190,40,40,0.45);'}>
+        <p style="margin:0;color:var(--o-hi);">
+          The preview could not be produced. {preview?.error || 'No reason was given.'}
+        </p>
+        {schemaMissing.length > 0 && (
+          <p style="margin:10px 0 0;color:var(--o-mid);line-height:1.6;">
+            Missing before this can run: {schemaMissing.join(', ')}. Create the module tables on
+            <a href="/admin/setup" style="color:#FF4F00;font-weight:600;"> the setup page</a> first.
+          </p>
+        )}
+      </div>
+    ) : (
+      <div>
+        <div style={CARD}>
+          <p style={HD}>What this will do</p>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:14px;margin-bottom:14px;">
+            <div>
+              <p style="font-size:1.7rem;margin:0;font-weight:700;color:var(--o-hi);">{plan?.employeesTotal ?? 0}</p>
+              <p style="margin:0;font-size:0.8rem;color:var(--o-low);">people on record</p>
+            </div>
+            <div>
+              <p style="font-size:1.7rem;margin:0;font-weight:700;color:var(--o-hi);">{plan?.employeesWithManagerColumn ?? 0}</p>
+              <p style="margin:0;font-size:0.8rem;color:var(--o-low);">have a manager written on their record</p>
+            </div>
+            <div>
+              <p style="font-size:1.7rem;margin:0;font-weight:700;color:#FF4F00;">{toCreate}</p>
+              <p style="margin:0;font-size:0.8rem;color:var(--o-low);">reporting lines this will create</p>
+            </div>
+            <div>
+              <p style="font-size:1.7rem;margin:0;font-weight:700;color:var(--o-hi);">{already}</p>
+              <p style="margin:0;font-size:0.8rem;color:var(--o-low);">already in the graph, skipped</p>
+            </div>
+          </div>
+
+          <p style="margin:0 0 14px;color:var(--o-mid);line-height:1.6;">{preview.summary}</p>
+
+          {toCreate > 0 ? (
+            <form method="POST">
+              <input type="hidden" name="action" value="apply" />
+              <button type="submit" style={BTN}>
+                Write {toCreate} reporting {toCreate === 1 ? 'line' : 'lines'} into the graph
+              </button>
+              <p style="margin:10px 0 0;font-size:0.82rem;color:var(--o-low);line-height:1.6;">
+                Nothing is deleted. Running it again writes nothing the second time, so it is safe to
+                repeat after fixing the records below.
+              </p>
+            </form>
+          ) : (
+            <p style="margin:0;color:var(--o-mid);">
+              There is nothing to write. Either every reporting line is already in the graph, or no
+              employee record names a manager — the counts above say which.
+            </p>
+          )}
+        </div>
+
+        {/* ---- THE PROBLEMS, BY NAME. The valuable half of this page. ---- */}
+        {blocking.length > 0 && (
+          <div style={CARD + 'border-color:rgba(190,40,40,0.45);'}>
+            <p style={HD}>No line will be created for these people</p>
+            <p style="margin:0 0 12px;color:var(--o-mid);line-height:1.6;">
+              Each of these is a fact about the employee record, fixed there rather than here. Until
+              it is, that person's requests have no approver and they cannot be assigned work through
+              the normal route.
+            </p>
+            <div style="display:grid;gap:10px;">
+              {blocking.map((p) => (
+                <div style="padding:10px 12px;border:1px solid var(--o-stroke);border-radius:10px;">
+                  <p style="margin:0 0 4px;font-weight:650;color:var(--o-hi);">{p.employeeName}</p>
+                  <p style="margin:0 0 6px;color:var(--o-mid);font-size:0.9rem;line-height:1.55;">{p.detail}</p>
+                  <a href={'/admin/hr/employees/' + p.employeeId} style="font-size:0.85rem;font-weight:600;color:#FF4F00;">
+                    Open their record
+                  </a>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {flagged.length > 0 && (
+          <div style={CARD}>
+            <p style={HD}>Written, but worth a look</p>
+            <p style="margin:0 0 12px;color:var(--o-mid);line-height:1.6;">
+              These lines are created. Something about them is unusual enough to say out loud.
+            </p>
+            <div style="display:grid;gap:8px;">
+              {flagged.map((p) => (
+                <p style="margin:0;color:var(--o-mid);font-size:0.9rem;line-height:1.55;">
+                  <strong style="color:var(--o-hi);">{p.employeeName}</strong> — {p.detail}
+                </p>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {plan && plan.problems.length === 0 && (
+          <div style={CARD}>
+            <p style="margin:0;color:var(--o-mid);">
+              No problems found in the employee records. Every manager named on a record points at a
+              real, active person.
+            </p>
+          </div>
+        )}
+
+        {toCreate > 0 && (
+          <div style={CARD}>
+            <p style={HD}>The lines that will be created</p>
+            <div style="overflow-x:auto;">
+              <table style="width:100%;border-collapse:collapse;font-size:0.9rem;min-width:380px;">
+                <thead>
+                  <tr style="text-align:left;border-bottom:1px solid var(--o-stroke);">
+                    <th style="padding:8px 6px;font-weight:600;color:var(--o-low);">Person</th>
+                    <th style="padding:8px 6px;font-weight:600;color:var(--o-low);">Reports to</th>
+                    <th style="padding:8px 6px;font-weight:600;color:var(--o-low);">From</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {plan!.edgesToCreate.map((e) => (
+                    <tr style="border-bottom:1px solid var(--o-hair);">
+                      <td style="padding:9px 6px;color:var(--o-hi);">{e.employeeName}</td>
+                      <td style="padding:9px 6px;color:var(--o-mid);">{e.managerName}</td>
+                      <td style="padding:9px 6px;color:var(--o-low);white-space:nowrap;">
+                        {String(e.effectiveFrom).slice(0, 10)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        <p style="margin:0;font-size:0.8rem;color:var(--o-low);line-height:1.6;">
+          Read at {String(preview.readAt).slice(0, 19).replace('T', ' ')}. A reporting line is
+          effective-dated and never overwritten: changing somebody's manager later closes the old line
+          and opens a new one, so who approved what on a given date stays answerable.
+        </p>
+      </div>
+    )}
+
+  </div>
+</AdminLayout>
