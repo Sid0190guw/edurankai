@@ -1278,6 +1278,49 @@ export async function applyLeave(
       (meta.name || type) + ' ' + describeUnits(unit, dayUnits, hours) + ' from ' + start + (start === end ? '' : ' to ' + end),
     );
 
+    // =============================================================================================
+    // A REQUEST NOBODY WAS TOLD ABOUT IS A REQUEST NOBODY DECIDES
+    // =============================================================================================
+    //
+    // Everything above this line was right and still left a real person waiting. An employee filed
+    // leave for a family function, routing found no approver because the organization graph is
+    // empty, the row was correctly marked halted with its reason — and then NOTHING TOLD A HUMAN.
+    // notifyEmployee() fires when a decision is made; there was no notification when one was asked
+    // for. The request sat pending until the employee asked in a group chat why nothing had happened.
+    //
+    // So when routing does not reach somebody, the people who can decide it ANYWAY are told. That is
+    // not a guess about who should approve: pendingLeaveForApprover() already returns every pending
+    // request to anyone holding leave.approve, so those accounts can act on it today, with no graph
+    // and no chain. They simply had no way of learning it existed.
+    //
+    // Deliberately only on the halted path. A routed request already notifies its approver through
+    // the workflow engine, and telling the whole HR desk about every ordinary request as well would
+    // train them to ignore the channel that matters.
+    //
+    // NEVER FAILS THE FILING. The leave is saved; a notification that could not be sent is a thing to
+    // log, not a reason to reject somebody's request for time off.
+    if (routing.halted) {
+      try {
+        const { notifyAllAdmins } = await import('@/lib/notify');
+        const who = rows(await db.execute(sql`
+          SELECT full_name FROM hr_employees WHERE id = ${employeeId} LIMIT 1`))[0];
+        const name = who?.full_name ? String(who.full_name) : 'An employee';
+        await notifyAllAdmins({
+          title: name + ' asked for leave and it could not be routed',
+          body: name + ' filed ' + describeUnits(unit, dayUnits, hours) + ' from ' + start
+            + (start === end ? '' : ' to ' + end) + '. No approver could be resolved, so nobody was '
+            + 'assigned it — but anyone who can approve leave can decide it from the leave queue. '
+            + 'Reason given: ' + (routing.haltReason || 'unknown').slice(0, 200),
+          type: 'leave',
+          actionUrl: '/admin/hr/leave',
+          entityType: 'leave_request',
+          entityId: requestId,
+        });
+      } catch (e: any) {
+        logFail('applyLeave.notifyUnrouted', e);
+      }
+    }
+
     return { ok: true, days, dayUnits, excluded: span.excluded, id: requestId, routing };
   } catch (e: any) {
     logFail('applyLeave', e);
