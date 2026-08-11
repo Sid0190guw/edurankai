@@ -245,6 +245,28 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // collapsed form is the one that should be returned to anyway.
   const path = normalisePath(new URL(context.request.url).pathname);
 
+  // FEATURES THAT ARE NOT OPEN YET — answered here, before any database work, so that EVERY door
+  // into a held-back feature gets the same answer: a nav entry, a deep link, an old bookmark, a link
+  // somebody pasted into a chat months ago.
+  //
+  // Doing this per page is how a paused feature stays half-live. This product has already shipped a
+  // messaging path that threw on every send for four months while the screen looked entirely normal,
+  // and the reason nobody noticed is that the failure was in one place and the doors were in six.
+  //
+  // A REDIRECT, NOT A 404. The feature is being finished, not removed, and telling somebody their
+  // page does not exist when it does is a lie that costs a support message. /upcoming says which
+  // feature, why, and what to do instead.
+  //
+  // GETs only: a POST to a held-back endpoint should fail as a POST rather than be bounced to a page
+  // that will look like a success in a fetch handler.
+  if (context.request.method === 'GET') {
+    const { upcomingForPath } = await import('@/lib/upcoming');
+    const held = upcomingForPath(path);
+    if (held) {
+      return context.redirect('/upcoming?f=' + encodeURIComponent(held.key), 302);
+    }
+  }
+
   // CIRCUIT BREAKER — answered before any database work, deliberately.
   //
   // sos.js v5 registered a new geolocation watcher every 60 seconds and never cleared any of them,
