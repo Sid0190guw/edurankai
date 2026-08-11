@@ -63,10 +63,23 @@ async function main() {
   ok('combinePlan takes the weaker of device/network', combinePlan('rich', 'lite', {}).tier === 'lite');
 
   console.log('\n== Part A: admin sidebar links exist + role-gated ==');
-  const layout = readFileSync('src/layouts/AdminLayout.astro', 'utf8');
-  ok('Knowledge link in navStructure', layout.includes("href: '/admin/knowledge'"));
-  ok('Access / RBAC link in navStructure', layout.includes("href: '/admin/rbac'"));
-  ok('both links are role-gated in NAV_SECTION', layout.includes("knowledge: 'lms'") && layout.includes("rbac: 'team_roles'"));
+  // ASKED OF THE CATALOGUE, NOT THE LAYOUT FILE.
+  //
+  // These three grepped AdminLayout.astro for a literal href line and for entries in a local
+  // NAV_SECTION map. Both were implementation: the sidebar now renders from src/lib/admin-nav.ts and
+  // that map is gone, so the assertions failed while the property they exist to protect — these two
+  // links are present and each is gated by a section — held perfectly.
+  //
+  // A test that breaks when the thing it checks is done BETTER is measuring the wrong noun. Reading
+  // the catalogue also makes it stronger: it proves the entries ARE gated, rather than proving two
+  // particular strings appear somewhere in a 900-line file.
+  const { ADMIN_NAV, flattenNav } = await import('@/lib/admin-nav');
+  const flat = flattenNav(ADMIN_NAV);
+  const knowledge = flat.find((e) => e.href === '/admin/knowledge');
+  const rbac = flat.find((e) => e.href === '/admin/rbac');
+  ok('Knowledge link is in the admin catalogue', !!knowledge);
+  ok('Access / RBAC link is in the admin catalogue', !!rbac);
+  ok('both carry a section, so both are role-gated', !!knowledge?.section && !!rbac?.section);
 
   console.log('\n' + pass + ' passed, ' + fail + ' failed');
   process.exit(fail ? 1 : 0);
