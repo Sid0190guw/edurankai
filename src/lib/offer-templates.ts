@@ -510,8 +510,16 @@ const ENGAGEMENT_PATTERNS: readonly { pattern: RegExp; kind: EngagementKind }[] 
   { pattern: APPRENTICE_PATTERN, kind: 'apprenticeship' },
   { pattern: INTERN_PATTERN, kind: 'internship' },
   { pattern: /\b(contract|contractor|consult\w*|freelance|retainer|sow)\b/i, kind: 'contract' },
-  { pattern: /\bpart[-\s]?time\b/i, kind: 'part-time' },
-  { pattern: /\b(full[-\s]?time|permanent|fulltime|employee|employment)\b/i, kind: 'full-time' },
+  // UNDERSCORES ARE IN THE CHARACTER CLASS ON PURPOSE. The strings this reads are not only the
+  // title-case ones an HR user picks on a form. src/lib/hr/sync.ts writes the literal 'full_time'
+  // for every person the auto-hire path creates, and the classification spine's own keys are
+  // 'part_time' and 'fixed_term'. An underscore is a WORD character, so /\bpart[-\s]?time\b/ never
+  // matched 'part_time': the commonest machine-written value in that column inferred nothing at all
+  // and fell through to the neutral template. The engagement kinds themselves are unchanged --
+  // part-time, internship and apprenticeship were already here; what was missing was the mapping
+  // from the spine's key strings onto them, so somebody is offered what they will be onboarded as.
+  { pattern: /\bpart[-\s_]?time\b/i, kind: 'part-time' },
+  { pattern: /\b(full[-\s_]?time|permanent|fulltime|employee|employment)\b/i, kind: 'full-time' },
 ];
 
 export function inferEngagement(raw: string | null | undefined): EngagementKind | null {

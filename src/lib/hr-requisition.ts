@@ -32,7 +32,8 @@ export function ensureRequisitionSchema(): Promise<void> {
         department VARCHAR(120),
         level VARCHAR(40),
         engagement_type VARCHAR(40),
-          -- permanent | fixed_term | intern | contractor | eor | consultant
+          -- A key of ENGAGEMENT_TYPES below, which is a subset of CLASSIFICATIONS (the spine):
+          -- permanent | part_time | fixed_term | intern | intern_unpaid | apprentice | contractor | eor | consultant
         country VARCHAR(80),
         work_mode VARCHAR(40),
           -- remote | hybrid | office
@@ -70,13 +71,31 @@ export function ensureRequisitionSchema(): Promise<void> {
   });
 }
 
+/**
+ * WHAT A REQUISITION IS ASKING FOR — and it is the SAME vocabulary the person will later be
+ * classified and onboarded under. Every key here is a key of CLASSIFICATIONS in
+ * src/lib/hr-classification.ts, which is the spine; src/lib/onboarding-packs.ts keys the joining
+ * checklist off those same keys. So a requisition raised for an unpaid intern produces a person
+ * classified as an unpaid intern who gets the unpaid-intern joining pack, rather than three screens
+ * each guessing.
+ *
+ * The three added keys (part_time, intern_unpaid, apprentice) were missing from the spine and are
+ * described there. `volunteer` is a spine key that is deliberately NOT offered here: a volunteer is
+ * somebody who offers, not a headcount a manager requisitions, and putting one on this form would
+ * turn "use sparingly, check local labour law" into a hiring channel.
+ *
+ * Descriptions kept short — this is a picker on a form, and the legal detail lives on the spine.
+ */
 export const ENGAGEMENT_TYPES = {
-  permanent:  { label: 'Permanent employee', description: 'Direct full-time hire on our payroll' },
-  fixed_term: { label: 'Fixed-term contract', description: 'Defined-end employment (e.g. 6/12 months)' },
-  intern:     { label: 'Paid intern',         description: 'Stipend-paid intern; paid-intern-to-FT pipeline' },
-  contractor: { label: 'Independent contractor', description: 'Genuine contractor — pay on invoice, NO control over hours/tools' },
-  eor:        { label: 'EOR-employed (foreign)', description: 'Senior specialist abroad via Employer-of-Record partner' },
-  consultant: { label: 'Consultant / advisor', description: 'Short engagement, advisory work' },
+  permanent:     { label: 'Permanent employee', description: 'Direct full-time hire on our payroll' },
+  part_time:     { label: 'Part-time employee', description: 'Employee on agreed reduced days or hours; leave and contributions pro-rata' },
+  fixed_term:    { label: 'Fixed-term contract', description: 'Defined-end employment (e.g. 6/12 months)' },
+  intern:        { label: 'Paid intern (stipend recorded)', description: 'Intern with a stipend recorded; intern-to-permanent pipeline' },
+  intern_unpaid: { label: 'Unpaid intern',      description: 'Intern with no stipend — the default here. Learning agreement, mentor and end date required' },
+  apprentice:    { label: 'Apprentice',         description: 'Registered contract of apprenticeship on a structured training programme' },
+  contractor:    { label: 'Independent contractor', description: 'Genuine contractor — pay on invoice, NO control over hours/tools' },
+  eor:           { label: 'EOR-employed (foreign)', description: 'Senior specialist abroad via Employer-of-Record partner' },
+  consultant:    { label: 'Consultant / advisor', description: 'Short engagement, advisory work' },
 };
 
 export async function createRequisition(opts: any) {

@@ -6,8 +6,8 @@ import { sql } from 'drizzle-orm';
 // unchanged; this adds the sequence around it, so a joiner can see what is still outstanding, who
 // each step is waiting on, and acknowledge the policies they are required to read.
 import {
-  journeyForEmployee, setItemState, acknowledgeItem, stepCategoryLabel, itemStateLabel,
-  joiningDocumentsProgress,
+  journeyStatusForEmployee, engagementForEmployee, packDocumentsFor, joiningDocumentsProgress,
+  setItemState, acknowledgeItem, stepCategoryLabel, itemStateLabel,
   type JourneyItem,
 } from '@/lib/onboarding-journey';
 
@@ -184,13 +184,22 @@ const doneBody = onbState === 'complete'
   ? 'The people desk has read your bank, identity and emergency details and they are right. Anything still outstanding is on the checklist below. To change a detail, write to '
   : 'Thank you. HR will verify your details. You can update them by contacting ';
 
-// ADDITIVE. The tracked checklist for this joiner, or null when HR has not started one — an honest
-// absence, rendered as a sentence rather than as an empty list that looks like a bug.
+// THE CHECKLIST, AND THE THREE DIFFERENT REASONS THERE MIGHT NOT BE ONE.
+//
+// This read journeyForEmployee(), which answers null for a missing row, for a provisioning failure
+// and for a SELECT that threw — and the page printed one confident sentence for all three: "No
+// onboarding checklist has been started for you yet. That is a genuine not-yet, not an empty screen."
+// For two of those three that sentence was false, and it was being told to the one person with no
+// other way of finding out. journeyStatusForEmployee() separates them and each is rendered as itself.
 const jmsg = new URL(Astro.request.url).searchParams.get('jmsg') || '';
-const journey = await journeyForEmployee(String(emp.id)).catch((e: any) => {
-  console.error('[portal/employee/onboarding] journey', e?.cause?.message || e?.message);
-  return null;
-});
+const jstatus = await journeyStatusForEmployee(String(emp.id));
+const journey = jstatus.journey;
+
+// WHICH PACK THIS PERSON'S CHECKLIST WOULD BE BUILT FROM, so a joiner and the people desk can both
+// see that the right one is about to be used BEFORE anything is started — and so that "not started
+// yet" is not the only thing this screen can say. Where nobody has recorded the engagement it says
+// exactly that, and names who records it, rather than implying the checklist is merely late.
+const engagement = await engagementForEmployee(String(emp.id));
 const myItems: JourneyItem[] = journey
   ? journey.items.filter((i) => i.ownerVia === 'the_joiner' || (i.ownerUserId && i.ownerUserId === user.id))
   : [];
@@ -207,11 +216,28 @@ const otherItems: JourneyItem[] = journey
 // joiner had no reason to revisit. hr-onboarding's progress() only counts a documents step complete
 // when EVERY document is verified and none is rejected, so one bounced credential holds it open
 // indefinitely; the joiner is now told that, here, with the way out.
-const docsState = await joiningDocumentsProgress(String(user.id)).catch((e: any) => {
-  console.error('[portal/employee/onboarding] joining documents progress', e?.cause?.message || e?.message);
-  return null;
-});
-const docsBlocked = !!docsState && docsState.rejected > 0;
+// THE COUNT COMES FROM THE PACK, NOT FROM WHATEVER HAPPENED TO BE UPLOADED.
+//
+// This printed "0 of 3 verified" — verified against however many links the person had added. The 3
+// was not a requirement, it was a coincidence, so it could not tell anybody whether they were
+// finished. Worse, the generic list is an employee's list: a contractor reading it would be measured
+// against a degree certificate and a relieving letter from a previous employer, which their
+// engagement does not ask for and which we would be wrong to hold. The denominator is now the set of
+// documents THIS engagement requires, and nothing outside that set is ever named as missing.
+const packDocs = engagement.engagementKey
+  ? await packDocumentsFor(String(user.id), engagement.engagementKey)
+  : null;
+
+// WHERE THE ENGAGEMENT IS NOT RECORDED, THIS SCREEN STILL OWES THE JOINER AN ANSWER ABOUT WHAT THEY
+// ALREADY SENT. It cannot say what is still REQUIRED of them, because which documents apply is
+// exactly the thing that depends on the engagement, and listing an employee's set at somebody who
+// may be a contractor is the mistake in miniature. But "we have three of your links and none is
+// verified yet" is true whoever they turn out to be, and leaving it out would replace a misleading
+// number with silence about their own submissions. joiningDocumentsProgress() reads hr-onboarding's
+// own progress(), so this can never disagree with the credentials screen.
+const rawDocs = packDocs ? null : await joiningDocumentsProgress(String(user.id));
+
+const docsBlocked = (!!packDocs && packDocs.rejected > 0) || (!!rawDocs && rawDocs.rejected > 0);
 ---
 <BaseLayout title="Employee onboarding - EduRankAI" description="Complete your employee onboarding.">
   <section class="px-[5vw] py-10 md:py-14 max-w-2xl mx-auto">
@@ -315,21 +341,58 @@ const docsBlocked = !!docsState && docsState.rejected > 0;
       ? 'mt-8 bg-red-500/5 border border-red-500/30 rounded-2xl p-5'
       : 'mt-8 bg-white border border-ink/10 rounded-2xl p-5'}>
       <p class="text-[0.7rem] font-bold uppercase tracking-wider text-burn mb-2">Joining documents</p>
-      {docsState === null ? (
-        <p class="text-[0.88rem] text-ink-2 leading-relaxed">
-          We could not read the state of your credentials just now, so this cannot say how many are
-          verified. Nothing you have sent is lost.
-        </p>
-      ) : docsState.submitted === 0 ? (
-        <p class="text-[0.88rem] text-ink-2 leading-relaxed">
-          You have not shared any credentials yet. They are Google Drive links, not uploads.
-        </p>
+      {packDocs === null ? (
+        <div>
+          <p class="text-[0.88rem] text-ink-2 leading-relaxed">
+            {rawDocs && rawDocs.submitted > 0
+              ? 'You have shared ' + rawDocs.submitted + ' document' + (rawDocs.submitted === 1 ? '' : 's')
+                + ' so far, of which ' + rawDocs.verified + ' ' + (rawDocs.verified === 1 ? 'has' : 'have')
+                + ' been verified'
+                + (rawDocs.rejected > 0 ? ' and ' + rawDocs.rejected + ' came back to you' : '') + '.'
+              : 'You have not shared any documents yet. They are Google Drive links, not uploads.'}
+          </p>
+          <p class="text-[0.85rem] text-ink-2 mt-2 leading-relaxed">
+            What is still <strong class="text-ink">required</strong> of you cannot be listed yet,
+            because the people desk has not recorded what your engagement here is &mdash; and which
+            documents apply is exactly the thing that depends on it. Rather than show you an
+            employee's list that might not be yours to send, this waits until it can say something
+            true. Nothing you have already shared is lost.
+          </p>
+        </div>
       ) : (
-        <p class="text-[0.88rem] text-ink-2 leading-relaxed">
-          <strong class="text-ink">{docsState.verified} of {docsState.submitted}</strong> verified
-          {docsState.rejected > 0 ? ' · ' + docsState.rejected + ' sent back to you' : ''}
-          {docsState.complete ? ' · nothing outstanding' : ''}
-        </p>
+        <div>
+          <p class="text-[0.88rem] text-ink-2 leading-relaxed">
+            <strong class="text-ink">{packDocs.requiredVerified} of {packDocs.requiredCount}</strong> verified
+            {packDocs.rejected > 0 ? ' · ' + packDocs.rejected + ' sent back to you' : ''}
+            {packDocs.complete ? ' · nothing outstanding' : ''}
+          </p>
+          <p class="text-[0.78rem] text-ink-soft mt-1 leading-relaxed">
+            Counted against what a {String(packDocs.engagementLabel).toLowerCase()} is actually asked
+            for, so you are never told you are short of something your engagement does not need.
+          </p>
+          <ul class="mt-3 flex flex-col gap-2">
+            {packDocs.expected.map((d) => (
+              <li class="text-[0.85rem] text-ink-2 leading-relaxed">
+                <strong class="text-ink">{d.label}</strong>
+                {d.required ? '' : ' (only if it applies to you)'}
+                {' — '}
+                {d.verified > 0 ? 'verified' : d.rejected > 0 ? 'sent back to you' : d.shared > 0 ? 'with the people desk' : 'not shared yet'}
+                <span class="block text-[0.78rem] text-ink-soft">{d.why}</span>
+              </li>
+            ))}
+          </ul>
+          {packDocs.missing.length > 0 && (
+            <p class="text-[0.85rem] text-ink-2 mt-3 leading-relaxed">
+              Still to share: {packDocs.missing.join(', ')}.
+            </p>
+          )}
+          {packDocs.extra > 0 && (
+            <p class="text-[0.78rem] text-ink-soft mt-2 leading-relaxed">
+              You have also shared {packDocs.extra} document{packDocs.extra === 1 ? '' : 's'} beyond
+              what your engagement asks for. They are kept, and they are not counted against you.
+            </p>
+          )}
+        </div>
       )}
       {docsBlocked && (
         <p class="text-[0.85rem] text-ink-2 mt-2 leading-relaxed">
@@ -355,11 +418,42 @@ const docsBlocked = !!docsState && docsState.rejected > 0;
 
       {!journey ? (
         <div class="bg-white border border-ink/10 rounded-2xl p-5">
-          <p class="text-[0.9rem] text-ink-2 leading-relaxed">
-            No onboarding checklist has been started for you yet. That is a genuine "not yet", not an
-            empty screen: HR starts one and it appears here with every step, who owns it and when it is
-            due. Nothing is waiting on you in the meantime beyond the form above.
-          </p>
+          {jstatus.state === 'unavailable' ? (
+            <p class="text-[0.9rem] text-ink-2 leading-relaxed">{jstatus.reason}</p>
+          ) : (
+            <p class="text-[0.9rem] text-ink-2 leading-relaxed">
+              No onboarding checklist has been started for you yet. That is a genuine "not yet", not an
+              empty screen: the people desk starts one and it appears here with every step, who owns it
+              and when it is due. Nothing is waiting on you in the meantime beyond the form above.
+            </p>
+          )}
+
+          {/* WHICH CHECKLIST IT WOULD BE. What is asked of a permanent employee and what is asked of
+              an independent contractor are different lists, because a checklist is a record of the
+              relationship — so the engagement is named here BEFORE anything is started, and both the
+              joiner and the people desk can see the right pack is about to be used. */}
+          {engagement.engagementLabel ? (
+            <div class="mt-4 pt-4 border-t border-ink/10">
+              <p class="text-[0.7rem] font-bold uppercase tracking-wider text-burn mb-1">Which checklist</p>
+              <p class="text-[0.88rem] text-ink-2 leading-relaxed">
+                It would be built as the checklist for
+                <strong class="text-ink"> {String(engagement.engagementLabel).toLowerCase()}</strong>.
+                {engagement.packSummary ? ' ' + engagement.packSummary : ''}
+              </p>
+            </div>
+          ) : (
+            <div class="mt-4 pt-4 border-t border-ink/10">
+              <p class="text-[0.7rem] font-bold uppercase tracking-wider text-burn mb-1">Which checklist</p>
+              <p class="text-[0.88rem] text-ink-2 leading-relaxed">
+                It cannot be built yet, because nobody has recorded what your engagement here is. That
+                is not a delay on your side and there is nothing for you to send: the people desk
+                records it, and until they do, no checklist is assembled from a guess. What is asked of
+                a permanent employee and what is asked of a contractor are genuinely different lists,
+                and giving everybody the same one would put things on your record that were never true
+                of you.
+              </p>
+            </div>
+          )}
         </div>
       ) : (
         <div class="flex flex-col gap-4">
@@ -374,6 +468,13 @@ const docsBlocked = !!docsState && docsState.rejected > 0;
             <div class="mt-3 h-1.5 rounded-full bg-ink/10 overflow-hidden">
               <div class="h-full bg-leaf" style={'width:' + journey.progress.percent + '%;'}></div>
             </div>
+            {journey.engagementLabel && (
+              <p class="text-[0.8rem] text-ink-soft mt-3 leading-relaxed">
+                Built as the checklist for {String(journey.engagementLabel).toLowerCase()}. Steps that
+                do not belong to that engagement are not on it, which is why this list may be shorter
+                than a colleague's.
+              </p>
+            )}
             {journey.progress.unowned > 0 && (
               <p class="text-[0.8rem] text-ink-soft mt-3 leading-relaxed">
                 {journey.progress.unowned} step{journey.progress.unowned === 1 ? ' has' : 's have'} no
@@ -403,6 +504,11 @@ const docsBlocked = !!docsState && docsState.rejected > 0;
                       </p>
                     )}
                     {i.note && <p class="text-[0.8rem] text-ink-soft mt-2">{i.note}</p>}
+                    {/* A step the pack withheld and somebody created anyway carries the reason, and
+                        it is shown to the person it was created for. They are the one it is about. */}
+                    {i.addedDespiteReason && (
+                      <p class="text-[0.78rem] text-ink-soft mt-2 leading-relaxed">{i.addedDespiteReason}</p>
+                    )}
 
                     {i.state !== 'done' && i.requiresAcknowledgement && (
                       <form method="POST" class="mt-3">

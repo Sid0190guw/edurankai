@@ -37,7 +37,7 @@
 // rule and now there is one expression: the door, the guard and the workspace gate all judge the
 // free-text columns identically, so an "Internal Auditor" can no longer be waved through one and
 // demoted by another.
-import { CLASSIFICATIONS } from '@/lib/hr-classification';
+import { CLASSIFICATIONS, INTERNSHIP_CLASSIFICATIONS } from '@/lib/hr-classification';
 import { isInternshipRecord } from '@/lib/auth/admin-access';
 
 /**
@@ -67,9 +67,19 @@ const INTERN_LEVELS: ReadonlySet<string> = new Set(['intern', 'apprentice']);
  * Every classification that is not an internship, derived from the single vocabulary so a value
  * added there cannot be missed here. Declared before the function that reads it: `const` is not
  * hoisted, and a reader reaching a later declaration has taken pages down on this project.
+ *
+ * IT SUBTRACTS A SET, NOT A STRING, AND THAT IS THE WHOLE POINT. This read `k !== 'intern'` while
+ * 'intern' was the only internship key in the spine. The moment `intern_unpaid` and `apprentice`
+ * were added to CLASSIFICATIONS, that expression would have called a REVIEWED unpaid intern a
+ * settled non-intern — quietly handing the trainee population whatever an ordinary employee can
+ * reach, through a line nobody would have thought to look at. INTERNSHIP_CLASSIFICATIONS is
+ * declared in the same file as the vocabulary it partitions, so adding a key forces the decision to
+ * be made there rather than being made by accident here.
  */
 const SETTLED_NON_INTERN: ReadonlySet<string> = new Set(
-  Object.keys(CLASSIFICATIONS).filter((k) => k !== 'intern').map((k) => k.toLowerCase()),
+  Object.keys(CLASSIFICATIONS)
+    .filter((k) => !INTERNSHIP_CLASSIFICATIONS.has(k))
+    .map((k) => k.toLowerCase()),
 );
 
 /**
@@ -90,7 +100,7 @@ export function resolveIsIntern(signals: InternSignals | null | undefined): bool
 
   // 1 and 2 — structured, and both only ever ADD an intern. A person the register calls an intern,
   // or who was hired into an Intern/Apprentice role, is one however their designation was typed.
-  if (classification === 'intern') return true;
+  if (INTERNSHIP_CLASSIFICATIONS.has(classification)) return true;
   if (INTERN_LEVELS.has(seniority)) return true;
 
   // 3 — the only arm that can REMOVE an intern, and the only one that needs evidence of a human.

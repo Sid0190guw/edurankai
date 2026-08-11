@@ -6,14 +6,29 @@
 
 export const MAX_DOCS = 5;
 
+// WHAT MAY BE ASKED FOR. This list is engagement-BLIND on purpose -- it says what a document IS,
+// not who has to produce one. WHICH of these a particular joiner actually owes is decided by their
+// engagement, in src/lib/onboarding-packs.ts, because the answer differs: an independent contractor
+// owes a signed contract and a tax registration and does NOT owe a relieving letter from a previous
+// employer, since asking one for a relieving letter presumes they were somebody's employee.
+//
+// `agreement` and `tax_registration` were added for exactly that reason. Every non-employee pack
+// needs a home for the document that actually governs the engagement, and 'other' is not a home --
+// a reviewer opening a link labelled "Other supporting document" cannot tell whether the contract
+// has been produced at all.
 export const DOC_TYPES = [
   { key: 'degree', label: 'Degree certificate', hint: 'Final degree / provisional certificate' },
   { key: 'marksheet', label: 'Mark sheets', hint: 'Consolidated or semester-wise' },
   { key: 'certification', label: 'Professional certification', hint: 'Course or industry certification' },
   { key: 'experience', label: 'Experience / relieving letter', hint: 'From a previous employer' },
   { key: 'identity', label: 'Government ID', hint: 'Aadhaar / PAN / passport' },
+  { key: 'agreement', label: 'Signed agreement', hint: 'The document that governs this engagement: appointment letter, contract and statement of work, learning agreement or contract of apprenticeship' },
+  { key: 'tax_registration', label: 'Tax registration', hint: 'For anyone who invoices us: PAN / GST or the local equivalent, in their own or their entity name' },
   { key: 'other', label: 'Other supporting document', hint: 'Anything else HR asked for' },
 ] as const;
+
+/** A key of DOC_TYPES. Used by the joining packs so a pack cannot ask for a document type that does not exist. */
+export type DocTypeKey = (typeof DOC_TYPES)[number]['key'];
 export type DocStatus = 'submitted' | 'verified' | 'rejected';
 
 /** The required sharing format. Enforced in the UI copy and re-stated to the reviewer. */

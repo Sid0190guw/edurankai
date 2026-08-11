@@ -1,43 +1,50 @@
 ---
-// /admin/hr/onboarding/journey — THE ONBOARDING JOURNEY: the template, and who is stuck.
+// /admin/hr/onboarding/journey — THE ONBOARDING JOURNEY: the packs, the template, and who is stuck.
 //
-// WHAT CHANGED. Onboarding here was one form a joiner filled in. Everything that actually has to
-// happen in somebody's first fortnight — equipment, accounts, introductions, the reading, the
-// policies they must acknowledge — lived in mail threads and in somebody's memory. This screen holds
-// the template that says what this company does for a joiner, and the running checklists that say how
-// far each one has got and WHO it is waiting on.
+// WHAT CHANGED, AND WHY IT IS NOT A COSMETIC CHANGE. This screen used to offer one flat suggested
+// checklist of eight steps and apply it to everybody: an unpaid intern, a freelancer and a permanent
+// employee were onboarded identically. Onboarding steps are EVIDENCE OF THE EMPLOYMENT RELATIONSHIP.
+// A genuine independent contractor controls their own hours and tools and is paid for outcomes, so
+// issuing them company equipment, recording a reporting manager against them and taking a timestamped
+// acknowledgement that they are bound by our employee policies produces a written record of exactly
+// the control that makes somebody an employee in fact, whatever the contract says.
+//
+// So the generous direction is the dangerous one. Everything below is built on that: the pack comes
+// from the REVIEWED classification and from nothing else, an unrecorded engagement is a refusal
+// rather than a default, and the steps a pack withholds are shown WITH THEIR REASONS at the moment
+// somebody presses start — not discovered later.
+//
+// THE START BUTTON LIVES INSIDE THE PREVIEW AND NOWHERE ELSE. "See what will be applied" is a link to
+// this same page carrying ?preview=<employee>, and the preview panel is the only place a checklist
+// can be created from. A checklist therefore cannot be started without the pack, its steps and its
+// exclusions being on the screen in front of the person creating it.
 //
 // EVERY STEP HAS AN OWNER, OR SAYS PLAINLY THAT IT CANNOT YET. Owners are RELATIONSHIPS resolved per
-// joiner from the Organization Graph (reporting manager, department head, the onboarding owner) — not
-// role names and never users.role. Before the graph is backfilled, items carry the sentence "the
-// organization graph has not been built yet" rather than "no manager", because those are different
-// facts and only one of them is the founder's to fix. Press "Re-resolve owners" after the backfill and
-// every waiting item picks up its owner without being re-created and without disturbing anything
-// already done.
-//
-// NOTHING IS SEEDED. The template is empty until somebody records a step. There is a button that adds
-// a SUGGESTED starter checklist, and it writes nothing until it is pressed; every step it adds is
-// editable and retirable afterwards.
+// joiner from the Organization Graph — not role names and never users.role. Before the graph is
+// backfilled, items carry the sentence "the organization graph has not been built yet" rather than
+// "no manager", because those are different facts and only one of them is the founder's to fix.
 //
 // THIS SCREEN DOES NOT REPLACE /admin/hr/onboarding, which reviews the joining CREDENTIALS (Google
 // Drive links a hire submits). That module still owns those; a `documents` step here points at it.
 //
-// THE GATE. `employee.manage` through can() — the people-desk capability, held today by exactly the
-// accounts that run onboarding. A narrower `onboarding.manage` key would be better and is reported as
-// a follow-up rather than minted here, because the Permission union lives in src/lib/auth, which
-// another workstream owns.
+// THE GATE. `employee.manage` through can() — the people-desk capability. A narrower
+// `onboarding.manage` key would be better and is reported as a follow-up rather than minted here,
+// because the Permission union lives in src/lib/auth, which another workstream owns.
 //
 // NO CLIENT JAVASCRIPT. Every action is a plain form POST.
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { can } from '@/lib/auth/permissions';
 import { isInitialized } from '@/lib/org-graph';
 import {
-  ensureJourneySchema, listTemplateSteps, addTemplateStep, setStepActive, setStepDocument,
-  addStarterSteps, startJourney, reresolveOwners, listJourneys, employeesWithoutJourney,
+  ensureJourneySchema, ensureJourneyEngagementSchema, listTemplateSteps, addTemplateStep,
+  setStepActive, setStepDocument, setStepEngagement, seedPackSteps, startJourney, previewJourney,
+  reresolveOwners, listJourneys, employeesWithoutJourney,
   stepCategoryLabel, ownerViaLabel, itemStateLabel,
-  STEP_CATEGORIES, OWNER_VIA, STARTER_STEPS,
-  type TemplateStep, type Journey, type JourneyItem,
+  STEP_CATEGORIES, OWNER_VIA, STEP_CONTROLS, ENGAGEMENT_CHOICES,
+  type TemplateStep, type Journey, type JourneyItem, type JourneyPreview, type WithheldStep,
+  type JoinerWithoutJourney,
 } from '@/lib/onboarding-journey';
+import { ENGAGEMENT_PACKS, stepsForEngagement, controlLabel } from '@/lib/onboarding-packs';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -59,6 +66,12 @@ const dueLabel = (day: number) => {
   return Math.abs(n) + ' day' + (Math.abs(n) === 1 ? '' : 's') + ' before joining';
 };
 
+const riskTone = (risk: string | null) => {
+  if (risk === 'high') return '#fca5a5';
+  if (risk === 'medium') return '#fbbf24';
+  return '#6ee7b7';
+};
+
 function itemTone(item: JourneyItem): string {
   if (item.state === 'done') return '#6ee7b7';
   if (item.state === 'not_applicable') return '#9aa6b6';
@@ -68,15 +81,19 @@ function itemTone(item: JourneyItem): string {
   return '#67e8f9';
 }
 
-// ensureJourneySchema() logs the Postgres cause and RE-THROWS on purpose, so a caller can tell "the
-// onboarding tables are not there" apart from "nobody has a checklist". Discarding it into
-// `.catch(() => {})` threw away the only difference between those two: every read below goes through
-// safeEnsure(), which answers an empty list on a failed provision, so a DDL failure drew an empty
-// template and an empty joiner list on the screen that answers whether a new starter has been set up
-// at all. The reason is now kept and shown, as the settlement and loans consoles already do.
+// ensureJourneySchema() logs the Postgres cause and re-throws on purpose — but ensureOnce() ends
+// with `p.catch(() => {})`, so it can never actually reject to a caller. This try/catch is therefore
+// not the check; engagementColumnsReady() inside the module asks information_schema for the columns
+// by name, and every read below returns empty when they are absent. Both are kept: the throw names a
+// cause in the log, and the emptiness is explained by the banner rather than read as "nobody has a
+// checklist".
 let schemaError = '';
-try { await ensureJourneySchema(); }
-catch (e: any) { schemaError = e?.cause?.message || e?.message || 'unknown error'; }
+try {
+  await ensureJourneySchema();
+  await ensureJourneyEngagementSchema();
+} catch (e: any) {
+  schemaError = e?.cause?.message || e?.message || 'unknown error';
+}
 
 if (Astro.request.method === 'POST') {
   let flash = '';
@@ -94,17 +111,32 @@ if (Astro.request.method === 'POST') {
         readingUrl: String(fd.get('reading_url') || ''),
         requiresAcknowledgement: String(fd.get('requires_acknowledgement') || '') === 'on',
         employmentType: String(fd.get('employment_type') || ''),
+        engagementKey: String(fd.get('engagement_key') || ''),
+        assertsControl: String(fd.get('asserts_control') || ''),
         sortOrder: Number(fd.get('sort_order') || 100),
         actorUserId: user.id,
       });
       flash = r.ok
         ? 'Step added to the template. Journeys already running pick it up the next time one is started or topped up.'
         : (r.error || 'The step was not saved.');
-    } else if (action === 'starter') {
-      const r = await addStarterSteps(user.id);
-      if (!r.ok) flash = r.error || 'The starter checklist was not added.';
-      else if (r.added === 0) flash = 'Nothing was added - every suggested step is already on the template.';
-      else flash = r.added + ' suggested step' + (r.added === 1 ? '' : 's') + ' added. Edit or retire any of them.';
+    } else if (action === 'seed') {
+      const which = String(fd.get('engagement_key') || '');
+      const r = await seedPackSteps(user.id, which || null);
+      if (!r.ok) flash = r.error || 'The packs were not added.';
+      else if (r.added === 0) flash = 'Nothing was added - every step of that pack is already on the template.';
+      else {
+        const parts = r.byEngagement.filter((e) => e.added > 0).map((e) => e.label + ' ' + e.added);
+        flash = r.added + ' step' + (r.added === 1 ? '' : 's') + ' added (' + parts.join(', ')
+          + '). Each one is editable and retirable, and each carries the engagement it belongs to.';
+      }
+    } else if (action === 'set_engagement') {
+      const r = await setStepEngagement(
+        String(fd.get('step_id') || ''),
+        String(fd.get('engagement_key') || '') || null,
+        String(fd.get('asserts_control') || '') || null,
+        user.id,
+      );
+      flash = r.ok ? 'Saved. That step is now judged against the packs.' : (r.error || 'That was not changed.');
     } else if (action === 'retire_step' || action === 'restore_step') {
       const r = await setStepActive(String(fd.get('step_id') || ''), action === 'restore_step', user.id);
       flash = r.ok ? 'Saved.' : (r.error || 'That was not changed.');
@@ -117,12 +149,33 @@ if (Astro.request.method === 'POST') {
       );
       flash = r.ok ? 'Document link saved.' : (r.error || 'The document link was not saved.');
     } else if (action === 'start_journey') {
-      const r = await startJourney(String(fd.get('employee_id') || ''), user.id);
-      if (!r.ok) flash = r.error || 'The journey was not started.';
-      else if (r.unowned && r.unowned > 0) {
-        flash = 'Checklist started. ' + r.unowned + ' step' + (r.unowned === 1 ? '' : 's')
-          + ' could not resolve an owner yet - each says why on the checklist, and nothing is lost.';
-      } else flash = 'Checklist started, and every step has an owner.';
+      const employeeId = String(fd.get('employee_id') || '');
+      const r = await startJourney(employeeId, user.id, {
+        addBackStepIds: fd.getAll('add_back').map((v) => String(v || '')),
+        addBackReason: String(fd.get('add_back_reason') || ''),
+      });
+      if (!r.ok) {
+        flash = r.error || 'The checklist was not started.';
+        // A refusal that has somewhere to go keeps the person on the preview, where the reason and
+        // the link to the register are both already on screen.
+        if (r.needsEngagement || r.engagementChanged) {
+          return Astro.redirect(PAGE + '?preview=' + encodeURIComponent(employeeId)
+            + '&msg=' + encodeURIComponent(flash.slice(0, 300)));
+        }
+      } else {
+        const bits = [r.created + ' step' + (r.created === 1 ? '' : 's') + ' created from the '
+          + String(r.engagementLabel || '').toLowerCase() + ' pack'];
+        if (r.withheld && r.withheld > 0) {
+          bits.push(r.withheld + ' withheld by that pack, each with its reason on the preview');
+        }
+        if (r.overridden && r.overridden > 0) {
+          bits.push(r.overridden + ' added back against the pack, with your reason recorded on each');
+        }
+        if (r.unowned && r.unowned > 0) {
+          bits.push(r.unowned + ' could not resolve an owner yet and each says why');
+        }
+        flash = bits.join('; ') + '.';
+      }
     } else if (action === 'reresolve') {
       const r = await reresolveOwners(user.id, String(fd.get('journey_id') || '') || null);
       if (!r.ok) flash = r.error || 'The owners could not be re-resolved.';
@@ -140,11 +193,17 @@ if (Astro.request.method === 'POST') {
   return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 300)));
 }
 
-const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const previewId = String(url.searchParams.get('preview') || '').trim();
+
 const graphReady = await isInitialized();
 const steps = await listTemplateSteps({ includeInactive: true });
 const activeSteps = steps.filter((s) => s.isActive);
 const retiredSteps = steps.filter((s) => !s.isActive);
+const packSteps = activeSteps.filter((s) => s.engagementKey);
+const sharedSteps = activeSteps.filter((s) => !s.engagementKey);
+const untaggedShared = sharedSteps.filter((s) => !s.assertsControl);
 const journeys = await listJourneys(80);
 const notStarted = await employeesWithoutJourney(40);
 
@@ -152,15 +211,26 @@ const running = journeys.filter((j) => !j.progress.complete);
 const finished = journeys.filter((j) => j.progress.complete);
 const unownedTotal = journeys.reduce((s, j) => s + j.progress.unowned, 0);
 const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
+const unclassified = notStarted.filter((e) => !e.engagementRecorded).length;
+
+// ONE preview per page load, and only when asked for. Building one for all forty people in the list
+// would be forty employee reads and forty template scans on a screen that is mostly read.
+const preview: JourneyPreview | null = previewId ? await previewJourney(previewId) : null;
+const previewSteps = preview ? preview.included : [];
+const previewWithheld = preview ? preview.withheld : [];
+const canStart = !!preview && preview.ok && preview.engagement.state === 'ready'
+  && (previewSteps.length > 0 || previewWithheld.length > 0);
 ---
 <AdminLayout title="Onboarding journey" activeNav="hr">
 <div class="wrap">
   <p class="eyebrow">HR &middot; Onboarding &middot; Journey</p>
   <h1>Onboarding journey</h1>
   <p class="lede">
-    What this company actually does for a new joiner, as a tracked sequence rather than a form. Each
-    step has an owner resolved from the Organization Graph and a due date counted from that person's
-    joining date. The joiner sees their own progress on their portal; you see who is stuck and where.
+    What this company actually does for a new joiner, as a tracked sequence rather than a form. The
+    steps come from the pack for that person's ENGAGEMENT, because what may be asked of a permanent
+    employee and what may be asked of an independent contractor are not the same list &mdash; and a
+    checklist is a written record of the relationship. Each step has an owner resolved from the
+    Organization Graph and a due date counted from the joining date.
   </p>
 
   {msg && <div class="flash">{msg}</div>}
@@ -189,6 +259,18 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
     </div>
   )}
 
+  {unclassified > 0 && (
+    <div class="flash warn">
+      {unclassified} {unclassified === 1 ? 'person has' : 'people have'} no engagement recorded, so no
+      checklist can be started for them. That is deliberate: the classification column reads
+      &ldquo;permanent employee&rdquo; for everybody nobody has reviewed, and building the employee
+      induction from that default is how a contractor ends up with a file full of evidence that they
+      were an employee. Record the engagement on the
+      <a class="link" href="/admin/hr/classification"> Worker Classification Register</a> and the
+      checklist can start straight away.
+    </div>
+  )}
+
   <div class="tiles">
     <div class="tile"><span class="tv">{activeSteps.length}</span><span class="tl">Steps on the template</span></div>
     <div class="tile"><span class="tv">{running.length}</span><span class="tl">Journeys running</span></div>
@@ -201,6 +283,179 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
     <button type="submit" class="btn ghost small">Re-resolve owners on every waiting step</button>
   </form>
 
+  {/* ==========================================================================================
+      THE PREVIEW. The only place a checklist can be started from, so the pack and its exclusions
+      are always on screen before anything is written.
+      ========================================================================================== */}
+  {preview && (
+    <div class="preview">
+      <p class="eyebrow">Before you start</p>
+      <h2 class="ph">{preview.employeeName || 'This joiner'}</h2>
+      <p class="sub">
+        {preview.employeeCode ? preview.employeeCode + ' · ' : ''}
+        {preview.joiningDate ? 'joins ' + fmtDate(preview.joiningDate) : 'no joining date recorded, so steps will have no dates'}
+      </p>
+
+      {preview.error && <div class="flash warn">{preview.error}</div>}
+
+      <div class="packhead">
+        <span class="chip" style={'color:' + riskTone(preview.engagement.risk) + ';border-color:' + riskTone(preview.engagement.risk) + ';'}>
+          {preview.engagement.engagementLabel || 'Engagement not recorded'}
+        </span>
+        {preview.engagement.risk && <span class="chip">{preview.engagement.risk} risk</span>}
+      </div>
+      <p class="reason">{preview.engagement.reason}</p>
+      {preview.engagement.packSummary && <p class="reason dim">{preview.engagement.packSummary}</p>}
+
+      {preview.engagement.state !== 'ready' && (
+        <p class="docline">
+          <a class="link" href={preview.engagement.fixUrl}>Open the {preview.engagement.fixLabel}</a>
+        </p>
+      )}
+
+      {preview.engagement.hint && <p class="reason dim">{preview.engagement.hint}</p>}
+      {preview.engagement.conflict && <div class="flash warn">{preview.engagement.conflict}</div>}
+
+      {preview.engagementChanged && (
+        <div class="flash warn">
+          This checklist was built for {preview.startedAsLabel} and the register now records
+          {' '}{preview.engagement.engagementLabel}. Topping it up would leave the person holding both
+          packs, because nothing here ever deletes what somebody was asked to do. Settle the
+          classification, then mark the steps that no longer apply as not applicable on their
+          checklist &mdash; each one stays on the record with its reason.
+        </div>
+      )}
+
+      {preview.engagement.state === 'ready' && !preview.packSeeded && (
+        <div class="flash warn">
+          The {String(preview.engagement.engagementLabel).toLowerCase()} pack has not been added to
+          the template yet, so there is little or nothing to create. Seed it below first.
+        </div>
+      )}
+
+      {preview.engagement.state === 'ready' && (
+        <form method="POST" class="form">
+          <input type="hidden" name="action" value="start_journey" />
+          <input type="hidden" name="employee_id" value={preview.employeeId} />
+
+          <div class="block">
+            <p class="blockhead">Will be created &mdash; {previewSteps.length} step{previewSteps.length === 1 ? '' : 's'}</p>
+            {previewSteps.length === 0 ? (
+              <p class="hint">
+                Nothing new. Every step this pack asks for is already on their checklist, or the pack
+                has not been seeded onto the template yet.
+              </p>
+            ) : (
+              <div class="scroller">
+                <table>
+                  <thead><tr><th>Step</th><th>Owner</th><th>Due</th><th>From</th></tr></thead>
+                  <tbody>
+                    {previewSteps.map((s) => (
+                      <tr>
+                        <td class="wrapcell">{s.title}</td>
+                        <td>{ownerViaLabel(s.ownerVia)}</td>
+                        <td>{dueLabel(s.dueDay)}</td>
+                        <td>{s.source === 'pack' ? 'The pack' : 'Added by hand'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          <div class="block">
+            <p class="blockhead">
+              Will NOT be created &mdash; {previewWithheld.length} withheld
+            </p>
+            {previewWithheld.length === 0 ? (
+              <p class="hint">
+                This pack withholds nothing from the template. That is what an employee-shaped
+                engagement looks like: everything an employment relationship legitimately carries is
+                appropriate, because the relationship genuinely is one.
+              </p>
+            ) : (
+              <div class="stack">
+                {previewWithheld.map((w: WithheldStep) => (
+                  <div class="withheld">
+                    <div class="cardhead">
+                      <div class="grow">
+                        <p class="name">{w.title}</p>
+                        <p class="sub">
+                          {stepCategoryLabel(w.category)} &middot; {ownerViaLabel(w.ownerVia)}
+                          {w.controlLabel ? ' · asserts ' + w.controlLabel.toLowerCase() : ' · not tagged'}
+                        </p>
+                      </div>
+                      <span class="chip warnchip">
+                        {w.kind === 'control' ? 'Excluded by this pack' : 'Not shown to be safe'}
+                      </span>
+                    </div>
+                    <p class="why">{w.why}</p>
+                    <label class="check">
+                      <input type="checkbox" name="add_back" value={w.stepId} />
+                      <span>Add this step back anyway</span>
+                    </label>
+                  </div>
+                ))}
+                <label>Why you are adding a withheld step back
+                  <textarea name="add_back_reason" rows="2" maxlength="1000"
+                    placeholder="Required if you ticked anything above. Recorded against every step it adds."></textarea>
+                  <span class="hint">
+                    Sometimes the classification is simply wrong, and then the honest fix is to change
+                    the classification rather than to override the pack. If that is what has happened,
+                    record it on the Worker Classification Register instead and come back.
+                  </span>
+                </label>
+              </div>
+            )}
+          </div>
+
+          {preview.documents.length > 0 && (
+            <div class="block">
+              <p class="blockhead">Documents this engagement asks for</p>
+              <div class="scroller">
+                <table>
+                  <thead><tr><th>Document</th><th>Required</th><th>Why</th></tr></thead>
+                  <tbody>
+                    {preview.documents.map((d) => (
+                      <tr>
+                        <td class="wrapcell">{d.label}</td>
+                        <td>{d.required ? 'Required' : 'Only if it applies'}</td>
+                        <td class="wrapcell">{d.why}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p class="hint">
+                This is what the joiner's own page counts against, so nobody is told they are short of
+                a document their engagement never asked for. Documents are Google Drive links and are
+                never uploaded to us.
+              </p>
+            </div>
+          )}
+
+          {(preview.otherEngagement > 0 || preview.restricted > 0) && (
+            <p class="hint">
+              {preview.otherEngagement > 0 ? preview.otherEngagement + ' step(s) on the template belong to another engagement pack and are not a decision about this person. ' : ''}
+              {preview.restricted > 0 ? preview.restricted + ' step(s) are restricted to a different employment type.' : ''}
+            </p>
+          )}
+
+          {canStart ? (
+            <button type="submit" class="btn">
+              Start the {String(preview.engagement.engagementLabel).toLowerCase()} checklist
+            </button>
+          ) : (
+            <p class="hint">There is nothing to create yet, so there is no button.</p>
+          )}
+        </form>
+      )}
+
+      <p class="docline"><a class="link" href={PAGE}>Close this preview</a></p>
+    </div>
+  )}
+
   {/* THE CHECKLIST IS ONLY HALF THE QUESTION. This screen shows joiners who have a journey and those
       who have none. It cannot show somebody who never became an employee record at all: a signed
       offer with no hr_employees row is invisible here, because there is no employee to attach a
@@ -208,26 +463,134 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
   <p class="reason">
     Somebody who signed an offer and never became an employee record cannot appear on this page &mdash;
     there is no employee to attach a checklist to.
-    <a class="link" href="/admin/hr/reconciliation">Joining and leaving: reconciliation</a> is the
+    <a class="link" href="/admin/hr/reconciliation"> Joining and leaving: reconciliation</a> is the
     screen that finds them.
   </p>
+
+  <h2>Start a checklist</h2>
+  {notStarted.length === 0 ? (
+    <div class="empty">Every active employee already has a checklist.</div>
+  ) : (
+    <div class="stack">
+      {notStarted.map((e: JoinerWithoutJourney) => (
+        <div class="card">
+          <div class="cardhead">
+            <div class="grow">
+              <p class="name">{e.fullName}</p>
+              <p class="sub">
+                {e.employeeCode ? e.employeeCode + ' · ' : ''}
+                {e.joiningDate ? 'joins ' + fmtDate(e.joiningDate) : 'no joining date recorded, so steps will have no dates'}
+              </p>
+            </div>
+            {e.engagementRecorded ? (
+              <span class="chip" style={'color:' + riskTone(e.risk) + ';border-color:' + riskTone(e.risk) + ';'}>{e.engagementLabel}</span>
+            ) : (
+              <span class="chip warnchip">Engagement not recorded</span>
+            )}
+          </div>
+          {e.engagementRecorded ? (
+            <p class="docline">
+              <a class="link" href={PAGE + '?preview=' + e.id}>See what will be applied, then start</a>
+            </p>
+          ) : (
+            <p class="reason dim">
+              Nobody has reviewed this person's worker classification, so the register still shows the
+              value the column was created with rather than a decision. No pack is chosen from a
+              default. <a class="link" href="/admin/hr/classification">Record the engagement</a>, then
+              come back.
+            </p>
+          )}
+        </div>
+      ))}
+    </div>
+  )}
+
+  <h2>The packs</h2>
+  <p class="reason">
+    One pack per engagement on the classification register. A step that is legally wrong for an
+    engagement does not exist in that pack at all &mdash; it is not present-and-filtered, because a
+    filter is one edit away from being removed by somebody who does not know what it was for.
+  </p>
+
+  <form method="POST" class="barform">
+    <input type="hidden" name="action" value="seed" />
+    <button type="submit" class="btn small">Add every pack to the template</button>
+  </form>
+
+  <div class="stack">
+    {ENGAGEMENT_CHOICES.map((eng) => (
+      <details class="panel">
+        <summary>
+          {eng.label}
+          <span class="chip" style={'color:' + riskTone(eng.risk) + ';border-color:' + riskTone(eng.risk) + ';'}>{eng.risk} risk</span>
+        </summary>
+        <div class="form">
+          <p class="reason">{eng.summary}</p>
+
+          <p class="blockhead">What this pack asks for</p>
+          <div class="scroller">
+            <table>
+              <thead><tr><th>Step</th><th>Owner</th><th>Due</th></tr></thead>
+              <tbody>
+                {stepsForEngagement(eng.key).map((s) => (
+                  <tr>
+                    <td class="wrapcell">{s.title}</td>
+                    <td>{ownerViaLabel(s.ownerVia)}</td>
+                    <td>{dueLabel(s.dueDay)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <p class="blockhead">What it deliberately withholds</p>
+          {ENGAGEMENT_PACKS[eng.key].excludes.length === 0 ? (
+            <p class="hint">Nothing. This engagement is an employment relationship, so everything an
+            employment relationship carries is appropriate for it.</p>
+          ) : (
+            <div class="stack">
+              {ENGAGEMENT_PACKS[eng.key].excludes.map((x) => (
+                <div class="withheld">
+                  <p class="name">{x.label}</p>
+                  <p class="sub">{controlLabel(x.control)}</p>
+                  <p class="why">{x.why}</p>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <form method="POST">
+            <input type="hidden" name="action" value="seed" />
+            <input type="hidden" name="engagement_key" value={eng.key} />
+            <button type="submit" class="btn ghost small">Add just this pack to the template</button>
+          </form>
+        </div>
+      </details>
+    ))}
+  </div>
 
   <h2>The template</h2>
   {activeSteps.length === 0 ? (
     <div class="empty">
       <p class="ec">The template has no steps yet.</p>
       <p class="es">
-        Nothing has been invented for you. Add the steps this company genuinely does for a joiner
-        below, or start from a suggested checklist and change it &mdash; nothing is written until you
-        press the button, and every step it adds can be edited or retired.
+        Nothing has been invented for you. Add the packs above &mdash; nothing is written until you
+        press the button, and every step they add can be edited or retired &mdash; or write the steps
+        this company genuinely does for a joiner yourself.
       </p>
-      <form method="POST" class="mid">
-        <input type="hidden" name="action" value="starter" />
-        <button type="submit" class="btn small">Add {STARTER_STEPS.length} suggested steps</button>
-      </form>
     </div>
   ) : (
     <div class="stack">
+      {untaggedShared.length > 0 && (
+        <div class="flash warn">
+          {untaggedShared.length} step{untaggedShared.length === 1 ? '' : 's'} on this template belong
+          to no pack and carry no note of what they assert about the relationship. They are WITHHELD
+          from every engagement whose pack excludes anything, and each says so on the preview. That is
+          the safe direction rather than the tidy one: an untagged &ldquo;Issue equipment&rdquo; landing
+          on a contractor is exactly the record that costs a misclassification case. Tag each one below
+          and it will be judged properly.
+        </div>
+      )}
       {activeSteps.map((s: TemplateStep) => (
         <div class="card">
           <div class="cardhead">
@@ -238,7 +601,11 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
                 {s.employmentType ? ' · only for ' + s.employmentType : ''}
               </p>
             </div>
-            {s.requiresAcknowledgement && <span class="chip">Must be acknowledged</span>}
+            {s.engagementKey ? (
+              <span class="chip">{s.engagementKey}</span>
+            ) : (
+              <span class="chip warnchip">{s.assertsControl ? controlLabel(s.assertsControl) : 'No pack, not tagged'}</span>
+            )}
           </div>
           {s.description && <p class="reason">{s.description}</p>}
           {s.readingUrl && (
@@ -247,7 +614,7 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
             </p>
           )}
           <details class="sub-panel">
-            <summary>Document and acknowledgement</summary>
+            <summary>Document, engagement and acknowledgement</summary>
             <form method="POST" class="form tight">
               <input type="hidden" name="action" value="set_document" />
               <input type="hidden" name="step_id" value={s.id} />
@@ -264,6 +631,37 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
               </label>
               <button type="submit" class="btn small">Save</button>
             </form>
+
+            <form method="POST" class="form tight">
+              <input type="hidden" name="action" value="set_engagement" />
+              <input type="hidden" name="step_id" value={s.id} />
+              <div class="pair">
+                <label>Only for this engagement
+                  <select name="engagement_key">
+                    <option value="" selected={!s.engagementKey}>Every engagement</option>
+                    {ENGAGEMENT_CHOICES.map((eng) => (
+                      <option value={eng.key} selected={eng.key === s.engagementKey}>{eng.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>What it asserts about the relationship
+                  <select name="asserts_control">
+                    <option value="" selected={!s.assertsControl}>Nothing in particular</option>
+                    {STEP_CONTROLS.map((c) => (
+                      <option value={c.key} selected={c.key === s.assertsControl}>{c.label}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <p class="hint">
+                A step tagged with a control is withheld from every engagement whose pack excludes it,
+                and the pack's own reason is what the preview prints. An untagged step that belongs to
+                no pack is withheld from every engagement that excludes anything, because nothing can
+                show it is safe for them.
+              </p>
+              <button type="submit" class="btn small">Save</button>
+            </form>
+
             <form method="POST" class="form tight">
               <input type="hidden" name="action" value="retire_step" />
               <input type="hidden" name="step_id" value={s.id} />
@@ -280,7 +678,7 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
   )}
 
   <details class="panel">
-    <summary>Add a step</summary>
+    <summary>Add a step by hand</summary>
     <form method="POST" class="form">
       <input type="hidden" name="action" value="add_step" />
       <label>What has to happen
@@ -308,6 +706,26 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
         the domain &ldquo;onboarding&rdquo;, and it covers every joiner.
       </p>
       <div class="pair">
+        <label>Only for this engagement
+          <select name="engagement_key">
+            <option value="">Every engagement</option>
+            {ENGAGEMENT_CHOICES.map((eng) => <option value={eng.key}>{eng.label}</option>)}
+          </select>
+        </label>
+        <label>What it asserts about the relationship
+          <select name="asserts_control">
+            <option value="">Nothing in particular</option>
+            {STEP_CONTROLS.map((c) => <option value={c.key}>{c.label}</option>)}
+          </select>
+        </label>
+      </div>
+      <p class="hint block">
+        Say what a step asserts and the packs judge it for you. A step that issues equipment, sets
+        working hours, records a reporting manager or takes a policy acknowledgement is EVIDENCE of
+        an employment relationship, which is correct for an employee and harmful for a contractor.
+        Leave both empty only for something that asserts nothing about anybody.
+      </p>
+      <div class="pair">
         <label>Due, in days from joining
           <input type="number" name="due_day" value="0" min="-30" max="365" required />
           <span class="hint">0 is the joining day. Negative is before it.</span>
@@ -316,9 +734,13 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
           <input type="number" name="sort_order" value="100" min="1" max="9999" />
         </label>
       </div>
-      <label>Only for one employment type
+      <label>Only for one employment type (legacy)
         <input name="employment_type" maxlength="100" placeholder="Leave empty for everybody" />
-        <span class="hint">Matched against the employment type on the employee record, ignoring case and spacing.</span>
+        <span class="hint">
+          The older free-text restriction, kept working for steps that already use it. Prefer the
+          engagement selector above: it is a closed list, so a typo cannot produce a step nobody
+          ever gets.
+        </span>
       </label>
       <label>Google Drive link
         <input name="reading_url" maxlength="500" placeholder="https://drive.google.com/... (optional)" />
@@ -353,7 +775,7 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
   {running.length === 0 ? (
     <div class="empty">
       <p class="ec">No checklist is running.</p>
-      <p class="es">Start one for a joiner below. It needs at least one step on the template first.</p>
+      <p class="es">Start one for a joiner above. It needs the pack for their engagement on the template first.</p>
     </div>
   ) : (
     <div class="stack">
@@ -368,6 +790,7 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
                 {' · '}{j.progress.done} of {j.progress.total} done
               </p>
             </div>
+            <span class="chip">{j.engagementLabel || 'Engagement not recorded'}</span>
             <span class="chip">{j.progress.percent}%</span>
           </div>
 
@@ -384,6 +807,7 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
                     <td class="wrapcell">
                       {i.title}
                       {i.ownerUnresolvedReason && <span class="why">{i.ownerUnresolvedReason}</span>}
+                      {i.addedDespiteReason && <span class="why">{i.addedDespiteReason}</span>}
                       {i.note && <span class="why note">{i.note}</span>}
                     </td>
                     <td>{i.ownerName || 'Nobody yet'}</td>
@@ -403,39 +827,9 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
               <input type="hidden" name="journey_id" value={j.id} />
               <button type="submit" class="btn ghost small">Re-resolve owners</button>
             </form>
-            <form method="POST">
-              <input type="hidden" name="action" value="start_journey" />
-              <input type="hidden" name="employee_id" value={j.employeeId} />
-              <button type="submit" class="btn ghost small">Top up from the template</button>
-            </form>
-          </div>
-        </div>
-      ))}
-    </div>
-  )}
-
-  <h2>Start a checklist</h2>
-  {activeSteps.length === 0 ? (
-    <div class="empty">Add at least one step to the template first, or there is nothing to track.</div>
-  ) : notStarted.length === 0 ? (
-    <div class="empty">Every active employee already has a checklist.</div>
-  ) : (
-    <div class="stack">
-      {notStarted.map((e) => (
-        <div class="card">
-          <div class="cardhead">
-            <div class="grow">
-              <p class="name">{e.fullName}</p>
-              <p class="sub">
-                {e.employeeCode ? e.employeeCode + ' · ' : ''}
-                {e.joiningDate ? 'joins ' + fmtDate(e.joiningDate) : 'no joining date recorded, so steps will have no dates'}
-              </p>
-            </div>
-            <form method="POST">
-              <input type="hidden" name="action" value="start_journey" />
-              <input type="hidden" name="employee_id" value={e.id} />
-              <button type="submit" class="btn small">Start</button>
-            </form>
+            <a class="btn ghost small link-btn" href={PAGE + '?preview=' + j.employeeId}>
+              Top up from the template
+            </a>
           </div>
         </div>
       ))}
@@ -451,7 +845,10 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
             <div class="cardhead">
               <div class="grow">
                 <p class="name">{j.employeeName || 'Employee'}</p>
-                <p class="sub">{j.progress.total} steps &middot; completed {fmtDate(j.completedAt)}</p>
+                <p class="sub">
+                  {j.progress.total} steps &middot; {j.engagementLabel || 'engagement not recorded'}
+                  &middot; completed {fmtDate(j.completedAt)}
+                </p>
               </div>
               <span class="chip">Done</span>
             </div>
@@ -467,6 +864,7 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
   .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
   h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
   h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; }
+  h2.ph { margin: 4px 0 2px; font-size: 17px; }
   .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
   .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.55; }
   .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
@@ -475,13 +873,21 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
   .tv { font-size: 19px; color: #fff; font-weight: 700; }
   .tl { font-size: 11px; color: #9aa6b6; }
   .barform { margin-bottom: 10px; }
-  .panel { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; margin: 16px 0; }
-  .panel > summary { cursor: pointer; padding: 14px 18px; font-size: 12.5px; color: #FF7040; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; list-style: none; min-height: 44px; display: flex; align-items: center; }
+  .preview { background: #0f0f14; border: 1px solid #2a2a2f; border-radius: 14px; padding: 16px; margin: 16px 0 24px; }
+  .packhead { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 8px; }
+  .block { border-top: 1px solid #1a1a1f; padding-top: 12px; }
+  .blockhead { font-size: 11px; color: #FF7040; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 700; margin: 0 0 8px; }
+  .withheld { background: rgba(251,191,36,0.05); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 12px 14px; }
+  .withheld .why { display: block; font-size: 12.5px; color: #fde68a; margin-top: 8px; line-height: 1.6; white-space: normal; }
+  .panel { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; margin: 10px 0; }
+  .panel > summary { cursor: pointer; padding: 14px 18px; font-size: 12.5px; color: #FF7040; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; list-style: none; min-height: 44px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .form { padding: 0 16px 16px; display: grid; gap: 12px; }
   .form.tight { padding: 12px 0 0; }
   .form label { font-size: 11px; color: #9aa6b6; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; display: grid; gap: 5px; }
   .form label.check { display: flex; align-items: flex-start; gap: 9px; text-transform: none; letter-spacing: normal; font-size: 13px; color: #d8d8de; font-weight: 400; line-height: 1.5; }
   .form label.check input { width: 20px; height: 20px; min-height: 20px; flex: 0 0 auto; margin-top: 1px; }
+  .check { display: flex; align-items: flex-start; gap: 9px; font-size: 13px; color: #d8d8de; line-height: 1.5; margin-top: 10px; }
+  .check input { width: 20px; height: 20px; min-height: 20px; flex: 0 0 auto; margin-top: 1px; }
   .pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
   input, select, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 11px 12px; border-radius: 8px; font-size: 14px; font-family: inherit; min-height: 44px; text-transform: none; letter-spacing: normal; }
   textarea { min-height: 66px; resize: vertical; }
@@ -490,7 +896,8 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
   .btn { background: #FF4F00; color: #fff; border: none; padding: 12px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; min-height: 44px; justify-self: start; }
   .btn.small { padding: 10px 16px; font-size: 12.5px; }
   .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #9aa6b6; }
-  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .link-btn { display: inline-flex; align-items: center; text-decoration: none; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
   .stack { display: flex; flex-direction: column; gap: 10px; }
   .card { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 14px 16px; }
   .card.dim { opacity: 0.62; }
@@ -499,7 +906,9 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
   .name { font-size: 14px; color: #fff; font-weight: 700; margin: 0; overflow-wrap: anywhere; }
   .sub { font-size: 11.5px; color: #9aa6b6; margin: 3px 0 0; line-height: 1.5; }
   .chip { font-size: 10px; font-weight: 700; padding: 4px 9px; border-radius: 100px; border: 1px solid #2a2a2f; color: #d8d8de; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+  .chip.warnchip { color: #fde68a; border-color: rgba(251,191,36,0.4); }
   .reason { font-size: 13px; color: #d8d8de; margin: 10px 0 0; line-height: 1.6; }
+  .reason.dim { color: #9aa6b6; font-size: 12.5px; }
   .docline { margin: 10px 0 0; font-size: 12.5px; }
   .link { color: #9bd1ff; }
   .bar { margin: 12px 0; height: 6px; border-radius: 99px; background: #1a1a1f; overflow: hidden; }
@@ -518,6 +927,5 @@ const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
   .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 28px 18px; text-align: center; color: #6e6e78; font-size: 13px; }
   .ec { color: #d8d8de; font-size: 14px; font-weight: 700; margin: 0; }
   .es { color: #6e6e78; font-size: 12.5px; margin: 8px auto 0; line-height: 1.6; max-width: 56ch; }
-  .mid { margin-top: 14px; display: flex; justify-content: center; }
 </style>
 </AdminLayout>

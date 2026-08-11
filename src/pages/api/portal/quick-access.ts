@@ -50,9 +50,34 @@ export const GET: APIRoute = async ({ locals }) => {
   const allow = [...BASE_TILES, ...LEARNER_TILES];
 
   try {
+    // work_email IS NOT NAMED HERE, AND THAT IS THE FIX.
+    //
+    // It is declared in db/hr-schema.sql and does NOT exist on the production table. Naming a column
+    // that does not exist makes the WHOLE statement throw, so this query failed on every single load
+    // of every /portal page — BaseLayout loads /quick-launch.js on all of them and it fetches this
+    // endpoint immediately. The catch below then swallowed it into a 200 with the employment tiles
+    // missing, so a new joiner silently lost Attendance, Wallet and Leave on the very page that is
+    // meant to be welcoming them, with nothing on screen saying anything had gone wrong.
+    //
+    // The identical mistake in src/lib/auth/admin-access.ts denied /admin to EVERY administrator
+    // including the founder, who then bounced to /portal and landed on the onboarding screen — which
+    // is exactly how somebody arrives at the page this was reported from. src/lib/employee-tasks.ts
+    // records the same column costing three outages in one day.
+    //
+    // Matching on user_id, email and personal_email is what admin-access.ts settled on and what the
+    // live schema actually supports. Addresses are compared case-insensitively, because an address is
+    // the same address however it was typed into the HR form, and the email arms are omitted entirely
+    // when the session carries no address so that an empty string can never match a row with an empty
+    // column. The right answer is to stop naming the column, NOT to add another ALTER: the only ALTER
+    // for it in src/ sits in the frontmatter of another page, so whether it exists depends on whether
+    // somebody happened to open that page first, and a spent ensure-once key never runs again.
+    const email = String(user.email || '').trim().toLowerCase();
+    const byEmail = email
+      ? sql` OR lower(coalesce(email, '')) = ${email} OR lower(coalesce(personal_email, '')) = ${email}`
+      : sql``;
     const r = await db.execute(sql`
       SELECT 1 FROM hr_employees
-      WHERE (user_id = ${user.id} OR work_email = ${user.email} OR personal_email = ${user.email})
+      WHERE (user_id = ${user.id}${byEmail})
         AND is_active = true
       LIMIT 1`);
     if (rows(r).length) allow.push(...EMPLOYEE_TILES);
