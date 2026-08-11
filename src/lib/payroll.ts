@@ -1699,6 +1699,30 @@ export async function generateRun(
     //
     // NOT EXISTS in the same statement closes the ordinary repeat; hr_payroll_runs_period_uniq (created
     // in ensurePayrollSchema above) is what closes the actual race. This form needs no ON CONFLICT
+    // IS THERE ANYBODY TO PAY? ASKED BEFORE THE PERIOD IS CONSUMED, NOT AFTER.
+    //
+    // The employee query used to sit AFTER the insert below, so pressing Generate on an empty
+    // organisation succeeded: it wrote a run row, computed nothing, and reported "Payroll run created
+    // for <month> with 0 employees, total net Rs.0". That month was then gone. The insert below
+    // refuses a second run for a period that already has one, there is no delete and no void anywhere
+    // in this file, and the console's own copy says a run cannot be regenerated — so an operator
+    // exploring the console on a quiet afternoon permanently consumed a real payroll month, and the
+    // only remaining fix was a hand-written statement against production.
+    //
+    // A run with nobody in it is not a payroll run. It is a mistake, and the cheapest possible moment
+    // to catch it is before the row exists.
+    const payable = rows(await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM hr_employees WHERE is_active = true`));
+    const payableCount = Number(payable[0]?.n || 0);
+    if (payableCount === 0) {
+      return {
+        ...blank,
+        error: 'There are no active employee records, so there is nobody to pay and no run was '
+          + 'created. This is deliberate: a run cannot be regenerated once it exists, so an empty one '
+          + 'would consume ' + MONTH_NAMES[m - 1] + ' ' + y + ' permanently. Add the people first.',
+      };
+    }
+
     // clause, so it still behaves correctly on a database where that index could not be built.
     const ins = rows(await db.execute(sql`
       INSERT INTO hr_payroll_runs (month, year, status, notes, processed_by)
