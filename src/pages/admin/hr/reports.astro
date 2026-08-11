@@ -1,0 +1,282 @@
+---
+// /admin/hr/reports — WHAT PEOPLE SUBMITTED AT CLOCK-OUT, AND WHO DID NOT.
+//
+// =================================================================================================
+// THE SURFACE THAT WAS MISSING
+// =================================================================================================
+//
+// src/lib/daily-report.ts is complete: it holds the schema, the revision trail, the review columns,
+// the Drive-link check, per-row reviewer resolution from the organisation graph, and teamWeek(),
+// which reads a whole team's week in THREE queries regardless of team size. Everything except a
+// screen. The founder asked three times to see what people submit after clocking out and there was
+// nowhere to look.
+//
+// So this page composes and does not reimplement. Every fact comes from the library — no query is
+// written here, because a second expression of "was this day worked" would drift from the first and
+// one of them would end up on a screen somebody makes decisions from.
+//
+// =================================================================================================
+// THE MISSING ONES ARE THE POINT
+// =================================================================================================
+//
+// A list of what was submitted is pleasant. A list of who CLOCKED OUT AND SUBMITTED NOTHING is the
+// one a founder actually needs, because it is the only view showing work nobody can account for.
+// DayRow.outstanding already computes exactly that and nothing had ever rendered it.
+//
+// It is ADVISORY, and the library says so in its own comment: nothing acts on it, nothing penalises
+// anybody, and there is no verdict on a daily report. Reviewing means "I have read this". If
+// something needs a decision, that is a conversation, and workflow.ts exists for things that route.
+//
+// =================================================================================================
+// SCOPE COMES FROM THE GRAPH, PER ROW
+// =================================================================================================
+//
+// reviewerRoster() resolves who a person is responsible for through org-graph.ts resolvers, and
+// markReviewed() re-checks that right from the report's OWN row rather than from anything this page
+// posts — a rendered list is not an authorisation.
+//
+// The graph is EMPTY in production. So this page will mostly say so, and that sentence is the
+// honest one: an empty roster is not "nobody submitted anything", it is "nobody is recorded as
+// responsible for anybody yet". Those are completely different facts and only one of them is true.
+//
+// const BEFORE THE HANDLER. MOBILE FIRST: 360px, 44px targets.
+// =================================================================================================
+
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import {
+  reviewerRoster, teamWeek, markReviewed, dayStateSentence, workedBasis,
+  type PersonWeek,
+} from '@/lib/daily-report';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=/admin/hr/reports');
+
+const CARD = 'background:var(--o-bg2);border:1px solid var(--o-stroke);border-radius:14px;padding:16px 18px;margin-bottom:16px;';
+const HD = "font-size:10.5px;text-transform:uppercase;letter-spacing:0.12em;font-weight:700;color:var(--o-low);margin:0 0 10px;";
+
+let notice = '';
+let problem = '';
+
+if (Astro.request.method === 'POST') {
+  const form = await Astro.request.formData().catch(() => null);
+  if (String(form?.get('action') || '') === 'reviewed') {
+    const r = await markReviewed({
+      reportId: String(form?.get('reportId') || ''),
+      reviewerUserId: String(user.id),
+      comment: String(form?.get('comment') || '').trim() || null,
+    });
+    if (r.ok) notice = 'Marked as read.';
+    else problem = r.error;
+  }
+}
+
+// The week being looked at. Defaults to this one; ?d= moves it.
+const asked = String(Astro.url.searchParams.get('d') || '');
+const anchor = /^\d{4}-\d{2}-\d{2}$/.test(asked) ? asked : new Date().toISOString().slice(0, 10);
+
+// Read AFTER the write, so a report just marked read shows as read.
+const roster = await reviewerRoster(String(user.id));
+let week: { weekStart: string; weekEnd: string; rows: PersonWeek[] } | null = null;
+let weekError = '';
+if (roster.people.length > 0) {
+  try {
+    week = await teamWeek(roster.people, anchor);
+  } catch (e: any) {
+    weekError = e?.cause?.message || e?.message || 'unknown error';
+  }
+}
+
+const rows = week?.rows || [];
+
+// Outstanding first: the whole reason to open this page. Then by name, so the order is stable.
+const ranked = [...rows].sort((a, b) => {
+  const ao = a.week?.outstandingDays || 0;
+  const bo = b.week?.outstandingDays || 0;
+  if (ao !== bo) return bo - ao;
+  return String(a.person.fullName || '').localeCompare(String(b.person.fullName || ''));
+});
+
+const totalOutstanding = rows.reduce((n, r) => n + (r.week?.outstandingDays || 0), 0);
+const totalFiled = rows.reduce((n, r) => n + (r.week?.reportsFiled || 0), 0);
+
+/** Previous and next week, so somebody can walk back through a month without typing a date. */
+function shiftWeek(iso: string, days: number): string {
+  const d = new Date(iso + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+const prevWeek = week ? shiftWeek(week.weekStart, -7) : anchor;
+const nextWeek = week ? shiftWeek(week.weekStart, 7) : anchor;
+---
+
+<AdminLayout title="Daily reports" activeNav="hr-reports">
+  <div style="max-width:1000px;">
+
+    <p style={HD}>HR · Attendance</p>
+    <h1 style="font-size:1.5rem;margin:0 0 6px;color:var(--o-hi);">What was submitted at clock-out</h1>
+    <p style="margin:0 0 20px;color:var(--o-mid);line-height:1.6;max-width:64ch;">
+      Each person's week, with the report sitting beside the day it covers. Reading one marks it read;
+      there is no verdict and nothing here penalises anybody.
+    </p>
+
+    {notice !== '' && (
+      <div style={CARD + 'border-color:rgba(0,150,70,0.45);'}>
+        <p style="margin:0;color:var(--o-hi);">{notice}</p>
+      </div>
+    )}
+    {problem !== '' && (
+      <div style={CARD + 'border-color:rgba(190,40,40,0.45);'}>
+        <p style="margin:0;color:var(--o-hi);">{problem}</p>
+      </div>
+    )}
+
+    {/* THE ROSTER SENTENCE. On an empty graph this is the entire content of the page, and it is the
+        true statement rather than an empty table implying nobody submitted anything. */}
+    {roster.people.length === 0 ? (
+      <div style={CARD}>
+        <p style={HD}>Nobody is on your list</p>
+        <p style="margin:0 0 12px;color:var(--o-mid);line-height:1.65;">{roster.sentence}</p>
+        {!roster.graphReady && (
+          <p style="margin:0;color:var(--o-mid);line-height:1.65;">
+            This is not a statement that nobody submitted anything — it is that no reporting
+            relationships are recorded yet, so nobody is named as responsible for anybody.
+            <a href="/admin/org/graph" style="color:#FF4F00;font-weight:600;"> Fill the organization
+            graph</a> and this page fills with it.
+          </p>
+        )}
+      </div>
+    ) : weekError !== '' ? (
+      <div style={CARD + 'border-color:rgba(190,40,40,0.45);'}>
+        <p style="margin:0;color:var(--o-hi);">
+          The week could not be read, so nothing here is known. The reason given was: {weekError}
+        </p>
+      </div>
+    ) : (
+      <div>
+        <div style={CARD}>
+          <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px;">
+            <div>
+              <p style="margin:0;font-weight:650;color:var(--o-hi);">
+                {week?.weekStart} to {week?.weekEnd}
+              </p>
+              <p style="margin:4px 0 0;font-size:0.85rem;color:var(--o-low);">
+                {rows.length} {rows.length === 1 ? 'person' : 'people'} · {totalFiled} reports filed
+                {totalOutstanding > 0 ? ' · ' + totalOutstanding + ' days worked with no report' : ''}
+              </p>
+            </div>
+            <div style="display:flex;gap:8px;">
+              <a href={'/admin/hr/reports?d=' + prevWeek}
+                 style="min-height:44px;line-height:44px;padding:0 14px;border-radius:9px;border:1px solid var(--o-stroke);color:var(--o-hi);">
+                Previous week
+              </a>
+              <a href={'/admin/hr/reports?d=' + nextWeek}
+                 style="min-height:44px;line-height:44px;padding:0 14px;border-radius:9px;border:1px solid var(--o-stroke);color:var(--o-hi);">
+                Next week
+              </a>
+            </div>
+          </div>
+          {roster.truncated && (
+            <p style="margin:0;font-size:0.82rem;color:var(--o-low);line-height:1.6;">
+              Your list was longer than this page shows and was cut. The people beyond the cut are not
+              on this screen at all — they are not people with nothing to show.
+            </p>
+          )}
+        </div>
+
+        {ranked.map((pw) => (
+          <div style={CARD}>
+            <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;justify-content:space-between;margin-bottom:12px;">
+              <div>
+                <p style="margin:0;font-weight:650;color:var(--o-hi);font-size:1.02rem;">
+                  {pw.person.fullName || 'Unnamed'}
+                </p>
+                <p style="margin:3px 0 0;font-size:0.8rem;color:var(--o-low);">
+                  on your list as {pw.person.via === 'reporting_manager' ? 'a direct report' : 'somebody you review'}
+                  {pw.week ? ' · ' + workedBasis(pw.week) : ''}
+                </p>
+              </div>
+              {(pw.week?.outstandingDays || 0) > 0 && (
+                <span style="font-size:0.82rem;font-weight:650;color:#c62828;">
+                  {pw.week!.outstandingDays} {pw.week!.outstandingDays === 1 ? 'day' : 'days'} worked with no report
+                </span>
+              )}
+            </div>
+
+            {!pw.week ? (
+              <p style="margin:0;color:var(--o-mid);">This person's week could not be read.</p>
+            ) : (
+              <div style="display:grid;gap:8px;">
+                {pw.week.days.filter((d) => !d.isFuture).map((d) => (
+                  <div style={'padding:10px 12px;border:1px solid var(--o-stroke);border-radius:10px;'
+                    + (d.outstanding ? 'border-left:3px solid #c62828;' : '')}>
+                    <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;align-items:baseline;">
+                      <p style="margin:0;font-weight:600;color:var(--o-hi);font-size:0.92rem;">
+                        {d.weekday} {d.dateIso.slice(5)}
+                      </p>
+                      <p style="margin:0;font-size:0.82rem;color:var(--o-low);">{d.sentence}</p>
+                    </div>
+
+                    {d.report && (
+                      <div style="margin-top:8px;">
+                        <p style="margin:0 0 6px;color:var(--o-mid);font-size:0.9rem;line-height:1.6;white-space:pre-wrap;">
+                          {d.report.summary}
+                        </p>
+                        {d.report.blockers && (
+                          <p style="margin:0 0 6px;color:var(--o-mid);font-size:0.88rem;line-height:1.55;">
+                            <strong style="color:var(--o-hi);">Blocked by:</strong> {d.report.blockers}
+                          </p>
+                        )}
+                        {d.report.url && (
+                          <p style="margin:0 0 6px;font-size:0.85rem;">
+                            {/* rel=noopener on an outbound link somebody else supplied. */}
+                            <a href={d.report.url} target="_blank" rel="noopener noreferrer"
+                               style="color:#FF4F00;font-weight:600;">Open the linked document</a>
+                            {!d.report.sharingAck && (
+                              <span style="color:var(--o-low);"> — they did not confirm it is shared, so it may not open for you</span>
+                            )}
+                          </p>
+                        )}
+                        {d.report.revision > 0 && (
+                          <p style="margin:0 0 6px;font-size:0.8rem;color:var(--o-low);">
+                            Revised {d.report.revision} {d.report.revision === 1 ? 'time' : 'times'}
+                            {d.report.revisedSinceReview ? ' — and changed since it was last read' : ''}
+                          </p>
+                        )}
+
+                        {d.report.reviewedAt && !d.report.revisedSinceReview ? (
+                          <p style="margin:0;font-size:0.82rem;color:var(--o-low);">
+                            Read {String(d.report.reviewedAt).slice(0, 10)}
+                            {d.report.reviewComment ? ' — ' + d.report.reviewComment : ''}
+                          </p>
+                        ) : (
+                          <form method="POST" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;">
+                            <input type="hidden" name="action" value="reviewed" />
+                            <input type="hidden" name="reportId" value={d.report.id} />
+                            <input name="comment" maxlength="300" placeholder="Add a note (optional)"
+                                   style="flex:1 1 220px;min-height:44px;padding:8px 10px;border-radius:9px;border:1px solid var(--o-stroke);background:var(--o-bg1);color:var(--o-hi);" />
+                            <button type="submit"
+                                    style="min-height:44px;padding:0 16px;border-radius:9px;border:0;background:#FF4F00;color:#fff;font-weight:600;cursor:pointer;">
+                              {d.report.revisedSinceReview ? 'Mark read again' : 'Mark read'}
+                            </button>
+                          </form>
+                        )}
+                      </div>
+                    )}
+
+                    {d.outstanding && !d.report && (
+                      <p style="margin:8px 0 0;color:#c62828;font-size:0.88rem;line-height:1.55;">
+                        The clock says this day was worked and no report was filed. This is a prompt
+                        for a conversation, not a finding — nothing here counts against anybody.
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    )}
+
+  </div>
+</AdminLayout>

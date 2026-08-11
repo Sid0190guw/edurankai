@@ -481,10 +481,17 @@ export async function attendanceFacts(
   try {
     // ::text on BOTH sides. hr_attendance.employee_id is uuid here, but casting the parameter list
     // the other way (::uuid) throws outright on anything that is not one and takes the page down.
+    // AN IN LIST, NOT = ANY($array). This driver sends a JS array as a plain parameter, never as a
+    // typed array, and Postgres answers "op ANY/ALL (array) requires array on right side" — so this
+    // query threw on EVERY call. Both callers wrap it in a catch that logs and returns an empty map,
+    // which means a review screen would have shown "nobody submitted anything" for a company that
+    // had submitted plenty. The identical bug ran in the health check for weeks, reporting ten
+    // missing tables without once reading the database.
+    const idList = sql.join(ids.map((x) => sql`${x}`), sql`, `);
     const r = await db.execute(sql`
       SELECT employee_id::text AS employee_id, date, status, clock_in, clock_out, work_hours, break_minutes
         FROM hr_attendance
-       WHERE employee_id::text = ANY(${ids})
+       WHERE employee_id::text IN (${idList})
          AND date >= ${from}::date
          AND date <= ${to}::date`);
     for (const row of rows(r)) {
@@ -591,9 +598,16 @@ export async function reportsFor(
   for (const id of ids) out.set(id, new Map());
   try {
     await ensureDailyReportSchema();
+    // AN IN LIST, NOT = ANY($array). This driver sends a JS array as a plain parameter, never as a
+    // typed array, and Postgres answers "op ANY/ALL (array) requires array on right side" — so this
+    // query threw on EVERY call. Both callers wrap it in a catch that logs and returns an empty map,
+    // which means a review screen would have shown "nobody submitted anything" for a company that
+    // had submitted plenty. The identical bug ran in the health check for weeks, reporting ten
+    // missing tables without once reading the database.
+    const idList = sql.join(ids.map((x) => sql`${x}`), sql`, `);
     const r = await db.execute(sql`
       SELECT ${REPORT_COLS} FROM hr_daily_reports
-       WHERE employee_id::text = ANY(${ids})
+       WHERE employee_id::text IN (${idList})
          AND report_date >= ${from}::date
          AND report_date <= ${to}::date
        ORDER BY report_date DESC`);

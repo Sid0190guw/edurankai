@@ -210,6 +210,8 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   // this catalogue — a page added anywhere else is a page nobody can find, which is the defect that
   // buried about fifty surfaces until the layout was changed to read this list.
   { id: 'org-graph', label: 'Organization graph', href: '/admin/org/graph', icon: 'users', section: 'employees' },
+  // The clock-out review surface. Registered here because the sidebar renders from this catalogue.
+  { id: 'hr-reports', label: 'Daily reports', href: '/admin/hr/reports', icon: 'document', section: 'attendance' },
   { id: 'threads', label: 'All Threads', href: '/admin/threads', icon: 'chat', section: 'dms' },
   { id: 'infra', label: 'Infrastructure', href: '/admin/infra', icon: 'shield', section: 'settings' },
   {
