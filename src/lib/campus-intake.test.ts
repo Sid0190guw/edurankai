@@ -1,0 +1,95 @@
+// Tests for the public campus intake helpers.
+//
+// These are the whole defence on six UNAUTHENTICATED write endpoints, so what is tested is the
+// refusal side: does a bad value get rejected, or does it reach a column? Every case below is a
+// shape that would otherwise be stored and later read back as if somebody had meant it.
+
+import { describe, it, expect, report } from './test-shim';
+import { text, email, when, num, tooFast, rowsOf } from './campus-intake';
+
+describe('text()', () => {
+  it('treats blank as absent so NOT NULL columns still bite', () => {
+    // '' would satisfy a NOT NULL constraint and produce a row nobody can act on.
+    expect(text('   ', 50)).toBe(null);
+    expect(text('', 50)).toBe(null);
+  });
+
+  it('refuses anything that is not a string, including numbers and objects', () => {
+    expect(text(42 as any, 50)).toBe(null);
+    expect(text({} as any, 50)).toBe(null);
+    expect(text(null, 50)).toBe(null);
+  });
+
+  it('caps length rather than letting a caller size the column', () => {
+    expect((text('x'.repeat(9000), 100) || '').length).toBe(100);
+  });
+
+  it('trims, because a trailing space is not part of anybody name', () => {
+    expect(text('  Shreedevi  ', 50)).toBe('Shreedevi');
+  });
+});
+
+describe('email()', () => {
+  it('accepts an ordinary address and lowercases it', () => {
+    expect(email('  Person@Example.IN ')).toBe('person@example.in');
+  });
+
+  it('refuses the shapes that would make a reply impossible', () => {
+    for (const bad of ['', 'person', 'person@', '@example.in', 'person@example', 'a b@c.in']) {
+      expect(email(bad)).toBe(null);
+    }
+  });
+});
+
+describe('when()', () => {
+  it('refuses an unparseable date rather than passing it to Postgres', () => {
+    // A booking whose slot is 'sometime next week' is not a booking, and the cast would throw
+    // inside a catch and read to the candidate as an outage.
+    expect(when('sometime next week')).toBe(null);
+    expect(when('')).toBe(null);
+  });
+
+  it('normalises a real timestamp', () => {
+    expect(String(when('2026-08-20T10:00:00+05:30'))).toContain('2026-08-20');
+  });
+});
+
+describe('num()', () => {
+  it('clamps instead of refusing, because a slider out of range is not a lie', () => {
+    expect(num(500, 0.25, 48)).toBe(48);
+    expect(num(0, 0.25, 48)).toBe(0.25);
+  });
+
+  it('refuses what is not a number at all', () => {
+    expect(num('lots', 0, 10)).toBe(null);
+    expect(num(undefined, 0, 10)).toBe(null);
+  });
+});
+
+describe('tooFast()', () => {
+  it('lets an ordinary submission through', () => {
+    expect(tooFast('test-bucket-a', 'someone')).toBe(false);
+  });
+
+  it('trips on a flood from one origin', () => {
+    let tripped = false;
+    for (let i = 0; i < 12; i++) tripped = tooFast('test-bucket-b', 'flooder') || tripped;
+    expect(tripped).toBe(true);
+  });
+
+  it('does not punish a second person for the first one flooding', () => {
+    for (let i = 0; i < 12; i++) tooFast('test-bucket-c', 'flooder');
+    expect(tooFast('test-bucket-c', 'somebody-else')).toBe(false);
+  });
+});
+
+describe('rowsOf()', () => {
+  it('handles the plain array postgres-js actually returns', () => {
+    // `r.rows[0]` is the bug this normaliser exists to prevent.
+    expect(rowsOf([{ id: 1 }]).length).toBe(1);
+    expect(rowsOf({ rows: [{ id: 1 }] }).length).toBe(1);
+    expect(rowsOf(null).length).toBe(0);
+  });
+});
+
+report();
