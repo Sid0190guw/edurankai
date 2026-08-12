@@ -86,6 +86,7 @@ import { ensureOnce } from '@/lib/ensure-once';
 import { can } from '@/lib/auth/permissions';
 import { logAudit } from '@/lib/audit';
 import { getMentor, isReportingManager, isResponsibleFor, employeeIdForUser } from '@/lib/org-graph';
+import { textIn } from '@/lib/pg-array';
 
 // -------------------------------------------------------------------------------------------------
 // HELPERS AND CONSTANTS — all declared above every function that reads them.
@@ -1458,7 +1459,7 @@ export async function readActivityFacts(
         SELECT la.id::text AS id, la.status, la.due_on, c.title AS course_title
           FROM hr_learning_assignments la
           LEFT JOIN training_courses c ON c.id = la.course_id
-         WHERE la.employee_id = ${employeeId}::uuid AND la.id::text = ANY(${learningIds})
+         WHERE la.employee_id = ${employeeId}::uuid AND la.id::text IN (${textIn(learningIds)})
          LIMIT ${MAX_ROWS_PER_SOURCE}`));
       for (const l of r) {
         const id = String(l.id);
@@ -1500,7 +1501,7 @@ export async function readActivityFacts(
       const r = rows(await (await database()).execute(sql`
         SELECT id::text AS id, name, link_url, status, due_on, accepted_on
           FROM project_deliverables
-         WHERE id::text = ANY(${deliverableIds})
+         WHERE id::text IN (${textIn(deliverableIds)})
          LIMIT ${MAX_ROWS_PER_SOURCE}`));
       for (const d of r) {
         const id = String(d.id);
@@ -1549,7 +1550,7 @@ export async function readActivityFacts(
       const r = rows(await (await database()).execute(sql`
         SELECT id::text AS id, report_date, report_url, reviewed_at
           FROM hr_daily_reports
-         WHERE employee_id = ${employeeId}::uuid AND id::text = ANY(${reportIds})
+         WHERE employee_id = ${employeeId}::uuid AND id::text IN (${textIn(reportIds)})
          LIMIT ${MAX_ROWS_PER_SOURCE}`));
       for (const d of r) {
         const id = String(d.id);
@@ -1634,7 +1635,7 @@ export async function readActivityFacts(
           SELECT a.test_id::text AS test_id, COUNT(*)::int AS attempts,
                  MAX(a.percentage) AS best, MAX(a.created_at) AS latest
             FROM test_attempts a
-           WHERE a.candidate_id = ${userId}::uuid AND a.test_id::text = ANY(${assessmentIds})
+           WHERE a.candidate_id = ${userId}::uuid AND a.test_id::text IN (${textIn(assessmentIds)})
            GROUP BY a.test_id
            LIMIT ${MAX_ROWS_PER_SOURCE}`));
         for (const a of r) {

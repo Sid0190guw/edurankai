@@ -154,6 +154,7 @@ import { verifyAssessmentEvidence } from '@/lib/learning-doors';
 import { getCertificatesForUser } from '@/lib/certificates';
 import { getSubmission } from '@/lib/submissions';
 import { evidenceColumnFor, getBgvRecord } from '@/lib/hr-bgv';
+import { textIn, uuidIn } from '@/lib/pg-array';
 
 const MOD = 'evidence-graph';
 const WRITE_FAILED = 'We could not save that just now. Nothing was changed.';
@@ -718,7 +719,7 @@ export async function verifyEvidenceGraphSchema(): Promise<GraphSchemaReport> {
     const cols = rowsOf(await db.execute(sql`
       SELECT table_name, column_name
         FROM information_schema.columns
-       WHERE table_schema = 'public' AND table_name = ANY(${names})`));
+       WHERE table_schema = 'public' AND table_name::text IN (${textIn(names)})`));
     const byTable = new Map<string, Set<string>>();
     for (const c of cols) {
       const t = String(c.table_name);
@@ -1870,12 +1871,12 @@ export async function whyDoesTheSystemBelieve(
       if (ids.length) {
         const steps = rowsOf(await db.execute(sql`
           SELECT * FROM capability_evidence
-           WHERE claim_id = ANY(${ids}::uuid[])
+           WHERE claim_id IN (${uuidIn(ids)})
            ORDER BY created_at ASC LIMIT 500`));
         base.chain = steps.map(mapStep);
         const verdicts = rowsOf(await db.execute(sql`
           SELECT * FROM capability_verifications
-           WHERE claim_id = ANY(${ids}::uuid[])
+           WHERE claim_id IN (${uuidIn(ids)})
            ORDER BY created_at DESC LIMIT 200`));
         base.verifications = verdicts.map(mapVerification);
       }

@@ -85,6 +85,7 @@ import {
 import { STATUTORY } from '@/lib/engagement-policy';
 import { leaveType, ensureLeaveSchema } from '@/lib/hr-leave';
 import { startWorkflow, getInstance, decideStep, cancelWorkflow, instanceForRecord } from '@/lib/workflow';
+import { textIn } from '@/lib/pg-array';
 
 // -------------------------------------------------------------------------------------------------
 // CONSTANTS AND PURE HELPERS — every one declared ABOVE the functions that read them.
@@ -439,7 +440,7 @@ async function daysFor(scheduleIds: string[]): Promise<Map<string, ScheduleDay[]
   const dr = rows(await db.execute(sql`
     SELECT id::text AS id, schedule_id::text AS schedule_id, day_date, activity, hours
       FROM eims_schedule_days
-     WHERE schedule_id::text = ANY(${list})
+     WHERE schedule_id::text IN (${textIn(list)})
      ORDER BY day_date ASC, activity ASC`));
   for (const d of dr) {
     const key = String(d.schedule_id);

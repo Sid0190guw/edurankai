@@ -6,6 +6,7 @@ import type { PermissionGrant, ResourceRef, EvalContext, Decision } from './type
 import type { Capability } from './capabilities';
 import type { KernelObject } from '@/lib/kernel/types';
 import { MAX_INHERITANCE_DEPTH } from './policy';
+import { uuidIn } from '@/lib/pg-array';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 async function ctx() {
@@ -56,7 +57,7 @@ export async function resolveInheritedGrants(objectId: string): Promise<Permissi
     let frontier = [objectId];
     const seen = new Set([objectId]);
     for (let depth = 0; depth < MAX_INHERITANCE_DEPTH && frontier.length; depth++) {
-      const parents = rows(await db.execute(sql`SELECT to_id FROM kernel_edges WHERE from_id = ANY(${frontier as any}) AND type = 'part_of'`))
+      const parents = rows(await db.execute(sql`SELECT to_id FROM kernel_edges WHERE from_id IN (${uuidIn(frontier as any)}) AND type = 'part_of'`))
         .map((r: any) => r.to_id).filter((pid: string) => !seen.has(pid));
       const next: string[] = [];
       for (const pid of parents) {

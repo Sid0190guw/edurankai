@@ -21,5 +21,13 @@ export function ensureOnce(key: string, fn: () => Promise<void>): Promise<void> 
   }
   // Swallow here so callers keep their existing "tolerate missing schema"
   // behaviour; the retry-on-failure is handled by the cache.delete above.
-  return p.catch(() => {});
+  //
+  // BUT NEVER SILENTLY. A resolved ensureOnce() proves only that the promise settled, not that any
+  // DDL ran — and this project has already shipped a bootstrap endpoint that reported
+  // `ok: true, ran: 8, failed: 0` while the health check said ten tables were missing, because the
+  // ensures had all thrown into this catch. The swallow stays (callers depend on it); the SILENCE
+  // does not. The real Postgres reason is on e.cause; e.message is just the failed statement.
+  return p.catch((e: any) => {
+    console.error('[ensure-once] ' + key + ' failed:', e?.cause?.message || e?.message || e);
+  });
 }

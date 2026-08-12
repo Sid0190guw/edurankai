@@ -17,6 +17,7 @@ import {
   summarise, completionFigures, remainingWeeks,
   type AttendanceDay, type DayStatus, type EngagementTerms, type CreditSummary, type ReviewEntry,
 } from '@/lib/credit-hours';
+import { textIn } from '@/lib/pg-array';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 const iso = (d: any): string => {
@@ -282,7 +283,7 @@ export async function ledgerForMany(
     for (const r of rows(await db.execute(sql`
       SELECT employee_id, start_date, end_date, requested_at
       FROM hr_leave_request
-      WHERE employee_id::text = ANY(${ids}) AND status = 'approved'
+      WHERE employee_id::text IN (${textIn(ids)}) AND status = 'approved'
       ORDER BY start_date ASC`))) {
       const key = String(r.employee_id);
       const start = iso(r.start_date);
@@ -298,7 +299,7 @@ export async function ledgerForMany(
     for (const r of rows(await db.execute(sql`
       SELECT a.employee_id, a.date, a.status, a.work_hours, a.clock_in, a.clock_out ${brk}
       FROM hr_attendance a
-      WHERE a.employee_id::text = ANY(${ids})
+      WHERE a.employee_id::text IN (${textIn(ids)})
       ORDER BY a.employee_id ASC, a.date ASC`))) {
       const key = String(r.employee_id);
       const list = attBy.get(key) || [];
