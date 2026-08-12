@@ -691,9 +691,42 @@ try {
         cancelBtn.hidden = true;
       }
 
+      // EVERY WAIT HERE HAS A DEADLINE, AND THAT IS THE WHOLE POINT OF THIS FUNCTION.
+      //
+      // An employee reported spending THIRTY MINUTES unable to clock out. The error handling below
+      // is careful and names every cause it knows — but script.onerror only fires on a HARD failure.
+      // A CDN that is slow, throttled, or blocked by a network that neither answers nor refuses does
+      // not error: it HANGS. This promise then never settled, the status stayed on "Look at the
+      // camera", and there was nothing on screen to suggest anything had gone wrong. The person
+      // waited, because the screen was still telling them to.
+      //
+      // grab() already had a 12-second deadline. The library load had none, and the model fetch had
+      // none. So both get one, and a timeout is reported as the same kind of failure as a refusal —
+      // which sends the person to the code or the checkbox instead of leaving them staring.
+      //
+      // The real fix is to stop depending on a third-party CDN in the path of somebody's working
+      // day; that is a larger change and is noted rather than smuggled in here.
+      function withDeadline(promise, ms, label) {
+        return new Promise(function (res, rej) {
+          var settled = false;
+          var t = setTimeout(function () {
+            if (settled) return;
+            settled = true;
+            rej(new Error(label));
+          }, ms);
+          promise.then(function (v) {
+            if (settled) return;
+            settled = true; clearTimeout(t); res(v);
+          }, function (e) {
+            if (settled) return;
+            settled = true; clearTimeout(t); rej(e);
+          });
+        });
+      }
+
       function loadLib() {
         if (libP) return libP;
-        libP = new Promise(function (res, rej) {
+        libP = withDeadline(new Promise(function (res, rej) {
           if (window.faceapi) { res(); return; }
           var s = document.createElement('script');
           s.src = LIB;
@@ -701,7 +734,7 @@ try {
           s.onload = function () { res(); };
           s.onerror = function () { rej(new Error('face-model-script')); };
           document.head.appendChild(s);
-        }).then(function () {
+        }), 10000, 'face-model-script').then(function () {
           var f = window.faceapi;
           if (!f) throw new Error('face-model-script');
           var back = Promise.resolve();
@@ -714,11 +747,12 @@ try {
               .catch(function () {});
           }
           return back.then(function () {
-            return Promise.all([
+            // The models are three more downloads from the same CDN and hang the same way.
+            return withDeadline(Promise.all([
               f.nets.tinyFaceDetector.loadFromUri(MODELS),
               f.nets.faceLandmark68TinyNet.loadFromUri(MODELS),
               f.nets.faceRecognitionNet.loadFromUri(MODELS)
-            ]);
+            ]), 15000, 'face-model-script');
           });
         }).catch(function (e) { libP = null; throw e; });
         return libP;
@@ -761,6 +795,9 @@ try {
           });
         } catch (e) { camP = Promise.reject(e); }
 
+        // A permission prompt nobody answers leaves this pending forever too.
+        camP = withDeadline(camP, 30000, 'camera-timeout');
+
         camP.then(function (s) {
           stream = s;
           video.setAttribute('playsinline', '');
@@ -794,7 +831,9 @@ try {
             : /NotReadable|TrackStart/i.test(name)
             ? 'The camera is being used by another app.'
             : /face-model-script/i.test(name)
-            ? 'The face model could not be downloaded.'
+            ? 'The face check could not be downloaded, which usually means the network is blocking it.'
+            : /camera-timeout/i.test(name)
+            ? 'The camera did not start in time.'
             : 'The face check could not run.';
           say(why + ' Use your code instead, or tick the box below - you will still be clocked out, and nothing is marked against you.');
         });
