@@ -99,7 +99,7 @@ export async function ensureSyncSchema(): Promise<void> {
 async function edgesFor(ids: string[]): Promise<Edge[]> {
   if (!ids.length) return [];
   const { db, sql } = await ctx();
-  try { return rows(await db.execute(sql`SELECT from_id AS "from", to_id AS "to", type FROM kernel_edges WHERE from_id IN (${uuidIn(ids)}) OR to_id IN (${uuidIn(ids)})`)); } catch { return []; }
+  try { return rows(await db.execute(sql`SELECT from_id AS "from", to_id AS "to", type FROM kernel_edges WHERE from_id IN ${uuidIn(ids)} OR to_id IN ${uuidIn(ids)}`)); } catch { return []; }
 }
 
 /** The current delta: dirty/pending kernel objects + everything affected along their chain. */
@@ -113,7 +113,7 @@ export async function computeServerDelta(): Promise<{ changed: string[]; affecte
   const edges = await edgesFor(seed);
   const affected = computeDelta(seed, edges);
   let objects: any[] = [];
-  if (affected.length) { try { objects = rows(await db.execute(sql`SELECT id, type, version, synchronization_state FROM kernel_objects WHERE id IN (${uuidIn(affected)})`)); } catch { objects = []; } }
+  if (affected.length) { try { objects = rows(await db.execute(sql`SELECT id, type, version, synchronization_state FROM kernel_objects WHERE id IN ${uuidIn(affected)}`)); } catch { objects = []; } }
   return { changed: seed, affected, objects };
 }
 

@@ -108,7 +108,7 @@ export async function compileForUser(userId: string | null, unitIds: string[], t
   }
   let progress: { koId: string; completed: boolean }[] = [];
   if (userId) { try { await import('@/lib/edu-runtime').then((m) => m.ensureRuntimeSchema()); const { db, sql } = await ctx();
-    progress = rows(await db.execute(sql`SELECT ko_id AS "koId", completed FROM edu_progress WHERE user_id = ${userId} AND ko_id IN (${uuidIn(unitIds)})`)).map((r: any) => ({ koId: r.koId, completed: !!r.completed }));
+    progress = rows(await db.execute(sql`SELECT ko_id AS "koId", completed FROM edu_progress WHERE user_id = ${userId} AND ko_id IN ${uuidIn(unitIds)}`)).map((r: any) => ({ koId: r.koId, completed: !!r.completed }));
   } catch { /* progress optional */ } }
 
   const manifest = buildManifest({ units, edges, progress, tier, budget });

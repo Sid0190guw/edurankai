@@ -440,7 +440,7 @@ async function daysFor(scheduleIds: string[]): Promise<Map<string, ScheduleDay[]
   const dr = rows(await db.execute(sql`
     SELECT id::text AS id, schedule_id::text AS schedule_id, day_date, activity, hours
       FROM eims_schedule_days
-     WHERE schedule_id::text IN (${textIn(list)})
+     WHERE schedule_id::text IN ${textIn(list)}
      ORDER BY day_date ASC, activity ASC`));
   for (const d of dr) {
     const key = String(d.schedule_id);

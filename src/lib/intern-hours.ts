@@ -961,7 +961,7 @@ async function readProfilesMany(ids: string[], failed: string[]): Promise<Map<st
            ORDER BY (ol.signed_at IS NOT NULL) DESC, ol.created_at DESC
            LIMIT 1
         ) o ON TRUE
-       WHERE e.id::text IN (${textIn(ids)})`))) {
+       WHERE e.id::text IN ${textIn(ids)}`))) {
       out.set(String(r.id), {
         fullName: String(r.full_name || ''),
         employeeCode: r.employee_code ? String(r.employee_code) : null,
@@ -984,7 +984,7 @@ async function readProfilesMany(ids: string[], failed: string[]): Promise<Map<st
   try {
     for (const r of rows(await db.execute(sql`
       SELECT id::text AS id, weekly_hours, working_days_per_week
-        FROM hr_employees WHERE id::text IN (${textIn(ids)})`))) {
+        FROM hr_employees WHERE id::text IN ${textIn(ids)}`))) {
       const p = out.get(String(r.id));
       if (!p) continue;
       p.weeklyHours = r.weekly_hours == null ? null : Number(r.weekly_hours);
@@ -1010,7 +1010,7 @@ async function readAttendanceMany(
       SELECT employee_id::text AS employee_id, date, status, clock_in, clock_out,
              work_hours, break_minutes
         FROM hr_attendance
-       WHERE employee_id::text IN (${textIn(ids)})
+       WHERE employee_id::text IN ${textIn(ids)}
          AND date >= ${from}::date
          AND date <= ${to}::date
        ORDER BY employee_id ASC, date ASC`))) {
@@ -1040,7 +1040,7 @@ async function readApprovedLeaveMany(
     for (const r of rows(await db.execute(sql`
       SELECT employee_id::text AS employee_id, start_date, end_date
         FROM hr_leave_request
-       WHERE employee_id::text IN (${textIn(ids)})
+       WHERE employee_id::text IN ${textIn(ids)}
          AND status = 'approved'
          AND end_date >= ${from}::date
          AND start_date <= ${to}::date

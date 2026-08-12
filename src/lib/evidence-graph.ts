@@ -719,7 +719,7 @@ export async function verifyEvidenceGraphSchema(): Promise<GraphSchemaReport> {
     const cols = rowsOf(await db.execute(sql`
       SELECT table_name, column_name
         FROM information_schema.columns
-       WHERE table_schema = 'public' AND table_name::text IN (${textIn(names)})`));
+       WHERE table_schema = 'public' AND table_name::text IN ${textIn(names)}`));
     const byTable = new Map<string, Set<string>>();
     for (const c of cols) {
       const t = String(c.table_name);
@@ -1871,12 +1871,12 @@ export async function whyDoesTheSystemBelieve(
       if (ids.length) {
         const steps = rowsOf(await db.execute(sql`
           SELECT * FROM capability_evidence
-           WHERE claim_id IN (${uuidIn(ids)})
+           WHERE claim_id IN ${uuidIn(ids)}
            ORDER BY created_at ASC LIMIT 500`));
         base.chain = steps.map(mapStep);
         const verdicts = rowsOf(await db.execute(sql`
           SELECT * FROM capability_verifications
-           WHERE claim_id IN (${uuidIn(ids)})
+           WHERE claim_id IN ${uuidIn(ids)}
            ORDER BY created_at DESC LIMIT 200`));
         base.verifications = verdicts.map(mapVerification);
       }

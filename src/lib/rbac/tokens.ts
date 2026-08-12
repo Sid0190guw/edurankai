@@ -177,14 +177,14 @@ export async function revokeToken(tokenId: string, opts: { cascade?: boolean } =
   if (cascade) {
     let frontier = [tokenId];
     for (let depth = 0; depth < 32 && frontier.length; depth++) {
-      const kids = rows(await db.execute(sql`SELECT token_id FROM rbac_capability_tokens WHERE delegated_from IN (${uuidIn(frontier as any)})`)).map((x: any) => x.token_id);
+      const kids = rows(await db.execute(sql`SELECT token_id FROM rbac_capability_tokens WHERE delegated_from IN ${uuidIn(frontier as any)}`)).map((x: any) => x.token_id);
       const fresh = kids.filter((k: string) => !ids.includes(k));
       ids = [...ids, ...fresh];
       frontier = fresh;
     }
   }
   const res = await db.execute(sql`UPDATE rbac_capability_tokens SET status='revoked', updated_at=NOW()
-    WHERE token_id IN (${uuidIn(ids as any)}) AND status IN ('issued','activated','delegated')`);
+    WHERE token_id IN ${uuidIn(ids as any)} AND status IN ('issued','activated','delegated')`);
   return (res as any)?.rowCount ?? rows(res).length ?? ids.length;
 }
 

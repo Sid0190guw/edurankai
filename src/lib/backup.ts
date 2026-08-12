@@ -53,8 +53,8 @@ export async function exportKernel(scopeCourseId?: string): Promise<BackupPackag
   if (scopeCourseId) {
     const koIds = (await q(sql`SELECT from_id FROM kernel_edges WHERE to_id = ${scopeCourseId} AND type = 'part_of'`)).map((r: any) => r.from_id);
     const ids = [scopeCourseId, ...koIds];
-    const objects = await q(sql`SELECT * FROM kernel_objects WHERE id IN (${uuidIn(ids)})`);
-    const edges = await q(sql`SELECT * FROM kernel_edges WHERE from_id IN (${uuidIn(ids)}) OR to_id IN (${uuidIn(ids)})`);
+    const objects = await q(sql`SELECT * FROM kernel_objects WHERE id IN ${uuidIn(ids)}`);
+    const edges = await q(sql`SELECT * FROM kernel_edges WHERE from_id IN ${uuidIn(ids)} OR to_id IN ${uuidIn(ids)}`);
     return makePackage(objects, edges, 'course:' + scopeCourseId);
   }
   const objects = await q(sql`SELECT * FROM kernel_objects`);

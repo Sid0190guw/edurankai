@@ -520,8 +520,8 @@ export async function presentColumns(): Promise<Set<string>> {
           SELECT table_name, column_name
             FROM information_schema.columns
            WHERE table_schema = current_schema()
-             AND table_name::text IN (${textIn(tables)})
-             AND column_name::text IN (${textIn(names)})`);
+             AND table_name::text IN ${textIn(tables)}
+             AND column_name::text IN ${textIn(names)}`);
         return new Set(rows.map((r: any) => String(r.table_name) + '.' + String(r.column_name)));
       } catch (e: any) {
         logFail(MOD, 'presentColumns', e);
@@ -728,7 +728,7 @@ function lessonProbes(id: string): Probe[] {
 async function existingTables(handle: any, names: string[]): Promise<Set<string>> {
   const rows = await ex(handle, 'select:information_schema.tables', sql`
     SELECT table_name FROM information_schema.tables
-     WHERE table_schema = current_schema() AND table_name::text IN (${textIn(names)})`);
+     WHERE table_schema = current_schema() AND table_name::text IN ${textIn(names)}`);
   return new Set(rows.map((r: any) => String(r.table_name)));
 }
 

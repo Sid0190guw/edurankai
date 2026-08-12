@@ -115,7 +115,7 @@ export async function resolvePrincipal(user: any, presentedTokens: string[] = []
     const ur = rows(await db.execute(sql`SELECT role_key, stage FROM rbac_user_roles WHERE user_id = ${userId}`));
     for (const r of ur) { roleKeys.push(r.role_key); if (r.role_key === 'student' && r.stage) stage = r.stage; }
     const roleIdents = roleKeys.map((k) => `role:${k}`);
-    const g = rows(await db.execute(sql`SELECT * FROM rbac_permission_grants WHERE identity_ref = ${userId} OR identity_ref IN (${textIn(roleIdents)})`));
+    const g = rows(await db.execute(sql`SELECT * FROM rbac_permission_grants WHERE identity_ref = ${userId} OR identity_ref IN ${textIn(roleIdents)}`));
     grants = g.map((r: any) => ({
       permissionId: r.permission_id, identityRef: r.identity_ref, resourceRef: r.resource_ref, operation: r.operation,
       effect: r.effect, state: r.state, inheritancePolicy: r.inheritance_policy, conditions: r.conditions ?? {},

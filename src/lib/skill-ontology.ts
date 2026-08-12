@@ -454,7 +454,7 @@ export async function verifyOntologySchema(): Promise<OntologySchemaReport> {
     const cols = rowsOf(await db.execute(sql`
       SELECT table_name, column_name
         FROM information_schema.columns
-       WHERE table_schema = 'public' AND table_name::text IN (${textIn(names)})`));
+       WHERE table_schema = 'public' AND table_name::text IN ${textIn(names)}`));
     const byTable = new Map<string, Set<string>>();
     for (const c of cols) {
       const t = String(c.table_name);
@@ -529,7 +529,7 @@ async function readForeignEdgeStores(): Promise<ForeignEdgeStore[]> {
     const names = FOREIGN_EDGE_STORES.map((f) => f.table);
     const found = rowsOf(await db.execute(sql`
       SELECT table_name FROM information_schema.tables
-       WHERE table_schema = 'public' AND table_name::text IN (${textIn(names)})`));
+       WHERE table_schema = 'public' AND table_name::text IN ${textIn(names)}`));
     const present = new Set(found.map((r: any) => String(r.table_name)));
     for (const f of FOREIGN_EDGE_STORES) {
       if (!present.has(f.table)) {
