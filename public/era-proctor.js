@@ -66,7 +66,7 @@
     return new Promise(function (resolve, reject) {
       if (window.faceapi) return resolve();
       var s = document.createElement('script');
-      s.src = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.min.js';
+      s.src = '/vendor/face-api/face-api.min.js';
       s.onload = function () { resolve(); };
       s.onerror = function () { reject(new Error('face-api load failed')); };
       document.head.appendChild(s);
@@ -77,7 +77,7 @@
     try {
       await loadFaceApi();
       try { if (window.faceapi && faceapi.tf && faceapi.tf.setBackend) await faceapi.tf.setBackend('webgl'); } catch (_) {}
-      var MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
+      var MODEL_URL = '/vendor/face-api/models';
       await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
     } catch (e) {
       logEvent('media_lost', 'warn', { reason: 'face_model_load_failed' });
