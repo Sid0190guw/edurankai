@@ -45,6 +45,25 @@ const MAIN_ROLES: SeedRole[] = [
   { key: 'researcher', surface: 'main', description: 'Research desk / research workspace access.', capabilities: ['read', 'write', 'execute'], color: 'teal' },
   { key: 'partner', surface: 'main', description: 'Institutional partner portal (read partnership data).', capabilities: ['read'], color: 'gold' },
   { key: 'guest', surface: 'main', description: 'Public catalogue browsing only.', capabilities: ['read'], color: 'gray' },
+  // ===============================================================================================
+  // EMPLOYEE — THE STAFF WORKSPACE, AND DELIBERATELY NOT THE ADMIN.
+  // ===============================================================================================
+  //
+  // surface: 'main' is the whole point. Everything under /admin is the 'admin' surface, so an
+  // employee holding this role reaches their own workspace at /portal/employee — attendance, leave,
+  // expenses, reports, their own record — and nothing on the administrative side. Somebody who
+  // should also administer is given a SECOND role; roles are additive here, one row each in
+  // rbac_user_roles, so a person can hold employee and faculty and guest at once and the engine
+  // unions their capabilities.
+  //
+  // 'read' and 'execute' only: read their own record, and act within it (clock in and out, file a
+  // request). No 'write' on other people's records, no 'manage', no 'configure'.
+  //
+  // WHAT THIS ROLE DOES NOT DO IS CONJURE AN HR RECORD. /portal/employee shows a person their own
+  // hr_employees row, so requireEmployee() still needs HR to have linked that row to the sign-in
+  // address — and it already says exactly that when the link is missing. Assigning this role marks
+  // somebody as staff for permission purposes; it does not, and must not, invent employment.
+  { key: 'employee', surface: 'main', description: 'Staff workspace only: own attendance, leave, expenses, reports and record. No admin access.', capabilities: ['read', 'execute'], color: 'teal' },
 ];
 
 export const SEED_ROLES: SeedRole[] = [...ADMIN_ROLES, ...MAIN_ROLES];

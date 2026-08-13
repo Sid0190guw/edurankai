@@ -8,6 +8,7 @@ import { sql } from 'drizzle-orm';
 import { can, ensureRbacSchema, seedRbac } from '@/lib/rbac';
 import { SEED_ROLES, STAGES, ADMIN_ROLE_KEYS } from '@/lib/rbac/roles';
 import { isCapability } from '@/lib/rbac/capabilities';
+import { textArray } from '@/lib/pg-array';
 
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 const ROLE_KEYS = SEED_ROLES.map((r) => r.key);
@@ -132,8 +133,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
       const inherits: string[] = Array.isArray(b.inherits) ? b.inherits.filter((x: any) => ROLE_KEYS.includes(String(x))) : [];
       const dup = rows(await db.execute(sql`SELECT 1 FROM rbac_roles WHERE key = ${key} LIMIT 1`)).length > 0;
       if (dup) return j({ ok: false, error: 'a role with that key already exists' }, 400);
+      // Same array-into-SQL bug that stopped seedRbac() ever running: `${inherits}` is serialised
+      // as a record literal, so this INSERT answered "syntax error at or near )" for a role with no
+      // parents and "cannot cast type record to text[]" for one with them. The + New role button
+      // has therefore never created a role. textArray() is the house fragment for a text[] write.
       await db.execute(sql`INSERT INTO rbac_roles (key, surface, description, color, is_system, inherits)
-        VALUES (${key}, ${surface}, ${String(b.description || '')}, 'orange', false, ${inherits})`);
+        VALUES (${key}, ${surface}, ${String(b.description || '')}, 'orange', false, ${textArray(inherits)})`);
       for (const c of caps) await db.execute(sql`INSERT INTO rbac_role_capabilities (role_key, capability) VALUES (${key}, ${c}) ON CONFLICT DO NOTHING`);
       return j({ ok: true, created: key });
     }

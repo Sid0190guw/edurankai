@@ -7,7 +7,7 @@ import { SEED_ROLES, resolveRoleCapabilities, type SeedRole } from './roles';
 import { RBAC_DDL, RBAC_TOKENS_DDL } from './schema';
 import { assertPermissionTransition, type CapabilityToken, type PermissionGrant, type PermissionState, type Principal } from './types';
 import type { AuditEntry } from './guard';
-import { textIn } from '@/lib/pg-array';
+import { textIn, textArray } from '@/lib/pg-array';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
@@ -39,8 +39,22 @@ export async function seedRbac(): Promise<{ roles: number; capabilities: number 
     await db.execute(sql`INSERT INTO rbac_capabilities (key) VALUES (${c}) ON CONFLICT (key) DO NOTHING`);
   }
   for (const r of SEED_ROLES) {
+    // `${r.inherits ?? []}` WAS THE BUG THAT KILLED /admin/rbac ENTIRELY.
+    //
+    // inherits is TEXT[], and a JS array interpolated into a drizzle template is serialised by
+    // postgres-js as a RECORD literal — so a role with no parents rendered as `()` and Postgres
+    // answered "syntax error at or near )". Every role with parents would have failed too, with
+    // "cannot cast type record to text[]".
+    //
+    // seedRbac() therefore NEVER ONCE SUCCEEDED. rbac_roles stayed empty, so the console saw zero
+    // roles, called seedRbac() to self-heal on every single visit, and threw — which is why
+    // /admin/rbac answered ERR_INVALID_RESPONSE rather than rendering. The page's new per-read
+    // error banner named this in one reload: "Seeding the default roles - syntax error at or near )".
+    //
+    // textArray() is the house fragment for exactly this, and it returns ARRAY[]::text[] when the
+    // list is empty rather than nothing at all.
     await db.execute(sql`INSERT INTO rbac_roles (key, surface, description, color, is_system, inherits)
-      VALUES (${r.key}, ${r.surface}, ${r.description}, ${r.color || 'orange'}, true, ${r.inherits ?? []})
+      VALUES (${r.key}, ${r.surface}, ${r.description}, ${r.color || 'orange'}, true, ${textArray(r.inherits ?? [])})
       ON CONFLICT (key) DO NOTHING`);
     for (const cap of r.capabilities) {
       await db.execute(sql`INSERT INTO rbac_role_capabilities (role_key, capability) VALUES (${r.key}, ${cap}) ON CONFLICT DO NOTHING`);
