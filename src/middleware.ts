@@ -245,6 +245,34 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // collapsed form is the one that should be returned to anyway.
   const path = normalisePath(new URL(context.request.url).pathname);
 
+  // ===============================================================================================
+  // AQUINTUTOR'S OWN PRINCIPAL, RESOLVED BEFORE ANYTHING ELSE AND KEPT SEPARATE FROM `user`
+  // ===============================================================================================
+  //
+  // aquintutor.com is its own product with its own accounts (docs/aquintutor-independence.md). It
+  // carries its own cookie and its own aq_* tables, and NOTHING below may treat one identity as a
+  // fallback for the other — an EduRankAI super admin has no standing on AquinTutor until somebody
+  // creates them an account there.
+  //
+  // Set here, once, so it exists on EVERY path out of this middleware. Three of the branches below
+  // return early after setting locals.user = null, and a field that is only assigned on the long
+  // path is a field that reads `undefined` on exactly the requests nobody tested.
+  //
+  // COSTS NOTHING WHEN THE COOKIE IS ABSENT. No AquinTutor cookie means no lookup at all, which
+  // matters while both products share one deployment: a database call per request for a product
+  // most visitors are not using is how the compute bill here has been burned before.
+  context.locals.aquin = null;
+  try {
+    const { readAquinCookie, resolveAquinPrincipal } = await import('@/lib/aquin/gate');
+    if (readAquinCookie(context.cookies)) {
+      context.locals.aquin = await resolveAquinPrincipal(context as any);
+    }
+  } catch (e: any) {
+    // Never fatal to the request. resolveAquinPrincipal already fails closed on its own errors; this
+    // covers the module itself failing to load, which must not take the whole site down.
+    console.error('[middleware] AquinTutor principal could not be resolved:', e?.cause?.message || e?.message);
+  }
+
   // FEATURES THAT ARE NOT OPEN YET — answered here, before any database work, so that EVERY door
   // into a held-back feature gets the same answer: a nav entry, a deep link, an old bookmark, a link
   // somebody pasted into a chat months ago.

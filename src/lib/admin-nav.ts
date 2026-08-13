@@ -494,6 +494,10 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // but super_admin, so the entry stays exactly as visible as it is today and the menu goes on
       // mirroring the lock. Widen it the day that page's own guard widens, not before.
       { id: 'aquintutor-command', label: 'Command Center', href: '/aquintutor/admin', icon: 'shield', section: 'settings' },
+      // A page nobody can navigate to is a page nobody runs, and this one is the only way AquinTutor
+      // gets its first administrator — until it runs, /aquintutor/admin/login has nobody to admit.
+      // Same 'settings' section as the entry above, which is held by super_admin alone.
+      { id: 'aquintutor-bootstrap', label: 'AquinTutor: first super admin', href: '/admin/aquintutor-bootstrap', icon: 'shield', section: 'settings' },
     ],
   },
   { id: 'custom-offer', label: 'Custom Offer', href: '/admin/offer/blank', icon: 'file-text', section: 'custom_offer' },

@@ -99,13 +99,46 @@ super admin through `assignRole()`, the only path that records who granted it.
 The **last super admin cannot be removed**, including by themselves — an AquinTutor with nobody able
 to grant a role needs a database console to recover.
 
+## Bootstrap: why the one EduRankAI touchpoint is not a bridge
+
+A system whose only role-granting authority is a super admin cannot create its first super admin.
+Something has to break that circle, so `/admin/aquintutor-bootstrap` does — **once**.
+
+The distinction is exact:
+
+- A **bridge** is standing. It says "whoever administers EduRankAI administers AquinTutor" and keeps
+  saying it, so the two can never be separated because one permanently derives authority from the
+  other.
+- A **bootstrap** is a single act that disables itself. The moment one super admin exists, the page
+  grants nothing to anybody again — including to the EduRankAI account that used it.
+
+The test: after it has run, removing EduRankAI entirely would not affect who administers AquinTutor.
+That is passed. The alternatives were worse — a secret in an environment variable (the founder
+cannot read Vercel runtime logs to retrieve one, established while diagnosing `/admin/rbac`), or a
+seeded password in a migration (a credential in the repository).
+
+The check is made again at POST, not just at render: between drawing the form and submitting it,
+somebody else may have run it.
+
+## Done
+
+- [x] **Identity foundation** — tenant, schema, store seam, identity rules. 27 tests.
+- [x] **Bootstrap the first super admin** — `/admin/aquintutor-bootstrap`, self-disabling, audited,
+      and in the sidebar (a page nobody can navigate to is a page nobody runs).
+- [x] **Middleware** resolves `Astro.locals.aquin` on every path out, and costs no database call
+      when the AquinTutor cookie is absent.
+- [x] **`/aquintutor/admin/login`** — signs in against `aq_users`, issues `aquin_session`, and says
+      plainly when no administrator exists yet rather than answering "wrong password" to an empty
+      table.
+
 ## Still to do
 
-1. **Bootstrap the first super admin** — a one-time, guarded route; nobody can sign in until it runs.
-2. **Wire the middleware** to resolve `Astro.locals.aquin` on AquinTutor hosts.
-3. **`/aquintutor/login`** and its own session cookie handling.
-4. **The admin shell** — its own layout and nav, not `AdminLayout`.
-5. **Port the 10 existing admin pages** off `Astro.locals.user` onto the AquinTutor principal.
-6. **Point aquintutor.com at the Vercel project** and confirm the host resolves.
+1. **The admin shell** — its own layout and nav, not `AdminLayout`.
+2. **Port the 10 existing admin pages** off `Astro.locals.user` onto the AquinTutor principal.
+3. **Migrate `/aquintutor/login`** (the learner login) once accounts exist in `aq_users`. It still
+   signs in against the EduRankAI tables and is left alone deliberately: repointing it today would
+   lock out everybody, since `aq_users` starts empty.
+4. **Point aquintutor.com at the Vercel project** and confirm `tenantForHost` resolves it.
 
-Steps 1 to 3 are the gate: until they exist, aquintutor.com has an identity domain with no way in.
+The gate is open: AquinTutor can now have an administrator, and that administrator can sign in
+without any EduRankAI account being involved.
