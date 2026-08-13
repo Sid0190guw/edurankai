@@ -10,6 +10,9 @@ import { resolveEngagementPolicy, shortCommitment } from '@/lib/engagement-polic
 // column, its history table and the notification that goes with a move.
 import { advanceStage } from '@/lib/application-stages';
 import { civilToday } from '@/lib/page-safety';
+// One place decides how much time is left and whether a revoke may be offered. The candidate's
+// page has counted these dates down since the table was written; this side showed nothing.
+import { offerClock } from '@/lib/offer-clock';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -600,11 +603,27 @@ const STAGE_LABELS: Record<string, string> = {
   rejected: 'Closed', withdrawn: 'Withdrawn'
 };
 const stageLabel = STAGE_LABELS[app.status] || app.status;
+// THE CLOCK, AND THE STATUS LINE THAT USED TO IGNORE IT.
+//
+// This read "Sent - awaiting signature" for an offer whose expiry had passed a fortnight earlier —
+// the row said `sent`, and nothing on this side ever compared a date. offerClock() reads the same
+// two columns the candidate's page has always counted down, so the two surfaces can no longer
+// disagree about whether an offer is still open.
+const clock = offerClock(currentOffer as any, civilToday());
 const letterStatusLabel = !currentOffer ? 'Not sent'
   : isSigned ? 'Signed by candidate'
-  : isWithdrawn ? 'Withdrawn'
+  : isWithdrawn ? 'Revoked'
   : isDeclined ? 'Declined'
+  : clock.state === 'expired' ? 'Expired - no longer signable'
+  : clock.state === 'overdue' ? 'Sent - reply overdue'
   : 'Sent - awaiting signature';
+
+// Colour for the clock line. Kept out of JSX because a conditional chain that long is unreadable
+// inline, and .astro will not take a typed Record here.
+const clockTone = clock.state === 'expired' || clock.state === 'overdue' ? '#f87171'
+  : clock.state === 'due_soon' ? '#fbbf24'
+  : clock.state === 'signed' ? '#4ade80'
+  : '#9aa0aa';
 ---
 <AdminLayout title="Offer Letter">
 
@@ -649,10 +668,57 @@ const letterStatusLabel = !currentOffer ? 'Not sent'
       {currentOffer ? (
         <>
           <p class="text-[0.74rem] text-white/55 mt-1">Ref: {currentOffer.refNumber} &middot; Hash: {currentOffer.integrityHash}</p>
+
+          {/* THE CLOCK. Server-rendered from the civil date in Asia/Kolkata, then kept honest by the
+              script at the foot of this page: a tab left open overnight used to keep showing
+              yesterday's figure, which is the one moment the number matters. */}
+          <p
+            class="text-[0.78rem] mt-2 leading-relaxed"
+            style={'color:' + clockTone + ';'}
+            data-offer-clock
+            data-deadline={clock.responseDeadline || ''}
+            data-expiry={clock.expiryDate || ''}
+            data-state={clock.state}
+          >{clock.sentence}</p>
+
           <div class="flex gap-3 mt-2">
             <a href={'/portal/offer/' + currentOffer.token} target="_blank" class="text-[0.76rem] text-burn hover:underline font-mono">Applicant link &rarr;</a>
             <a href={'/offer/verify/' + currentOffer.token} target="_blank" class="text-[0.76rem] text-sky hover:underline font-mono">Public verify &rarr;</a>
           </div>
+
+          {/* REVOKE. The handler for this has existed, complete and tested against its own failure
+              modes, since the page was written — and no form ever submitted it, so no letter on this
+              product could be taken back. It is a disclosure rather than a bare button because it
+              notifies the candidate the moment it is pressed, and it demands a reason because
+              "withdrawn, no reason recorded" is the version nobody can defend later. */}
+          {clock.canRevoke && (
+            <details class="mt-3 border-t border-white/10 pt-3">
+              <summary class="text-[0.76rem] text-red-300 cursor-pointer select-none">
+                {clock.revokeIsRescission ? 'Revoke this signed offer' : 'Revoke this offer letter'}
+              </summary>
+              <div class="mt-2">
+                <p class="text-[0.73rem] text-white/55 leading-relaxed mb-2">
+                  {clock.revokeIsRescission
+                    ? 'The candidate has already signed. Revoking now withdraws an offer they have accepted and may have acted on, so the reason below is the record of why.'
+                    : 'The candidate is told immediately, with the reason you give. The application stage is not changed, and a corrected letter can still be issued from the form below.'}
+                </p>
+                <form method="POST" onsubmit="return confirm('Revoke this offer letter? The candidate is notified straight away.');">
+                  <input type="hidden" name="action" value="withdraw" />
+                  <textarea
+                    name="reason"
+                    required
+                    rows="2"
+                    maxlength="500"
+                    placeholder="Why is this being revoked? The candidate sees this."
+                    class="w-full bg-black/30 border border-white/15 rounded-lg p-2 text-[0.8rem] text-white"
+                  ></textarea>
+                  <button type="submit" class="mt-2 bg-red-500/15 hover:bg-red-500/25 border border-red-500/40 text-red-300 font-semibold py-2 px-4 rounded-lg text-[0.8rem]">
+                    Revoke and notify the candidate
+                  </button>
+                </form>
+              </div>
+            </details>
+          )}
         </>
       ) : (
         <p class="text-[0.74rem] text-white/55 mt-1">Fill the form below and send the formal letter.</p>
@@ -788,5 +854,73 @@ const letterStatusLabel = !currentOffer ? 'Not sent'
         if (inp) { inp.value = b.getAttribute('data-comp'); inp.focus(); }
       });
     });
+
+    // -------------------------------------------------------------------------------------------
+    // KEEP THE CLOCK HONEST ON A TAB THAT STAYS OPEN.
+    //
+    // The sentence above is rendered on the server from today's civil date in Asia/Kolkata. Admin
+    // tabs on this product stay open for days — the applications list refreshes itself every five
+    // minutes and this page does not — so "expires in 1 day" would still read "expires in 1 day"
+    // the morning after it expired. That is the single moment the number has to be right.
+    //
+    // This recomputes from the same two dates, in the same zone, and rewrites the line when the
+    // civil day changes underneath it. It never invents a state the server did not: a signed,
+    // revoked or declined offer is left exactly as rendered, because those do not move with time.
+    (function () {
+      var el = document.querySelector('[data-offer-clock]');
+      if (!el) return;
+      var frozen = ['signed', 'withdrawn', 'declined', 'draft', 'none'];
+      if (frozen.indexOf(el.getAttribute('data-state') || '') !== -1) return;
+
+      function istToday() {
+        var p = new Intl.DateTimeFormat('en-CA', {
+          timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit'
+        }).format(new Date());
+        return p;   // en-CA formats as YYYY-MM-DD
+      }
+      function days(from, to) {
+        if (!from || !to) return null;
+        var f = from.split('-').map(Number), t = to.split('-').map(Number);
+        return Math.round((Date.UTC(t[0], t[1] - 1, t[2]) - Date.UTC(f[0], f[1] - 1, f[2])) / 86400000);
+      }
+      function phrase(n) {
+        if (n === 0) return 'today';
+        if (n === 1) return 'tomorrow';
+        if (n === -1) return 'yesterday';
+        return n > 0 ? 'in ' + n + ' days' : Math.abs(n) + ' days ago';
+      }
+
+      var startedOn = istToday();
+      setInterval(function () {
+        var today = istToday();
+        if (today === startedOn) return;      // same civil day, the server line still holds
+        startedOn = today;
+
+        var deadline = el.getAttribute('data-deadline') || '';
+        var expiry = el.getAttribute('data-expiry') || '';
+        var dd = days(today, deadline);
+        var ed = days(today, expiry);
+
+        if (ed !== null && ed < 0) {
+          el.textContent = 'This offer expired ' + phrase(ed) + ' (' + expiry + '). The candidate can no longer sign it. '
+            + 'Reload for the full picture.';
+          el.style.color = '#f87171';
+          return;
+        }
+        if (dd !== null && dd < 0) {
+          el.textContent = 'The reply was due ' + phrase(dd) + ' (' + deadline + ') and none has come.';
+          el.style.color = '#f87171';
+          return;
+        }
+        var soonest = null;
+        if (dd !== null) soonest = dd;
+        if (ed !== null && (soonest === null || ed < soonest)) soonest = ed;
+        if (soonest === null) return;
+        var isDeadline = dd !== null && dd === soonest;
+        el.textContent = (isDeadline ? 'A reply is due ' : 'It expires ') + phrase(soonest)
+          + ' (' + (isDeadline ? deadline : expiry) + ').';
+        el.style.color = soonest <= 3 ? '#fbbf24' : '#9aa0aa';
+      }, 60000);
+    })();
   </script>
 </AdminLayout>
