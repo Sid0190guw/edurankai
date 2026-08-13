@@ -21,7 +21,7 @@ import {
   capabilitiesFor, holds, mayOpenAquinAdmin, isAquinSuperAdmin, hashToken, newToken, ANONYMOUS,
 } from './identity';
 import { memoryStore } from './store';
-import { AQUIN_ROLES, AQUIN_ADMIN_ROLE_KEYS } from './schema';
+import { AQUIN_ROLES, AQUIN_ADMIN_ROLE_KEYS, AQUIN_TABLES } from './schema';
 import { tenantForHost, sessionCookieName, normaliseHost, isAquinPath, loginPathFor } from './tenant';
 
 const PW = 'a-long-enough-password';
@@ -273,5 +273,63 @@ describe('nothing here can be reached from the other product', () => {
     const p = await resolveAquinUser(store, 'a-token-that-does-not-exist');
     expect(p.userId).toBe(null);
     expect(p.roles.includes('super_admin')).toBe(false);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+describe('the two store implementations do not drift apart', () => {
+  it('the in-memory store reports exactly the tables the schema declares', async () => {
+    // Its whole justification is being a faithful second implementation — the only real proof that
+    // AquinStore is an abstraction rather than the shape of one SQL dialect. It had already drifted
+    // once: aq_course_authors was added and the hand-typed list still said six tables.
+    const store = memoryStore();
+    expect((await store.presentTables()).sort()).toEqual([...AQUIN_TABLES].sort());
+  });
+
+  it('course authorship is AquinTutor own, and additive per course', async () => {
+    // training_course_authors keys on EduRankAI ids, so reading it from this panel would show every
+    // AquinTutor teacher an empty catalogue. This is the replacement.
+    const { store, userId } = await withAccount();
+    expect(await store.coursesAuthoredBy(userId)).toEqual([]);
+    await store.setCourseAuthor(userId, 'course-a', null);
+    await store.setCourseAuthor(userId, 'course-b', null);
+    expect((await store.coursesAuthoredBy(userId)).sort()).toEqual(['course-a', 'course-b']);
+    await store.removeCourseAuthor(userId, 'course-a');
+    expect(await store.coursesAuthoredBy(userId)).toEqual(['course-b']);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+describe('a port must never widen who sees personal data', () => {
+  // The regression: moving six pages onto a shared layout replaced each page's own gate with the
+  // layout's default of "any admin-surface role". Two had been narrower ON PURPOSE — analytics
+  // (named learners, email addresses, CSV exports) and moderator (identity documents) — and both
+  // were silently re-opened to every teacher and partner. A port may narrow by accident and somebody
+  // complains; it must never widen by accident, because nobody does.
+  const pageRoles = (allowed: readonly string[], held: readonly string[]) =>
+    held.some((r) => allowed.includes(r));
+
+  it('a teacher does not reach a page restricted to admins and moderators', () => {
+    expect(pageRoles(['super_admin', 'admin', 'moderator'], ['teacher'])).toBe(false);
+    expect(pageRoles(['super_admin', 'admin', 'moderator'], ['partner'])).toBe(false);
+  });
+
+  it('the roles it is meant for still reach it', () => {
+    for (const r of ['super_admin', 'admin', 'moderator']) {
+      expect(pageRoles(['super_admin', 'admin', 'moderator'], [r])).toBe(true);
+    }
+  });
+
+  it('holding several roles is enough if ONE of them qualifies', () => {
+    // Roles add up. Somebody who teaches and moderates keeps the moderation console.
+    expect(pageRoles(['super_admin', 'admin', 'moderator'], ['teacher', 'moderator'])).toBe(true);
+  });
+
+  it('no admin-surface role other than super_admin holds administer', () => {
+    // The reason 'admin' cannot simply be trusted with everything super_admin sees.
+    for (const key of AQUIN_ADMIN_ROLE_KEYS) {
+      if (key === 'super_admin') continue;
+      expect(capabilitiesFor([key]).has('administer')).toBe(false);
+    }
   });
 });

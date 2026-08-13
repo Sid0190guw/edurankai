@@ -144,6 +144,23 @@ export function postgresStore(): AquinStore {
       return Number(r?.c ?? 0);
     },
 
+    async coursesAuthoredBy(userId) {
+      return rowsOf(await db.execute(sql`
+        SELECT course_id FROM aq_course_authors WHERE user_id = ${userId}::uuid`)).map((r: any) => String(r.course_id));
+    },
+
+    async setCourseAuthor(userId, courseId, actorId) {
+      await db.execute(sql`
+        INSERT INTO aq_course_authors (user_id, course_id, assigned_by)
+        VALUES (${userId}::uuid, ${courseId}::uuid, ${actorId ? sql`${actorId}::uuid` : sql`NULL`})
+        ON CONFLICT (user_id, course_id) DO NOTHING`);
+    },
+
+    async removeCourseAuthor(userId, courseId) {
+      await db.execute(sql`
+        DELETE FROM aq_course_authors WHERE user_id = ${userId}::uuid AND course_id = ${courseId}::uuid`);
+    },
+
     async audit(e: AuditEntry) {
       await db.execute(sql`
         INSERT INTO aq_audit (actor_id, action, subject, detail, host, ip)

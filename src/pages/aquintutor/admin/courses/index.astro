@@ -1,21 +1,52 @@
 ---
-import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+// /aquintutor/admin/courses — the authoring catalogue, on AquinTutor's own identity.
+//
+// THE LAYOUT IS THE GATE. AquinAdminLayout runs requireAquinAdmin() and renders a refusal in place
+// of this page when it says no, so nothing here re-decides who may be present. A second gate that
+// could disagree with the layout is worse than none.
+//
+// What is still needed here is a WORK guard: a page's frontmatter runs before the layout it
+// renders, so the POST block below — and every read — would otherwise run for a caller the layout
+// is about to refuse. It is guarded with mayOpenAquinAdmin() — the identical predicate
+// requireAquinAdmin() uses, on the principal already resolved by the middleware, so it cannot
+// answer differently and costs no second lookup.
+//
+// const BEFORE ITS FIRST READER — `const` is not hoisted, and that has taken pages down here.
+import AquinAdminLayout from '@/layouts/AquinAdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureAquintutorAuthoringSchema } from '@/lib/aquintutor-authoring';
 import { uuidIn } from '@/lib/pg-array';
+import { aquinStore } from '@/lib/aquin/store';
+import { mayOpenAquinAdmin } from '@/lib/aquin/identity';
 
-const user = Astro.locals.user;
-if (!user) return Astro.redirect('/admin/login?next=/aquintutor/admin/courses');
-if (user.role === 'applicant') return Astro.redirect('/portal');
-const isSuper = user.role === 'admin' || user.role === 'super_admin';
+const p = Astro.locals.aquin;
+const viewUserId = p?.userId || '';
+const isSuper = (p?.roles || []).includes('super_admin');
+// ONE predicate, two uses, and neither of them decides who is SHOWN this page — the layout does:
+//   (a) the WRITE guard described above;
+//   (b) whether to spend any database work at all on a caller the layout is about to refuse.
+// (b) matters because the deleted gate used to `return` above this line, so an anonymous GET
+// touched no database. Without it the schema bootstrap and every query below now run on every
+// anonymous hit of this URL. It can only ever do LESS than the layout, never more, so the two
+// cannot disagree into access — and the one way they could disagree (a lookup that degrades
+// between the middleware and the layout) is said out loud by scopeNote instead of showing an
+// administrator a silently empty catalogue.
+const mayOpen = !!p && mayOpenAquinAdmin(p);
 
-await ensureAquintutorAuthoringSchema();
+// AquinTutor's own store. Authorship lives in aq_course_authors, not training_course_authors:
+// an AquinTutor account holds no EduRankAI id, so a lookup by one would answer "you author
+// nothing" for every teacher on the platform.
+const store = await aquinStore();
+
+if (mayOpen) await ensureAquintutorAuthoringSchema();
 function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
-async function safeRows(q: any): Promise<any[]> { try { return rowsOf(await db.execute(q)); } catch { return []; } }
 
 let okMsg = '', errMsg = '';
-if (Astro.request.method === 'POST') {
+// mayOpen, not a fresh gate: the frontmatter of a page runs BEFORE the layout that gates it, so
+// without this an unauthenticated POST would create, publish or DELETE a course and only then be
+// shown the refusal screen.
+if (mayOpen && Astro.request.method === 'POST') {
   try {
     const fd = await Astro.request.formData();
     const action = (fd.get('action') as string) || 'create';
@@ -33,11 +64,9 @@ if (Astro.request.method === 'POST') {
       if (r[0]?.id) {
         // Record the creator as the course author so their partner / teacher
         // console automatically scopes to this course (end-to-end ownership).
-        await db.execute(sql`
-          INSERT INTO training_course_authors (course_id, user_id, role)
-          VALUES (${r[0].id}, ${user.id}, 'author')
-          ON CONFLICT (course_id, user_id) DO NOTHING
-        `).catch(() => {});
+        // Written through the AquinTutor store, because that is the table the scoping below reads —
+        // an EduRankAI author row keyed by an AquinTutor id would scope nothing for anybody.
+        await store.setCourseAuthor(viewUserId, String(r[0].id), viewUserId).catch(() => {});
         okMsg = 'Course created.';
         return Astro.redirect('/aquintutor/admin/courses/' + r[0].id + '/edit');
       }
@@ -65,16 +94,17 @@ const filterSchool = url.searchParams.get('school') || '';
 // Author scoping: a partner / teacher only ever sees the courses they author.
 // Super admins see every course. Non-super authors with no courses see an
 // empty state, never the whole catalogue.
+// Authorship is AquinTutor's own (aq_course_authors). Empty is a real answer, not a failure.
 let authoredIds: any[] = [];
-if (!isSuper) {
-  authoredIds = (await safeRows(sql`SELECT course_id FROM training_course_authors WHERE user_id = ${user.id}`)).map((a: any) => a.course_id);
+if (mayOpen && !isSuper) {
+  authoredIds = await store.coursesAuthoredBy(viewUserId).catch(() => []);
 }
 
 // Defensive: the rich query references columns added by the self-bootstrap
 // (training_lessons.status, training_courses.school). If a prod schema is
 // missing them we fall back to a minimal query so the page never 500s.
 let courses: any[] = [];
-if (isSuper || authoredIds.length > 0) {
+if (mayOpen && (isSuper || authoredIds.length > 0)) {
   const scopeClause = isSuper ? sql`` : sql`AND c.id IN ${uuidIn(authoredIds)}`;
   try {
     courses = rowsOf(await db.execute(sql`
@@ -106,16 +136,38 @@ if (isSuper || authoredIds.length > 0) {
 }
 
 let schools: any[] = [];
-try { schools = rowsOf(await db.execute(sql`SELECT DISTINCT school FROM training_courses WHERE school IS NOT NULL ORDER BY school`)); } catch (_) { schools = []; }
+if (mayOpen) {
+  try { schools = rowsOf(await db.execute(sql`SELECT DISTINCT school FROM training_courses WHERE school IS NOT NULL ORDER BY school`)); } catch (_) { schools = []; }
+}
+
+// WHOSE COURSES THIS LIST IS, SAID ON THE SCREEN.
+// The list is scoped for everybody except a super admin, and it is the same authorship the teacher
+// console reads — the console that until today showed every author's work under "Your classroom".
+// A scoped list has to say it is scoped, in both directions: a super admin is looking at other
+// people's courses, and a teacher looking at an empty screen is not looking at an empty platform.
+// It is the ordinary case now, not a rare one: authorship moved to aq_course_authors, which starts
+// empty, so nearly every account here lists zero until somebody is recorded as an author.
+const scopeNote = !mayOpen
+  ? 'Your AquinTutor sign-in could not be checked just now, so nothing could be listed. Nothing is wrong with your account.'
+  : isSuper
+    ? 'Every course on the platform, by every author. Courses you did not write are shown here too.'
+    : 'Only the courses that list your AquinTutor account as an author. This is not the whole platform catalogue.';
+
+const emptyNote = !mayOpen
+  ? 'Nothing could be listed.'
+  : isSuper
+    ? 'No courses yet. Create your first.'
+    : 'No course lists your AquinTutor account as an author yet, so there is nothing to show. The platform may hold courses by other authors. Ask an AquinTutor super admin to record you as an author, or create one above.';
 
 function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day:'2-digit', month:'short', year:'numeric' }); } catch { return ''; } }
 ---
-<AquintutorLayout title="AquinTutor Courses" noindex={true}>
+<AquinAdminLayout title="Courses" active="/aquintutor/admin/courses">
 <div style="padding:14px 16px 80px;max-width:1280px;margin:0 auto;">
-  <a href="/aquintutor/admin" style="font-size:11.5px;color:#9aa6b6;text-decoration:none;font-family:'Geist Mono',monospace;letter-spacing:0.06em;">COMMAND CENTER / AQUINTUTOR</a>
+  <a href="/aquintutor/admin/console" style="font-size:11.5px;color:#9aa6b6;text-decoration:none;font-family:'Geist Mono',monospace;letter-spacing:0.06em;">AQUINTUTOR / OVERVIEW</a>
   <p style="font-size:10.5px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:10px 0 0;font-family:'Geist Mono',monospace;font-weight:700;">AquinTutor · Authoring</p>
   <h1 style="font-size:24px;color:#fff;margin:6px 0 4px;font-weight:700;">Courses</h1>
-  <p style="font-size:13px;color:#9aa6b6;margin:0 0 18px;">Full-scale course authoring. Modules · lessons · block-based content · versions · review workflow · published.</p>
+  <p style="font-size:13px;color:#9aa6b6;margin:0 0 6px;">Full-scale course authoring. Modules · lessons · block-based content · versions · review workflow · published.</p>
+  <p style="font-size:12px;color:#cfd6da;margin:0 0 18px;background:rgba(255,112,64,0.08);border-left:2px solid #FF7040;padding:7px 10px;border-radius:0 6px 6px 0;">{scopeNote}</p>
 
   {okMsg && <div style="background:rgba(74,222,128,0.10);border:1px solid rgba(74,222,128,0.32);color:#86efac;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;">{okMsg}</div>}
   {errMsg && <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.32);color:#fca5a5;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;">{errMsg}</div>}
@@ -140,7 +192,7 @@ function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { ti
     <button type="submit" style="background:#15151a;border:1px solid #2a2a2f;color:#FF7040;padding:9px 16px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;">Filter</button>
   </form>
 
-  {courses.length === 0 ? (<div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:36px;text-align:center;color:#6e6e78;font-size:13px;">No courses yet. Create your first.</div>) : (
+  {courses.length === 0 ? (<div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:36px;text-align:center;color:#6e6e78;font-size:13px;max-width:640px;margin:0 auto;line-height:1.55;">{emptyNote}</div>) : (
     <div style="display:flex;flex-direction:column;gap:8px;">
       {courses.map((c: any) => (
         <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:14px 18px;display:grid;grid-template-columns:1.6fr 1.2fr 100px 100px 100px 120px;gap:12px;align-items:center;">
@@ -161,4 +213,4 @@ function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { ti
     </div>
   )}
 </div>
-</AquintutorLayout>
+</AquinAdminLayout>

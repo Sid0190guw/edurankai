@@ -17,6 +17,8 @@
 // existing today, which is the only real proof that the interface is actually an abstraction rather
 // than the shape of one particular SQL dialect.
 
+import { AQUIN_TABLES } from './schema';
+
 export interface AquinUserRow {
   id: string;
   email: string;
@@ -80,6 +82,11 @@ export interface AquinStore {
   removeRole(userId: string, roleKey: string): Promise<void>;
   countRole(roleKey: string): Promise<number>;
 
+  /** Course ids this AquinTutor account authors. Empty is a real answer, not a failure. */
+  coursesAuthoredBy(userId: string): Promise<string[]>;
+  setCourseAuthor(userId: string, courseId: string, actorId: string | null): Promise<void>;
+  removeCourseAuthor(userId: string, courseId: string): Promise<void>;
+
   audit(e: AuditEntry): Promise<void>;
 }
 
@@ -91,6 +98,7 @@ export function memoryStore(): AquinStore & { _users: Map<string, AquinUserRow>;
   const users = new Map<string, AquinUserRow>();
   const sessions = new Map<string, { row: AquinSessionRow; hash: string }>();
   const roles = new Map<string, Set<string>>();
+  const authored = new Map<string, Set<string>>();
   const audits: AuditEntry[] = [];
   let n = 0;
   const id = () => 'u' + (++n);
@@ -100,7 +108,10 @@ export function memoryStore(): AquinStore & { _users: Map<string, AquinUserRow>;
     _audit: audits,
     async ensureSchema() {},
     async presentTables() {
-      return ['aq_users', 'aq_sessions', 'aq_roles', 'aq_role_capabilities', 'aq_user_roles', 'aq_audit'];
+      // Read from AQUIN_TABLES rather than a hand-typed list. The in-memory store is only worth
+      // anything as a faithful second implementation, and it had already drifted: aq_course_authors
+      // was added to the schema and this list still claimed six tables.
+      return [...AQUIN_TABLES];
     },
     async userByEmail(emailLower) {
       for (const u of users.values()) if (u.email.toLowerCase() === emailLower) return u;
@@ -141,6 +152,13 @@ export function memoryStore(): AquinStore & { _users: Map<string, AquinUserRow>;
       for (const set of roles.values()) if (set.has(roleKey)) c++;
       return c;
     },
+    async coursesAuthoredBy(userId) { return [...(authored.get(userId) || [])]; },
+    async setCourseAuthor(userId, courseId) {
+      const set = authored.get(userId) || new Set<string>();
+      set.add(courseId);
+      authored.set(userId, set);
+    },
+    async removeCourseAuthor(userId, courseId) { authored.get(userId)?.delete(courseId); },
     async audit(e) { audits.push(e); },
   };
 }

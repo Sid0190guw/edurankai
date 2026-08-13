@@ -34,7 +34,7 @@
 // harder.
 
 /** Bumped when a statement is added, so a deployment can tell whether it has the current shape. */
-export const AQUIN_SCHEMA_VERSION = 1;
+export const AQUIN_SCHEMA_VERSION = 2;
 
 export const AQUIN_DDL: readonly string[] = Object.freeze([
   // -----------------------------------------------------------------------------------------------
@@ -105,6 +105,30 @@ export const AQUIN_DDL: readonly string[] = Object.freeze([
   `CREATE INDEX IF NOT EXISTS aq_user_roles_user_idx ON aq_user_roles (user_id)`,
 
   // -----------------------------------------------------------------------------------------------
+  // AUTHORSHIP, IN AQUINTUTOR'S OWN TERMS.
+  // -----------------------------------------------------------------------------------------------
+  //
+  // training_course_authors already records who authors a course — by EduRankAI user id. That is the
+  // right answer for edurankai.in and the wrong one here, because an AquinTutor teacher has an
+  // AquinTutor account and no EduRankAI id at all. Reading that table from this panel would show
+  // every teacher an empty catalogue.
+  //
+  // So authorship-by-AquinTutor-account is AquinTutor's own fact and lives in AquinTutor's own
+  // table. course_id points at the SHARED training_courses while the database is shared, and is
+  // deliberately NOT a foreign key: a constraint against a table that is staying behind would make
+  // the aq_* dump fail to restore on the day of the split, which is the one day it must not.
+  `CREATE TABLE IF NOT EXISTS aq_course_authors (
+     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+     user_id     UUID NOT NULL REFERENCES aq_users(id) ON DELETE CASCADE,
+     course_id   UUID NOT NULL,
+     role        TEXT NOT NULL DEFAULT 'author',
+     assigned_by UUID,
+     assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+     UNIQUE (user_id, course_id))`,
+  `CREATE INDEX IF NOT EXISTS aq_course_authors_user_idx ON aq_course_authors (user_id)`,
+  `CREATE INDEX IF NOT EXISTS aq_course_authors_course_idx ON aq_course_authors (course_id)`,
+
+  // -----------------------------------------------------------------------------------------------
   // AUDIT. Append-only. Who did what, on which host, from which account.
   // -----------------------------------------------------------------------------------------------
   `CREATE TABLE IF NOT EXISTS aq_audit (
@@ -121,7 +145,8 @@ export const AQUIN_DDL: readonly string[] = Object.freeze([
 
 /** The tables the DDL above is expected to produce, for verifying rather than trusting an ensure. */
 export const AQUIN_TABLES: readonly string[] = Object.freeze([
-  'aq_users', 'aq_sessions', 'aq_roles', 'aq_role_capabilities', 'aq_user_roles', 'aq_audit',
+  'aq_users', 'aq_sessions', 'aq_roles', 'aq_role_capabilities', 'aq_user_roles',
+  'aq_course_authors', 'aq_audit',
 ]);
 
 // -------------------------------------------------------------------------------------------------

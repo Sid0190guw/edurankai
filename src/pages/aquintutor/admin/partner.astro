@@ -1,35 +1,43 @@
 ---
-import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+// /aquintutor/admin/partner — the partner console, on AquinTutor's own identity.
+//
+// PORTED OFF EduRankAI. The shell is AquinAdminLayout, which gates this page on the AquinTutor
+// principal, so there is exactly ONE gate. The old `Astro.locals.user` block that stood here is
+// deleted rather than translated: a second check that disagreed with the layout would be worse
+// than no check at all, because whichever of the two is wrong is the one nobody reads.
+//
+// AUTHORSHIP COMES FROM AQUINTUTOR'S OWN TABLE. This page used to read training_course_authors,
+// which is keyed on EduRankAI user ids. An AquinTutor account has none, so that query answered
+// nothing for every partner — and the `seeAll` fallback below would then have handed a super admin
+// the entire catalogue under a heading that says "Your catalogue". aq_course_authors, reached
+// through the store seam, is the table that actually knows who authored what here.
+//
+// const BEFORE ANYTHING READS IT — `const` is not hoisted, and that has taken pages down here.
+import AquinAdminLayout from '@/layouts/AquinAdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { aquinStore } from '@/lib/aquin/store';
 import { getPayoutSummary, listPayouts, requestPayout } from '@/lib/partner-payouts';
 import { uuidIn } from '@/lib/pg-array';
 
-const user = Astro.locals.user;
-if (!user) return Astro.redirect('/admin/login?next=/aquintutor/admin/partner');
-if (user.role === 'applicant') return Astro.redirect('/portal');
-
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 async function safeRows(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
-// Compared as a string on purpose. 'admin' is not in the User['role'] union (src/lib/db/schema.ts),
-// so `user.role === 'admin'` was a type error AND dead to the compiler — while a row written by
-// hand can still carry it. String() keeps the runtime behaviour identical and stops the checker
-// silently treating the whole expression as narrowed.
-const isSuper = String(user.role) === 'admin' || user.role === 'super_admin';
 
-// Same open impersonation handle as the teacher console, and it exposed more: this page also renders
-// the viewed partner's partnership applications, their contact email and their gross revenue. `?as=`
-// was read with no check at all while `isSuper` sat unused on the line above.
-//
-// Honoured for a super admin only; ignored (not refused) for everyone else, so an old link still
-// opens the caller's own console. (The payout REQUEST below already binds to user.id, not to this
-// value — only the payout summary and history were readable for an arbitrary partner.)
+// The AquinTutor principal, resolved by middleware. Never Astro.locals.user: there is no bridge.
+const p = Astro.locals.aquin;
+const selfUserId = p?.userId || '';
+const isSuper = (p?.roles || []).includes('super_admin');
+
+// The impersonation handle, unchanged in meaning: honoured for a super admin only, and ignored
+// (not refused) for everyone else, so an old link still opens the caller's own console. The payout
+// REQUEST below still binds to the signed-in account and never to this value — only the payout
+// summary and history were ever readable for another partner.
 const asParam = new URL(Astro.request.url).searchParams.get('as');
-const viewUserId = (isSuper && asParam) ? asParam : user.id;
+const viewUserId = (isSuper && asParam) ? asParam : selfUserId;
 
 // Partner's hosted courses (authored) + their partnership application(s).
-const authored = await safeRows(sql`SELECT course_id FROM training_course_authors WHERE user_id = ${viewUserId}`);
-const myCourseIds = authored.map((a: any) => a.course_id);
+const store = await aquinStore();
+const myCourseIds = await store.coursesAuthoredBy(viewUserId).catch(() => []);
 const seeAll = isSuper && myCourseIds.length === 0;
 
 let courses: any[] = [];
@@ -37,7 +45,7 @@ if (seeAll) courses = await safeRows(sql`SELECT id, slug, title, is_published, C
 else if (myCourseIds.length) courses = await safeRows(sql`SELECT id, slug, title, is_published, COALESCE(enrolled_count,0) AS enrolled, COALESCE(price_inr_paise,0) AS price, category, school, created_at FROM training_courses WHERE id IN ${uuidIn(myCourseIds)} ORDER BY created_at DESC LIMIT 40`);
 const courseIds = courses.map((c: any) => c.id);
 
-const myApplications = await safeRows(sql`SELECT id, org_name, contact_email, intended_course_title, tier, status, created_at FROM partnership_applications WHERE (user_id = ${viewUserId} OR contact_email = ${(user as any).email || ''}) ORDER BY created_at DESC LIMIT 10`);
+const myApplications = await safeRows(sql`SELECT id, org_name, contact_email, intended_course_title, tier, status, created_at FROM partnership_applications WHERE (user_id = ${viewUserId} OR contact_email = ${p?.email || ''}) ORDER BY created_at DESC LIMIT 10`);
 
 // Per-course rollups (enrolments, avg progress, completion, avg rating, review counts).
 let perCourse = new Map<any, any>();
@@ -115,7 +123,7 @@ function slugify(s: any) { return String(s || '').toLowerCase().trim().replace(/
 function stars(n: any) { const r = Math.round(Number(n) || 0); return '★'.repeat(Math.max(0, Math.min(5, r))) + '☆'.repeat(Math.max(0, 5 - Math.min(5, r))); }
 
 // ---- Partner payouts (request against accrued 15% share) ----
-const isOwnView = viewUserId === user.id;
+const isOwnView = viewUserId === selfUserId;
 let payoutMsg = '', payoutErr = '';
 if (Astro.request.method === 'POST' && isOwnView) {
   try {
@@ -124,7 +132,7 @@ if (Astro.request.method === 'POST' && isOwnView) {
       const amtRs = Math.round(Number(fd.get('amount') || 0));
       const method = ((fd.get('method') as string) || 'bank').trim();
       const details = ((fd.get('details') as string) || '').trim();
-      const summ0 = await getPayoutSummary(user.id, revShareInr);
+      const summ0 = await getPayoutSummary(selfUserId, revShareInr);
       const amtPaise = amtRs * 100;
       // THE JAVASCRIPT TEST IS A COURTESY, NOT THE GATE. It gives a readable refusal without a round
       // trip, but two submits arriving together both passed it against the same summary, so the real
@@ -134,7 +142,7 @@ if (Astro.request.method === 'POST' && isOwnView) {
       if (!summ0.known) payoutErr = 'Your payout history could not be read just now, so no request was raised. Try again in a moment.';
       else if (amtPaise > summ0.available) payoutErr = 'Amount exceeds your available balance.';
       else {
-        const rr = await requestPayout(user.id, amtPaise, method, details, revShareInr);
+        const rr = await requestPayout(selfUserId, amtPaise, method, details, revShareInr);
         if (rr.ok) {
           payoutMsg = 'Payout requested. Our team will process it per the agreement.';
           try {
@@ -142,7 +150,7 @@ if (Astro.request.method === 'POST' && isOwnView) {
             await sendPushToAdmins({
               type: 'partner_payout_request',
               title: 'Partner payout requested',
-              body: ((user as any).name || 'A partner') + ' requested Rs ' + (amtPaise / 100).toLocaleString('en-IN'),
+              body: (p?.name || 'A partner') + ' requested Rs ' + (amtPaise / 100).toLocaleString('en-IN'),
               url: '/aquintutor/admin/payouts?status=requested',
               tag: 'partner-payout',
             });
@@ -163,10 +171,28 @@ const payoutReadFailed = !payoutSummary.known || payoutHistoryResult.error !== n
 const academyName = courses.find((c: any) => c.school)?.school || myApplications[0]?.org_name || '';
 const academySlug = slugify(academyName);
 ---
-<AquintutorLayout title="Partner panel" description="AquinTutor partner hosting console." noindex={true}>
+<AquinAdminLayout title="Partners" active="/aquintutor/admin/partner">
 <style>
+  /* The four custom properties this page's own CSS reads were defined by the OLD shell's
+     stylesheet (aquintutor-academy.css, scoped to html.academy.editorial). AquinAdminLayout does
+     not load it, so without these the borders, rules and table headers below would silently
+     compute to nothing. Same values, declared where the page can see them; --paper and --rust
+     stay the admin shell's, which is the point of the move. */
+  .pt, .pt-crumb {
+    --rule: rgba(11, 14, 20, 0.15);
+    --sand-100: #F4F1E4;
+    --ink-500: #3B3A30;
+    --ink-700: #181815;
+  }
   .pt { max-width: 1200px; margin: 0 auto; padding: 0 28px; }
-  .pt-crumb { border-bottom: 1px solid var(--rule); background: var(--sand-100); margin: 0 -28px; }
+  /* The crumb bleeds to the edge of its container, and -28px was written against the OLD shell:
+     AquintutorLayout <main id="main-content"> has no padding at all, so this page's own 28px gutter
+     was the only one and the bleed landed exactly on the edge. AquinAdminLayout <main> has 20px,
+     and 14px under 520px, so -28px hung 8px past each edge on a desktop and 14px on a 360px phone,
+     putting a horizontal scrollbar on the whole admin panel. The teacher console hit this first;
+     these are the same numbers. */
+  .pt-crumb { border-bottom: 1px solid var(--rule); background: var(--sand-100); margin: 0 -20px; }
+  @media (max-width: 520px) { .pt-crumb { margin: 0 -14px; } }
   .pt-crumb-in { max-width: 1200px; margin: 0 auto; padding: 10px 28px; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.08em; color: var(--ink-500); }
   .pt-crumb-in a { color: var(--ink-500); text-decoration: none; } .pt-crumb-in .cur { color: var(--rust); font-weight: 600; }
   .pt-hero { padding: 40px 0 18px; }
@@ -378,12 +404,15 @@ const academySlug = slugify(academyName);
       <table class="pt-tbl" style="margin-top:16px;">
         <thead><tr><th>Requested</th><th class="num">Amount</th><th>Method</th><th>Status</th></tr></thead>
         <tbody>
-          {payoutHistory.map((p) => (
+          <!-- The row is `po`, not `p`: `p` is this file's AquinTutor principal, and the payout REQUEST
+               above binds to it. A loop variable shadowing it on the money panel is one careless
+               rename away from reading the wrong account. -->
+          {payoutHistory.map((po) => (
             <tr>
-              <td>{fmt(p.requested_at)}</td>
-              <td class="num">{inr(p.amount_paise)}</td>
-              <td>{p.method}</td>
-              <td><span style={'font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;padding:2px 9px;border-radius:100px;' + (p.status === 'paid' ? 'background:rgba(16,185,129,0.14);color:#047857;' : p.status === 'rejected' ? 'background:rgba(239,68,68,0.12);color:#b91c1c;' : p.status === 'approved' ? 'background:rgba(59,130,246,0.12);color:#1d4ed8;' : 'background:rgba(250,204,21,0.16);color:#92400e;')}>{p.status}</span></td>
+              <td>{fmt(po.requested_at)}</td>
+              <td class="num">{inr(po.amount_paise)}</td>
+              <td>{po.method}</td>
+              <td><span style={'font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;padding:2px 9px;border-radius:100px;' + (po.status === 'paid' ? 'background:rgba(16,185,129,0.14);color:#047857;' : po.status === 'rejected' ? 'background:rgba(239,68,68,0.12);color:#b91c1c;' : po.status === 'approved' ? 'background:rgba(59,130,246,0.12);color:#1d4ed8;' : 'background:rgba(250,204,21,0.16);color:#92400e;')}>{po.status}</span></td>
             </tr>
           ))}
         </tbody>
@@ -407,4 +436,4 @@ const academySlug = slugify(academyName);
     <a href="/aquintutor/partnerships" class="pt-btn">Host another course &rarr;</a>
   </div>
 </main>
-</AquintutorLayout>
+</AquinAdminLayout>
