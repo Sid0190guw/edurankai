@@ -17,16 +17,54 @@ const gate = await can(user, 'manage', { type: 'rbac' });
 if (!gate.allow) return Astro.redirect('/admin');
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
-await ensureRbacSchema();
+
+// =================================================================================================
+// THIS PAGE USED TO DIE WHOLE, AND SAY NOTHING
+// =================================================================================================
+//
+// Seven db.execute() calls sat here with no try/catch between them, and `await ensureRbacSchema()`
+// ran bare on the line above. ensureRbacSchema() is NOT wrapped in ensureOnce — it awaits raw DDL
+// and rethrows — so a single failing CREATE, or one missing table underneath any of the seven
+// reads, took the entire page down. The founder opened /admin/rbac and Chrome said
+// ERR_INVALID_RESPONSE: no status, no message, no indication of which of eight things had failed.
+//
+// A permissions console that cannot be opened is the worst one to lose, because it is also where
+// somebody would go to fix whatever broke it.
+//
+// Every read is now named and independent. One failing does not stop the others, the page renders
+// what it could read, and the banner says exactly which query failed and the real Postgres reason
+// (e.cause.message — e.message is only the failed SQL). If the schema itself is missing there is a
+// button that creates it and VERIFIES the result against information_schema rather than trusting an
+// ensure that resolves either way.
+const failures: { what: string; why: string }[] = [];
+function note(what: string, e: any): void {
+  const why = e?.cause?.message || e?.message || String(e);
+  console.error('[admin/rbac] ' + what + ' failed:', why);
+  failures.push({ what, why });
+}
+async function read(what: string, q: any): Promise<any[]> {
+  try { return rows(await db.execute(q)); } catch (e: any) { note(what, e); return []; }
+}
+
+let schemaOk = true;
+try {
+  await ensureRbacSchema();
+} catch (e: any) {
+  schemaOk = false;
+  note('Creating the permission tables', e);
+}
 
 // self-heal: seed the roster on first visit if empty
-let roleCount = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM rbac_roles`))[0]?.c || 0;
-if (roleCount === 0) { await seedRbac(); roleCount = SEED_ROLES.length; }
+let roleCount = (await read('Counting roles', sql`SELECT COUNT(*)::int AS c FROM rbac_roles`))[0]?.c || 0;
+if (roleCount === 0 && schemaOk && failures.length === 0) {
+  try { await seedRbac(); roleCount = SEED_ROLES.length; }
+  catch (e: any) { note('Seeding the default roles', e); }
+}
 
-const dbRoles = rows(await db.execute(sql`SELECT r.key, r.surface, r.color, r.is_system, r.inherits,
+const dbRoles = await read('Roles and their capabilities', sql`SELECT r.key, r.surface, r.color, r.is_system, r.inherits,
     COALESCE(array_agg(rc.capability) FILTER (WHERE rc.capability IS NOT NULL), '{}') AS caps
   FROM rbac_roles r LEFT JOIN rbac_role_capabilities rc ON rc.role_key = r.key
-  GROUP BY r.key, r.surface, r.color, r.is_system, r.inherits ORDER BY r.surface, r.key`));
+  GROUP BY r.key, r.surface, r.color, r.is_system, r.inherits ORDER BY r.surface, r.key`);
 
 // resolve inheritance from LIVE db rows (reflects toggles + newly-created roles)
 const roleMap = new Map(dbRoles.map((r: any) => [r.key, r]));
@@ -41,20 +79,20 @@ function resolvedCaps(key: string, seen = new Set<string>()): Set<string> {
 
 // users (searchable) + their rbac roles/stage
 const uq = (Astro.url.searchParams.get('u') || '').trim();
-const users = rows(await db.execute(sql`SELECT u.id, u.email, u.name, u.role,
+const users = await read('Users and their roles', sql`SELECT u.id, u.email, u.name, u.role,
     COALESCE(json_agg(json_build_object('role', ur.role_key, 'stage', ur.stage)) FILTER (WHERE ur.role_key IS NOT NULL), '[]') AS rbac
   FROM users u LEFT JOIN rbac_user_roles ur ON ur.user_id = u.id
   ${uq ? sql`WHERE u.name ILIKE ${'%' + uq + '%'} OR u.email ILIKE ${'%' + uq + '%'}` : sql``}
-  GROUP BY u.id, u.email, u.name, u.role ORDER BY u.name LIMIT 60`));
+  GROUP BY u.id, u.email, u.name, u.role ORDER BY u.name LIMIT 60`);
 
 // which minors already have a guardian (to compute the block state)
-const guardedSet = new Set(rows(await db.execute(sql`SELECT DISTINCT minor_user_id FROM rbac_guardian_links`)).map((r: any) => r.minor_user_id));
+const guardedSet = new Set((await read('Guardian coverage', sql`SELECT DISTINCT minor_user_id FROM rbac_guardian_links`)).map((r: any) => r.minor_user_id));
 function minorBlocked(u: any): boolean {
   return (u.rbac || []).some((a: any) => a.role === 'student' && isMinorStage(a.stage)) && !guardedSet.has(u.id);
 }
 
-const guardians = rows(await db.execute(sql`SELECT gl.guardian_user_id, gl.minor_user_id, g.name AS guardian_name, m.name AS minor_name
-  FROM rbac_guardian_links gl LEFT JOIN users g ON g.id = gl.guardian_user_id LEFT JOIN users m ON m.id = gl.minor_user_id ORDER BY gl.created_at DESC LIMIT 50`));
+const guardians = await read('Guardian links', sql`SELECT gl.guardian_user_id, gl.minor_user_id, g.name AS guardian_name, m.name AS minor_name
+  FROM rbac_guardian_links gl LEFT JOIN users g ON g.id = gl.guardian_user_id LEFT JOIN users m ON m.id = gl.minor_user_id ORDER BY gl.created_at DESC LIMIT 50`);
 
 // audit: search + decision + date range + pagination
 const q = (Astro.url.searchParams.get('q') || '').trim();
@@ -70,9 +108,9 @@ if (dec === 'deny') conds.push(sql`a.allow = false`);
 if (/^\d{4}-\d{2}-\d{2}$/.test(from)) conds.push(sql`a.at >= ${from}::date`);
 if (/^\d{4}-\d{2}-\d{2}$/.test(to)) conds.push(sql`a.at < (${to}::date + interval '1 day')`);
 const where = conds.length ? sql`WHERE ${sql.join(conds, sql` AND `)}` : sql``;
-const auditTotal = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM rbac_audit a LEFT JOIN users u ON u.id = a.user_id ${where}`))[0]?.c || 0;
-const audit = rows(await db.execute(sql`SELECT a.*, u.name AS user_name FROM rbac_audit a LEFT JOIN users u ON u.id = a.user_id
-  ${where} ORDER BY a.at DESC LIMIT ${PER} OFFSET ${ap * PER}`));
+const auditTotal = (await read('Audit total', sql`SELECT COUNT(*)::int AS c FROM rbac_audit a LEFT JOIN users u ON u.id = a.user_id ${where}`))[0]?.c || 0;
+const audit = await read('Audit log', sql`SELECT a.*, u.name AS user_name FROM rbac_audit a LEFT JOIN users u ON u.id = a.user_id
+  ${where} ORDER BY a.at DESC LIMIT ${PER} OFFSET ${ap * PER}`);
 function qs(over: Record<string, any> = {}) {
   const p = new URLSearchParams();
   if (uq) p.set('u', uq); if (q) p.set('q', q); if (dec) p.set('dec', dec); if (from) p.set('from', from); if (to) p.set('to', to); if (ap) p.set('ap', String(ap));
@@ -92,6 +130,34 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
     <h1 style="font-size:22px;font-weight:800;color:#fff;margin:0;">Roles, capabilities &amp; access</h1>
     <p style="font-size:12.5px;color:#8a8a94;margin:6px 0 0;max-width:780px;line-height:1.55;">Capability-based RBAC enforced on both surfaces; every access decision is audited below. {roleCount} roles seeded. Content authoring: <a href="/admin/knowledge" style="color:#FF7040;">/admin/knowledge</a> &middot; your own view: <a href="/aquintutor/access" style="color:#FF7040;">/aquintutor/access</a>.</p>
     <div id="msg" style="display:none;margin:12px 0;padding:9px 13px;border-radius:8px;font-size:13px;"></div>
+
+    <!-- WHAT COULD NOT BE READ, AND THE WAY OUT.
+         This replaces an ERR_INVALID_RESPONSE: the page used to throw whole when any one of eight
+         database calls failed, on the one screen somebody would open to fix a permissions problem.
+         Each failure is now named with the real Postgres reason, and the rest of the page still
+         renders from whatever did load. -->
+    {failures.length > 0 && (
+      <div style="margin:12px 0;padding:14px 16px;border-radius:10px;border:1px solid rgba(248,113,113,0.45);background:rgba(220,38,38,0.10);">
+        <p style="margin:0 0 8px;font-size:13px;color:#fca5a5;font-weight:700;">
+          {failures.length === 1 ? 'One part of this page could not be read.' : failures.length + ' parts of this page could not be read.'}
+          <span style="font-weight:400;color:#e5b4b4;"> Everything below is drawn from what did load, so figures may be incomplete.</span>
+        </p>
+        <ul style="margin:0;padding-left:18px;font-size:12.5px;color:#e5b4b4;line-height:1.7;">
+          {failures.map((f) => (<li><strong style="color:#fca5a5;">{f.what}</strong> &mdash; {f.why}</li>))}
+        </ul>
+        {!schemaOk && (
+          <div style="margin-top:12px;padding-top:12px;border-top:1px solid rgba(248,113,113,0.25);">
+            <p style="margin:0 0 8px;font-size:12.5px;color:#e5b4b4;line-height:1.6;">
+              The permission tables themselves are missing or incomplete. This creates them and then
+              checks the database to confirm they exist, rather than reporting success because a
+              statement returned without complaint.
+            </p>
+            <button id="rbacBootstrapBtn" type="button" style="background:rgba(255,79,0,0.18);border:1px solid rgba(255,112,64,0.6);color:#FF7040;font-size:12px;font-weight:600;padding:7px 14px;border-radius:8px;cursor:pointer;">Create the permission tables</button>
+            <span id="rbacBootstrapMsg" style="margin-left:10px;font-size:12px;color:#8a8a94;"></span>
+          </div>
+        )}
+      </div>
+    )}
 
     <!-- ROLES & CAPABILITIES -->
     <div style={CARD}>
@@ -270,4 +336,40 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
       document.querySelectorAll('.g-unlink').forEach(function (b) { b.addEventListener('click', function () { post({ action: 'unlinkGuardian', guardianUserId: b.getAttribute('data-g'), minorUserId: b.getAttribute('data-m') }); }); });
     })();
   </script>
+
+<script is:inline>
+  /* Creates the rbac_* tables through the ops bootstrap endpoint, which VERIFIES the result against
+     information_schema instead of trusting the ensure — ensureOnce() resolves whether or not its DDL
+     ran, and this project has already shipped a bootstrap that reported ran:8 failed:0 while ten
+     tables were missing. */
+  (function () {
+    var btn = document.getElementById('rbacBootstrapBtn');
+    if (!btn) return;
+    var out = document.getElementById('rbacBootstrapMsg');
+    btn.addEventListener('click', function () {
+      btn.disabled = true;
+      if (out) out.textContent = 'Creating...';
+      fetch('/api/admin/ops/bootstrap', { method: 'POST' })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d && d.ok) {
+            if (out) out.textContent = 'Created and verified. Reloading...';
+            setTimeout(function () { location.reload(); }, 900);
+            return;
+          }
+          var miss = d && d.verified && d.verified.missing ? d.verified.missing : [];
+          if (out) {
+            out.textContent = miss.length
+              ? ('Still missing: ' + miss.join(', '))
+              : ('Did not complete: ' + ((d && d.error) || 'no reason given'));
+          }
+          btn.disabled = false;
+        })
+        .catch(function (e) {
+          if (out) out.textContent = 'Could not reach the server: ' + (e && e.message ? e.message : 'unknown');
+          btn.disabled = false;
+        });
+    });
+  })();
+</script>
 </AdminLayout>
