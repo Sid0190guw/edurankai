@@ -57,7 +57,24 @@
 
     iframe = document.createElement('iframe');
     iframe.style.cssText = 'flex:1;border:none;background:#08080a;width:100%;display:none;';
-    iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts allow-forms allow-popups');
+    // allow-modals IS LOAD-BEARING, NOT A LOOSENING.
+    //
+    // Without it the browser IGNORES window.confirm() in this frame and returns FALSE. Every admin
+    // control written as onsubmit="return confirm(...)" therefore cancelled its own submit here —
+    // no dialog, no error, no request. 104 of them across 68 pages, including Revoke offer, Archive
+    // application, and six on /admin/users. Each looked like a broken button and was in fact a
+    // button obeying a `false` it was never meant to receive.
+    //
+    // The pages framed here are our own admin pages on our own origin, and allow-same-origin plus
+    // allow-scripts is already granted above — so this adds no capability the frame did not
+    // effectively have. What it adds back is the ability to ask a question before acting.
+    //
+    // A confirm() is still only a dialog: a browser told "prevent this page from creating
+    // additional dialogs" suppresses it and the same silent cancellation returns. So genuinely
+    // destructive controls carry a native HTML guard of their own (a required acknowledgement)
+    // rather than relying on this line. See the revoke form in
+    // src/pages/admin/applications/[id]/offer-letter.astro.
+    iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts allow-forms allow-popups allow-modals');
     panel.appendChild(iframe);
 
     document.body.appendChild(panel);
