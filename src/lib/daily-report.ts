@@ -714,8 +714,14 @@ export async function reviewerFor(employeeId: string): Promise<ReviewerResolutio
 }
 
 export interface RosterEntry extends OrgPerson {
-  /** How this person came to be on the reviewer's list. Shown, so nothing looks like a guess. */
-  via: 'reporting_manager' | 'reviewer';
+  /**
+   * How this person came to be on the list. Shown, so nothing looks like a guess.
+   *
+   * 'everyone' is not a relationship — it is the absence of one, used by the whole-company view
+   * below. Kept distinct precisely so the screen cannot imply that somebody reports to the viewer
+   * when the only thing they have in common is being employed here.
+   */
+  via: 'reporting_manager' | 'reviewer' | 'everyone';
 }
 
 export interface ReviewerRoster {
@@ -741,6 +747,74 @@ export interface ReviewerRoster {
  * reporting and review lines are listed — see the follow-up note in the return sentence. Reviewing
  * an individual report still works for a mentor, because reviewerFor() resolves the mentor edge.
  */
+/**
+ * Everybody currently employed, as a roster.
+ *
+ * =================================================================================================
+ * WHY THIS EXISTS: THE REVIEW SCREEN SHOWED NOTHING WHILE NINETY-ONE REPORTS SAT IN THE TABLE
+ * =================================================================================================
+ *
+ * reviewerRoster() answers "who is recorded as reporting to me", read from the organisation graph.
+ * That is the right question for a manager, and it was the ONLY question /admin/hr/reports asked —
+ * so with an empty graph the founder opened the page and saw "nobody is on your list" while people
+ * were filing reports at clock-out every day.
+ *
+ * The page was careful to say that an empty roster does not mean nobody submitted anything, which
+ * is true and was not the point: somebody who needs to READ the submissions still could not.
+ *
+ * So there is a second, blunter question — everybody employed — for the people whose job is to see
+ * all of it. It requires no graph, because needing the graph is exactly what broke.
+ *
+ * `via: 'everyone'` on every entry, so the screen never implies these people report to the viewer.
+ */
+export async function everyoneRoster(): Promise<ReviewerRoster> {
+  const empty: ReviewerRoster = {
+    graphReady: true, reviewerEmployeeId: null, people: [], truncated: false,
+    sentence: 'Nobody has an active employee record, so there is nobody to show.',
+  };
+  try {
+    const list = rows(await db.execute(sql`
+      SELECT id::text          AS employee_id,
+             user_id::text     AS user_id,
+             full_name,
+             designation,
+             department_id::text AS department_id
+        FROM hr_employees
+       WHERE is_active = true
+       ORDER BY full_name ASC
+       LIMIT ${ROSTER_CAP + 1}`));
+    const people: RosterEntry[] = list.slice(0, ROSTER_CAP).map((r: any) => ({
+      employeeId: r.employee_id ? String(r.employee_id) : null,
+      userId: r.user_id ? String(r.user_id) : null,
+      fullName: r.full_name ? String(r.full_name) : null,
+      designation: r.designation ? String(r.designation) : null,
+      departmentId: r.department_id ? String(r.department_id) : null,
+      via: 'everyone',
+    }));
+    const truncated = list.length > ROSTER_CAP;
+    return {
+      graphReady: true,
+      reviewerEmployeeId: null,
+      people,
+      truncated,
+      sentence: people.length === 0
+        ? empty.sentence
+        : 'Everybody with an active employee record'
+          + (truncated ? ', showing the first ' + ROSTER_CAP + ' by name.' : '.')
+          + ' This list does not use the organisation graph, so it works whether or not that has been filled.',
+    };
+  } catch (e: any) {
+    // NOT an empty list. "We could not read who works here" and "nobody works here" are different
+    // facts, and showing the second when the first is true is how a screen lies quietly.
+    logFail('everyoneRoster', e);
+    return {
+      graphReady: true, reviewerEmployeeId: null, people: [], truncated: false,
+      sentence: 'The employee list could not be read just now, so this is not a statement that '
+        + 'nobody submitted anything. Reload in a moment.',
+    };
+  }
+}
+
 export async function reviewerRoster(userId: string): Promise<ReviewerRoster> {
   const notReady: ReviewerRoster = {
     graphReady: false, reviewerEmployeeId: null, people: [], truncated: false,
