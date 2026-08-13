@@ -1,0 +1,249 @@
+---
+// /aquintutor/admin/people — the super admin panel: who has an AquinTutor account, and what they may do.
+//
+// This is the screen the whole identity separation was for. Every account here is an AquinTutor
+// account: created here, signed in here, revoked here. No EduRankAI account appears on this page,
+// and nothing on it can grant anybody anything on EduRankAI.
+//
+// ROLES ADD UP. Each grant is its own row, so one person can be a teacher and a partner and a
+// moderator at once, and removing one leaves the others standing.
+//
+// const BEFORE THE HANDLER — `const` is not hoisted, and that has taken pages down here.
+import AquinAdminLayout from '@/layouts/AquinAdminLayout.astro';
+import { aquinStore } from '@/lib/aquin/store';
+import { requireAquinSuperAdmin } from '@/lib/aquin/gate';
+import { createAccount, assignRole, removeRole } from '@/lib/aquin/identity';
+import { AQUIN_ROLES, AQUIN_ADMIN_ROLE_KEYS } from '@/lib/aquin/schema';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+let flashOk = '';
+let flashErr = '';
+const failures: { what: string; why: string }[] = [];
+
+// Every read is named and independent, so one failing does not blank the page and leave nobody able
+// to say which. /admin/rbac died whole for exactly this reason.
+async function read(what: string, q: any): Promise<any[]> {
+  try { return rowsOf(await db.execute(q)); }
+  catch (e: any) {
+    const why = e?.cause?.message || e?.message || String(e);
+    console.error('[aquin/people] ' + what + ' failed:', why);
+    failures.push({ what, why });
+    return [];
+  }
+}
+
+const gate = await requireAquinSuperAdmin(Astro as any);
+
+if (gate.ok && Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData().catch(() => null);
+  const action = String(fd?.get('action') || '');
+  const store = await aquinStore().catch(() => null);
+  if (!store) {
+    flashErr = 'The AquinTutor store could not be opened, so nothing was changed.';
+  } else if (action === 'create') {
+    const r = await createAccount(store, {
+      email: String(fd?.get('email') || ''),
+      name: String(fd?.get('name') || ''),
+      password: String(fd?.get('password') || ''),
+      roles: ['learner'],
+    });
+    if (!r.ok) flashErr = r.error || 'That account could not be created.';
+    else {
+      const wanted = String(fd?.get('role') || '').trim();
+      if (wanted && wanted !== 'learner') {
+        // createAccount refuses admin-surface roles by design; the grant goes through assignRole,
+        // which records who did it.
+        const g = await assignRole(store, gate.principal, r.userId!, wanted);
+        flashOk = g.ok
+          ? 'Account created and given the ' + wanted + ' role.'
+          : 'Account created, but the role was not granted: ' + g.error;
+        if (!g.ok) flashErr = '';
+      } else {
+        flashOk = 'Account created as a learner.';
+      }
+    }
+  } else if (action === 'grant') {
+    const r = await assignRole(store, gate.principal, String(fd?.get('userId') || ''), String(fd?.get('role') || ''));
+    if (r.ok) flashOk = 'Role granted.'; else flashErr = r.error || 'That role could not be granted.';
+  } else if (action === 'revoke') {
+    const r = await removeRole(store, gate.principal, String(fd?.get('userId') || ''), String(fd?.get('role') || ''));
+    if (r.ok) flashOk = 'Role removed.'; else flashErr = r.error || 'That role could not be removed.';
+  }
+}
+
+// -------------------------------------------------------------------------------------------------
+// The roster, read after any write so the page shows the state that now exists.
+// -------------------------------------------------------------------------------------------------
+const q = String(Astro.url.searchParams.get('q') || '').trim();
+const people = gate.ok ? await read('The people list', sql`
+  SELECT u.id, u.email, u.name, u.is_active, u.created_at, u.last_seen_at,
+         COALESCE(array_agg(r.role_key) FILTER (WHERE r.role_key IS NOT NULL), '{}') AS roles
+    FROM aq_users u LEFT JOIN aq_user_roles r ON r.user_id = u.id
+   ${q ? sql`WHERE u.email ILIKE ${'%' + q + '%'} OR u.name ILIKE ${'%' + q + '%'}` : sql``}
+   GROUP BY u.id, u.email, u.name, u.is_active, u.created_at, u.last_seen_at
+   ORDER BY u.created_at DESC LIMIT 100`) : [];
+
+const recent = gate.ok ? await read('The audit trail', sql`
+  SELECT a.action, a.subject, a.detail, a.at, u.email AS actor_email
+    FROM aq_audit a LEFT JOIN aq_users u ON u.id = a.actor_id
+   ORDER BY a.at DESC LIMIT 20`) : [];
+
+const CARD = 'background:#fff;border:1px solid rgba(14,11,8,0.12);border-radius:14px;padding:18px 20px;margin-bottom:18px;';
+const LBL = 'display:block;font-size:10px;letter-spacing:0.1em;text-transform:uppercase;font-weight:700;color:#8a7f76;margin-bottom:5px;';
+const INP = 'width:100%;padding:9px 11px;border:1px solid rgba(14,11,8,0.18);border-radius:8px;font-size:14px;background:#fff;color:#0E0B08;';
+const BTN = 'min-height:44px;padding:0 18px;border:0;border-radius:9px;background:#a8472c;color:#fff;font-weight:650;font-size:14px;cursor:pointer;';
+
+function when(v: any): string {
+  try { return v ? new Date(v).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric' }) : '—'; }
+  catch { return '—'; }
+}
+---
+
+<AquinAdminLayout title="People and roles" active="/aquintutor/admin/people" superAdminOnly={true}>
+  <h1 style="font-size:24px;margin:0 0 6px;">People &amp; roles</h1>
+  <p style="font-size:13.5px;color:#6f665e;line-height:1.65;margin:0 0 20px;max-width:70ch;">
+    Every account here is an AquinTutor account. Signing in to EduRankAI does not sign anybody in
+    here, and nothing on this page grants anybody anything there. Roles add up: one person can be a
+    teacher and a partner at once, and removing one leaves the rest.
+  </p>
+
+  {failures.length > 0 && (
+    <div style={CARD + 'border-color:rgba(180,60,40,0.4);background:rgba(180,60,40,0.05);'}>
+      <p style="margin:0 0 6px;font-weight:700;color:#a04330;font-size:13.5px;">Part of this page could not be read.</p>
+      <ul style="margin:0;padding-left:18px;font-size:13px;color:#6f665e;line-height:1.7;">
+        {failures.map((f) => <li><strong>{f.what}</strong> — {f.why}</li>)}
+      </ul>
+    </div>
+  )}
+
+  {flashOk !== '' && <div style={CARD + 'border-color:rgba(0,140,70,0.4);background:rgba(0,140,70,0.06);'}><p style="margin:0;font-size:13.5px;color:#2f6b45;">{flashOk}</p></div>}
+  {flashErr !== '' && <div style={CARD + 'border-color:rgba(180,60,40,0.4);background:rgba(180,60,40,0.05);'}><p style="margin:0;font-size:13.5px;color:#a04330;">{flashErr}</p></div>}
+
+  <!-- CREATE -->
+  <form method="POST" style={CARD}>
+    <input type="hidden" name="action" value="create" />
+    <p style="font-size:11px;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;color:#8a7f76;margin:0 0 14px;">Add somebody to AquinTutor</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;">
+      <div><label style={LBL} for="p-name">Name</label><input id="p-name" style={INP} type="text" name="name" required /></div>
+      <div><label style={LBL} for="p-email">Email</label><input id="p-email" style={INP} type="email" name="email" required /></div>
+      <div><label style={LBL} for="p-pw">Password</label><input id="p-pw" style={INP} type="password" name="password" required minlength="10" autocomplete="new-password" /></div>
+      <div>
+        <label style={LBL} for="p-role">Role</label>
+        <select id="p-role" style={INP} name="role">
+          {AQUIN_ROLES.filter((r) => r.key !== 'super_admin').map((r) => (
+            <option value={r.key} selected={r.key === 'learner'}>{r.label}</option>
+          ))}
+        </select>
+      </div>
+    </div>
+    <button type="submit" style={BTN + 'margin-top:14px;'}>Create the account</button>
+    <p style="margin:9px 0 0;font-size:11.5px;color:#8a7f76;line-height:1.55;">
+      They sign in at /aquintutor/admin/login with this password. Super admin is not offered here —
+      it is granted below, to an account that already exists.
+    </p>
+  </form>
+
+  <!-- ROSTER -->
+  <div style={CARD}>
+    <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:12px;">
+      <p style="font-size:11px;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;color:#8a7f76;margin:0;">
+        AquinTutor accounts<span style="color:#a8472c;margin-left:6px;">{people.length}</span>
+      </p>
+      <form method="GET" style="display:flex;gap:6px;">
+        <input style={INP + 'width:auto;'} type="search" name="q" value={q} placeholder="name or email" />
+        <button type="submit" style="min-height:44px;padding:0 14px;border:1px solid rgba(14,11,8,0.18);border-radius:8px;background:#fff;cursor:pointer;font-size:13px;">Search</button>
+      </form>
+    </div>
+
+    {people.length === 0 ? (
+      <p style="margin:0;font-size:13.5px;color:#6f665e;line-height:1.6;">
+        {failures.length > 0
+          ? 'The list could not be read, so this is not a statement that nobody has an account.'
+          : 'Nobody has an AquinTutor account yet apart from you. Add somebody above.'}
+      </p>
+    ) : (
+      <div style="overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;font-size:13.5px;min-width:640px;">
+          <thead>
+            <tr style="text-align:left;color:#8a7f76;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;">
+              <th style="padding:8px 8px 8px 0;">Person</th>
+              <th style="padding:8px;">Roles</th>
+              <th style="padding:8px;min-width:230px;">Grant</th>
+            </tr>
+          </thead>
+          <tbody>
+            {people.map((u: any) => (
+              <tr style="border-top:1px solid rgba(14,11,8,0.08);vertical-align:top;">
+                <td style="padding:10px 8px 10px 0;">
+                  <div style="font-weight:650;">{u.name || '(no name)'}</div>
+                  <div style="color:#8a7f76;font-size:12px;">{u.email}</div>
+                  <div style="color:#a89f96;font-size:11px;margin-top:3px;">joined {when(u.created_at)}{u.is_active === false ? ' · closed' : ''}</div>
+                </td>
+                <td style="padding:10px 8px;">
+                  {(u.roles || []).length === 0
+                    ? <span style="color:#a89f96;font-size:12px;">none</span>
+                    : (u.roles || []).map((r: string) => (
+                        <form method="POST" style="display:inline-block;margin:0 4px 4px 0;">
+                          <input type="hidden" name="action" value="revoke" />
+                          <input type="hidden" name="userId" value={u.id} />
+                          <input type="hidden" name="role" value={r} />
+                          <span style={'display:inline-flex;align-items:center;gap:5px;border:1px solid ' + (AQUIN_ADMIN_ROLE_KEYS.includes(r) ? 'rgba(168,71,44,0.45)' : 'rgba(14,11,8,0.16)') + ';border-radius:100px;padding:2px 4px 2px 10px;font-size:12px;' + (AQUIN_ADMIN_ROLE_KEYS.includes(r) ? 'color:#a8472c;' : 'color:#4a443e;')}>
+                            {r}
+                            <button type="submit" title={'Remove the ' + r + ' role'} style="background:none;border:0;color:#a04330;cursor:pointer;font-size:15px;line-height:1;padding:0 4px;min-height:28px;">&times;</button>
+                          </span>
+                        </form>
+                      ))}
+                </td>
+                <td style="padding:10px 8px;">
+                  <form method="POST" style="display:flex;gap:6px;flex-wrap:wrap;">
+                    <input type="hidden" name="action" value="grant" />
+                    <input type="hidden" name="userId" value={u.id} />
+                    <select name="role" style={INP + 'width:auto;min-width:140px;'}>
+                      {AQUIN_ROLES.map((r) => <option value={r.key}>{r.label}</option>)}
+                    </select>
+                    <button type="submit" style="min-height:44px;padding:0 14px;border:0;border-radius:8px;background:#0E0B08;color:#fff;font-size:13px;font-weight:600;cursor:pointer;">Grant</button>
+                  </form>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+  </div>
+
+  <!-- WHAT THE ROLES MEAN. Assigning a role nobody can describe is how access drifts. -->
+  <div style={CARD}>
+    <p style="font-size:11px;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;color:#8a7f76;margin:0 0 12px;">What each role opens</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;">
+      {AQUIN_ROLES.map((r) => (
+        <div style={'padding:11px 13px;border-radius:10px;border:1px solid ' + (r.surface === 'admin' ? 'rgba(168,71,44,0.3)' : 'rgba(14,11,8,0.12)') + ';'}>
+          <p style={'margin:0 0 4px;font-weight:700;font-size:13.5px;' + (r.surface === 'admin' ? 'color:#a8472c;' : '')}>{r.label}</p>
+          <p style="margin:0;font-size:12.5px;color:#6f665e;line-height:1.55;">{r.description}</p>
+          <p style="margin:6px 0 0;font-size:11px;color:#a89f96;font-family:'Geist Mono',ui-monospace,monospace;">{r.surface === 'admin' ? 'reaches the admin' : 'never reaches the admin'}</p>
+        </div>
+      ))}
+    </div>
+  </div>
+
+  <!-- AUDIT -->
+  <div style={CARD}>
+    <p style="font-size:11px;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;color:#8a7f76;margin:0 0 12px;">Recent changes</p>
+    {recent.length === 0 ? (
+      <p style="margin:0;font-size:13px;color:#6f665e;">Nothing recorded yet.</p>
+    ) : (
+      <ul style="margin:0;padding-left:18px;font-size:13px;color:#4a443e;line-height:1.8;">
+        {recent.map((a: any) => (
+          <li>
+            <strong>{a.action}</strong>
+            {a.detail && a.detail.role ? ' · ' + a.detail.role : ''}
+            <span style="color:#8a7f76;"> — {a.actor_email || 'bootstrap'} · {when(a.at)}</span>
+          </li>
+        ))}
+      </ul>
+    )}
+  </div>
+</AquinAdminLayout>
