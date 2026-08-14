@@ -368,6 +368,53 @@ export function punchRefusal(kind: PunchKind, totals: DayTotals): string {
 export const ATTENDANCE_TIME_ZONE = 'Asia/Kolkata';
 
 /**
+ * A punch timestamp as a wall clock, in the zone this company actually works in.
+ *
+ * =================================================================================================
+ * SIX SCREENS SHOWED UTC AND CALLED IT THE TIME
+ * =================================================================================================
+ *
+ * Every attendance surface formatted a punch with getUTCHours(). India is UTC+5:30, so somebody who
+ * clocked in at 11:41 was shown 06:11, and somebody at 11:45 was shown 06:15. Three employees
+ * reported it in one evening, and every one of them assumed the tracker had recorded the wrong time
+ * rather than displayed the right one badly.
+ *
+ * It was deliberate, and the reasoning is still in punctuality(): "TIMES ARE READ IN UTC ... Both
+ * sides of the comparison therefore use one clock. Mixing the process timezone into one side would
+ * make somebody in a different timezone permanently four hours late."
+ *
+ * The worry was right and the remedy was wrong. What must not vary is which clock — not which
+ * offset. A FIXED zone keeps both sides on one clock and makes it the clock people actually work
+ * against; reading the process or browser zone is the thing that would drift.
+ *
+ * AND IT WAS NOT ONLY COSMETIC. Shifts are stored as minutes past local midnight, so comparing a
+ * 09:00 shift against a UTC clock made everybody appear five and a half hours early. Nobody could
+ * ever be marked late.
+ */
+export function clockTimeIst(iso: string | null | undefined): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      timeZone: ATTENDANCE_TIME_ZONE, hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    }).format(d);
+  } catch {
+    // A runtime without the timezone database must not blank the whole column.
+    return String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+  }
+}
+
+/** Minutes past midnight in the working zone. The other half of the same fix — see clockTimeIst. */
+export function minuteOfDayIst(iso: string | null | undefined): number | null {
+  const hhmm = clockTimeIst(iso);
+  if (!hhmm) return null;
+  const [h, m] = hhmm.split(':').map(Number);
+  if (!isFinite(h) || !isFinite(m)) return null;
+  return h * 60 + m;
+}
+
+/**
  * Today, as the working day is counted here. Null when the read did not happen.
  *
  * ASKING POSTGRES WAS ONLY HALF THE ANSWER, AND THE MISSING HALF COST FIVE AND A HALF HOURS A DAY.
@@ -1919,10 +1966,14 @@ export interface Punctuality {
 /**
  * How the day sat against the shift. PURE, and it returns WORDS beside its numbers on purpose.
  *
- * TIMES ARE READ IN UTC, matching how every attendance screen in this product renders a clock time
- * (see clockTime() in /portal/employee/attendance). Both sides of the comparison therefore use one
- * clock. Mixing the process timezone into one side would make somebody in a different timezone
- * permanently four hours late.
+ * TIMES ARE READ IN THE WORKING ZONE, matching every attendance screen (see clockTimeIst above).
+ * Both sides of the comparison use one clock, and it is now the clock people work against.
+ *
+ * This read UTC on both sides. That kept the two consistent and made them consistently wrong:
+ * shift_start is minutes past LOCAL midnight, so a 09:00 shift compared against a UTC punch made
+ * everybody five and a half hours early and nobody could ever be marked late. The original worry —
+ * that mixing in the process timezone would make a remote colleague permanently late — is answered
+ * by fixing the zone rather than by choosing the wrong one.
  */
 export function punctuality(shift: Shift | null, totals: DayTotals | null): Punctuality {
   const none: Punctuality = { lateMinutes: 0, earlyMinutes: 0, sentence: null, noShift: !shift };
@@ -1930,9 +1981,7 @@ export function punctuality(shift: Shift | null, totals: DayTotals | null): Punc
 
   const minuteOfDay = (iso: string | null): number | null => {
     if (!iso) return null;
-    const d = new Date(iso);
-    if (isNaN(d.getTime())) return null;
-    return d.getUTCHours() * 60 + d.getUTCMinutes();
+    return minuteOfDayIst(iso);
   };
 
   const inMin = minuteOfDay(totals.clockIn);
