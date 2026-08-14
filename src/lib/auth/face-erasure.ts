@@ -345,7 +345,10 @@ export async function runFaceRetention(opts: { dryRun?: boolean } = {}): Promise
           body: 'Face sign-in was not in use on your account, so the facial data held for it has been '
             + 'deleted under our retention policy. Your account and every other way of signing in are '
             + 'unchanged, and you can set face sign-in up again at any time.',
-          url: '/portal/face-data',
+          // actionUrl, not url. NotifyOptions has no `url` field, so the notification would have
+          // carried no link at all — a message telling somebody their biometric data was deleted,
+          // with nowhere to go and check.
+          actionUrl: '/portal/face-data',
         });
       } catch (e: any) {
         console.error('[face-erasure] retention notice failed for', c.userId, e?.cause?.message || e?.message);

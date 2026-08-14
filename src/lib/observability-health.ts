@@ -221,6 +221,9 @@ export const CONFIGURED_CRONS: { path: string; schedule: string }[] = [
   { path: '/api/hiring/draft-reminders', schedule: '45 4 * * *' },
   { path: '/api/cron/hei-refresh', schedule: '0 3 * * *' },
   { path: '/api/cron/activity-digest', schedule: '0 13 * * *' },
+  // Deletes facial data whose purpose has ended. The test that pairs this list against
+  // vercel.json caught its absence immediately — which is the point of keeping both.
+  { path: '/api/cron/face-retention', schedule: '40 2 * * *' },
 ];
 
 /**
