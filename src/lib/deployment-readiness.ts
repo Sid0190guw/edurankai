@@ -93,6 +93,20 @@ export const REQUIREMENTS: readonly EnvRequirement[] = Object.freeze([
     mustMatchOld: 'Links already handed out were signed with the old secret and will 404.' },
 
   // ---- optional: absent is a legitimate configuration ----
+  // ---- the streaming-channel connector (src/lib/live-egress.ts) ----
+  // All four absent is the normal state: no channel is connected and the admin screen says so.
+  // The refresh token is the one worth watching — see accountBound, which is the failure mode that
+  // produces no symptom at all until a scheduled class does not start.
+  { name: 'LIVE_EGRESS_CLIENT_ID', severity: 'optional',
+    breaks: 'No live class can be scheduled on the streaming channel. Everything else about a live class still works.' },
+  { name: 'LIVE_EGRESS_CLIENT_SECRET', severity: 'optional',
+    breaks: 'No live class can be scheduled on the streaming channel.' },
+  { name: 'LIVE_EGRESS_REFRESH_TOKEN', severity: 'optional',
+    breaks: 'No live class can be scheduled on the streaming channel.',
+    accountBound: 'This consent belongs to the account that granted it, for one channel. It also EXPIRES: a token issued while the sign-in consent screen is still in testing stops working after seven days, and any token stops after six months unused. Neither failure has a visible symptom until a class fails to start.' },
+  { name: 'LIVE_EGRESS_CHANNEL_LABEL', severity: 'optional',
+    breaks: 'The connected channel is described generically in the admin screen.' },
+
   { name: 'S3_ENDPOINT', severity: 'optional', breaks: 'S3 storage is not used; the Blob store or the dev store is used instead.' },
   { name: 'S3_BUCKET', severity: 'optional', breaks: 'S3 storage is not used.' },
   { name: 'S3_ACCESS_KEY_ID', severity: 'optional', breaks: 'S3 storage is not used.' },
