@@ -498,6 +498,9 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // gets its first administrator — until it runs, /aquintutor/admin/login has nobody to admit.
       // Same 'settings' section as the entry above, which is held by super_admin alone.
       { id: 'aquintutor-bootstrap', label: 'AquinTutor: first super admin', href: '/admin/aquintutor-bootstrap', icon: 'shield', section: 'settings' },
+      // The page to open FIRST on a new hosting account. Unreachable is useless: this one exists to
+      // be found by somebody who has just moved the project and does not yet know what is missing.
+      { id: 'deployment-check', label: 'Deployment check', href: '/admin/deployment-check', icon: 'shield', section: 'settings' },
     ],
   },
   { id: 'custom-offer', label: 'Custom Offer', href: '/admin/offer/blank', icon: 'file-text', section: 'custom_offer' },
