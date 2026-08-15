@@ -56,13 +56,60 @@ export class VodService {
 
   /** Snapshot a live session's spec timeline into a VOD AnimationObject linked to a Course/KO. */
   async record(sessionId: string, meta: { title: string; linkId?: string | null; owner?: string | null; labels?: SecurityLabel[]; mediaUrl?: string | null }): Promise<string> {
-    const events = await eventsSince(sessionId, 0, 5000).catch(() => [] as BoardEvent[]);
+    // A RECORDING THAT SILENTLY LOSES THE LESSON IS WORSE THAN ONE THAT FAILS.
+    //
+    // Two caps used to combine into unrecoverable data loss with no error anywhere: the read below
+    // stopped at 5,000 events with `.catch(() => [])`, and the serialised payload was cut with
+    // `.slice(0, 400000)` — mid-JSON. A long session therefore produced a row that parses to `{}`
+    // on read (see get(), whose `try { JSON.parse } catch {}` leaves payload empty), i.e. a VOD
+    // that exists, is listed, opens, and plays NOTHING. The session it came from is gone by then.
+    //
+    // Both limits stay — an unbounded read and an unbounded column are their own problems — but
+    // hitting either is now a LOUD, RECORDED fact rather than a silent truncation.
+    const EVENT_CAP = 5000;
+    const SCENE_CAP = 400000;
+
+    let events: BoardEvent[] = [];
+    let readFailed = false;
+    try {
+      events = await eventsSince(sessionId, 0, EVENT_CAP);
+    } catch (e: any) {
+      readFailed = true;
+      console.error('[vod] record: reading session ' + sessionId + ' failed:', e?.cause?.message || e?.message);
+    }
+    if (readFailed) {
+      throw new Error('The session could not be read, so nothing was recorded. Nothing has been saved under a title that would imply otherwise.');
+    }
+    const truncatedEvents = events.length >= EVENT_CAP;
+
     const tl = buildTimeline(events);
     if (meta.mediaUrl) tl.mediaUrl = meta.mediaUrl;
     const payload = { vod: true, title: meta.title, timeline: tl.timeline, durationMs: tl.durationMs, chapters: tl.chapters, mediaUrl: tl.mediaUrl };
+
+    // Serialise ONCE and measure it. Cutting a JSON string at a byte offset produces something that
+    // cannot be parsed at all, so if it does not fit we drop whole events off the end — which
+    // yields a shorter but VALID timeline — and record that we did.
+    let scene = JSON.stringify(payload);
+    let droppedForSize = 0;
+    while (scene.length > SCENE_CAP && payload.timeline.length > 1) {
+      const drop = Math.max(1, Math.ceil(payload.timeline.length * 0.1));
+      payload.timeline.splice(payload.timeline.length - drop, drop);
+      droppedForSize += drop;
+      scene = JSON.stringify(payload);
+    }
+    if (scene.length > SCENE_CAP) {
+      throw new Error('This recording cannot be stored: a single event exceeds the size a recording may occupy. Nothing was saved.');
+    }
+    if (truncatedEvents || droppedForSize) {
+      console.error('[vod] record ' + sessionId + ': INCOMPLETE — ' +
+        (truncatedEvents ? 'session had at least ' + EVENT_CAP + ' events (read cap reached); ' : '') +
+        (droppedForSize ? droppedForSize + ' event(s) dropped to fit the size cap; ' : '') +
+        'the stored recording is shorter than the class was.');
+    }
+
     const o = await this.repo.createObject({
       type: 'AnimationObject',
-      data: { title: meta.title || 'Recording', scene: JSON.stringify(payload).slice(0, 400000) } as any,
+      data: { title: meta.title || 'Recording', scene } as any,
       owner: meta.owner ?? null,
       securityLabels: (meta.labels && meta.labels.length ? meta.labels : ['enrolled-only']) as any,
       metadata: { vod: true, sessionId, durationMs: tl.durationMs, events: tl.timeline.length, chapters: tl.chapters.length, published: false, mediaUrl: tl.mediaUrl },
