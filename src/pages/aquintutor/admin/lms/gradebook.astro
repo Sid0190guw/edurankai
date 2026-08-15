@@ -1,0 +1,274 @@
+---
+// /aquintutor/admin/lms/gradebook — THE WHOLE COHORT AT ONCE.
+//
+// The matrix, the weighted categories that produce the course grade, the letter scale, the CSV
+// export, and the act of posting a final grade.
+//
+// POSTING A FINAL GRADE IS A FREEZE, NOT A VIEW. After it, the transcript reads that stored row and
+// never recomputes — so an assignment edited in December cannot silently rewrite a grade a learner
+// was given in November. That is why it is a separate button with its own consequence spelled out,
+// and why it is limited to people whose claim on the course includes administering it.
+import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+import { myTaughtCourses, teachClaim } from '@/lib/lms/access';
+import { gradebookMatrix, courseCategories, saveCategory, deleteCategory, courseScale, saveScale, postFinalGrade, courseRubrics, createRubric } from '@/lib/lms/gradebook';
+import { courseSections } from '@/lib/lms/sections';
+import { DEFAULT_SCALE } from '@/lib/lms/policy';
+
+export const prerender = false;
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/aquintutor/login?next=' + encodeURIComponent('/aquintutor/admin/lms/gradebook'));
+
+const courses = await myTaughtCourses(user);
+const courseId = String(Astro.url.searchParams.get('course') || courses[0]?.id || '');
+const sectionId = String(Astro.url.searchParams.get('section') || '') || null;
+const claim = courseId ? await teachClaim(user, courseId) : { canTeach: false, canGrade: false, canAdminister: false, via: 'none' };
+
+// Declared before the POST handler. const is not hoisted.
+let flash = '';
+let flashOk = false;
+
+if (Astro.request.method === 'POST') {
+  if (!claim.canGrade) {
+    flash = 'You do not have grading access to this course.';
+  } else {
+    try {
+      const form = await Astro.request.formData();
+      const action = String(form.get('action') || '');
+
+      if (action === 'category') {
+        const r = await saveCategory(courseId, {
+          id: String(form.get('categoryId') || '') || null,
+          name: String(form.get('name') || ''),
+          weight: Number(form.get('weight') || 0),
+          dropLowest: Number(form.get('dropLowest') || 0),
+          position: Number(form.get('position') || 0),
+        });
+        flashOk = r.ok;
+        flash = r.ok ? 'Category saved.' : (r.error || 'Could not save the category.');
+      } else if (action === 'delete_category') {
+        await deleteCategory(courseId, String(form.get('categoryId') || ''));
+        flashOk = true;
+        flash = 'Category removed. Its assignments are now uncategorised.';
+      } else if (action === 'scale') {
+        const bands = String(form.get('bands') || '').split(/[\r\n]+/).map((line) => {
+          const parts = line.split(/[,\t]/).map((p) => p.trim());
+          return { letter: parts[0] || '', min: Number(parts[1]), points: Number(parts[2]) };
+        }).filter((b) => b.letter && Number.isFinite(b.min) && Number.isFinite(b.points));
+        if (!bands.length) {
+          flash = 'No usable band was read. Each line must be: letter, minimum percent, grade points.';
+        } else {
+          await saveScale(courseId, bands, user.id);
+          flashOk = true;
+          flash = 'Saved ' + bands.length + ' band(s).';
+        }
+      } else if (action === 'rubric') {
+        const labels = form.getAll('critLabel').map(String);
+        const points = form.getAll('critPoints').map((p) => Number(p));
+        const criteria = labels.map((label, i) => ({ label, points: points[i] || 0 })).filter((c) => c.label.trim());
+        const r = await createRubric(courseId, String(form.get('rubricTitle') || ''), criteria, user.id);
+        flashOk = r.ok;
+        flash = r.ok ? 'Rubric created. Attach it to an assignment on the assignments screen.' : (r.error || 'Could not create the rubric.');
+      } else if (action === 'final') {
+        if (!claim.canAdminister) {
+          flash = 'Posting a final grade needs administering access to this course.';
+        } else {
+          const r = await postFinalGrade(courseId, sectionId, String(form.get('userId') || ''), user.id, {
+            pct: form.get('pct') ? Number(form.get('pct')) : null,
+            note: String(form.get('note') || ''),
+          });
+          flashOk = r.ok;
+          flash = r.ok ? 'Final grade posted. It is frozen on the transcript now.' : (r.error || 'Could not post the final grade.');
+        }
+      }
+    } catch (e: any) {
+      console.error('[admin/lms/gradebook] POST:', e?.cause?.message || e?.message);
+      flash = 'That did not save: ' + (e?.cause?.message || e?.message || 'unknown error');
+      flashOk = false;
+    }
+  }
+}
+
+const sections = courseId ? await courseSections(courseId) : [];
+const categories = courseId ? await courseCategories(courseId) : [];
+const rubrics = courseId ? await courseRubrics(courseId) : [];
+const scale = courseId ? await courseScale(courseId) : DEFAULT_SCALE;
+const matrix = courseId && claim.canGrade ? await gradebookMatrix(courseId, sectionId) : { assignments: [], students: [] };
+const weightSum = categories.reduce((s: number, c: any) => s + Number(c.weight || 0), 0);
+const scaleText = scale.map((b) => b.letter + ', ' + b.min + ', ' + b.points).join('\n');
+const exportHref = '/api/aquintutor/lms/export?course=' + courseId + (sectionId ? '&section=' + sectionId : '');
+---
+<AquintutorLayout title="Gradebook" description="The cohort, the weights, the export." noindex={true}>
+
+  <div style="border-bottom:1px solid var(--rule); background:var(--sand-100);">
+    <div style="max-width:1500px; margin:0 auto; padding:10px 28px; font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:0.08em; color:var(--ink-500);">
+      <a href="/aquintutor/admin/lms" style="color:var(--ink-500); text-decoration:none;">TEACHING</a>
+      <span style="margin:0 8px;">/</span>
+      <span style="color:var(--rust); font-weight:600;">GRADEBOOK</span>
+    </div>
+  </div>
+
+  <section style="max-width:1500px; margin:0 auto; padding:26px 28px 60px;">
+
+    {flash && (
+      <div style={'margin-bottom:18px; border:1px solid ' + (flashOk ? '#4a7048' : '#a8472c') + '; background:' + (flashOk ? '#f2f7f1' : '#fdf3f0') + '; border-radius:10px; padding:13px 16px; font-family:"Inter Tight",sans-serif; font-size:14px; color:' + (flashOk ? '#2f4a2d' : '#7a2f1a') + ';'}>{flash}</div>
+    )}
+
+    <form method="GET" style="margin-bottom:20px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <select name="course" style="padding:9px 12px; border:1px solid var(--rule); border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px; min-width:240px;">
+        {courses.map((c: any) => (<option value={c.id} selected={c.id === courseId}>{c.title}</option>))}
+      </select>
+      <select name="section" style="padding:9px 12px; border:1px solid var(--rule); border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px;">
+        <option value="">Everyone enrolled</option>
+        {sections.map((s: any) => (<option value={s.id} selected={s.id === sectionId}>{s.code}{s.term_code ? ' · ' + s.term_code : ''} ({s.student_count})</option>))}
+      </select>
+      <button type="submit" style="padding:9px 16px; border:1px solid var(--rule); background:transparent; border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px; cursor:pointer;">Show</button>
+    </form>
+
+    <div style="margin-bottom:20px;">
+      <a href={exportHref} style="display:inline-block; padding:9px 18px; background:var(--ink); color:var(--sand-50); border-radius:8px; text-decoration:none; font-family:'Inter Tight',sans-serif; font-size:14px;">Download grades as CSV</a>
+    </div>
+
+    {weightSum > 0 && Math.abs(weightSum - 100) > 0.01 && (
+      <div style="margin-bottom:18px; border:1px solid #a87526; background:#fdf8ef; border-radius:10px; padding:12px 16px; font-family:'Inter Tight',sans-serif; font-size:13.5px; color:#6d4d12;">
+        Your category weights add up to {weightSum}%, not 100%. The roll-up still works &mdash; it normalises against the
+        categories that have grades &mdash; but the percentages a learner sees will not match what you probably intend.
+      </div>
+    )}
+
+    <div style="border:1px solid var(--rule); border-radius:12px; background:#fff; overflow:hidden; margin-bottom:26px;">
+      <div style="padding:14px 18px; border-bottom:1px solid var(--rule); background:var(--sand-50);">
+        <h2 class="font-display" style="font-size:16px; font-weight:500; margin:0;">
+          {matrix.students.length} learner(s) &middot; {matrix.assignments.length} assignment(s)
+        </h2>
+      </div>
+      <div style="overflow-x:auto;">
+        <table style="border-collapse:collapse; font-family:'Inter Tight',sans-serif; font-size:13.5px; min-width:100%;">
+          <thead>
+            <tr style="background:var(--sand-50);">
+              <th style="padding:10px 16px; text-align:left; position:sticky; left:0; background:var(--sand-50); font-family:'JetBrains Mono',monospace; font-size:9.5px; letter-spacing:0.08em; color:var(--ink-500); font-weight:500;">LEARNER</th>
+              {matrix.assignments.map((a: any) => (
+                <th style="padding:10px 10px; text-align:left; font-family:'JetBrains Mono',monospace; font-size:9.5px; letter-spacing:0.05em; color:var(--ink-500); font-weight:500; max-width:120px;">
+                  {String(a.title).slice(0, 22)}<br />/{Number(a.points)}
+                </th>
+              ))}
+              <th style="padding:10px 14px; text-align:left; font-family:'JetBrains Mono',monospace; font-size:9.5px; letter-spacing:0.08em; color:var(--ink-500); font-weight:500;">COURSE</th>
+              {claim.canAdminister && <th style="padding:10px 14px; text-align:left; font-family:'JetBrains Mono',monospace; font-size:9.5px; letter-spacing:0.08em; color:var(--ink-500); font-weight:500;">FINAL</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {matrix.students.length === 0 && (
+              <tr><td colspan={matrix.assignments.length + 3} style="padding:20px 16px; color:var(--ink-500);">Nobody is enrolled in this selection yet.</td></tr>
+            )}
+            {matrix.students.map((s: any) => (
+              <tr style="border-top:1px solid var(--rule);">
+                <td style="padding:9px 16px; position:sticky; left:0; background:#fff; white-space:nowrap;">
+                  <div style="font-weight:600;">{s.name}</div>
+                  <div style="font-size:11.5px; color:var(--ink-500);">{s.email}</div>
+                </td>
+                {s.cells.map((c: any) => (
+                  <td style={'padding:9px 10px; font-family:"JetBrains Mono",monospace; font-size:12.5px; color:' + (c.points == null ? 'var(--ink-500)' : (c.posted ? 'var(--ink)' : '#a87526')) + ';'}>
+                    {c.excused ? 'exc' : (c.points == null ? '—' : Number(c.points))}
+                    {c.points != null && !c.posted ? '*' : ''}
+                  </td>
+                ))}
+                <td style="padding:9px 14px; font-family:'JetBrains Mono',monospace; font-size:13px; font-weight:600; white-space:nowrap;">
+                  {s.total.pct == null ? '—' : s.total.pct + '% ' + s.total.letter}
+                </td>
+                {claim.canAdminister && (
+                  <td style="padding:9px 14px;">
+                    <form method="POST" style="display:flex; gap:5px; align-items:center;">
+                      <input type="hidden" name="action" value="final" />
+                      <input type="hidden" name="userId" value={s.userId} />
+                      <input name="pct" type="number" step="0.01" min="0" max="100" placeholder={s.total.pct == null ? '' : String(s.total.pct)} style="width:72px; padding:5px 7px; border:1px solid var(--rule); border-radius:6px; font-family:'JetBrains Mono',monospace; font-size:12px;" />
+                      <button type="submit" style="padding:5px 10px; border:1px solid var(--rule); background:transparent; border-radius:6px; font-family:'Inter Tight',sans-serif; font-size:12px; cursor:pointer; white-space:nowrap;">Post</button>
+                    </form>
+                  </td>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style="padding:11px 18px; border-top:1px solid var(--rule); font-family:'Inter Tight',sans-serif; font-size:12.5px; color:var(--ink-500);">
+        An asterisk marks a grade you have saved but not released. Learners cannot see those. Leave the final-grade box empty to
+        post the computed figure; type a number to override it.
+      </div>
+    </div>
+
+    <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:20px; align-items:start;">
+
+      <div style="border:1px solid var(--rule); border-radius:12px; background:#fff; overflow:hidden;">
+        <div style="padding:13px 17px; border-bottom:1px solid var(--rule); background:var(--sand-50);">
+          <h2 class="font-display" style="font-size:15px; font-weight:500; margin:0;">Weighted categories</h2>
+        </div>
+        <div style="padding:14px 17px;">
+          {categories.length === 0 && (
+            <p style="font-family:'Inter Tight',sans-serif; font-size:13px; color:var(--ink-500); margin:0 0 12px;">
+              No categories: every assignment counts by its points, in one flat pool. Add categories to weight them.
+            </p>
+          )}
+          {categories.map((c: any) => (
+            <form method="POST" style="display:flex; gap:6px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
+              <input type="hidden" name="action" value="category" />
+              <input type="hidden" name="categoryId" value={c.id} />
+              <input name="name" value={c.name} style="flex:1 1 110px; padding:6px 9px; border:1px solid var(--rule); border-radius:6px; font-size:13px;" />
+              <input name="weight" type="number" step="0.5" min="0" max="100" value={Number(c.weight)} style="width:66px; padding:6px 8px; border:1px solid var(--rule); border-radius:6px; font-family:'JetBrains Mono',monospace; font-size:12.5px;" />
+              <input name="dropLowest" type="number" min="0" value={Number(c.drop_lowest)} title="drop the lowest N" style="width:52px; padding:6px 8px; border:1px solid var(--rule); border-radius:6px; font-family:'JetBrains Mono',monospace; font-size:12.5px;" />
+              <button type="submit" style="padding:6px 10px; border:1px solid var(--rule); background:transparent; border-radius:6px; font-size:12px; cursor:pointer;">Save</button>
+              <button type="submit" name="action" value="delete_category" formnovalidate style="padding:6px 9px; border:1px solid var(--rule); background:transparent; border-radius:6px; font-size:12px; cursor:pointer; color:#a8472c;">Remove</button>
+            </form>
+          ))}
+          <form method="POST" style="display:flex; gap:6px; align-items:center; margin-top:12px; border-top:1px solid var(--rule); padding-top:12px; flex-wrap:wrap;">
+            <input type="hidden" name="action" value="category" />
+            <input name="name" placeholder="New category" required style="flex:1 1 110px; padding:6px 9px; border:1px solid var(--rule); border-radius:6px; font-size:13px;" />
+            <input name="weight" type="number" step="0.5" min="0" max="100" placeholder="%" style="width:66px; padding:6px 8px; border:1px solid var(--rule); border-radius:6px; font-size:12.5px;" />
+            <input name="dropLowest" type="number" min="0" placeholder="drop" style="width:52px; padding:6px 8px; border:1px solid var(--rule); border-radius:6px; font-size:12.5px;" />
+            <button type="submit" style="padding:6px 12px; background:var(--ink); color:var(--sand-50); border:none; border-radius:6px; font-size:12.5px; cursor:pointer;">Add</button>
+          </form>
+          <p style="font-family:'Inter Tight',sans-serif; font-size:11.5px; color:var(--ink-500); margin:10px 0 0;">
+            Columns are name, weight percent, and how many of the lowest to drop. Dropping compares percentages, not raw points.
+          </p>
+        </div>
+      </div>
+
+      <div style="border:1px solid var(--rule); border-radius:12px; background:#fff; overflow:hidden;">
+        <div style="padding:13px 17px; border-bottom:1px solid var(--rule); background:var(--sand-50);">
+          <h2 class="font-display" style="font-size:15px; font-weight:500; margin:0;">Letter scale</h2>
+        </div>
+        <form method="POST" style="padding:14px 17px;">
+          <input type="hidden" name="action" value="scale" />
+          <p style="font-family:'Inter Tight',sans-serif; font-size:12.5px; color:var(--ink-500); margin:0 0 8px;">
+            One band per line: letter, minimum percent, grade points. Highest first is not required &mdash; it is sorted.
+          </p>
+          <textarea name="bands" rows="8" style="width:100%; padding:10px 12px; border:1px solid var(--rule); border-radius:7px; font-family:'JetBrains Mono',monospace; font-size:12.5px; resize:vertical;">{scaleText}</textarea>
+          <button type="submit" style="margin-top:10px; padding:8px 16px; background:var(--ink); color:var(--sand-50); border:none; border-radius:7px; font-family:'Inter Tight',sans-serif; font-size:13.5px; cursor:pointer;">Save the scale</button>
+        </form>
+      </div>
+
+      <div style="border:1px solid var(--rule); border-radius:12px; background:#fff; overflow:hidden;">
+        <div style="padding:13px 17px; border-bottom:1px solid var(--rule); background:var(--sand-50);">
+          <h2 class="font-display" style="font-size:15px; font-weight:500; margin:0;">Rubrics ({rubrics.length})</h2>
+        </div>
+        <div style="padding:14px 17px;">
+          {rubrics.map((r: any) => (
+            <div style="font-family:'Inter Tight',sans-serif; font-size:13px; padding:6px 0; border-bottom:1px solid var(--rule);">
+              {r.title} &mdash; {r.criteria_count} criteria, {Number(r.total_points)} points
+            </div>
+          ))}
+          <form method="POST" style="margin-top:12px;">
+            <input type="hidden" name="action" value="rubric" />
+            <input name="rubricTitle" placeholder="Rubric title" required style="width:100%; padding:8px 10px; border:1px solid var(--rule); border-radius:7px; font-size:13.5px; margin-bottom:8px;" />
+            {[0, 1, 2, 3].map((i) => (
+              <div style="display:flex; gap:6px; margin-bottom:6px;">
+                <input name="critLabel" placeholder={'Criterion ' + (i + 1)} style="flex:1; padding:7px 9px; border:1px solid var(--rule); border-radius:6px; font-size:13px;" />
+                <input name="critPoints" type="number" min="0" step="1" placeholder="pts" style="width:70px; padding:7px 9px; border:1px solid var(--rule); border-radius:6px; font-size:13px;" />
+              </div>
+            ))}
+            <button type="submit" style="padding:8px 16px; background:var(--ink); color:var(--sand-50); border:none; border-radius:7px; font-family:'Inter Tight',sans-serif; font-size:13.5px; cursor:pointer;">Create rubric</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </section>
+</AquintutorLayout>

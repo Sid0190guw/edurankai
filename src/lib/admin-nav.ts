@@ -481,6 +481,12 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // src/middleware.ts maps the whole /admin/aquintutor subtree to 'lms', so this entry names the
       // gate the door already applies.
       { id: 'aquintutor-courses', label: 'Course authoring', href: '/admin/aquintutor/courses', icon: 'book', section: 'lms' },
+      // THE TEACHING CONSOLE — assignments, the grading queue, the gradebook, sections and rosters.
+      // It leaves /admin like the Command Center below it, but unlike that page it does NOT require
+      // super_admin: it guards itself per course through src/lib/lms/access.ts teachClaim(), and a
+      // person with no teaching claim on any course sees an empty console rather than a bounce. So
+      // it belongs on 'lms' with the rest of the group, where faculty can actually reach it.
+      { id: 'aquintutor-teaching', label: 'Teaching: assignments & grading', href: '/aquintutor/admin/lms', icon: 'book', section: 'lms' },
       { id: 'schools', label: 'Schools & Departments', href: '/admin/schools', icon: 'book', section: 'lms' },
       { id: 'courses', label: 'Courses', href: '/admin/courses', icon: 'book', section: 'lms' },
       { id: 'paths', label: 'Learning Paths', href: '/admin/paths', icon: 'grid', section: 'lms' },

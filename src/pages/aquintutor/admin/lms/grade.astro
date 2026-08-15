@@ -1,0 +1,257 @@
+---
+// /aquintutor/admin/lms/grade — THE QUEUE, AND THE ONE SUBMISSION IN FRONT OF YOU.
+//
+// Oldest first. A queue sorted newest-first is a queue whose oldest submission is never reached,
+// and the person at the bottom of it is always the same person.
+//
+// SAVING IS NOT RELEASING. The form has two buttons: save the mark (the learner sees nothing) and
+// save and release (the learner sees it, and is notified). An instructor can mark a whole section
+// over three evenings and release it in one act — and until they do, no learner-side query in this
+// codebase can reach the row.
+//
+// The late penalty shown on this screen is computed from the FROZEN days_late on the submission,
+// not from the clock now, so marking a fortnight later applies exactly what the learner was warned
+// about at submit time.
+import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+import { myTaughtCourses, teachClaim } from '@/lib/lms/access';
+import { gradingQueue, submissionForGrading, saveGrade, rubricCriteria, postAllGrades } from '@/lib/lms/gradebook';
+import { courseAssignments } from '@/lib/lms/assignments';
+import { applyLatePolicy } from '@/lib/lms/policy';
+
+export const prerender = false;
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/aquintutor/login?next=' + encodeURIComponent('/aquintutor/admin/lms/grade'));
+
+const courses = await myTaughtCourses(user);
+const courseId = String(Astro.url.searchParams.get('course') || courses[0]?.id || '');
+const assignmentFilter = String(Astro.url.searchParams.get('assignment') || '');
+const openId = String(Astro.url.searchParams.get('submission') || '');
+const claim = courseId ? await teachClaim(user, courseId) : { canTeach: false, canGrade: false, canAdminister: false, via: 'none' };
+
+// Declared before the POST handler below. const is not hoisted.
+let flash = '';
+let flashOk = false;
+
+if (Astro.request.method === 'POST') {
+  if (!claim.canGrade) {
+    flash = 'You do not have grading access to this course.';
+  } else {
+    try {
+      const form = await Astro.request.formData();
+      const action = String(form.get('action') || '');
+      if (action === 'post_all') {
+        const n = await postAllGrades(String(form.get('assignmentId') || ''));
+        flashOk = true;
+        flash = n === 0 ? 'Nothing was waiting to be released.' : 'Released ' + n + ' grade(s). The learners can see them now.';
+      } else {
+        const scores: Record<string, number> = {};
+        for (const [key, value] of form.entries()) {
+          if (key.startsWith('crit_')) scores[key.slice(5)] = Number(value);
+        }
+        const r = await saveGrade({
+          submissionId: String(form.get('submissionId') || ''),
+          rawPoints: Number(form.get('rawPoints') || 0),
+          rubricScores: scores,
+          feedback: String(form.get('feedback') || ''),
+          excused: String(form.get('excused') || '') === 'on',
+          post: action === 'save_release',
+          returnForRevision: action === 'return',
+        }, user.id);
+        flashOk = r.ok;
+        flash = r.ok
+          ? (action === 'save_release'
+              ? 'Marked ' + r.points + ' and released. The learner has been notified.'
+              : (action === 'return' ? 'Returned for revision.' : 'Marked ' + r.points + '. Not released yet.'))
+          : (r.error || 'Could not save the mark.');
+      }
+    } catch (e: any) {
+      console.error('[admin/lms/grade] POST:', e?.cause?.message || e?.message);
+      flash = 'The mark was not saved: ' + (e?.cause?.message || e?.message || 'unknown error');
+      flashOk = false;
+    }
+  }
+}
+
+const queue = courseId && claim.canGrade
+  ? await gradingQueue([courseId], { assignmentId: assignmentFilter || null, limit: 80 })
+  : [];
+const assignments = courseId ? await courseAssignments(courseId, { includeUnpublished: true }) : [];
+const open = openId ? await submissionForGrading(openId) : (queue[0] ? await submissionForGrading(queue[0].submission_id) : null);
+const criteria = open?.rubric_id ? await rubricCriteria(open.rubric_id) : [];
+const openPenalty = open
+  ? applyLatePolicy(Number(open.points || 0), Number(open.days_late || 0), {
+      allowLate: !!open.allow_late,
+      penaltyPctPerDay: Number(open.late_penalty_pct_per_day || 0),
+      maxLateDays: Number(open.max_late_days || 0),
+    })
+  : null;
+const openLinks: string[] = open && Array.isArray(open.links) ? open.links : [];
+---
+<AquintutorLayout title="Grading queue" description="Everything waiting on you." noindex={true}>
+
+  <div style="border-bottom:1px solid var(--rule); background:var(--sand-100);">
+    <div style="max-width:1400px; margin:0 auto; padding:10px 28px; font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:0.08em; color:var(--ink-500);">
+      <a href="/aquintutor/admin/lms" style="color:var(--ink-500); text-decoration:none;">TEACHING</a>
+      <span style="margin:0 8px;">/</span>
+      <span style="color:var(--rust); font-weight:600;">GRADING &middot; {queue.length} WAITING</span>
+    </div>
+  </div>
+
+  <section style="max-width:1400px; margin:0 auto; padding:26px 28px 60px;">
+
+    {flash && (
+      <div style={'margin-bottom:18px; border:1px solid ' + (flashOk ? '#4a7048' : '#a8472c') + '; background:' + (flashOk ? '#f2f7f1' : '#fdf3f0') + '; border-radius:10px; padding:13px 16px; font-family:"Inter Tight",sans-serif; font-size:14px; color:' + (flashOk ? '#2f4a2d' : '#7a2f1a') + ';'}>{flash}</div>
+    )}
+
+    <form method="GET" style="margin-bottom:22px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <select name="course" style="padding:9px 12px; border:1px solid var(--rule); border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px; min-width:240px;">
+        {courses.map((c: any) => (<option value={c.id} selected={c.id === courseId}>{c.title}</option>))}
+      </select>
+      <select name="assignment" style="padding:9px 12px; border:1px solid var(--rule); border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px; min-width:220px;">
+        <option value="">Every assignment</option>
+        {assignments.map((a: any) => (<option value={a.id} selected={a.id === assignmentFilter}>{a.title} ({a.ungraded_count} waiting)</option>))}
+      </select>
+      <button type="submit" style="padding:9px 16px; border:1px solid var(--rule); background:transparent; border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px; cursor:pointer;">Filter</button>
+    </form>
+
+    {/* A separate form, NOT nested inside the GET filter above — a form inside a form is invalid
+        HTML and the browser drops the inner one, so the button would silently do nothing. */}
+    {assignmentFilter && claim.canGrade && (
+      <form method="POST" style="margin:-12px 0 22px;">
+        <input type="hidden" name="action" value="post_all" />
+        <input type="hidden" name="assignmentId" value={assignmentFilter} />
+        <button type="submit" style="padding:9px 16px; background:var(--rust); color:#fff; border:none; border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px; cursor:pointer;">Release every marked grade on this assignment</button>
+      </form>
+    )}
+
+    {!claim.canGrade && (
+      <div style="border:1px solid #a8472c; background:#fdf3f0; border-radius:10px; padding:14px 16px; font-family:'Inter Tight',sans-serif; font-size:14px; color:#7a2f1a;">
+        You do not have grading access to this course.
+      </div>
+    )}
+
+    {claim.canGrade && (
+      <div style="display:grid; grid-template-columns:minmax(260px,340px) minmax(360px,1fr); gap:22px; align-items:start;">
+
+        <div style="border:1px solid var(--rule); border-radius:12px; background:#fff; overflow:hidden; max-height:78vh; overflow-y:auto;">
+          <div style="padding:13px 16px; border-bottom:1px solid var(--rule); background:var(--sand-50); position:sticky; top:0;">
+            <h2 class="font-display" style="font-size:15px; font-weight:500; margin:0;">Waiting, oldest first</h2>
+          </div>
+          {queue.length === 0 && (
+            <p style="font-family:'Inter Tight',sans-serif; font-size:13.5px; color:var(--ink-500); margin:16px;">Nothing is waiting. Everything submitted on this course has been marked.</p>
+          )}
+          {queue.map((q: any) => (
+            <a href={'/aquintutor/admin/lms/grade?course=' + courseId + (assignmentFilter ? '&assignment=' + assignmentFilter : '') + '&submission=' + q.submission_id}
+               style={'display:block; padding:12px 16px; border-bottom:1px solid var(--rule); text-decoration:none; color:var(--ink); background:' + (open && open.id === q.submission_id ? 'var(--sand-100)' : 'transparent') + ';'}>
+              <div style="font-family:'Inter Tight',sans-serif; font-size:14px; font-weight:600;">{q.student_name || q.student_email || 'A learner'}</div>
+              <div style="font-family:'Inter Tight',sans-serif; font-size:12.5px; color:var(--ink-500); margin-top:2px;">{q.assignment_title}</div>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.05em; color:var(--ink-500); margin-top:4px;">
+                {q.submitted_at ? new Date(q.submitted_at).toISOString().slice(0, 16).replace('T', ' ') : ''}
+                {q.is_late ? ' · ' + q.days_late + 'D LATE' : ''}
+                {q.attempt > 1 ? ' · ATTEMPT ' + q.attempt : ''}
+              </div>
+            </a>
+          ))}
+        </div>
+
+        <div style="border:1px solid var(--rule); border-radius:12px; background:#fff; overflow:hidden;">
+          {!open && (
+            <p style="font-family:'Inter Tight',sans-serif; font-size:14px; color:var(--ink-500); margin:24px;">Choose a submission on the left.</p>
+          )}
+          {open && (
+            <div>
+              <div style="padding:16px 20px; border-bottom:1px solid var(--rule); background:var(--sand-50);">
+                <h2 class="font-display" style="font-size:18px; font-weight:500; margin:0 0 4px;">{open.assignment_title}</h2>
+                <div style="font-family:'Inter Tight',sans-serif; font-size:13.5px; color:var(--ink-500);">
+                  {open.student_name || open.student_email} &middot; attempt {open.attempt} &middot; worth {Number(open.points)} points
+                  {open.is_late ? ' · submitted ' + open.days_late + ' day(s) late' : ''}
+                </div>
+              </div>
+
+              <div style="padding:18px 20px; border-bottom:1px solid var(--rule);">
+                <h3 style="font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.08em; color:var(--ink-500); margin:0 0 10px;">WHAT THEY SUBMITTED</h3>
+                {openLinks.length > 0 && (
+                  <ul style="margin:0 0 12px; padding-left:18px; font-family:'JetBrains Mono',monospace; font-size:12.5px;">
+                    {openLinks.map((l: string) => (
+                      <li style="margin-bottom:4px;"><a href={l} target="_blank" rel="noopener noreferrer nofollow" style="color:var(--rust);">{l}</a></li>
+                    ))}
+                  </ul>
+                )}
+                {open.body && (
+                  <div style="font-family:'Inter Tight',sans-serif; font-size:14.5px; line-height:1.7; white-space:pre-wrap; max-height:420px; overflow-y:auto; border:1px solid var(--rule); border-radius:8px; padding:14px 16px; background:var(--sand-50);">{open.body}</div>
+                )}
+                {!open.body && openLinks.length === 0 && (
+                  <p style="font-family:'Inter Tight',sans-serif; font-size:13.5px; color:#7a2f1a; margin:0;">This submission is empty.</p>
+                )}
+                {open.word_count > 0 && (
+                  <div style="font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--ink-500); margin-top:8px;">{open.word_count} words</div>
+                )}
+              </div>
+
+              <form method="POST" style="padding:18px 20px;">
+                <input type="hidden" name="submissionId" value={open.id} />
+
+                {criteria.length > 0 && (
+                  <div style="margin-bottom:16px;">
+                    <h3 style="font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.08em; color:var(--ink-500); margin:0 0 10px;">RUBRIC</h3>
+                    {criteria.map((c: any) => (
+                      <div style="display:flex; align-items:center; justify-content:space-between; gap:14px; border-bottom:1px solid var(--rule); padding:9px 0;">
+                        <div>
+                          <div style="font-family:'Inter Tight',sans-serif; font-size:13.5px; font-weight:600;">{c.label}</div>
+                          {c.description && <div style="font-family:'Inter Tight',sans-serif; font-size:12.5px; color:var(--ink-500);">{c.description}</div>}
+                        </div>
+                        <div style="display:flex; align-items:center; gap:6px; white-space:nowrap;">
+                          <input name={'crit_' + c.id} type="number" min="0" max={Number(c.points)} step="0.5"
+                                 value={open.rubric_scores && open.rubric_scores[c.id] != null ? open.rubric_scores[c.id] : ''}
+                                 style="width:74px; padding:7px 9px; border:1px solid var(--rule); border-radius:6px; font-family:'JetBrains Mono',monospace; font-size:13px;" />
+                          <span style="font-family:'JetBrains Mono',monospace; font-size:12.5px; color:var(--ink-500);">/ {Number(c.points)}</span>
+                        </div>
+                      </div>
+                    ))}
+                    <p style="font-family:'Inter Tight',sans-serif; font-size:12px; color:var(--ink-500); margin:8px 0 0;">
+                      The rubric total is the score. Each criterion is clamped to its own maximum, and the total is scaled to the
+                      assignment points if the rubric does not add to the same number.
+                    </p>
+                  </div>
+                )}
+
+                {criteria.length === 0 && (
+                  <div style="margin-bottom:14px;">
+                    <label style="display:block; font-family:'Inter Tight',sans-serif; font-size:13px; font-weight:600; margin-bottom:5px;">Score out of {Number(open.points)}</label>
+                    <input name="rawPoints" type="number" min="0" max={Number(open.points)} step="0.5" value={open.raw_points != null ? Number(open.raw_points) : ''}
+                           style="width:140px; padding:9px 11px; border:1px solid var(--rule); border-radius:7px; font-family:'JetBrains Mono',monospace; font-size:14px;" />
+                  </div>
+                )}
+
+                {openPenalty && openPenalty.penaltyPoints > 0 && (
+                  <p style="font-family:'Inter Tight',sans-serif; font-size:13px; color:#7a2f1a; border-left:3px solid #a8472c; padding-left:10px; margin:0 0 14px;">
+                    The late policy will take {openPenalty.penaltyPoints} points ({openPenalty.penaltyPct}%) off this score
+                    automatically &mdash; {open.days_late} day(s) late. Tick excused below to waive it.
+                  </p>
+                )}
+
+                <label style="display:block; font-family:'Inter Tight',sans-serif; font-size:13px; font-weight:600; margin-bottom:5px;">Feedback to the learner</label>
+                <textarea name="feedback" rows="5" style="width:100%; padding:10px 12px; border:1px solid var(--rule); border-radius:7px; font-family:'Inter Tight',sans-serif; font-size:14px; resize:vertical; margin-bottom:12px;">{open.feedback || ''}</textarea>
+
+                <label style="display:flex; align-items:center; gap:8px; font-family:'Inter Tight',sans-serif; font-size:13px; margin-bottom:14px;">
+                  <input type="checkbox" name="excused" checked={!!open.excused} /> Excused &mdash; waive the late penalty and leave this out of the course average
+                </label>
+
+                <div style="display:flex; gap:9px; flex-wrap:wrap; align-items:center;">
+                  <button type="submit" name="action" value="save" style="padding:10px 18px; background:transparent; border:1px solid var(--rule); border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px; cursor:pointer;">Save the mark</button>
+                  <button type="submit" name="action" value="save_release" style="padding:10px 20px; background:var(--ink); color:var(--sand-50); border:none; border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px; font-weight:600; cursor:pointer;">Save and release</button>
+                  <button type="submit" name="action" value="return" style="padding:10px 16px; background:transparent; border:1px solid #a8472c; color:#a8472c; border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px; cursor:pointer;">Return for revision</button>
+                </div>
+                <p style="font-family:'Inter Tight',sans-serif; font-size:12px; color:var(--ink-500); margin:10px 0 0;">
+                  Saved is private to you. Released is what the learner sees, and sends them a notification.
+                  {open.posted ? ' This grade is currently released.' : ' This grade is not released.'}
+                </p>
+              </form>
+            </div>
+          )}
+        </div>
+      </div>
+    )}
+  </section>
+</AquintutorLayout>

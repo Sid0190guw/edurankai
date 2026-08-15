@@ -1,0 +1,313 @@
+---
+// /aquintutor/admin/lms/course-home — ANNOUNCEMENTS, SYLLABUS, RELEASE, MODERATION.
+//
+// The instructor side of L4. Four jobs on one screen because they are the four things you do to a
+// course between classes, and splitting them into four routes would mean repeating the same
+// teaching gate four times.
+//
+// MODERATION HIDES, IT DOES NOT DELETE, and the person doing it types a reason. This platform's
+// standing rule is that automated detection is advisory and a human decides; the same principle
+// applies to a human decision — it has to be reviewable afterwards, which means the post survives.
+import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+import { myTaughtCourses, teachClaim } from '@/lib/lms/access';
+import { courseAnnouncements, postAnnouncement, deleteAnnouncement, getSyllabus, saveSyllabus, courseTopics, courseReleaseRules, saveReleaseRule, deleteReleaseRule, hidePost, setTopicFlags, getTopic } from '@/lib/lms/course-home';
+import { courseAssignments } from '@/lib/lms/assignments';
+import { courseSections } from '@/lib/lms/sections';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+export const prerender = false;
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/aquintutor/login?next=' + encodeURIComponent('/aquintutor/admin/lms/course-home'));
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const courses = await myTaughtCourses(user);
+const courseId = String(Astro.url.searchParams.get('course') || courses[0]?.id || '');
+const openTopicId = String(Astro.url.searchParams.get('topic') || '');
+const claim = courseId ? await teachClaim(user, courseId) : { canTeach: false, canGrade: false, canAdminister: false, via: 'none' };
+
+// Declared before the POST handler. const is not hoisted.
+let flash = '';
+let flashOk = false;
+
+if (Astro.request.method === 'POST') {
+  if (!claim.canTeach) {
+    flash = 'You do not have teaching access to this course.';
+  } else {
+    try {
+      const form = await Astro.request.formData();
+      const action = String(form.get('action') || '');
+
+      if (action === 'announce') {
+        const r = await postAnnouncement({
+          courseId,
+          sectionId: String(form.get('sectionId') || '') || null,
+          title: String(form.get('title') || ''),
+          body: String(form.get('body') || ''),
+          pinned: String(form.get('pinned') || '') === 'on',
+          notify: String(form.get('notify') || '') === 'on',
+        }, user.id);
+        flashOk = r.ok;
+        flash = r.ok
+          ? 'Posted' + (r.notified ? ' and ' + r.notified + ' learner(s) notified.' : '. Nobody was notified — you left that unticked.')
+          : (r.error || 'Could not post it.');
+      } else if (action === 'delete_announce') {
+        await deleteAnnouncement(String(form.get('id') || ''), courseId);
+        flashOk = true;
+        flash = 'Announcement removed.';
+      } else if (action === 'syllabus') {
+        const r = await saveSyllabus(courseId, String(form.get('sectionId') || '') || null, String(form.get('body') || ''), user.id);
+        flashOk = r.ok;
+        flash = r.ok ? 'Syllabus saved.' : (r.error || 'Could not save the syllabus.');
+      } else if (action === 'release') {
+        const target = String(form.get('target') || '');
+        const [targetKind, targetId] = target.split(':');
+        const r = await saveReleaseRule({
+          courseId,
+          sectionId: String(form.get('sectionId') || '') || null,
+          targetKind: targetKind || '',
+          targetId: targetId || '',
+          releaseAt: String(form.get('releaseAt') || '') || null,
+          releaseAfterDays: form.get('afterDays') ? Number(form.get('afterDays')) : null,
+          requiresLessonId: String(form.get('requiresLessonId') || '') || null,
+          requiresAssignmentId: String(form.get('requiresAssignmentId') || '') || null,
+          minPct: form.get('minPct') ? Number(form.get('minPct')) : null,
+        }, user.id);
+        flashOk = r.ok;
+        flash = r.ok ? 'Release rule saved.' : (r.error || 'Could not save the rule.');
+      } else if (action === 'delete_release') {
+        await deleteReleaseRule(String(form.get('id') || ''), courseId);
+        flashOk = true;
+        flash = 'Rule removed. The item is open to everybody again.';
+      } else if (action === 'hide') {
+        await hidePost(String(form.get('postId') || ''), String(form.get('reason') || 'hidden by a moderator'));
+        flashOk = true;
+        flash = 'Reply hidden. The row is kept with your reason so the decision can be reviewed.';
+      } else if (action === 'topic_flags') {
+        await setTopicFlags(String(form.get('topicId') || ''), {
+          locked: String(form.get('locked') || '') === 'on',
+          pinned: String(form.get('pinned') || '') === 'on',
+        });
+        flashOk = true;
+        flash = 'Topic updated.';
+      }
+    } catch (e: any) {
+      console.error('[admin/lms/course-home] POST:', e?.cause?.message || e?.message);
+      flash = 'That did not save: ' + (e?.cause?.message || e?.message || 'unknown error');
+      flashOk = false;
+    }
+  }
+}
+
+const sections = courseId ? await courseSections(courseId) : [];
+const announcements = courseId ? await courseAnnouncements(courseId, null, 12) : [];
+const syllabus = courseId ? await getSyllabus(courseId, null) : '';
+const topics = courseId ? await courseTopics(courseId, null, 25) : [];
+const rules = courseId ? await courseReleaseRules(courseId) : [];
+const assignments = courseId ? await courseAssignments(courseId, { includeUnpublished: true }) : [];
+const thread = openTopicId ? await getTopic(openTopicId) : { topic: null, posts: [] };
+
+let modules: any[] = [];
+let lessons: any[] = [];
+if (courseId) {
+  try {
+    modules = rows(await db.execute(sql`SELECT id, title FROM training_modules WHERE course_id = ${courseId} ORDER BY order_in_course LIMIT 200`));
+  } catch (e: any) { console.error('[admin/lms/course-home] modules:', e?.cause?.message || e?.message); }
+  try {
+    lessons = rows(await db.execute(sql`SELECT id, title FROM training_lessons WHERE course_id = ${courseId} ORDER BY sort_order LIMIT 400`));
+  } catch (e: any) { console.error('[admin/lms/course-home] lessons:', e?.cause?.message || e?.message); }
+}
+
+function targetName(kind: string, id: string): string {
+  const list = kind === 'module' ? modules : (kind === 'lesson' ? lessons : assignments);
+  const hit = list.find((x: any) => x.id === id);
+  return hit ? hit.title : '(removed)';
+}
+---
+<AquintutorLayout title="Course home" description="Announcements, syllabus, release and moderation." noindex={true}>
+
+  <div style="border-bottom:1px solid var(--rule); background:var(--sand-100);">
+    <div style="max-width:1400px; margin:0 auto; padding:10px 28px; font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:0.08em; color:var(--ink-500);">
+      <a href="/aquintutor/admin/lms" style="color:var(--ink-500); text-decoration:none;">TEACHING</a>
+      <span style="margin:0 8px;">/</span>
+      <span style="color:var(--rust); font-weight:600;">COURSE HOME</span>
+    </div>
+  </div>
+
+  <section style="max-width:1400px; margin:0 auto; padding:26px 28px 60px;">
+
+    {flash && (
+      <div style={'margin-bottom:18px; border:1px solid ' + (flashOk ? '#4a7048' : '#a8472c') + '; background:' + (flashOk ? '#f2f7f1' : '#fdf3f0') + '; border-radius:10px; padding:13px 16px; font-family:"Inter Tight",sans-serif; font-size:14px; color:' + (flashOk ? '#2f4a2d' : '#7a2f1a') + ';'}>{flash}</div>
+    )}
+
+    <form method="GET" style="margin-bottom:22px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <select name="course" style="padding:9px 12px; border:1px solid var(--rule); border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px; min-width:250px;">
+        {courses.map((c: any) => (<option value={c.id} selected={c.id === courseId}>{c.title}</option>))}
+      </select>
+      <button type="submit" style="padding:9px 16px; border:1px solid var(--rule); background:transparent; border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px; cursor:pointer;">Switch course</button>
+      {courseId && <a href={'/aquintutor/course/' + courseId} style="padding:9px 16px; border:1px solid var(--rule); border-radius:8px; font-family:'Inter Tight',sans-serif; font-size:14px; text-decoration:none; color:var(--ink);">See it as a learner does</a>}
+    </form>
+
+    <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:20px; align-items:start;">
+
+      <div style="border:1px solid var(--rule); border-radius:12px; background:#fff; overflow:hidden;">
+        <div style="padding:13px 17px; border-bottom:1px solid var(--rule); background:var(--sand-50);">
+          <h2 class="font-display" style="font-size:15px; font-weight:500; margin:0;">Announcements</h2>
+        </div>
+        <form method="POST" style="padding:15px 17px; border-bottom:1px solid var(--rule);">
+          <input type="hidden" name="action" value="announce" />
+          <input name="title" placeholder="Title" required style="width:100%; padding:8px 10px; border:1px solid var(--rule); border-radius:7px; font-size:13.5px; margin-bottom:7px;" />
+          <textarea name="body" rows="4" placeholder="What do they need to know?" required style="width:100%; padding:9px 11px; border:1px solid var(--rule); border-radius:7px; font-size:13.5px; resize:vertical; margin-bottom:8px;"></textarea>
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:9px;">
+            <select name="sectionId" style="flex:1 1 140px; padding:7px 9px; border:1px solid var(--rule); border-radius:6px; font-size:12.5px;">
+              <option value="">Everybody on the course</option>
+              {sections.map((s: any) => (<option value={s.id}>Only section {s.code}</option>))}
+            </select>
+            <label style="display:inline-flex; align-items:center; gap:5px; font-family:'Inter Tight',sans-serif; font-size:12.5px;"><input type="checkbox" name="pinned" /> Pin</label>
+            <label style="display:inline-flex; align-items:center; gap:5px; font-family:'Inter Tight',sans-serif; font-size:12.5px;"><input type="checkbox" name="notify" checked /> Notify</label>
+          </div>
+          <button type="submit" style="padding:8px 16px; background:var(--ink); color:var(--sand-50); border:none; border-radius:7px; font-size:13.5px; cursor:pointer;">Post</button>
+        </form>
+        <div style="padding:12px 17px; max-height:340px; overflow-y:auto;">
+          {announcements.length === 0 && <p style="font-family:'Inter Tight',sans-serif; font-size:13px; color:var(--ink-500); margin:4px 0;">Nothing posted yet.</p>}
+          {announcements.map((a: any) => (
+            <div style="border-bottom:1px solid var(--rule); padding:9px 0;">
+              <div style="display:flex; justify-content:space-between; gap:10px; align-items:start;">
+                <div style="font-family:'Inter Tight',sans-serif; font-size:13.5px; font-weight:600;">{a.pinned ? 'Pinned: ' : ''}{a.title}</div>
+                <form method="POST">
+                  <input type="hidden" name="action" value="delete_announce" />
+                  <input type="hidden" name="id" value={a.id} />
+                  <button type="submit" style="padding:3px 8px; border:1px solid var(--rule); background:transparent; border-radius:5px; font-size:11px; cursor:pointer; color:#a8472c;">Remove</button>
+                </form>
+              </div>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--ink-500); margin-top:4px;">{new Date(a.published_at).toISOString().slice(0, 10)}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style="border:1px solid var(--rule); border-radius:12px; background:#fff; overflow:hidden;">
+        <div style="padding:13px 17px; border-bottom:1px solid var(--rule); background:var(--sand-50);">
+          <h2 class="font-display" style="font-size:15px; font-weight:500; margin:0;">Syllabus</h2>
+        </div>
+        <form method="POST" style="padding:15px 17px;">
+          <input type="hidden" name="action" value="syllabus" />
+          <p style="font-family:'Inter Tight',sans-serif; font-size:12.5px; color:var(--ink-500); margin:0 0 8px;">
+            Plain text, shown on the learner course home. A section with no syllabus of its own inherits this one.
+          </p>
+          <textarea name="body" rows="12" style="width:100%; padding:11px 13px; border:1px solid var(--rule); border-radius:7px; font-family:'Inter Tight',sans-serif; font-size:13.5px; line-height:1.6; resize:vertical;">{syllabus}</textarea>
+          <button type="submit" style="margin-top:9px; padding:8px 16px; background:var(--ink); color:var(--sand-50); border:none; border-radius:7px; font-size:13.5px; cursor:pointer;">Save the syllabus</button>
+        </form>
+      </div>
+
+      <div style="border:1px solid var(--rule); border-radius:12px; background:#fff; overflow:hidden;">
+        <div style="padding:13px 17px; border-bottom:1px solid var(--rule); background:var(--sand-50);">
+          <h2 class="font-display" style="font-size:15px; font-weight:500; margin:0;">Scheduled release</h2>
+        </div>
+        <div style="padding:15px 17px;">
+          <p style="font-family:'Inter Tight',sans-serif; font-size:12.5px; color:var(--ink-500); margin:0 0 12px;">
+            Hold an item until a date, until a number of days after the learner enrolled, or until they have finished something
+            else. Every condition set must pass. An item with no rule is open.
+          </p>
+          {rules.map((r: any) => (
+            <div style="display:flex; justify-content:space-between; gap:10px; align-items:center; border-bottom:1px solid var(--rule); padding:8px 0; font-family:'Inter Tight',sans-serif; font-size:13px;">
+              <div>
+                <strong>{targetName(r.target_kind, r.target_id)}</strong>
+                <div style="font-size:12px; color:var(--ink-500);">
+                  {r.release_at ? 'from ' + new Date(r.release_at).toISOString().slice(0, 10) : ''}
+                  {r.release_after_days ? ' · ' + r.release_after_days + ' days after enrolling' : ''}
+                  {r.requires_lesson_id ? ' · needs a lesson finished' : ''}
+                  {r.requires_assignment_id ? ' · needs the previous assignment' + (r.min_pct ? ' at ' + Number(r.min_pct) + '%' : '') : ''}
+                </div>
+              </div>
+              <form method="POST">
+                <input type="hidden" name="action" value="delete_release" />
+                <input type="hidden" name="id" value={r.id} />
+                <button type="submit" style="padding:4px 9px; border:1px solid var(--rule); background:transparent; border-radius:5px; font-size:11.5px; cursor:pointer; color:#a8472c;">Remove</button>
+              </form>
+            </div>
+          ))}
+
+          <form method="POST" style="margin-top:14px; border-top:1px solid var(--rule); padding-top:14px;">
+            <input type="hidden" name="action" value="release" />
+            <select name="target" required style="width:100%; padding:8px 10px; border:1px solid var(--rule); border-radius:7px; font-size:13px; margin-bottom:7px;">
+              <option value="">What is being held back</option>
+              {modules.map((m: any) => (<option value={'module:' + m.id}>Module: {m.title}</option>))}
+              {lessons.map((l: any) => (<option value={'lesson:' + l.id}>Lesson: {l.title}</option>))}
+              {assignments.map((a: any) => (<option value={'assignment:' + a.id}>Assignment: {a.title}</option>))}
+            </select>
+            <div style="display:flex; gap:6px; margin-bottom:7px;">
+              <input name="releaseAt" type="datetime-local" style="flex:1; padding:7px 9px; border:1px solid var(--rule); border-radius:6px; font-size:12.5px;" />
+              <input name="afterDays" type="number" min="0" placeholder="days after enrolling" style="flex:1; padding:7px 9px; border:1px solid var(--rule); border-radius:6px; font-size:12.5px;" />
+            </div>
+            <select name="requiresLessonId" style="width:100%; padding:7px 9px; border:1px solid var(--rule); border-radius:6px; font-size:12.5px; margin-bottom:7px;">
+              <option value="">No lesson prerequisite</option>
+              {lessons.map((l: any) => (<option value={l.id}>After finishing: {l.title}</option>))}
+            </select>
+            <div style="display:flex; gap:6px; margin-bottom:9px;">
+              <select name="requiresAssignmentId" style="flex:1; padding:7px 9px; border:1px solid var(--rule); border-radius:6px; font-size:12.5px;">
+                <option value="">No assignment prerequisite</option>
+                {assignments.map((a: any) => (<option value={a.id}>After: {a.title}</option>))}
+              </select>
+              <input name="minPct" type="number" min="0" max="100" placeholder="min %" style="width:88px; padding:7px 9px; border:1px solid var(--rule); border-radius:6px; font-size:12.5px;" />
+            </div>
+            <button type="submit" style="padding:8px 16px; background:var(--ink); color:var(--sand-50); border:none; border-radius:7px; font-size:13.5px; cursor:pointer;">Save rule</button>
+          </form>
+        </div>
+      </div>
+
+      <div style="border:1px solid var(--rule); border-radius:12px; background:#fff; overflow:hidden;">
+        <div style="padding:13px 17px; border-bottom:1px solid var(--rule); background:var(--sand-50); display:flex; justify-content:space-between; align-items:center; gap:10px;">
+          <h2 class="font-display" style="font-size:15px; font-weight:500; margin:0;">Discussion</h2>
+          {thread.topic && <a href={'/aquintutor/admin/lms/course-home?course=' + courseId} style="font-family:'Inter Tight',sans-serif; font-size:12.5px; color:var(--rust); text-decoration:none;">All topics</a>}
+        </div>
+        <div style="padding:14px 17px; max-height:520px; overflow-y:auto;">
+          {!thread.topic && topics.length === 0 && <p style="font-family:'Inter Tight',sans-serif; font-size:13px; color:var(--ink-500); margin:0;">No topics on this course yet.</p>}
+          {!thread.topic && topics.map((t: any) => (
+            <div style="border-bottom:1px solid var(--rule); padding:9px 0;">
+              <a href={'/aquintutor/admin/lms/course-home?course=' + courseId + '&topic=' + t.id} style="font-family:'Inter Tight',sans-serif; font-size:13.5px; font-weight:600; color:var(--ink); text-decoration:none;">
+                {t.pinned ? 'Pinned: ' : ''}{t.locked ? 'Locked: ' : ''}{t.title}
+              </a>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--ink-500); margin-top:3px;">
+                {t.reply_count} REPLIES &middot; {t.author_name || 'A learner'}
+              </div>
+            </div>
+          ))}
+
+          {thread.topic && (
+            <div>
+              <h3 class="font-display" style="font-size:16px; font-weight:500; margin:0 0 8px;">{thread.topic.title}</h3>
+              <form method="POST" style="display:flex; gap:12px; align-items:center; margin-bottom:14px; flex-wrap:wrap;">
+                <input type="hidden" name="action" value="topic_flags" />
+                <input type="hidden" name="topicId" value={thread.topic.id} />
+                <label style="display:inline-flex; align-items:center; gap:5px; font-family:'Inter Tight',sans-serif; font-size:12.5px;"><input type="checkbox" name="pinned" checked={!!thread.topic.pinned} /> Pinned</label>
+                <label style="display:inline-flex; align-items:center; gap:5px; font-family:'Inter Tight',sans-serif; font-size:12.5px;"><input type="checkbox" name="locked" checked={!!thread.topic.locked} /> Locked</label>
+                <button type="submit" style="padding:5px 12px; border:1px solid var(--rule); background:transparent; border-radius:6px; font-size:12px; cursor:pointer;">Apply</button>
+              </form>
+
+              {thread.posts.map((p: any) => (
+                <div style={'border-left:3px solid ' + (p.hidden ? '#a8472c' : 'var(--rule)') + '; padding:7px 0 7px 11px; margin-bottom:11px;'}>
+                  <div style="font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--ink-500); margin-bottom:3px;">
+                    {p.author_name || 'A learner'} &middot; {new Date(p.created_at).toISOString().slice(0, 10)}
+                    {p.hidden ? ' · HIDDEN: ' + (p.hidden_reason || '') : ''}
+                  </div>
+                  <div style="font-family:'Inter Tight',sans-serif; font-size:13.5px; line-height:1.55; white-space:pre-wrap;">{p.body}</div>
+                  {!p.hidden && (
+                    <form method="POST" style="margin-top:6px; display:flex; gap:6px;">
+                      <input type="hidden" name="action" value="hide" />
+                      <input type="hidden" name="postId" value={p.id} />
+                      <input name="reason" placeholder="Why you are hiding it" required style="flex:1; padding:5px 8px; border:1px solid var(--rule); border-radius:5px; font-size:12px;" />
+                      <button type="submit" style="padding:5px 10px; border:1px solid var(--rule); background:transparent; border-radius:5px; font-size:11.5px; cursor:pointer; color:#a8472c;">Hide</button>
+                    </form>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  </section>
+</AquintutorLayout>

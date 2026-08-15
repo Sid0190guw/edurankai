@@ -224,6 +224,9 @@ export const CONFIGURED_CRONS: { path: string; schedule: string }[] = [
   // Deletes facial data whose purpose has ended. The test that pairs this list against
   // vercel.json caught its absence immediately — which is the point of keeping both.
   { path: '/api/cron/face-retention', schedule: '40 2 * * *' },
+  // Deadline reminders for unsubmitted coursework. Idempotent by marker row, so a retry costs
+  // nothing; see src/lib/lms/notify.ts sendDueReminders().
+  { path: '/api/cron/lms-reminders', schedule: '0 6 * * *' },
 ];
 
 /**
@@ -243,6 +246,9 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   { module: 'Audit log', table: 'audit_log', owner: 'src/lib/db/schema.ts' },
   { module: 'Knowledge sync queue', table: 'edu_sync_queue', owner: 'src/lib/knowledge-sync.ts' },
   { module: 'Mail config', table: 'mail_config', owner: 'src/lib/mail.ts' },
+  // The LMS spine — assignments, submissions, grades, sections, discussion, statement store. One
+  // module owns every CREATE TABLE for it, so one table answers "has it bootstrapped in production".
+  { module: 'LMS coursework', table: 'lms_assignments', owner: 'src/lib/lms/schema.ts' },
 ];
 
 // ============================================================================================
