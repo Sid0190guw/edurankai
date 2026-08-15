@@ -510,9 +510,14 @@ export const ACCEPTED_VIDEO_TYPES = ['video/mp4', 'video/webm', 'video/ogg', 'vi
 
 /**
  * The ceiling on a file that arrives through a request body. It is small because a serverless
- * request body is small — this is not a guess about what a lecture weighs. Anything larger needs a
- * direct-to-storage upload, which needs presigned URLs, which src/lib/storage.ts does not expose;
- * that gap is declared as `resumable_upload` rather than discovered by an author at 90 percent.
+ * request body is small — this is not a guess about what a lecture weighs.
+ *
+ * THE GAP THIS COMMENT USED TO DESCRIBE IS CLOSED, AND THIS FILE IS NOT THE THING THAT CLOSED IT.
+ * src/lib/storage.ts now exposes presignedUpload(), and POST /api/aquintutor/lms/upload-url mints
+ * one so the browser uploads straight to storage — the 4 MB below does not apply on that path and
+ * the working limit there is 5 GB. Nothing imports this module (a repo-wide search for
+ * 'providers/video' finds only this file), so the number is inert; it is left with this note rather
+ * than quietly raised, because two upload contracts in one tree is how the wrong one gets used.
  */
 export const MAX_INLINE_UPLOAD_BYTES = 4 * 1024 * 1024;
 

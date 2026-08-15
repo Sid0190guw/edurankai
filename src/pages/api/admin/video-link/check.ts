@@ -50,5 +50,14 @@ export const POST: APIRoute = async ({ request, locals }) => {
     // Returned so the form can show a real preview of what a learner will get. It is a URL this
     // module built itself, never the caller's string.
     embedUrl: r.embedUrl,
+    // Which element the learner will actually get — a picture, or sound only, or an adaptive stream
+    // that some browsers cannot play unaided. A form that says "recognised" without saying WHICH of
+    // those it is has told the author almost nothing.
+    mediaKind: r.mediaKind || null,
+    needsStreamPlayer: !!r.needsStreamPlayer,
+    // A precondition we cannot check from here — nearly always a sharing setting. Printed verbatim.
+    // This is the difference between a lesson that works for the author and one that works for the
+    // cohort, and it is invisible until somebody complains, so it is said at the point of entry.
+    warning: r.warning || null,
   });
 };
