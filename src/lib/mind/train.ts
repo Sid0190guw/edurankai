@@ -29,8 +29,9 @@ import { kmeans, chooseK, OnlineKMeans } from './cluster';
 import { pseudoLabelBinary, propagateLabels, type PropEdge } from './semisup';
 import { evaluateBinary, isHoldout, shouldPromote, type Metrics } from './evaluate';
 import {
-  loadEvents, saveCheckpoint, getChampion, recordRun, type MindTask, type MindEventRow,
+  loadEvents, saveCheckpoint, getChampion, recordRun, resolveEncoder, type MindTask, type MindEventRow,
 } from './store';
+import { HashingEncoder, type TextEncoder } from './encoder';
 
 export interface CycleOptions {
   task?: MindTask;
@@ -64,6 +65,9 @@ export interface CycleResult {
   version: number | null;
   ms: number;
   note: string;
+  /** Which encoder read the text this cycle — 'hash-v1' or 'embed:<model>@32/s<seed>'. */
+  encoderId: string;
+  encoderNote: string;
 }
 
 const STOP = new Set(['the', 'a', 'an', 'of', 'is', 'are', 'to', 'in', 'and', 'for', 'on', 'at', 'by', 'with', 'what', 'which', 'this', 'that', 'it', 'as', 'be', 'from', 'if', 'was', 'were', 'how', 'why', 'when']);
@@ -119,9 +123,14 @@ export async function runCycle(opts: CycleOptions = {}): Promise<CycleResult> {
   const base: CycleResult = {
     ok: false, task, examples: 0, trainN: 0, holdoutN: 0, pseudo: 0, clusters: [], conceptPriors: {},
     candidate: empty, champion: null, baseline: empty, promoted: false, decision: '', version: null, ms: 0, note: '',
+    encoderId: 'hash-v1', encoderNote: '',
   };
 
   const labelled = await loadEvents({ task, limit: maxExamples, labelled: true });
+  // Loaded up front, not later, because every piece of text in this cycle must go through ONE
+  // encoder. Encoding half a cycle with a pretrained model and half with the hashing fallback would
+  // produce a training set whose text dimensions mean two different things.
+  const unlabelledAll = semi ? await loadEvents({ task, limit: Math.min(4000, maxExamples), labelled: false }).catch(() => [] as MindEventRow[]) : [];
   if (labelled.length < 40) {
     const note = 'Only ' + labelled.length + ' graded moments recorded. The cycle needs at least 40 before training is meaningful; the platform keeps answering with its existing estimator until then.';
     await recordRun({ task, modes: [], examples: labelled.length, pseudo: 0, clusters: 0, metrics: {}, promoted: false, decision: note, version: null, ms: Date.now() - t0 });
@@ -144,11 +153,36 @@ export async function runCycle(opts: CycleOptions = {}): Promise<CycleResult> {
     conceptStats.set(ck, cs);
   }
 
+  // ---- the encoder: this is where a pretrained model enters the loop ------------------------------
+  // One encode pass over every distinct string in the cycle. If the pretrained endpoint fails, the
+  // WHOLE cycle drops back to hashing and says so, rather than mixing two vocabularies.
+  const textOf = (e: MindEventRow) => (e.signals?.text || e.signals?.conceptKey || '');
+  const distinct = [...new Set([...itemText.values(), ...labelled.map(textOf), ...unlabelledAll.map(textOf)].filter((t) => t !== undefined))];
+  let encoder: TextEncoder = new HashingEncoder();
+  let encoderNote = '';
+  try {
+    const resolved = await resolveEncoder();
+    encoder = resolved.encoder;
+    encoderNote = resolved.note;
+  } catch (e: any) { console.error('[mind/train] encoder resolve failed:', e?.cause?.message || e?.message); }
+  let vecMap = new Map<string, number[]>();
+  try {
+    const vs = await encoder.encode(distinct);
+    distinct.forEach((t, i) => vecMap.set(t, vs[i]));
+  } catch (e: any) {
+    console.error('[mind/train] encoding failed, falling back to hashing for this cycle:', e?.message);
+    encoder = new HashingEncoder();
+    encoderNote = 'The pretrained encoder could not be reached, so this cycle learned through the hashing encoder. Its checkpoint is marked accordingly and will not be served to a model trained the other way.';
+    const vs = await encoder.encode(distinct);
+    distinct.forEach((t, i) => vecMap.set(t, vs[i]));
+  }
+  const vecFor = (t: string) => vecMap.get(t || '') || null;
+
   let clusters: OnlineKMeans | null = null;
   let summaries: ClusterSummary[] = [];
   if (unsup && itemText.size >= 8) {
     const keys = [...itemText.keys()];
-    const vectors = keys.map((k) => hashVector(itemText.get(k) || k));
+    const vectors = keys.map((k) => vecFor(itemText.get(k) || k) || hashVector(itemText.get(k) || k));
     const k = Math.min(CLUSTER_SLOTS, chooseK(vectors, CLUSTER_SLOTS, seed));
     const km = kmeans(vectors, k, { seed });
     clusters = new OnlineKMeans(km.centroids, km.sizes);
@@ -184,8 +218,9 @@ export async function runCycle(opts: CycleOptions = {}): Promise<CycleResult> {
     }
     let st = states.get(e.userKey);
     if (!st) { st = newSequenceState(); states.set(e.userKey, st); }
-    const one = clusters ? clusters.oneHot(hashVector(s.text || s.conceptKey || ''), CLUSTER_SLOTS) : null;
-    rowsOut.push({ id: e.id, x: featurize(s, st, one), y: (e.label ?? 0) >= 0.5 ? 1 : 0, base: baselinePredict(s, st) });
+    const tv = vecFor(s.text || s.conceptKey || '');
+    const one = clusters && tv ? clusters.oneHot(tv, CLUSTER_SLOTS) : null;
+    rowsOut.push({ id: e.id, x: featurize(s, st, one, tv), y: (e.label ?? 0) >= 0.5 ? 1 : 0, base: baselinePredict(s, st) });
     advanceSequence(st, s, (e.label ?? 0) >= 0.5, s.atMs);
   }
 
@@ -202,7 +237,10 @@ export async function runCycle(opts: CycleOptions = {}): Promise<CycleResult> {
   const arch = { sizes: [FEATURE_DIM, 24, 12, 1], output: 'sigmoid' as const, l2: 1e-4, seed };
   let net: MLP;
   let warmStarted = false;
-  if (warm && champion && champion.featureVersion === FEATURE_VERSION && champion.weights?.sizes?.[0] === FEATURE_DIM) {
+  // Warm starting across a change of encoder would continue training a model on inputs that no
+  // longer mean what they meant — so an encoder change starts a fresh line of checkpoints.
+  const sameEncoder = (champion?.arch?.encoderId || 'hash-v1') === encoder.id;
+  if (warm && sameEncoder && champion && champion.featureVersion === FEATURE_VERSION && champion.weights?.sizes?.[0] === FEATURE_DIM) {
     try { net = MLP.fromJSON(champion.weights); warmStarted = true; } catch { net = new MLP(arch); }
   } else net = new MLP(arch);
 
@@ -212,7 +250,7 @@ export async function runCycle(opts: CycleOptions = {}): Promise<CycleResult> {
   // ---- 5. semi-supervised -----------------------------------------------------------------------
   let pseudoCount = 0;
   if (semi) {
-    const unlabelled = await loadEvents({ task, limit: Math.min(4000, maxExamples), labelled: false }).catch(() => []);
+    const unlabelled = unlabelledAll;
     if (unlabelled.length) {
       // Replay these through each learner's state as well, so an abandoned question is featurised in
       // the same situation it was abandoned in.
@@ -220,8 +258,9 @@ export async function runCycle(opts: CycleOptions = {}): Promise<CycleResult> {
         const s: MindSignals = { ...(e.signals || {}) } as MindSignals;
         s.atMs = s.atMs || Date.parse(e.occurredAt) || Date.now();
         const st = states.get(e.userKey) || newSequenceState();
-        const one = clusters ? clusters.oneHot(hashVector(s.text || s.conceptKey || ''), CLUSTER_SLOTS) : null;
-        return { id: e.id, x: featurize(s, st, one) };
+        const tv = vecFor(s.text || s.conceptKey || '');
+        const one = clusters && tv ? clusters.oneHot(tv, CLUSTER_SLOTS) : null;
+        return { id: e.id, x: featurize(s, st, one, tv) };
       });
       const pseudo = pseudoLabelBinary(items, (x) => net.predictOne(x), { threshold: 0.85, max: Math.min(2000, trainRows.length), maxWeight: 0.4 });
       pseudoCount = pseudo.length;
@@ -241,7 +280,9 @@ export async function runCycle(opts: CycleOptions = {}): Promise<CycleResult> {
   const candidate = evaluateBinary(testRows.map((r) => net.predictOne(r.x)), labels);
   const baseline = evaluateBinary(testRows.map((r) => r.base), labels);
   let championMetrics: Metrics | null = null;
-  if (champion && champion.featureVersion === FEATURE_VERSION && champion.weights?.sizes?.[0] === FEATURE_DIM) {
+  // Only comparable if it read text the same way. Scoring an embedding-trained champion on hashed
+  // vectors would produce a number that looks like a comparison and is not one.
+  if (sameEncoder && champion && champion.featureVersion === FEATURE_VERSION && champion.weights?.sizes?.[0] === FEATURE_DIM) {
     try {
       const old = MLP.fromJSON(champion.weights);
       championMetrics = evaluateBinary(testRows.map((r) => old.predictOne(r.x)), labels);
@@ -256,7 +297,8 @@ export async function runCycle(opts: CycleOptions = {}): Promise<CycleResult> {
     featureVersion: FEATURE_VERSION,
   };
   const version = await saveCheckpoint({
-    task, featureVersion: FEATURE_VERSION, arch: { ...arch, warmStartedFrom: warmStarted ? champion?.version ?? null : null, modes },
+    task, featureVersion: FEATURE_VERSION,
+    arch: { ...arch, warmStartedFrom: warmStarted ? champion?.version ?? null : null, modes, encoderId: encoder.id, encoderNote },
     weights: net.toJSON(), clusters: clustersPayload,
     metrics: { candidate, baseline, champion: championMetrics, deltaVsBaseline: decision.deltaVsBaseline, deltaVsChampion: decision.deltaVsChampion },
     status: decision.promote ? 'champion' : 'candidate',
@@ -275,6 +317,8 @@ export async function runCycle(opts: CycleOptions = {}): Promise<CycleResult> {
     ok: true, task, examples: rowsOut.length, trainN: trainRows.length, holdoutN: testRows.length,
     pseudo: pseudoCount, clusters: summaries, conceptPriors, candidate, champion: championMetrics, baseline,
     promoted: decision.promote, decision: decision.reason, version, ms,
-    note: (warmStarted ? 'Continued from checkpoint v' + champion?.version : 'Trained from scratch') + ' · ' + modes.join(' + '),
+    note: (warmStarted ? 'Continued from checkpoint v' + champion?.version : 'Trained from scratch') + ' · ' + modes.join(' + ')
+      + (encoderNote ? ' · ' + encoderNote : ''),
+    encoderId: encoder.id, encoderNote,
   };
 }

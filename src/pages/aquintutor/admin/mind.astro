@@ -6,16 +6,27 @@
 // time it refused to promote a model and why. A console that only showed successes would be a
 // marketing surface for a system that is allowed to influence what a learner is asked next.
 //
-// AGGREGATE ONLY. Nothing here shows one named person's learning. There is no per-learner row, no
-// search by learner, and no way to reach one from this page: the corpus is read as counts and the
-// clusters as item wording from the question bank. A screen that showed one learner's stream is the
-// screen somebody would eventually use to judge them, and it must not exist.
+// NOBODY IS IDENTIFIED HERE. There is no per-learner row, no search by learner, and no way to reach
+// a person from this page. Counts are counts; the clusters are the question bank's own wording.
+//
+// The one exception is deliberate and bounded: the labelling queue shows the WORDS somebody typed to
+// the tutor, because a router cannot be corrected without the sentence. It shows the sentence and
+// nothing else - no name, no account, no session, no link back. A screen that joined those words to
+// a person is the screen somebody would eventually use to judge them, and that is the screen that
+// must not exist.
 //
 // Zero client-side JavaScript: every control is a form the server handles.
 //
 // const BEFORE THE HANDLER — `const` is not hoisted, and that has taken pages down on this project.
 import AquinAdminLayout from '@/layouts/AquinAdminLayout.astro';
-import { eventStats, getChampion, listCheckpoints, listRuns, promoteVersion, rollback } from '@/lib/mind/store';
+import { requireAquinAdmin } from '@/lib/aquin/gate';
+import {
+  eventStats, getChampion, listCheckpoints, listRuns, promoteVersion, rollback,
+  getMindConfig, saveMindConfig, resolveEncoder, invalidateEncoderCache,
+  labellingQueue, addHumanLabel,
+} from '@/lib/mind/store';
+import { datasetSize, evaluateConfiguredModel } from '@/lib/mind/dataset';
+import { INTENT_CLASSES } from '@/lib/mind/distill';
 import { runCycle } from '@/lib/mind/train';
 import { invalidateServingCache } from '@/lib/mind/serve';
 import { runIntentCycle, distillBatch, classifyIntent, INTENT_LABELS, type IntentResult } from '@/lib/mind/distill';
@@ -37,7 +48,20 @@ let flashOk = true;
 let tried: IntentResult | null = null;
 let triedText = '';
 
-if (Astro.request.method === 'POST') {
+// GATE BEFORE ACTION, NOT AFTER.
+//
+// A page's frontmatter runs to completion BEFORE the layout it renders into is ever constructed, so
+// AquinAdminLayout's gate cannot protect anything this block does. Without the check below, an
+// unauthenticated POST to this URL would train a model, promote a checkpoint, or — worst of the
+// three — run a distillation batch that ships stored learner text to whichever provider is
+// configured, and only then would the layout render a refusal to a caller who no longer needed the
+// page. The layout's gate still stands for what is DISPLAYED; this one stands for what is DONE.
+const actionGate = Astro.request.method === 'POST' ? await requireAquinAdmin(Astro as any) : null;
+
+if (Astro.request.method === 'POST' && !actionGate?.ok) {
+  flashOk = false;
+  flash = actionGate?.message || 'Sign in as an AquinTutor administrator to run anything on this page. Nothing was run.';
+} else if (Astro.request.method === 'POST') {
   try {
     const fd = await Astro.request.formData();
     const action = String(fd.get('action') || '');
@@ -69,6 +93,45 @@ if (Astro.request.method === 'POST') {
       const restored = await rollback(task);
       invalidateServingCache();
       flash = restored ? 'Rolled back: v' + restored + ' is serving again.' : 'Nothing earlier to fall back to. The platform is answering with its own estimator again — which is where it started, and is never worse than nothing.';
+    } else if (action === 'encoder') {
+      // Which model the platform LEARNS THROUGH. Changing it starts a fresh line of checkpoints:
+      // a network trained on one encoder is never served another's vectors.
+      const choice = String(fd.get('encoder') || 'hash') === 'pretrained' ? 'pretrained' : 'hash';
+      const model = String(fd.get('embedModel') || '').trim().slice(0, 120);
+      const baseUrl = String(fd.get('embedBaseUrl') || '').trim().slice(0, 300);
+      const key = String(fd.get('embedApiKey') || '');
+      await saveMindConfig({ encoder: choice, embedModel: model, embedBaseUrl: baseUrl, ...(key ? { embedApiKey: key } : {}) });
+      invalidateEncoderCache();
+      invalidateServingCache();
+      const r = await resolveEncoder();
+      flash = 'Encoder saved. ' + r.note + ' Any checkpoint trained through a different encoder stops serving until a cycle is run on this one.';
+    } else if (action === 'embedtest') {
+      const r = await resolveEncoder();
+      const sample = String(fd.get('sample') || 'A ball is thrown upward at twenty metres per second.').slice(0, 400);
+      const t0 = Date.now();
+      try {
+        const v = await r.encoder.encode([sample]);
+        const dims = Array.isArray(v[0]) ? v[0].length : 0;
+        flash = r.encoder.id + ' answered in ' + (Date.now() - t0) + 'ms with a ' + dims + '-dimension vector. '
+          + (r.encoder.id === 'hash-v1' ? 'That is the built-in encoder — no pretrained model is in the loop yet.' : 'The pretrained model is reachable and its output is cached.');
+      } catch (e: any) {
+        flashOk = false;
+        flash = 'The encoder could not be reached: ' + (e?.message || 'unknown error')
+          + '. Nothing has broken — the platform keeps using the built-in encoder, and any model trained on embeddings stays parked rather than being fed the wrong kind of vector.';
+      }
+    } else if (action === 'label') {
+      // The human tier. A person's correction outranks a rule and a teacher model, and it is the only
+      // evidence the router may be judged on.
+      const eventId = String(fd.get('eventId') || '');
+      const idx = Number(fd.get('label'));
+      if (eventId && Number.isFinite(idx) && idx >= 0 && idx < INTENT_CLASSES.length) {
+        await addHumanLabel(eventId, idx, 'corrected on the Mind console', actionGate?.principal?.email || actionGate?.principal?.userId || 'admin');
+        flash = 'Recorded as ' + INTENT_LABELS[INTENT_CLASSES[idx]] + '. That correction now outranks the rule that labelled it, and the router will be judged on it rather than trained to agree with itself.';
+      } else { flashOk = false; flash = 'Nothing to record.'; }
+    } else if (action === 'evaluate') {
+      const r = await evaluateConfiguredModel(60);
+      flashOk = r.ok;
+      flash = r.ok ? r.verdict + ' (' + r.provider + ')' : (r.error || 'Evaluation unavailable.');
     } else if (action === 'classify') {
       triedText = String(fd.get('text') || '').slice(0, 500);
       if (triedText.trim()) tried = await classifyIntent(triedText);
@@ -94,6 +157,8 @@ async function safe<T>(what: string, fn: () => Promise<T>, fallback: T): Promise
 }
 const EMPTY_STATS = { total: 0, labelled: 0, unlabelled: 0, learners: 0, bySource: [] as { source: string; n: number }[], last: null as string | null };
 
+const mindCfg = await safe('encoder config', () => getMindConfig(), { encoder: 'hash' as const, embedModel: '', embedBaseUrl: '', embedApiKey: '' });
+const active = await safe('encoder', () => resolveEncoder(), null);
 const stats = await safe('event stats', () => eventStats('mastery'), EMPTY_STATS);
 const intentStats = await safe('intent stats', () => eventStats('intent'), EMPTY_STATS);
 const champion = await safe('champion', () => getChampion('mastery'), null);
@@ -101,12 +166,17 @@ const intentChampion = await safe('intent champion', () => getChampion('intent')
 const checkpoints = await safe('checkpoints', () => listCheckpoints('mastery', 10), []);
 const intentCheckpoints = await safe('intent checkpoints', () => listCheckpoints('intent', 5), []);
 const runs = await safe('runs', () => listRuns('mastery', 10), []);
+const queue = await safe('labelling queue', () => labellingQueue(8), []);
+const corpus = await safe('corpus size', () => datasetSize(), { captured: 0, whitelisted: 0, intent: 0 });
 
 const cm = champion?.metrics || {};
 const clusters = (champion?.clusters?.summaries || []) as { index: number; items: number; attempts: number; failureRate: number; terms: string[]; exemplars: string[] }[];
 const priors = (champion?.clusters?.conceptPriors || {}) as Record<string, { value: number; confidence: number; observed: boolean }>;
 const priorRows = Object.entries(priors).filter(([, v]) => !v.observed).sort((a, b) => b[1].confidence - a[1].confidence).slice(0, 8);
 const im = (intentChampion?.metrics || {}) as any;
+
+const championEncoder = (champion?.arch?.encoderId || (champion ? 'hash-v1' : '')) as string;
+const encoderSkew = !!(champion && active && championEncoder !== active.encoder.id);
 
 const TILES = [
   { v: String(stats.labelled), l: 'Graded moments', note: 'Supervised: an answer with a known outcome' },
@@ -201,6 +271,66 @@ const TILES = [
         floor this feature is built never to fall below.
       </p>
     )}
+  </div>
+
+  <!-- ============================ the encoder ============================ -->
+  <div style={CARD}>
+    <p style={LBL}>What the platform learns through</p>
+    <p style="margin:0 0 12px;font-size:13.5px;color:#0E0B08;line-height:1.7;max-width:80ch;">
+      The network reads text through an encoder. The built-in one hashes words into numbers: free,
+      offline, and completely meaning-blind — to it, <em>a ball is thrown upward</em> and
+      <em>a projectile is launched</em> are unrelated. A PRETRAINED embedding model already knows they
+      are the same thing, and that is knowledge a few thousand of our own rows can never buy. Point
+      this at your own model server and the network trains on top of it: the pretrained weights are
+      never modified, never bundled, and never required.
+    </p>
+    <p style="margin:0 0 14px;font-size:13px;color:#6f665e;line-height:1.6;">
+      <b>In force now:</b> {active ? active.note : 'could not be read'}
+      {champion && <span> · <b>Serving checkpoint v{champion.version}</b> was trained through <code style="font-size:12px;">{championEncoder}</code>.</span>}
+    </p>
+    {encoderSkew && (
+      <p style="margin:0 0 14px;padding:11px 13px;border-radius:9px;background:rgba(230,120,0,0.08);border:1px solid rgba(230,120,0,0.4);font-size:13px;color:#8a5a10;line-height:1.6;">
+        The serving checkpoint and the encoder in force disagree, so that checkpoint is NOT being
+        used and the platform is answering with its own estimator. This is deliberate: the two kinds
+        of vector are the same width and mean entirely different things, and a model fed the wrong
+        one produces confident nonsense. Run a learning cycle to train on the current encoder.
+      </p>
+    )}
+    <form method="POST" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;align-items:end;">
+      <input type="hidden" name="action" value="encoder" />
+      <label style="font-size:12px;color:#6f665e;">Encoder
+        <select name="encoder" style="display:block;width:100%;margin-top:5px;font:inherit;font-size:13px;padding:9px 10px;border:1px solid rgba(14,11,8,0.16);border-radius:9px;min-height:44px;">
+          <option value="hash" selected={mindCfg.encoder === 'hash'}>Built-in hashing (offline, free)</option>
+          <option value="pretrained" selected={mindCfg.encoder === 'pretrained'}>Pretrained embeddings (your endpoint)</option>
+        </select>
+      </label>
+      <label style="font-size:12px;color:#6f665e;">Embedding model
+        <input type="text" name="embedModel" value={mindCfg.embedModel} placeholder="e.g. bge-small-en-v1.5"
+               style="display:block;width:100%;margin-top:5px;font:inherit;font-size:13px;padding:9px 10px;border:1px solid rgba(14,11,8,0.16);border-radius:9px;min-height:44px;" />
+      </label>
+      <label style="font-size:12px;color:#6f665e;">Endpoint (blank = the gateway's own model server)
+        <input type="text" name="embedBaseUrl" value={mindCfg.embedBaseUrl} placeholder="http://your-host:8000/v1"
+               style="display:block;width:100%;margin-top:5px;font:inherit;font-size:13px;padding:9px 10px;border:1px solid rgba(14,11,8,0.16);border-radius:9px;min-height:44px;" />
+      </label>
+      <label style="font-size:12px;color:#6f665e;">Key {mindCfg.embedApiKey ? '(stored; leave blank to keep)' : '(optional)'}
+        <input type="password" name="embedApiKey" value="" autocomplete="new-password"
+               style="display:block;width:100%;margin-top:5px;font:inherit;font-size:13px;padding:9px 10px;border:1px solid rgba(14,11,8,0.16);border-radius:9px;min-height:44px;" />
+      </label>
+      <button type="submit" style={BTN}>Save encoder</button>
+    </form>
+    <form method="POST" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <input type="hidden" name="action" value="embedtest" />
+      <input type="text" name="sample" placeholder="Text to encode as a test" maxlength="400"
+             style="flex:1;min-width:220px;font:inherit;font-size:13px;padding:10px 12px;border:1px solid rgba(14,11,8,0.16);border-radius:9px;min-height:44px;" />
+      <button type="submit" style={BTN2}>Test the encoder</button>
+    </form>
+    <p style="margin:12px 0 0;font-size:12.5px;color:#6f665e;line-height:1.7;">
+      Any server speaking the OpenAI embeddings shape works (vLLM, TGI, LocalAI, llama.cpp server) and
+      Ollama's own shape is tried as a fallback — so this runs on a machine you control. Embeddings are
+      cached per model and text, so a cycle calls the endpoint once per new item, not once per answer.
+      Switching encoder does not delete anything: old checkpoints are kept, parked, and can be
+      returned to by switching back.
+    </p>
   </div>
 
   <!-- ============================ controls ============================ -->
@@ -311,6 +441,78 @@ const TILES = [
           </form>
         ))}
       </div>
+    )}
+  </div>
+
+  <!-- ============================ the fine-tuning corpus ============================ -->
+  <div style={CARD}>
+    <p style={LBL}>Fine-tuning corpus (for a LoRA, trained elsewhere)</p>
+    <p style="margin:0 0 12px;font-size:13.5px;color:#0E0B08;line-height:1.7;max-width:80ch;">
+      Everything above trains inside this platform. A LoRA cannot: adapting a billion-parameter model
+      needs a graphics card, which serverless functions do not have and will not get. What belongs
+      here instead is the two ends of that loop — a corpus fit to train on, and a way to judge what
+      comes back. The middle is a script in <code style="font-size:12px;">ml/lora/</code> that runs on
+      a machine you own, exactly as <code style="font-size:12px;">ml/intent/</code> already does.
+    </p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px;">
+      <div style="background:rgba(14,11,8,0.03);border-radius:10px;padding:12px 14px;">
+        <div style="font-size:22px;font-weight:800;">{corpus.captured}</div>
+        <div style="font-size:11px;color:#8a7f76;margin-top:3px;">Exchanges captured</div>
+      </div>
+      <div style="background:rgba(14,11,8,0.03);border-radius:10px;padding:12px 14px;">
+        <div style="font-size:22px;font-weight:800;">{corpus.whitelisted}</div>
+        <div style="font-size:11px;color:#8a7f76;margin-top:3px;">From tutoring, so eligible</div>
+      </div>
+      <div style="background:rgba(14,11,8,0.03);border-radius:10px;padding:12px 14px;">
+        <div style="font-size:22px;font-weight:800;">{corpus.intent}</div>
+        <div style="font-size:11px;color:#8a7f76;margin-top:3px;">Labelled tutor turns</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+      <a href="/api/aquintutor/mind/dataset?part=manifest" style={BTN2 + 'text-decoration:none;display:inline-block;line-height:24px;'}>Manifest first</a>
+      <a href="/api/aquintutor/mind/dataset?part=train" style={BTN2 + 'text-decoration:none;display:inline-block;line-height:24px;'}>Download training set</a>
+      <a href="/api/aquintutor/mind/dataset?part=validation" style={BTN2 + 'text-decoration:none;display:inline-block;line-height:24px;'}>Download validation set</a>
+      <form method="POST"><input type="hidden" name="action" value="evaluate" /><button type="submit" style={BTN}>Evaluate the configured model</button></form>
+    </div>
+    <ul style="margin:14px 0 0;padding-left:18px;font-size:12.5px;color:#6f665e;line-height:1.75;">
+      <li>The export is <b>curated</b>: only tutoring capture sites, personal detail scrubbed, exchanges that handed over an answer dropped, near-duplicates removed, and a deterministic train/validation split so two runs can be compared. Read the manifest before training — it says what was refused and why.</li>
+      <li><b>Evaluate the configured model</b> scores whatever the gateway points at right now against this platform's own rules, on turns a person or a teacher model labelled. A fine-tune that cannot beat a regular expression on our own taxonomy has not learned this platform.</li>
+      <li>Most of this corpus is another model's output. Check that provider's terms before training on it — that is a licensing question, not a technical one.</li>
+      <li>Before spending on a GPU: turning on the pretrained encoder above costs a small always-on CPU box and no new code, and it is the larger gain per rupee. <code style="font-size:12px;">ml/lora/README.md</code> sets out both paths honestly.</li>
+    </ul>
+  </div>
+
+  <!-- ============================ human labels ============================ -->
+  <div style={CARD}>
+    <p style={LBL}>Turns waiting for a person</p>
+    <p style="margin:0 0 12px;font-size:13px;color:#6f665e;line-height:1.65;max-width:80ch;">
+      A router trained on its own rules and then scored against those rules proves nothing. These are
+      real messages, labelled so far only by a rule, waiting for somebody to say what they actually
+      were. A correction here outranks the rule and the teacher model, and becomes evidence the model
+      is judged on. <b>The words are shown and nothing else</b> — no name, no account, no way to reach
+      the person who wrote them, because correcting a sentence needs the sentence and nothing more.
+    </p>
+    {queue.length ? (
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        {queue.map((q: any) => (
+          <form method="POST" style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;border:1px solid rgba(14,11,8,0.1);border-radius:10px;padding:10px 12px;">
+            <input type="hidden" name="action" value="label" />
+            <input type="hidden" name="eventId" value={q.id} />
+            <span style="font-size:13px;line-height:1.5;">{q.text}</span>
+            <select name="label" style="font:inherit;font-size:12.5px;padding:8px 9px;border:1px solid rgba(14,11,8,0.16);border-radius:8px;min-height:40px;">
+              {INTENT_CLASSES.map((k: any, i: number) => (
+                <option value={String(i)} selected={q.label === i}>{INTENT_LABELS[k]}</option>
+              ))}
+            </select>
+            <button type="submit" style={BTN2}>Record</button>
+          </form>
+        ))}
+      </div>
+    ) : (
+      <p style="margin:0;font-size:13.5px;color:#6f665e;line-height:1.65;">
+        Nothing waiting. Turns appear here as learners use the tutor, provided the capture switch on
+        the LLM panel is on.
+      </p>
     )}
   </div>
 

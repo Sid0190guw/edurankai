@@ -10,13 +10,16 @@ import {
 } from './features';
 import { kmeans, OnlineKMeans, chooseK, cosineDistance, normalize } from './cluster';
 import { pseudoLabelBinary, pseudoLabelMulti, propagateLabels } from './semisup';
+import {
+  HashingEncoder, PretrainedEncoder, projectTo, projectionMatrix, textKey, encoderMatches,
+} from './encoder';
 import { evaluateBinary, evaluateMulti, auc, isHoldout, shouldPromote } from './evaluate';
 
 let pass = 0, fail = 0;
 const ok = (n: string, c: boolean, extra?: unknown) => { console.log((c ? '  ok  ' : 'FAIL  ') + n + (extra != null ? '  ' + JSON.stringify(extra) : '')); c ? pass++ : fail++; };
 const near = (a: number, b: number, tol = 1e-6) => Math.abs(a - b) <= tol;
 
-function main() {
+async function main() {
   // ---------------------------------------------------------------- nn
   console.log('\n== neural network ==');
   {
@@ -238,6 +241,100 @@ function main() {
     const unlabeled = rows.filter((r) => isHoldout(r.id, 0.25)).slice(0, 300).map((r) => ({ id: r.id, x: r.x }));
     const pseudo = pseudoLabelBinary(unlabeled, (x) => net.predictOne(x), { threshold: 0.8, max: 200 });
     ok('self-training produced weighted examples from unlabelled rows', pseudo.length > 0 && pseudo.every((p) => p.w < 1), pseudo.length);
+  }
+
+  // ---------------------------------------------------------------- the pretrained encoder seam
+  console.log('\n== encoders: hashing vs a pretrained model ==');
+  {
+    const hash = new HashingEncoder();
+    ok('the built-in encoder always works and is the right width', (await hash.encode(['newton second law']))[0].length === TEXT_DIM);
+    ok('its id is stable', hash.id === 'hash-v1');
+
+    // projection
+    const big = Array.from({ length: 384 }, (_, i) => Math.sin(i * 0.37));
+    const pj = projectTo(big, 32, 7);
+    let n = 0; for (const x of pj) n += x * x;
+    ok('projection lands on the right width, unit length', pj.length === 32 && near(Math.sqrt(n), 1, 1e-9));
+    ok('projection is deterministic', JSON.stringify(projectTo(big, 32, 7)) === JSON.stringify(pj));
+    ok('a different seed is a different projection', JSON.stringify(projectTo(big, 32, 8)) !== JSON.stringify(pj));
+    ok('the matrix is memoised, not rebuilt', projectionMatrix(384, 32, 7) === projectionMatrix(384, 32, 7));
+    ok('a vector already at the target width passes through', JSON.stringify(projectTo([1, 0], 2, 7)) === JSON.stringify([1, 0]));
+
+    // Johnson-Lindenstrauss in the only form that matters here: near things stay nearer than far things.
+    const a = Array.from({ length: 384 }, (_, i) => Math.sin(i * 0.37));
+    const b = a.map((x, i) => x + (i % 17 === 0 ? 0.05 : 0));        // close to a
+    const c = Array.from({ length: 384 }, (_, i) => Math.cos(i * 1.13));  // unrelated
+    const [pa, pb, pc] = [projectTo(a, 32, 7), projectTo(b, 32, 7), projectTo(c, 32, 7)];
+    ok('projection preserves who is closer to whom', cosineDistance(pa, pb) < cosineDistance(pa, pc),
+      { near: +cosineDistance(pa, pb).toFixed(3), far: +cosineDistance(pa, pc).toFixed(3) });
+
+    // cache keys
+    ok('the same text under the same model is the same key', textKey('m1', 'hello') === textKey('m1', 'hello'));
+    ok('a different model is a different key', textKey('m1', 'hello') !== textKey('m2', 'hello'));
+    ok('a different text is a different key', textKey('m1', 'hello') !== textKey('m1', 'hallo'));
+
+    // the skew guard
+    ok('an old checkpoint with no encoder recorded is hashing', encoderMatches(undefined, hash));
+    ok('a mismatch is caught', !encoderMatches('embed:bge-small@32/s1', hash));
+    ok('a match is allowed', encoderMatches('hash-v1', hash));
+
+    // a pretrained encoder against a stubbed endpoint: batching, projection, cache, fallback
+    const realFetch = globalThis.fetch;
+    let calls = 0, lastBody: any = null;
+    (globalThis as any).fetch = async (_url: any, init: any) => {
+      calls++;
+      lastBody = JSON.parse(init.body);
+      const input: string[] = lastBody.input;
+      return {
+        ok: true,
+        json: async () => ({ data: input.map((t: string) => ({ embedding: Array.from({ length: 384 }, (_, i) => Math.sin(i + t.length)) })) }),
+        text: async () => '',
+      };
+    };
+    try {
+      const store = new Map<string, number[]>();
+      const cache = {
+        async get(keys: string[]) { const m = new Map<string, number[]>(); for (const k of keys) if (store.has(k)) m.set(k, store.get(k)!); return m; },
+        async put(rows: { key: string; model: string; vec: number[] }[]) { for (const r of rows) store.set(r.key, r.vec); },
+      };
+      const enc = new PretrainedEncoder({ baseUrl: 'http://localhost:8000/v1', model: 'bge-small' }, cache);
+      ok('its id names the model and the projection', /^embed:bge-small@32\/s\d+$/.test(enc.id), enc.id);
+
+      const v1 = await enc.encode(['photosynthesis', 'mitochondria']);
+      ok('a pretrained embedding arrives projected to the feature width', v1.length === 2 && v1[0].length === TEXT_DIM);
+      ok('one HTTP call for the batch, not one per text', calls === 1, calls);
+      ok('the OpenAI-shaped request carries the model and the batch', lastBody.model === 'bge-small' && lastBody.input.length === 2);
+      ok('vectors were written to the cache', store.size === 2);
+
+      const before = calls;
+      const v2 = await enc.encode(['photosynthesis', 'mitochondria']);
+      ok('a second call for the same text hits the cache and does not call out', calls === before, calls - before);
+      ok('and returns exactly the same vectors', JSON.stringify(v2) === JSON.stringify(v1));
+
+      // an endpoint that answers with nothing must not produce zero vectors
+      (globalThis as any).fetch = async () => ({ ok: true, json: async () => ({ data: [{ embedding: [] }] }), text: async () => '' });
+      const v3 = await new PretrainedEncoder({ baseUrl: 'http://localhost:8000/v1', model: 'bge-small' }).encode(['a fresh string nobody embedded']);
+      const zero = v3[0].every((x) => x === 0);
+      ok('an empty embedding falls back to hashing rather than a row of zeros', !zero && v3[0].length === TEXT_DIM);
+
+      // a dead endpoint must throw so the caller can fall back deliberately
+      (globalThis as any).fetch = async () => { throw new Error('connection refused'); };
+      let threw = false;
+      try { await new PretrainedEncoder({ baseUrl: 'http://localhost:9/v1', model: 'x' }).encode(['y']); } catch { threw = true; }
+      ok('a dead endpoint raises rather than inventing numbers', threw);
+    } finally {
+      (globalThis as any).fetch = realFetch;
+    }
+
+    // features honour an injected vector
+    const sig2: MindSignals = { itemKey: 'q', conceptKey: 'optics', text: 'refraction', difficulty: 0.5, atMs: 1 };
+    const injected = new Array(TEXT_DIM).fill(0).map((_, i) => (i === 3 ? 1 : 0));
+    const withInjected = featurize(sig2, newSequenceState(), null, injected);
+    const withHash = featurize(sig2, newSequenceState(), null);
+    ok('featurize uses the encoder vector it is given', JSON.stringify(withInjected) !== JSON.stringify(withHash));
+    ok('and keeps the same width either way', withInjected.length === withHash.length && withHash.length === FEATURE_DIM);
+    ok('a wrong-width vector is ignored rather than corrupting the row',
+      JSON.stringify(featurize(sig2, newSequenceState(), null, [1, 2, 3])) === JSON.stringify(withHash));
   }
 
   console.log('\n' + (fail === 0 ? 'ALL PASS' : 'FAILURES: ' + fail) + '  (' + pass + ' passed)');

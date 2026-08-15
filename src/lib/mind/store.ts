@@ -8,11 +8,24 @@
 //   aq_mind_run     what happened in one training cycle, including the times it refused to promote.
 //   aq_mind_label   a human correction. The highest-authority label there is; it outranks the rest.
 //
-// WHAT IS DELIBERATELY NOT STORED. No page URLs, no free text a learner typed about themselves, no
-// wellness or health signal, nothing from the consult system — the corpus is answers to questions
-// from the question bank and the platform's own item text. The admin console reads this store in
-// aggregate only: there is no screen anywhere in this feature that shows one named person's row,
-// because the moment that screen exists it is the screen somebody uses.
+// WHAT IS AND IS NOT STORED — stated precisely, because an earlier draft of this header was wrong.
+//
+// The MASTERY corpus holds no learner-authored text at all: it is answers to questions from the
+// question bank, plus that bank's own item wording, plus timing and outcome.
+//
+// The INTENT corpus DOES hold learner-authored text — up to 300 characters of what somebody typed
+// to the tutor (distill.ts, recordTutorTurn). That is the point of it: a router cannot learn to
+// recognise "I am stuck" from an aggregate. It is written only while the LLM gateway's
+// capture-training switch is on, the same switch that governs the older ai_training_example corpus.
+// It is never shown next to a name, and the labelling queue that does show it shows the text and
+// nothing else about the person.
+//
+// NEVER, in either: wellness or health signals, consult messages, legal-hold records, documents,
+// page URLs, or anything from the HR side of the platform.
+//
+// The admin console reads this store in aggregate; the one screen that shows a learner's words shows
+// only the words, because the moment a screen joins those words to a name it becomes the screen
+// somebody uses to judge a person.
 //
 // Weights live in JSONB. A checkpoint here is a few thousand numbers — small enough that the model
 // is a row you can copy, diff and roll back, and portable enough to leave with the data if the
@@ -21,6 +34,7 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import type { MindSignals } from './features';
+import { HashingEncoder, PretrainedEncoder, type TextEncoder } from './encoder';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
@@ -103,6 +117,26 @@ export function ensureMindSchema(): Promise<void> {
         ms INT NOT NULL DEFAULT 0,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS aq_mind_run_idx ON aq_mind_run (task, created_at DESC)`);
+
+      // Which encoder the platform learns through, and where the pretrained one lives. Kept in the
+      // Mind's OWN table rather than added to the LLM gateway's config, so switching the tutor's
+      // model and switching the learning encoder stay separate decisions.
+      await db.execute(sql`CREATE TABLE IF NOT EXISTS aq_mind_config (
+        id TEXT PRIMARY KEY DEFAULT 'default',
+        encoder TEXT NOT NULL DEFAULT 'hash',
+        embed_model TEXT NOT NULL DEFAULT '',
+        embed_base_url TEXT NOT NULL DEFAULT '',
+        embed_api_key TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+
+      // Pretrained embeddings, cached by (model, text). An embedding never changes for the same text
+      // and model, so this is the difference between one call per cycle and six thousand.
+      await db.execute(sql`CREATE TABLE IF NOT EXISTS aq_mind_embedding (
+        key TEXT PRIMARY KEY,
+        model TEXT NOT NULL DEFAULT '',
+        dim INT NOT NULL DEFAULT 0,
+        vec JSONB NOT NULL DEFAULT '[]'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
 
       // A human correction of a machine label. Kept apart from the event so the original is never
       // overwritten — the disagreement itself is evidence, and a corrected label must be traceable
@@ -213,8 +247,13 @@ function toEvent(r: any): MindEventRow {
 }
 
 /**
- * The training corpus, oldest first — order matters, because the sequence features are replayed
- * forward through it exactly as they were lived.
+ * The training corpus: the MOST RECENT `limit` moments, handed back oldest-first.
+ *
+ * Both halves of that matter. Oldest-first because the sequence features are replayed forward
+ * exactly as they were lived. Most-recent-N because the obvious `ORDER BY occurred_at ASC LIMIT n`
+ * quietly stops the platform learning the moment the corpus outgrows the cap: every later cycle
+ * re-reads the same oldest rows and never sees anything that happened since. The inner query takes
+ * the newest window, the outer one puts it back in order.
  *
  * A human correction (aq_mind_label) overrides the recorded label here, which is the only place in
  * the system where one label beats another.
@@ -226,15 +265,18 @@ export async function loadEvents(opts: { task?: MindTask; limit?: number; labell
   const days = Math.max(1, Math.min(3650, opts.days ?? 400));
   const labelFilter = opts.labelled === true ? sql` AND e.label IS NOT NULL` : opts.labelled === false ? sql` AND e.label IS NULL` : sql``;
   const r = await db.execute(sql`
-    SELECT e.id, e.user_key, e.task, e.signals,
-           COALESCE(h.label, e.label) AS label,
-           CASE WHEN h.label IS NOT NULL THEN 'human' ELSE e.label_source END AS label_source,
-           e.confidence, e.occurred_at
-    FROM aq_mind_event e
-    LEFT JOIN LATERAL (SELECT label FROM aq_mind_label l WHERE l.event_id = e.id ORDER BY created_at DESC LIMIT 1) h ON true
-    WHERE e.task = ${task} AND e.occurred_at > NOW() - (${days} || ' days')::interval${labelFilter}
-    ORDER BY e.occurred_at ASC
-    LIMIT ${limit}`);
+    SELECT * FROM (
+      SELECT e.id, e.user_key, e.task, e.signals,
+             COALESCE(h.label, e.label) AS label,
+             CASE WHEN h.label IS NOT NULL THEN 'human' ELSE e.label_source END AS label_source,
+             e.confidence, e.occurred_at
+      FROM aq_mind_event e
+      LEFT JOIN LATERAL (SELECT label FROM aq_mind_label l WHERE l.event_id = e.id ORDER BY created_at DESC LIMIT 1) h ON true
+      WHERE e.task = ${task} AND e.occurred_at > NOW() - (${days} || ' days')::interval${labelFilter}
+      ORDER BY e.occurred_at DESC
+      LIMIT ${limit}
+    ) w
+    ORDER BY w.occurred_at ASC`);
   return rows(r).map(toEvent);
 }
 
@@ -266,6 +308,37 @@ export async function loadLearnerEvents(userKey: string, task: MindTask = 'maste
           ORDER BY occurred_at DESC LIMIT ${Math.max(1, Math.min(1000, limit))}) t
     ORDER BY occurred_at ASC`);
   return rows(r).map(toEvent);
+}
+
+export interface QueueItem { id: string; text: string; label: number | null; labelSource: string; occurredAt: string }
+
+/**
+ * Turns waiting for a person to say what they really were.
+ *
+ * Returns the words and NOTHING else — no user key, no name, no session, no way to reach the person
+ * from the row. That is the whole design: correcting a label needs the sentence, and needs nothing
+ * about who wrote it, so the screen is built so that the identity is not there to be looked at.
+ *
+ * Only turns nobody has corrected yet, newest first, because a rule-labelled corpus that nobody ever
+ * disagrees with is a corpus that can only ever teach a model the rules it already has.
+ */
+export async function labellingQueue(limit = 12): Promise<QueueItem[]> {
+  await ensureMindSchema();
+  const r = await db.execute(sql`
+    SELECT e.id, e.signals->>'text' AS text, e.label, e.label_source, e.occurred_at
+    FROM aq_mind_event e
+    WHERE e.task = 'intent'
+      AND COALESCE(e.signals->>'text', '') <> ''
+      AND NOT EXISTS (SELECT 1 FROM aq_mind_label l WHERE l.event_id = e.id)
+    ORDER BY e.occurred_at DESC
+    LIMIT ${Math.max(1, Math.min(50, limit))}`);
+  return rows(r).map((x: any) => ({
+    id: x.id,
+    text: String(x.text || '').slice(0, 300),
+    label: x.label == null ? null : Number(x.label),
+    labelSource: x.label_source || '',
+    occurredAt: x.occurred_at instanceof Date ? x.occurred_at.toISOString() : String(x.occurred_at),
+  }));
 }
 
 export async function addHumanLabel(eventId: string, label: number, note: string, by: string): Promise<void> {
@@ -366,6 +439,105 @@ export async function recordRun(i: {
     VALUES (${i.task}, ${JSON.stringify(i.modes)}::jsonb, ${i.examples}, ${i.pseudo}, ${i.clusters},
             ${JSON.stringify(i.metrics)}::jsonb, ${i.promoted}, ${i.decision.slice(0, 800)}, ${i.version ?? null}, ${Math.round(i.ms)})`);
 }
+
+// ---- the encoder: which model the platform learns THROUGH -----------------------------------------
+
+export interface MindConfig { encoder: 'hash' | 'pretrained'; embedModel: string; embedBaseUrl: string; embedApiKey: string }
+const DEFAULT_CONFIG: MindConfig = { encoder: 'hash', embedModel: '', embedBaseUrl: '', embedApiKey: '' };
+
+export async function getMindConfig(): Promise<MindConfig> {
+  try {
+    await ensureMindSchema();
+    const r = rows(await db.execute(sql`SELECT * FROM aq_mind_config WHERE id = 'default' LIMIT 1`))[0];
+    if (!r) return { ...DEFAULT_CONFIG };
+    return {
+      encoder: r.encoder === 'pretrained' ? 'pretrained' : 'hash',
+      embedModel: r.embed_model || '', embedBaseUrl: r.embed_base_url || '', embedApiKey: r.embed_api_key || '',
+    };
+  } catch (e: any) {
+    console.error('[mind/store] config read failed:', e?.cause?.message || e?.message);
+    return { ...DEFAULT_CONFIG };   // the always-available encoder, never a hard failure
+  }
+}
+
+export async function saveMindConfig(c: Partial<MindConfig>): Promise<void> {
+  await ensureMindSchema();
+  const n = { ...(await getMindConfig()), ...c };
+  await db.execute(sql`INSERT INTO aq_mind_config (id, encoder, embed_model, embed_base_url, embed_api_key, updated_at)
+    VALUES ('default', ${n.encoder}, ${n.embedModel}, ${n.embedBaseUrl}, ${n.embedApiKey}, NOW())
+    ON CONFLICT (id) DO UPDATE SET encoder = ${n.encoder}, embed_model = ${n.embedModel},
+      embed_base_url = ${n.embedBaseUrl}, embed_api_key = ${n.embedApiKey}, updated_at = NOW()`);
+  encoderCache = null;
+}
+
+/** The cache the pretrained encoder writes through. */
+export const embeddingCache = {
+  async get(keys: string[]): Promise<Map<string, number[]>> {
+    const out = new Map<string, number[]>();
+    if (!keys.length) return out;
+    await ensureMindSchema();
+    // Chunked so a large cycle does not build one enormous statement.
+    for (let i = 0; i < keys.length; i += 500) {
+      const chunk = keys.slice(i, i + 500);
+      const r = await db.execute(sql`SELECT key, vec FROM aq_mind_embedding WHERE key IN (${sql.join(chunk.map((k) => sql`${k}`), sql`, `)})`);
+      for (const row of rows(r)) {
+        let v = (row as any).vec;
+        if (typeof v === 'string') { try { v = JSON.parse(v); } catch { v = null; } }
+        if (Array.isArray(v)) out.set((row as any).key, v.map(Number));
+      }
+    }
+    return out;
+  },
+  async put(entries: { key: string; model: string; vec: number[] }[]): Promise<void> {
+    if (!entries.length) return;
+    await ensureMindSchema();
+    for (let i = 0; i < entries.length; i += 200) {
+      const chunk = entries.slice(i, i + 200);
+      const values = chunk.map((e) => sql`(${e.key}, ${e.model}, ${e.vec.length}, ${JSON.stringify(e.vec)}::jsonb)`);
+      await db.execute(sql`INSERT INTO aq_mind_embedding (key, model, dim, vec) VALUES ${sql.join(values, sql`, `)}
+        ON CONFLICT (key) DO NOTHING`);
+    }
+  },
+};
+
+let encoderCache: { at: number; encoder: TextEncoder; note: string } | null = null;
+
+/**
+ * The encoder in force right now.
+ *
+ * Pretrained if an administrator has chosen it AND there is somewhere to call — falling back to the
+ * embedding endpoint configured here, or failing that to the LLM gateway's own self-hosted base URL,
+ * so a platform that already runs its own model does not have to configure it twice. Otherwise the
+ * hashing encoder, which always works.
+ */
+export async function resolveEncoder(): Promise<{ encoder: TextEncoder; note: string }> {
+  if (encoderCache && Date.now() - encoderCache.at < 60_000) return { encoder: encoderCache.encoder, note: encoderCache.note };
+  const cfg = await getMindConfig();
+  let encoder: TextEncoder = new HashingEncoder();
+  let note = 'Hashing encoder: no pretrained model in the loop. Free, offline, meaning-blind.';
+
+  if (cfg.encoder === 'pretrained') {
+    let baseUrl = cfg.embedBaseUrl.trim();
+    let apiKey = cfg.embedApiKey.trim();
+    if (!baseUrl) {
+      try {
+        const { getConfig } = await import('@/lib/llm/gateway');
+        const g = await getConfig();
+        if (g.provider === 'own' && g.baseUrl) { baseUrl = g.baseUrl; apiKey = apiKey || g.apiKey; }
+      } catch { /* the gateway is optional here, as it is everywhere else */ }
+    }
+    if (baseUrl && cfg.embedModel.trim()) {
+      encoder = new PretrainedEncoder({ baseUrl, model: cfg.embedModel.trim(), apiKey }, embeddingCache);
+      note = 'Pretrained embeddings from ' + cfg.embedModel.trim() + ' at ' + baseUrl.replace(/^(https?:\/\/[^/]+).*$/, '$1') + ', projected to ' + encoder.dim + ' dimensions.';
+    } else {
+      note = 'Pretrained encoding is selected but incomplete (a model name and an endpoint are both required), so the hashing encoder is still in force. Nothing is broken; nothing is pretending either.';
+    }
+  }
+  encoderCache = { at: Date.now(), encoder, note };
+  return { encoder, note };
+}
+
+export function invalidateEncoderCache(): void { encoderCache = null; }
 
 export async function listRuns(task: MindTask = 'mastery', limit = 15): Promise<any[]> {
   await ensureMindSchema();

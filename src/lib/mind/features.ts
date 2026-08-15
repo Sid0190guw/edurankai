@@ -143,7 +143,7 @@ const clamp = (x: number, lo: number, hi: number) => (x < lo ? lo : x > hi ? hi 
  * network can use. Pass null before any clusters exist — the slots are simply zero, and the model
  * still trains.
  */
-export function featurize(s: MindSignals, state: SequenceState, clusterOneHot?: number[] | null): number[] {
+export function featurize(s: MindSignals, state: SequenceState, clusterOneHot?: number[] | null, textVec?: number[] | null): number[] {
   const diff = clamp(typeof s.difficulty === 'number' && isFinite(s.difficulty) ? s.difficulty : 0.5, 0.02, 0.98);
   const c = state.concepts[s.conceptKey || 'unknown'];
   const pL = c ? c.mastery.pL : 0.2;
@@ -173,11 +173,15 @@ export function featurize(s: MindSignals, state: SequenceState, clusterOneHot?: 
   ];
 
   const typeVec = ITEM_TYPES.map((t) => (s.itemType === t ? 1 : 0));
-  const textVec = hashVector(s.text || s.conceptKey || '', TEXT_DIM);
+  // The text slots come from whichever encoder is in force — the built-in hashing one, or a
+  // PRETRAINED embedding model projected to this width (encoder.ts). Same width either way, which is
+  // why every checkpoint records WHICH encoder made its inputs: swapping them silently would feed a
+  // model numbers that mean something else entirely.
+  const textSlots = textVec && textVec.length === TEXT_DIM ? textVec : hashVector(s.text || s.conceptKey || '', TEXT_DIM);
   const clusterVec = new Array(CLUSTER_SLOTS).fill(0);
   if (clusterOneHot) for (let i = 0; i < Math.min(CLUSTER_SLOTS, clusterOneHot.length); i++) clusterVec[i] = clusterOneHot[i];
 
-  return [...dense, ...typeVec, ...textVec, ...clusterVec];
+  return [...dense, ...typeVec, ...textSlots, ...clusterVec];
 }
 
 /**

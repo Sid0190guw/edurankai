@@ -28,9 +28,10 @@ import { hashVector } from './features';
 import { evaluateMulti, isHoldout, shouldPromote } from './evaluate';
 import { aquinReply } from '@/lib/aquin-brain';
 import {
-  loadEvents, saveCheckpoint, getChampion, recordRun, recordEventSafe, setTeacherLabel,
+  loadEvents, saveCheckpoint, getChampion, recordRun, recordEventSafe, setTeacherLabel, resolveEncoder,
   type MindEventRow,
 } from './store';
+import { HashingEncoder, encoderMatches, type TextEncoder } from './encoder';
 
 export const INTENT_CLASSES = ['concept_help', 'platform_question', 'logistics', 'encouragement', 'off_topic'] as const;
 export type IntentClass = typeof INTENT_CLASSES[number];
@@ -58,11 +59,19 @@ export function ruleIntent(text: string): { index: number; klass: IntentClass } 
   return { index: 4, klass: 'off_topic' };
 }
 
-export const INTENT_DIM = 35;   // 32 hashed text dimensions + 3 shape features
+export const INTENT_DIM = 35;   // 32 text dimensions + 3 shape features
 
-export function intentFeatures(text: string): number[] {
+/**
+ * `textVec` is where the PRETRAINED model earns its place on this task.
+ *
+ * Routing intent is exactly the job a hashing encoder is bad at: "I don't get eigenvalues" and "the
+ * matrix stuff makes no sense" share almost no characters and mean the same thing. An embedding
+ * model knows that already, and this little network gets to stand on it instead of learning English
+ * from a few thousand tutor turns. Pass null and it falls back to hashing, which still works.
+ */
+export function intentFeatures(text: string, textVec?: number[] | null): number[] {
   const t = (text || '').slice(0, 2000);
-  const v = hashVector(t, 32);
+  const v = textVec && textVec.length === 32 ? textVec : hashVector(t, 32);
   return [
     ...v,
     Math.min(1, t.length / 300),
@@ -83,17 +92,27 @@ export async function recordTutorTurn(userKey: string, text: string): Promise<vo
   });
 }
 
-const cache: { at: number; net: MLP | null; version: number | null } = { at: 0, net: null, version: null };
+const cache: { at: number; net: MLP | null; version: number | null; encoder: TextEncoder } =
+  { at: 0, net: null, version: null, encoder: new HashingEncoder() };
 
-async function servingIntentNet(): Promise<{ net: MLP | null; version: number | null }> {
-  if (Date.now() - cache.at < 60_000) return { net: cache.net, version: cache.version };
+async function servingIntentNet(): Promise<{ net: MLP | null; version: number | null; encoder: TextEncoder }> {
+  if (Date.now() - cache.at < 60_000) return { net: cache.net, version: cache.version, encoder: cache.encoder };
   let net: MLP | null = null, version: number | null = null;
+  let encoder: TextEncoder = new HashingEncoder();
+  try { encoder = (await resolveEncoder()).encoder; } catch { /* the always-available one */ }
   try {
     const champ = await getChampion('intent');
-    if (champ?.weights?.sizes?.[0] === INTENT_DIM) { net = MLP.fromJSON(champ.weights); version = champ.version; }
+    // Same skew guard as the mastery head: a router trained on embeddings is never fed hashed text.
+    if (champ?.weights?.sizes?.[0] === INTENT_DIM && encoderMatches(champ.arch?.encoderId, encoder)) {
+      net = MLP.fromJSON(champ.weights);
+      version = champ.version;
+    } else if (champ && !encoderMatches(champ.arch?.encoderId, encoder)) {
+      console.error('[mind/distill] router v' + champ.version + ' was trained through '
+        + (champ.arch?.encoderId || 'hash-v1') + ', encoder in force is ' + encoder.id + '; routing with the rules instead.');
+    }
   } catch (e: any) { console.error('[mind/distill] intent champion load failed:', e?.cause?.message || e?.message); }
-  cache.at = Date.now(); cache.net = net; cache.version = version;
-  return { net, version };
+  cache.at = Date.now(); cache.net = net; cache.version = version; cache.encoder = encoder;
+  return { net, version, encoder };
 }
 
 export interface IntentResult { klass: IntentClass; label: string; p: number; source: 'model' | 'rules'; version: number | null; rules: IntentClass; scores: { klass: IntentClass; p: number }[] }
@@ -101,11 +120,16 @@ export interface IntentResult { klass: IntentClass; label: string; p: number; so
 /** Route one message. Falls back to the deterministic router whenever no model has earned promotion. */
 export async function classifyIntent(text: string): Promise<IntentResult> {
   const rules = ruleIntent(text);
-  const { net, version } = await servingIntentNet();
-  if (!net) {
-    return { klass: rules.klass, label: INTENT_LABELS[rules.klass], p: 1, source: 'rules', version: null, rules: rules.klass, scores: INTENT_CLASSES.map((k, i) => ({ klass: k, p: i === rules.index ? 1 : 0 })) };
-  }
-  const p = net.predict(intentFeatures(text));
+  const { net, version, encoder } = await servingIntentNet();
+  const bail = () => ({
+    klass: rules.klass, label: INTENT_LABELS[rules.klass], p: 1, source: 'rules' as const, version: null,
+    rules: rules.klass, scores: INTENT_CLASSES.map((k, i) => ({ klass: k, p: i === rules.index ? 1 : 0 })),
+  });
+  if (!net) return bail();
+  let vec: number[] | null = null;
+  try { vec = (await encoder.encode([text]))[0] || null; }
+  catch (e: any) { console.error('[mind/distill] encoding failed; routing with the rules:', e?.message); return bail(); }
+  const p = net.predict(intentFeatures(text, vec));
   let top = 0;
   for (let i = 1; i < p.length; i++) if (p[i] > p[top]) top = i;
   return {
@@ -182,6 +206,24 @@ export async function runIntentCycle(opts: { epochs?: number; seed?: number; max
     return { ok: false, examples: usable.length, judged: 0, accuracy: 0, rulesAccuracy: 0, promoted: false, decision, version: null, ms: Date.now() - t0 };
   }
 
+  // ONE encode pass for the whole cycle, exactly as the mastery cycle does it.
+  let encoder: TextEncoder = new HashingEncoder();
+  let encoderNote = '';
+  try { const r = await resolveEncoder(); encoder = r.encoder; encoderNote = r.note; } catch { /* hashing */ }
+  const texts = usable.map((e) => e.signals.text || '');
+  const vecMap = new Map<string, number[]>();
+  try {
+    const distinct = [...new Set(texts)];
+    const vs = await encoder.encode(distinct);
+    distinct.forEach((t, i) => { if (vs[i]?.length) vecMap.set(t, vs[i]); });
+  } catch (e: any) {
+    console.error('[mind/distill] encoding failed, this cycle uses hashing:', e?.message);
+    encoder = new HashingEncoder();
+    encoderNote = 'The pretrained encoder could not be reached; this router was trained through the hashing encoder.';
+    vecMap.clear();
+  }
+  const vecOf = (t: string) => vecMap.get(t) || null;
+
   const oneHot = (i: number) => INTENT_CLASSES.map((_, k) => (k === i ? 1 : 0));
   const independent = (e: MindEventRow) => e.labelSource === 'teacher' || e.labelSource === 'human';
   const judged = usable.filter((e) => independent(e) && isHoldout(e.id, 0.35));
@@ -189,14 +231,15 @@ export async function runIntentCycle(opts: { epochs?: number; seed?: number; max
   const train = usable.filter((e) => !judgedIds.has(e.id));
 
   const net = new MLP({ sizes: [INTENT_DIM, 16, INTENT_CLASSES.length], output: 'softmax', seed, l2: 1e-4 });
-  net.fit(train.map((e) => ({ x: intentFeatures(e.signals.text || ''), y: oneHot(Math.round(e.label as number)) })),
+  net.fit(train.map((e) => ({ x: intentFeatures(e.signals.text || '', vecOf(e.signals.text || '')), y: oneHot(Math.round(e.label as number)) })),
     { epochs, batchSize: 16, lr: 0.02, seed, maxMs: Math.max(1000, Math.min(15000, opts.maxMs ?? 8000)) });
 
   if (judged.length < 60) {
     const decision = 'Trained on ' + train.length + ' turns, but only ' + judged.length
       + ' of them carry an independent label (a teacher model or a person). A model scored against the rules that taught it proves nothing, so this checkpoint is kept as a candidate and the platform keeps routing with its rules. Run a distillation batch, or correct some turns by hand, to give it something real to be judged on.';
     const version = await saveCheckpoint({
-      task: 'intent', featureVersion: 1, arch: { sizes: [INTENT_DIM, 16, INTENT_CLASSES.length], output: 'softmax', classes: INTENT_CLASSES },
+      task: 'intent', featureVersion: 1,
+      arch: { sizes: [INTENT_DIM, 16, INTENT_CLASSES.length], output: 'softmax', classes: INTENT_CLASSES, encoderId: encoder.id, encoderNote },
       weights: net.toJSON(), clusters: {}, metrics: { judged: judged.length }, status: 'candidate', trainedOn: train.length, note: decision,
     });
     await recordRun({ task: 'intent', modes: ['supervised'], examples: train.length, pseudo: 0, clusters: 0, metrics: { judged: judged.length }, promoted: false, decision, version, ms: Date.now() - t0 });
@@ -204,7 +247,7 @@ export async function runIntentCycle(opts: { epochs?: number; seed?: number; max
   }
 
   const golds = judged.map((e) => oneHot(Math.round(e.label as number)));
-  const modelPreds = judged.map((e) => net.predict(intentFeatures(e.signals.text || '')));
+  const modelPreds = judged.map((e) => net.predict(intentFeatures(e.signals.text || '', vecOf(e.signals.text || ''))));
   // The rules, smoothed into a distribution so a confident miss is finite rather than infinite.
   const rulePreds = judged.map((e) => {
     const r = ruleIntent(e.signals.text || '');
@@ -215,7 +258,8 @@ export async function runIntentCycle(opts: { epochs?: number; seed?: number; max
   const decisionObj = shouldPromote({ candidate: { ...mModel, ece: 0 }, champion: null, baseline: mRules, minHoldout: 60 });
 
   const version = await saveCheckpoint({
-    task: 'intent', featureVersion: 1, arch: { sizes: [INTENT_DIM, 16, INTENT_CLASSES.length], output: 'softmax', classes: INTENT_CLASSES },
+    task: 'intent', featureVersion: 1,
+    arch: { sizes: [INTENT_DIM, 16, INTENT_CLASSES.length], output: 'softmax', classes: INTENT_CLASSES, encoderId: encoder.id, encoderNote },
     weights: net.toJSON(), clusters: {}, metrics: { model: mModel, rules: mRules },
     status: decisionObj.promote ? 'champion' : 'candidate', trainedOn: train.length, note: decisionObj.reason,
   });
