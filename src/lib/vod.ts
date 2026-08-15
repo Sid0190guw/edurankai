@@ -77,8 +77,13 @@ export class VodService {
       readFailed = true;
       console.error('[vod] record: reading session ' + sessionId + ' failed:', e?.cause?.message || e?.message);
     }
-    if (readFailed) {
-      throw new Error('The session could not be read, so nothing was recorded. Nothing has been saved under a title that would imply otherwise.');
+    // A FAILED READ AND AN EMPTY SESSION ARE DIFFERENT FACTS, and so are "there is a video file" and
+    // "there is not". Refuse only in the case that would produce a recording containing NOTHING —
+    // no board timeline and no media — because that is the row that lists, opens and plays silence.
+    // Where a media file exists, the class IS recorded and the missing timeline is a degradation to
+    // report, not a reason to discard forty minutes of video.
+    if (readFailed && !meta.mediaUrl) {
+      throw new Error('The session could not be read and there is no media file, so there is nothing to record. Nothing has been saved under a title that would imply otherwise.');
     }
     const truncatedEvents = events.length >= EVENT_CAP;
 
@@ -112,7 +117,16 @@ export class VodService {
       data: { title: meta.title || 'Recording', scene } as any,
       owner: meta.owner ?? null,
       securityLabels: (meta.labels && meta.labels.length ? meta.labels : ['enrolled-only']) as any,
-      metadata: { vod: true, sessionId, durationMs: tl.durationMs, events: tl.timeline.length, chapters: tl.chapters.length, published: false, mediaUrl: tl.mediaUrl },
+      // `incomplete` travels WITH the recording, so a surface listing it can say so. A shorter
+      // recording that admits it is a different object from one that pretends to be whole.
+      metadata: {
+        vod: true, sessionId, durationMs: tl.durationMs, events: payload.timeline.length,
+        chapters: tl.chapters.length, published: false, mediaUrl: tl.mediaUrl,
+        incomplete: truncatedEvents || droppedForSize > 0 || readFailed,
+        droppedEvents: droppedForSize,
+        hitReadCap: truncatedEvents,
+        timelineUnavailable: readFailed,
+      },
     } as any);
     const id = (o as any).id;
     if (meta.linkId) await this.repo.addRelationship(meta.linkId, 'references', id).catch(() => {});   // Course/KO -references-> VOD

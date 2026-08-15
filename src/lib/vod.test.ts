@@ -51,10 +51,16 @@ ok('storageKey is filesystem-safe + kinded', /^vod\/abc-\d+\.webm$/.test(storage
   // seed the broadcast session timeline into the in-memory kernel-independent board channel: buildTimeline
   // is what record() stores; here we exercise record() end-to-end by stubbing eventsSince via a direct call.
   const course = await repo.createObject({ type: 'CourseObject', data: { title: 'Physics' } });
-  // record() reads eventsSince from the DB; with the in-memory kernel there are no board events, so the
-  // timeline is empty — we still assert the ASSET shape, linkage, and label gating (the timeline path is
+  // record() reads eventsSince from the DB; with the in-memory kernel that read FAILS, so there is no
+  // board timeline — we still assert the ASSET shape, linkage, and label gating (the timeline path is
   // covered by buildTimeline above).
-  const id = await svc.record(broadcastSession('bc1'), { title: 'Lecture 1', linkId: course.id, owner: null, labels: ['enrolled-only'] });
+  //
+  // A mediaUrl is passed deliberately. record() now REFUSES to create a recording that would contain
+  // nothing at all — no timeline and no media — because that produced a row which listed, opened and
+  // played silence, with the session it came from already gone. A media file is real content, so the
+  // missing timeline degrades the recording rather than voiding it, and this call exercises exactly
+  // that path. The refusal itself is asserted below.
+  const id = await svc.record(broadcastSession('bc1'), { title: 'Lecture 1', linkId: course.id, owner: null, labels: ['enrolled-only'], mediaUrl: 'https://cdn.example.org/lecture-1.webm' });
   const graph = await repo.getObjectGraph(course.id);
   ok('Course -references-> the VOD asset', graph.outgoing.filter((e) => e.type === 'references').map((e) => e.toId).includes(id));
   const got = await svc.get(id);
@@ -62,6 +68,20 @@ ok('storageKey is filesystem-safe + kinded', /^vod\/abc-\d+\.webm$/.test(storage
   ok('the stored asset is a kernel AnimationObject flagged vod', (await repo.getObject(id))!.type === 'AnimationObject' && ((await repo.getObject(id))!.metadata as any).vod === true);
   await svc.setPublished(id, true);
   ok('publish toggles the flag; list(published) surfaces it', (await svc.get(id))!.published === true && (await svc.list(true)).some((v) => v.id === id));
+
+  // A recording that lost part of the class SAYS SO. Both the truncation and the unreadable
+  // timeline used to be swallowed — a shorter recording was indistinguishable from a whole one, and
+  // the source session is gone by the time anybody notices.
+  const meta = (await repo.getObject(id))!.metadata as any;
+  ok('a degraded recording is flagged incomplete rather than passing as whole', meta.incomplete === true, meta);
+  ok('and names which part is missing', meta.timelineUnavailable === true, meta);
+
+  // The one case that must be refused outright: nothing to record at all.
+  let refused = '';
+  try {
+    await svc.record(broadcastSession('bc-empty'), { title: 'Nothing', owner: null });
+  } catch (e: any) { refused = e?.message || ''; }
+  ok('a recording with no timeline AND no media is refused, not silently created', /nothing to record/i.test(refused), refused);
 
   console.log('\n' + pass + ' passed, ' + fail + ' failed');
   process.exit(fail ? 1 : 0);
