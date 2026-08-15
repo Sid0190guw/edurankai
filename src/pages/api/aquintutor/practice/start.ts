@@ -98,6 +98,24 @@ export const POST: APIRoute = async ({ request, locals }) => {
       marks: q.marks,
     }));
 
+    // AquinTutor Mind (src/lib/mind): record what was SHOWN, with no label yet. /answer attaches the
+    // outcome to the same row; the rows that STAY unlabelled are the questions the learner walked
+    // away from, and those are the honest input to semi-supervised learning rather than a gap in the
+    // data. One batched insert, best-effort — a training row must never slow or break practice.
+    if (user) {
+      try {
+        const { recordEventsSafe } = await import('@/lib/mind/store');
+        await recordEventsSafe(qs.map((q: any) => ({
+          userKey: user.id,
+          signals: {
+            itemKey: String(q.id), conceptKey: String(q.category || slug), itemType: String(q.question_type || ''),
+            difficulty: Number(q.emp_diff ?? 0.5), marks: Number(q.marks || 1),
+            text: String(q.question_text || '').slice(0, 300), atMs: Date.now(),
+          },
+        })));
+      } catch (e: any) { console.error('[practice/start] mind capture:', e?.cause?.message || e?.message); }
+    }
+
     return json({ ok: true, sessionId, testTitle: t.title, questions: out, ability: abilityTheta, targetDifficulty });
   } catch (e: any) {
     return json({ ok: false, error: e?.message || 'server error' }, 500);

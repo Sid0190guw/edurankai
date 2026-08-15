@@ -25,6 +25,17 @@ export const POST: APIRoute = async ({ request, locals }) => {
   const messages = sanitizeMessages(b.messages);
   if (!messages.length) return j({ error: 'Say something to start.' }, 400);
 
+  // AquinTutor Mind (src/lib/mind): record this turn for the platform's OWN intent router, labelled
+  // on the way in by the deterministic brain. Honours the same capture switch as the LLM training
+  // corpus — if an administrator has turned capture off, nothing here is stored either.
+  if (cfg.captureTraining !== false) {
+    try {
+      const { recordTutorTurn } = await import('@/lib/mind/distill');
+      const lastUser = [...messages].reverse().find((m) => m.role === 'user')?.content || '';
+      await recordTutorTurn(user.id, lastUser);
+    } catch (e: any) { console.error('[aquin-chat] mind capture:', e?.cause?.message || e?.message); }
+  }
+
   const sys = systemPrompt(mode, cfg);
   const promptChars = sys.length + messages.reduce((n, m) => n + m.content.length, 0);
   const t0 = Date.now();

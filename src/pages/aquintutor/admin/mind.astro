@@ -1,0 +1,386 @@
+---
+// /aquintutor/admin/mind — the Mind console: AquinTutor's own model, its corpus, and its record.
+//
+// This screen exists to make the intelligence ACCOUNTABLE rather than impressive. It shows what the
+// platform learned from, what it trained, what it measured, and — the part that matters — every
+// time it refused to promote a model and why. A console that only showed successes would be a
+// marketing surface for a system that is allowed to influence what a learner is asked next.
+//
+// AGGREGATE ONLY. Nothing here shows one named person's learning. There is no per-learner row, no
+// search by learner, and no way to reach one from this page: the corpus is read as counts and the
+// clusters as item wording from the question bank. A screen that showed one learner's stream is the
+// screen somebody would eventually use to judge them, and it must not exist.
+//
+// Zero client-side JavaScript: every control is a form the server handles.
+//
+// const BEFORE THE HANDLER — `const` is not hoisted, and that has taken pages down on this project.
+import AquinAdminLayout from '@/layouts/AquinAdminLayout.astro';
+import { eventStats, getChampion, listCheckpoints, listRuns, promoteVersion, rollback } from '@/lib/mind/store';
+import { runCycle } from '@/lib/mind/train';
+import { invalidateServingCache } from '@/lib/mind/serve';
+import { runIntentCycle, distillBatch, classifyIntent, INTENT_LABELS, type IntentResult } from '@/lib/mind/distill';
+import { FEATURE_DIM, FEATURE_VERSION } from '@/lib/mind/features';
+
+const CARD = 'background:#fff;border:1px solid rgba(14,11,8,0.12);border-radius:14px;padding:18px 20px;margin-bottom:18px;';
+const BTN = 'font:inherit;font-size:13px;font-weight:650;padding:10px 15px;border-radius:9px;border:1px solid rgba(168,71,44,0.45);background:#fff;color:#a8472c;cursor:pointer;min-height:44px;';
+const BTN2 = 'font:inherit;font-size:12.5px;font-weight:600;padding:8px 12px;border-radius:8px;border:1px solid rgba(14,11,8,0.16);background:#fff;color:#0E0B08;cursor:pointer;min-height:40px;';
+const TH = 'text-align:left;font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:#8a7f76;font-weight:700;padding:8px 10px;border-bottom:1px solid rgba(14,11,8,0.12);';
+const TD = 'padding:9px 10px;border-bottom:1px solid rgba(14,11,8,0.08);font-size:12.5px;vertical-align:top;';
+const LBL = 'font-size:11px;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;color:#8a7f76;margin:0 0 12px;';
+
+const pct = (x: number | null | undefined) => (x == null || !isFinite(x) ? '—' : (x * 100).toFixed(1) + '%');
+const num = (x: number | null | undefined, d = 4) => (x == null || !isFinite(x) ? '—' : Number(x).toFixed(d));
+const when = (s: any) => { try { return new Date(s).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }); } catch { return String(s || ''); } };
+
+let flash = '';
+let flashOk = true;
+let tried: IntentResult | null = null;
+let triedText = '';
+
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+    if (action === 'train') {
+      const r = await runCycle({});
+      invalidateServingCache();
+      flashOk = r.ok;
+      flash = r.ok
+        ? 'Cycle finished in ' + (r.ms / 1000).toFixed(1) + 's over ' + r.examples + ' moments (' + r.trainN + ' trained, ' + r.holdoutN + ' held out'
+          + (r.pseudo ? ', ' + r.pseudo + ' self-labelled' : '') + '). ' + (r.promoted ? 'PROMOTED v' + r.version + '. ' : 'Not promoted. ') + r.decision
+        : r.decision;
+    } else if (action === 'intent') {
+      const r = await runIntentCycle({});
+      flashOk = r.ok;
+      flash = 'Router: trained on ' + r.examples + ' turns, ' + r.judged + ' independently labelled. ' + r.decision;
+    } else if (action === 'distill') {
+      const r = await distillBatch(40);
+      flashOk = r.ok;
+      flash = r.ok
+        ? 'Teacher pass over ' + r.asked + ' turns via ' + r.provider + ': ' + r.labelled + ' labelled, ' + r.changed + ' disagreed with the rules. Those disagreements are now the evidence the router is judged on.'
+        : (r.error || 'Distillation unavailable.');
+    } else if (action === 'promote') {
+      const v = Number(fd.get('version') || 0);
+      const task = String(fd.get('task') || 'mastery') === 'intent' ? 'intent' : 'mastery';
+      if (v) { await promoteVersion(task, v); invalidateServingCache(); flash = 'Checkpoint v' + v + ' is now serving.'; }
+      else { flashOk = false; flash = 'No version given.'; }
+    } else if (action === 'rollback') {
+      const task = String(fd.get('task') || 'mastery') === 'intent' ? 'intent' : 'mastery';
+      const restored = await rollback(task);
+      invalidateServingCache();
+      flash = restored ? 'Rolled back: v' + restored + ' is serving again.' : 'Nothing earlier to fall back to. The platform is answering with its own estimator again — which is where it started, and is never worse than nothing.';
+    } else if (action === 'classify') {
+      triedText = String(fd.get('text') || '').slice(0, 500);
+      if (triedText.trim()) tried = await classifyIntent(triedText);
+    }
+  } catch (e: any) {
+    flashOk = false;
+    flash = 'Action failed: ' + (e?.cause?.message || e?.message || 'unknown error');
+    console.error('[aquin/mind] action failed:', e?.cause?.message || e?.message);
+  }
+}
+
+// ---- read the current state (each guarded: a cold table shows a dash, never a false zero) --------
+const gaps: string[] = [];
+async function safe<T>(what: string, fn: () => Promise<T>, fallback: T): Promise<T> {
+  try { return await fn(); }
+  catch (e: any) {
+    // Named, and said out loud below. A failed read that renders as a zero is a claim that there is
+    // nothing there, which on this screen would read as "the platform has learned nothing".
+    console.error('[aquin/mind] ' + what + ':', e?.cause?.message || e?.message);
+    gaps.push(what);
+    return fallback;
+  }
+}
+const EMPTY_STATS = { total: 0, labelled: 0, unlabelled: 0, learners: 0, bySource: [] as { source: string; n: number }[], last: null as string | null };
+
+const stats = await safe('event stats', () => eventStats('mastery'), EMPTY_STATS);
+const intentStats = await safe('intent stats', () => eventStats('intent'), EMPTY_STATS);
+const champion = await safe('champion', () => getChampion('mastery'), null);
+const intentChampion = await safe('intent champion', () => getChampion('intent'), null);
+const checkpoints = await safe('checkpoints', () => listCheckpoints('mastery', 10), []);
+const intentCheckpoints = await safe('intent checkpoints', () => listCheckpoints('intent', 5), []);
+const runs = await safe('runs', () => listRuns('mastery', 10), []);
+
+const cm = champion?.metrics || {};
+const clusters = (champion?.clusters?.summaries || []) as { index: number; items: number; attempts: number; failureRate: number; terms: string[]; exemplars: string[] }[];
+const priors = (champion?.clusters?.conceptPriors || {}) as Record<string, { value: number; confidence: number; observed: boolean }>;
+const priorRows = Object.entries(priors).filter(([, v]) => !v.observed).sort((a, b) => b[1].confidence - a[1].confidence).slice(0, 8);
+const im = (intentChampion?.metrics || {}) as any;
+
+const TILES = [
+  { v: String(stats.labelled), l: 'Graded moments', note: 'Supervised: an answer with a known outcome' },
+  { v: String(stats.unlabelled), l: 'Unlabelled', note: 'Shown, never answered — the semi-supervised input' },
+  { v: String(stats.learners), l: 'Learners in the corpus', note: 'Counted, never listed' },
+  { v: String(intentStats.total), l: 'Tutor turns', note: 'For the intent router' },
+  { v: champion ? 'v' + champion.version : '—', l: 'Serving checkpoint', note: champion ? 'Promoted on evidence' : 'None yet: the platform answers with its own estimator' },
+  { v: cm?.deltaVsBaseline != null ? pct(cm.deltaVsBaseline) : '—', l: 'Better than before', note: 'Log-loss improvement over the existing estimator' },
+];
+---
+
+<AquinAdminLayout title="The Mind" active="/aquintutor/admin/mind">
+  <h1 style="font-size:24px;margin:0 0 6px;">The Mind</h1>
+  <p style="font-size:13.5px;color:#6f665e;line-height:1.65;margin:0 0 18px;max-width:78ch;">
+    AquinTutor learns from its own use. Every graded answer becomes a training example, every
+    abandoned question becomes an unlabelled one, and the wording of the question bank is grouped
+    with nobody labelling anything. A network trains on all three and is then measured against the
+    estimator the platform already uses — and only serves learners if it wins on answers it has
+    never seen. This page shows that record, including the refusals.
+  </p>
+
+  {gaps.length > 0 && (
+    <div style={CARD + 'border-color:rgba(180,60,40,0.4);background:rgba(180,60,40,0.05);'}>
+      <p style="margin:0;font-size:13.5px;color:#a04330;line-height:1.6;">
+        These could not be read, so any figure below that depends on them is missing rather than
+        real: {gaps.join(', ')}. On first use this usually means the aq_mind_ tables have not been
+        created yet — running a learning cycle creates them.
+      </p>
+    </div>
+  )}
+
+  {flash && (
+    <div style={CARD + (flashOk ? 'border-color:rgba(26,107,53,0.4);background:rgba(26,107,53,0.05);' : 'border-color:rgba(180,60,40,0.4);background:rgba(180,60,40,0.05);')}>
+      <p style={'margin:0;font-size:13.5px;line-height:1.6;color:' + (flashOk ? '#1A6B35' : '#a04330') + ';'}>{flash}</p>
+    </div>
+  )}
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px;margin-bottom:18px;">
+    {TILES.map((t) => (
+      <div style="background:#fff;border:1px solid rgba(14,11,8,0.12);border-radius:12px;padding:15px 16px;">
+        <div style="font-size:26px;font-weight:800;letter-spacing:-0.02em;">{t.v}</div>
+        <div style="font-size:12.5px;color:#4a443e;margin-top:2px;">{t.l}</div>
+        <div style="font-size:11px;color:#a89f96;margin-top:3px;line-height:1.45;">{t.note}</div>
+      </div>
+    ))}
+  </div>
+
+  <!-- ============================ what is answering right now ============================ -->
+  <div style={CARD}>
+    <p style={LBL}>What is answering right now</p>
+    {champion ? (
+      <>
+        <p style="margin:0 0 12px;font-size:13.5px;color:#0E0B08;line-height:1.65;">
+          Checkpoint <b>v{champion.version}</b>, trained on {champion.trainedOn} examples,
+          promoted {when(champion.createdAt)}. Feature set v{champion.featureVersion}
+          {' '}({FEATURE_DIM} inputs){champion.arch?.warmStartedFrom ? ', continued from v' + champion.arch.warmStartedFrom : ', trained from scratch'}.
+        </p>
+        <div style="overflow-x:auto;">
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr>
+              <th style={TH}>Measured on held-out answers</th><th style={TH}>Log-loss</th><th style={TH}>Accuracy</th>
+              <th style={TH}>AUC</th><th style={TH}>Calibration error</th><th style={TH}>Rows</th>
+            </tr></thead>
+            <tbody>
+              <tr>
+                <td style={TD}><b>This model</b></td>
+                <td style={TD}>{num(cm?.candidate?.logLoss, 4)}</td><td style={TD}>{pct(cm?.candidate?.accuracy)}</td>
+                <td style={TD}>{num(cm?.candidate?.auc, 3)}</td><td style={TD}>{pct(cm?.candidate?.ece)}</td><td style={TD}>{cm?.candidate?.n ?? '—'}</td>
+              </tr>
+              <tr>
+                <td style={TD}>The estimator it replaced (BKT / item difficulty)</td>
+                <td style={TD}>{num(cm?.baseline?.logLoss, 4)}</td><td style={TD}>{pct(cm?.baseline?.accuracy)}</td>
+                <td style={TD}>{num(cm?.baseline?.auc, 3)}</td><td style={TD}>{pct(cm?.baseline?.ece)}</td><td style={TD}>{cm?.baseline?.n ?? '—'}</td>
+              </tr>
+              {cm?.champion && (
+                <tr>
+                  <td style={TD}>The checkpoint serving before it</td>
+                  <td style={TD}>{num(cm.champion.logLoss, 4)}</td><td style={TD}>{pct(cm.champion.accuracy)}</td>
+                  <td style={TD}>{num(cm.champion.auc, 3)}</td><td style={TD}>{pct(cm.champion.ece)}</td><td style={TD}>{cm.champion.n}</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <p style="margin:12px 0 0;font-size:12.5px;color:#6f665e;line-height:1.6;">{champion.note}</p>
+      </>
+    ) : (
+      <p style="margin:0;font-size:13.5px;color:#6f665e;line-height:1.65;">
+        No checkpoint has earned promotion, so every prediction on the platform is coming from the
+        estimator that was already there — Bayesian Knowledge Tracing once a learner has touched a
+        concept, the item's population miss rate before that. That is not a failure state: it is the
+        floor this feature is built never to fall below.
+      </p>
+    )}
+  </div>
+
+  <!-- ============================ controls ============================ -->
+  <div style={CARD}>
+    <p style={LBL}>Run the loop</p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+      <form method="POST"><input type="hidden" name="action" value="train" /><button type="submit" style={BTN}>Run a learning cycle</button></form>
+      <form method="POST"><input type="hidden" name="action" value="intent" /><button type="submit" style={BTN2}>Train the router</button></form>
+      <form method="POST"><input type="hidden" name="action" value="distill" /><button type="submit" style={BTN2}>Teacher labelling pass</button></form>
+      <form method="POST"><input type="hidden" name="action" value="rollback" /><input type="hidden" name="task" value="mastery" /><button type="submit" style={BTN2}>Roll back</button></form>
+    </div>
+    <ul style="margin:14px 0 0;padding-left:18px;font-size:12.5px;color:#6f665e;line-height:1.75;">
+      <li><b>A learning cycle</b> reads the corpus, groups the item wording, replays every learner's history in order, trains, and judges. It continues from the serving checkpoint rather than starting over, so each run builds on the last.</li>
+      <li><b>The router</b> is the intent model: it learns to tell "stuck on a concept" from "asking how the platform works" so the tutor can respond in kind without a language model in the loop.</li>
+      <li><b>A teacher labelling pass</b> asks the configured model — self-hosted or connector, whichever is set in the LLM panel — to label stored tutor turns. It sends those turns to that provider, which is why it is a button somebody presses rather than a background job. Its labels become training data and the evidence the router is judged on.</li>
+      <li><b>Roll back</b> puts the previous checkpoint back. If there is none, the platform returns to its own estimator.</li>
+    </ul>
+  </div>
+
+  <!-- ============================ unsupervised ============================ -->
+  <div style={CARD}>
+    <p style={LBL}>Found without labels</p>
+    {clusters.length ? (
+      <>
+        <p style="margin:0 0 12px;font-size:13px;color:#6f665e;line-height:1.6;">
+          Groups of questions that fail together, discovered by clustering their wording. Nobody
+          tagged these; the failure rate is what the group actually costs learners. A group high on
+          this list with unrelated-looking items is usually one misconception nobody wrote down.
+        </p>
+        <div style="overflow-x:auto;">
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr><th style={TH}>Group</th><th style={TH}>Items</th><th style={TH}>Attempts</th><th style={TH}>Failure rate</th><th style={TH}>Recurring words</th><th style={TH}>Example wording</th></tr></thead>
+            <tbody>
+              {clusters.map((c) => (
+                <tr>
+                  <td style={TD}>{c.index + 1}</td>
+                  <td style={TD}>{c.items}</td>
+                  <td style={TD}>{c.attempts}</td>
+                  <td style={TD + (c.failureRate > 0.5 ? 'color:#a04330;font-weight:700;' : '')}>{pct(c.failureRate)}</td>
+                  <td style={TD}>{c.terms.join(', ') || '—'}</td>
+                  <td style={TD + 'color:#6f665e;max-width:34ch;'}>{c.exemplars[0] || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </>
+    ) : (
+      <p style="margin:0;font-size:13.5px;color:#6f665e;line-height:1.65;">
+        No groups yet — clustering needs at least eight distinct items in the corpus. Run a cycle
+        once practice has been used.
+      </p>
+    )}
+    {priorRows.length > 0 && (
+      <div style="margin-top:16px;">
+        <p style={LBL}>Inferred across the concept graph</p>
+        <p style="margin:0 0 10px;font-size:13px;color:#6f665e;line-height:1.6;">
+          Concepts nobody has attempted enough to measure, given a starting difficulty from the
+          concepts they sit beside in real learner journeys. Confidence falls with distance from
+          evidence, and is shown so a thin inference is not read as a measurement.
+        </p>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;">
+          {priorRows.map(([k, v]) => (
+            <span style="font-size:12px;border:1px solid rgba(14,11,8,0.14);border-radius:100px;padding:5px 11px;color:#4a443e;">
+              {k}: {pct(v.value)} miss rate · confidence {pct(v.confidence)}
+            </span>
+          ))}
+        </div>
+      </div>
+    )}
+  </div>
+
+  <!-- ============================ the router ============================ -->
+  <div style={CARD}>
+    <p style={LBL}>The intent router</p>
+    <p style="margin:0 0 12px;font-size:13px;color:#6f665e;line-height:1.6;">
+      {intentChampion
+        ? 'Checkpoint v' + intentChampion.version + ' is routing, at ' + pct(im?.model?.accuracy) + ' accuracy against ' + pct(im?.rules?.accuracy) + ' for the rules it learned from.'
+        : 'The deterministic rules are routing. A trained router is only promoted once there are turns labelled by a teacher model or a person to judge it against — a model scored against the rules that taught it would look perfect and prove nothing.'}
+      {' '}Corpus: {intentStats.total} turns
+      {intentStats.bySource.length ? ' (' + intentStats.bySource.map((s) => s.n + ' ' + s.source).join(', ') + ')' : ''}.
+    </p>
+    <form method="POST" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <input type="hidden" name="action" value="classify" />
+      <input type="text" name="text" value={triedText} placeholder="Type what a learner might say" maxlength="500"
+             style="flex:1;min-width:240px;font:inherit;font-size:13px;padding:10px 12px;border:1px solid rgba(14,11,8,0.16);border-radius:9px;min-height:44px;" />
+      <button type="submit" style={BTN2}>Route it</button>
+    </form>
+    {tried && (
+      <div style="margin-top:12px;padding:12px 14px;border:1px solid rgba(14,11,8,0.12);border-radius:10px;">
+        <p style="margin:0 0 6px;font-size:13.5px;">
+          <b>{tried.label}</b> · {tried.source === 'model' ? 'the trained model (v' + tried.version + '), confidence ' + pct(tried.p) : 'the deterministic rules'}
+        </p>
+        <p style="margin:0;font-size:12.5px;color:#6f665e;line-height:1.6;">
+          The rules say: {INTENT_LABELS[tried.rules]}.
+          {tried.source === 'model' && tried.rules !== tried.klass ? ' They disagree — which is the interesting case, and the one worth a human deciding.' : ''}
+        </p>
+      </div>
+    )}
+    {intentCheckpoints.length > 0 && (
+      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+        {intentCheckpoints.map((c) => (
+          <form method="POST">
+            <input type="hidden" name="action" value="promote" /><input type="hidden" name="task" value="intent" /><input type="hidden" name="version" value={String(c.version)} />
+            <button type="submit" style={BTN2} disabled={c.status === 'champion'}>
+              {c.status === 'champion' ? 'v' + c.version + ' serving' : 'Promote router v' + c.version}
+            </button>
+          </form>
+        ))}
+      </div>
+    )}
+  </div>
+
+  <!-- ============================ checkpoints ============================ -->
+  <div style={CARD}>
+    <p style={LBL}>Checkpoints</p>
+    {checkpoints.length ? (
+      <div style="overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr><th style={TH}>Version</th><th style={TH}>Status</th><th style={TH}>Trained on</th><th style={TH}>Log-loss</th><th style={TH}>vs baseline</th><th style={TH}>Created</th><th style={TH}></th></tr></thead>
+          <tbody>
+            {checkpoints.map((c) => (
+              <tr>
+                <td style={TD}><b>v{c.version}</b></td>
+                <td style={TD + (c.status === 'champion' ? 'color:#1A6B35;font-weight:700;' : 'color:#8a7f76;')}>{c.status === 'champion' ? 'serving' : c.status}</td>
+                <td style={TD}>{c.trainedOn}</td>
+                <td style={TD}>{num(c.metrics?.candidate?.logLoss, 4)}</td>
+                <td style={TD}>{c.metrics?.deltaVsBaseline != null ? pct(c.metrics.deltaVsBaseline) : '—'}</td>
+                <td style={TD + 'color:#8a7f76;'}>{when(c.createdAt)}</td>
+                <td style={TD}>
+                  {c.status !== 'champion' && (
+                    <form method="POST">
+                      <input type="hidden" name="action" value="promote" /><input type="hidden" name="task" value="mastery" /><input type="hidden" name="version" value={String(c.version)} />
+                      <button type="submit" style={BTN2}>Promote</button>
+                    </form>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    ) : <p style="margin:0;font-size:13.5px;color:#6f665e;">Nothing trained yet.</p>}
+  </div>
+
+  <!-- ============================ the record, refusals included ============================ -->
+  <div style={CARD}>
+    <p style={LBL}>Every cycle, including the ones that refused</p>
+    {runs.length ? (
+      <div style="overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr><th style={TH}>When</th><th style={TH}>Learning used</th><th style={TH}>Moments</th><th style={TH}>Self-labelled</th><th style={TH}>Took</th><th style={TH}>Outcome</th></tr></thead>
+          <tbody>
+            {runs.map((r: any) => (
+              <tr>
+                <td style={TD + 'color:#8a7f76;white-space:nowrap;'}>{when(r.created_at)}</td>
+                <td style={TD}>{Array.isArray(r.modes) && r.modes.length ? r.modes.join(' + ') : '—'}</td>
+                <td style={TD}>{r.examples}</td>
+                <td style={TD}>{r.pseudo || 0}</td>
+                <td style={TD}>{(Number(r.ms || 0) / 1000).toFixed(1)}s</td>
+                <td style={TD + 'max-width:52ch;line-height:1.55;'}>
+                  <span style={'font-weight:700;color:' + (r.promoted ? '#1A6B35' : '#8a7f76') + ';'}>{r.promoted ? 'promoted v' + r.version : 'not promoted'}</span>
+                  <span style="color:#6f665e;"> — {r.decision}</span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    ) : <p style="margin:0;font-size:13.5px;color:#6f665e;">No cycles have been run.</p>}
+  </div>
+
+  <div style={CARD + 'background:rgba(14,11,8,0.02);'}>
+    <p style={LBL}>What this system may and may not do</p>
+    <ul style="margin:0;padding-left:18px;font-size:12.5px;color:#6f665e;line-height:1.8;">
+      <li>It chooses what to offer a learner next and states how confident it is. It does not grade, gate, rank or penalise anybody — a person decides anything that affects a learner's standing.</li>
+      <li>It never serves a prediction it cannot explain: every one carries the inputs that moved it.</li>
+      <li>It reads answers to questions and the platform's own item wording. No health or wellness signal, no consult message, no document reaches this corpus.</li>
+      <li>This console is aggregate only. There is no screen here that shows one named learner's stream, by design.</li>
+      <li>Feature set v{FEATURE_VERSION}. A checkpoint trained on an older feature set is never served — it is kept, and ignored, until it is retrained.</li>
+    </ul>
+  </div>
+</AquinAdminLayout>

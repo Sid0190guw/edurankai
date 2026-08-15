@@ -24,9 +24,16 @@ export const POST: APIRoute = async ({ request, locals }) => {
   if (!questionId) return json({ ok: false, error: 'questionId required' }, 400);
 
   try {
+    // question_text / category / the CURRENT empirical difficulty come along for the AquinTutor Mind
+    // event below — read here so the capture costs no extra query, and read BEFORE the stats update
+    // so the difficulty recorded is the one this learner actually faced.
     const q = rows(await db.execute(sql`
-      SELECT id, question_type, options, correct_answer, accepted_answers, answer_tolerance, explanation, marks
-      FROM test_questions WHERE id = ${questionId} LIMIT 1
+      SELECT q.id, q.question_type, q.options, q.correct_answer, q.accepted_answers, q.answer_tolerance,
+             q.explanation, q.marks, q.question_text, q.category,
+             COALESCE(s.empirical_difficulty, 0.5)::float8 AS emp_diff
+      FROM test_questions q
+      LEFT JOIN question_stats s ON s.question_id = q.id
+      WHERE q.id = ${questionId} LIMIT 1
     `))[0] as any;
     if (!q) return json({ ok: false, error: 'Question not found' }, 404);
 
@@ -99,6 +106,23 @@ export const POST: APIRoute = async ({ request, locals }) => {
         `).catch(() => {});
       }
     } catch (_) {}
+
+    // AquinTutor Mind (src/lib/mind): attach the outcome to the moment this question was shown.
+    // This is the supervised half of the corpus — one graded moment, in the situation it happened in.
+    if (user) {
+      try {
+        const { recordOutcome } = await import('@/lib/mind/store');
+        const blank = u == null || u === '' || (Array.isArray(u) && u.length === 0);
+        await recordOutcome({
+          userKey: user.id, label: correct ? 1 : 0, labelSource: 'outcome',
+          signals: {
+            itemKey: questionId, conceptKey: String(q.category || 'practice'), itemType: String(q.question_type || ''),
+            difficulty: Number(q.emp_diff ?? 0.5), marks: Number(q.marks || 1), blank,
+            text: String(q.question_text || '').slice(0, 300), atMs: Date.now(),
+          },
+        });
+      } catch (e: any) { console.error('[practice/answer] mind capture:', e?.cause?.message || e?.message); }
+    }
 
     // Update practice session counters
     if (sessionId) {
