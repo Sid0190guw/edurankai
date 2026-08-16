@@ -22,7 +22,22 @@ const GIF_HEADERS: Record<string, string> = {
   'Pragma': 'no-cache',
 };
 
+/**
+ * OFF BY DEFAULT, AND THIS IS THE ROUTE WHERE THAT MATTERS MOST.
+ *
+ * The reader here is an EXTERNAL recipient — somebody outside the company who was sent a message.
+ * Their IP address was being handed to a third-party service on every open, and the city it
+ * returned stored against their address with no retention limit. They were never asked and are
+ * never told, and there is no screen where they could see it or object.
+ *
+ * The same variable controls the in-app counterpart in /api/mail/open. Set MAIL_GEOLOCATE_OPENS
+ * =true to restore it. The open itself is still recorded either way — this only stops the country,
+ * region and city columns being filled, and stops the outbound request that filled them.
+ */
+const GEO_ENABLED = process.env.MAIL_GEOLOCATE_OPENS === 'true';
+
 async function geo(ip: string | null): Promise<{ country?: string; region?: string; city?: string }> {
+  if (!GEO_ENABLED) return {};
   if (!ip) return {};
   // ipapi.co with a tight timeout — we never want geo to slow the GIF response.
   try {

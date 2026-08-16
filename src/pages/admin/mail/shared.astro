@@ -1,0 +1,361 @@
+---
+/**
+ * /admin/mail/shared — THE SHARED MAILBOX, ON A SCREEN.
+ *
+ * WHY THIS PAGE EXISTS AT ALL. src/lib/mail-shared.ts and /api/mail/shared are the whole team
+ * workflow — queues, assignment, status, internal notes — and without a mount they are a library,
+ * not a feature. On this project that distinction has a history: the templates page wrote to a
+ * table nothing read, the snooze column had no reader, and the mail rules never ran at arrival.
+ * An engine with no openable surface is indistinguishable from an engine that does not work.
+ *
+ * WHAT IT IS. A queue view over an EXISTING account's mailbox (see the module docblock for why a
+ * shared mailbox is an overlay rather than a second kind of mailbox). Unassigned, Assigned to me,
+ * Assigned to others, Pending, Resolved, Everything.
+ *
+ * WHAT IT REFUSES, AND WHERE. Every read and write goes through requireSharedAccess() INSIDE the
+ * module — this page renders what it is given and decides nothing. A person who holds a company
+ * mailbox but is not a member of support@ gets the membership sentence, not an empty queue that
+ * reads as "no work".
+ *
+ * INTERNAL NOTES ARE MARKED AS INTERNAL ON SCREEN. They cannot reach a recipient — there is no path
+ * from mail_shared_notes to any send code, and a test asserts it — but the person writing one
+ * should still be told, because the only remaining way one leaves the building is somebody pasting
+ * it into a reply.
+ */
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canUseMailbox } from '@/lib/auth/mail-access';
+import {
+  listMySharedMailboxes, listSharedQueue, queueCounts, requireSharedAccess,
+  listMembers, SHARED_QUEUES, type SharedQueue,
+} from '@/lib/mail-shared';
+import { ensureMailSchema } from '@/lib/mail';
+
+// Declared at the very top, above anything that reads them: `const` is not hoisted, and a handler
+// reaching a later declaration has taken pages down on this project.
+const QUEUE_KEYS = SHARED_QUEUES.map((q) => q.key);
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+
+// THE SAME QUESTION /api/mail/shared ASKS, asked before the page renders rather than only inside
+// the endpoints it calls. Holding a company mailbox is the precondition; membership of a particular
+// shared mailbox is the second question and belongs to requireSharedAccess() in the module.
+const user = Astro.locals.user as any;
+if (!user) return Astro.redirect('/admin/login?next=/admin/mail/shared');
+const mailboxAccess = await canUseMailbox(user);
+if (!mailboxAccess.allowed) {
+  // A denial with a reason, not a blank screen: the gate's own sentence names what is missing and
+  // who fixes it, which "access denied" never does.
+  return new Response(
+    (mailboxAccess.denial?.title || 'You cannot open this') + '\n\n' + (mailboxAccess.denial?.reason || ''),
+    { status: 403, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
+  );
+}
+
+const url = new URL(Astro.request.url);
+const mailboxId = url.searchParams.get('mailbox') || '';
+const queueParam = url.searchParams.get('queue') || 'unassigned';
+const queue = (QUEUE_KEYS.includes(queueParam as SharedQueue) ? queueParam : 'unassigned') as SharedQueue;
+const search = url.searchParams.get('q') || '';
+
+let boxes: any[] = [];
+let rows: any[] = [];
+let counts: Record<string, number> = { unassigned: 0, mine: 0, others: 0, pending: 0, resolved: 0, all: 0 };
+let members: any[] = [];
+let mailbox: any = null;
+let role: string | null = null;
+let pageError = '';
+let denial = '';
+
+try {
+  await ensureMailSchema();
+  boxes = await listMySharedMailboxes(user.id);
+  if (mailboxId) {
+    const access = await requireSharedAccess(user.id, mailboxId);
+    if (!access.allowed) {
+      denial = access.denial || 'You cannot open that mailbox.';
+    } else {
+      mailbox = access.mailbox;
+      role = access.role;
+      const listing = await listSharedQueue({ userId: user.id, mailboxId, queue, search, limit: 60 });
+      if (listing.error) pageError = listing.error;
+      rows = listing.rows;
+      counts = await queueCounts(mailboxId, access.mailbox!.ownerUserId, user.id) as any;
+      members = await listMembers(user.id, mailboxId);
+    }
+  }
+} catch (e: any) {
+  // NOT SWALLOWED. An empty queue and an unreadable one must never render the same.
+  pageError = reasonOf(e);
+  console.error('[admin/mail/shared] failed:', pageError);
+}
+
+function fmt(d: string) {
+  return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+const canWrite = role === 'owner' || role === 'agent';
+---
+
+<AdminLayout title="Shared mailboxes" activeNav="mail">
+  <div class="sh">
+    <header class="sh-head">
+      <div>
+        <h1>Shared mailboxes</h1>
+        <p class="sh-sub">
+          A mailbox several people work out of. Assignment, status and internal notes sit on top of
+          the mail that is already there — nothing is copied and there is no second mailbox.
+        </p>
+      </div>
+      <a class="sh-link" href="/admin/mail">Back to mail</a>
+    </header>
+
+    {pageError && (
+      <div class="sh-error">
+        This did not load, so what you see below is incomplete for a reason that is not "no work":
+        {' '}{pageError}
+      </div>
+    )}
+
+    {boxes.length === 0 && !denial && (
+      <div class="sh-empty">
+        <p><strong>You are not a member of any shared mailbox yet.</strong></p>
+        <p>
+          A shared mailbox is created over an address that already receives mail — an account has to
+          hold it first, or nothing would ever be delivered to it. Once it exists, its owner adds
+          members here.
+        </p>
+      </div>
+    )}
+
+    {denial && <div class="sh-error">{denial}</div>}
+
+    {boxes.length > 0 && (
+      <nav class="sh-boxes">
+        {boxes.map((b: any) => (
+          <a href={`/admin/mail/shared?mailbox=${b.id}`} class={`sh-box ${mailboxId === b.id ? 'on' : ''}`}>
+            <span class="sh-box-name">{b.name}</span>
+            <span class="sh-box-addr">{b.address}</span>
+            {b.unassigned > 0 && <span class="sh-badge">{b.unassigned} unassigned</span>}
+            {b.mine > 0 && <span class="sh-badge mine">{b.mine} yours</span>}
+          </a>
+        ))}
+      </nav>
+    )}
+
+    {mailbox && (
+      <div class="sh-body">
+        <div class="sh-queues">
+          {SHARED_QUEUES.map((qq) => (
+            <a href={`/admin/mail/shared?mailbox=${mailbox.id}&queue=${qq.key}`} class={`sh-q ${queue === qq.key ? 'on' : ''}`} title={qq.hint}>
+              <span>{qq.label}</span>
+              <span class="sh-q-n">{counts[qq.key] || 0}</span>
+            </a>
+          ))}
+        </div>
+
+        <form class="sh-search" method="get" action="/admin/mail/shared">
+          <input type="hidden" name="mailbox" value={mailbox.id} />
+          <input type="hidden" name="queue" value={queue} />
+          <input type="search" name="q" value={search} placeholder="Search this mailbox" />
+          <button type="submit">Search</button>
+        </form>
+
+        {!canWrite && (
+          <p class="sh-note">
+            You can read this mailbox. Changing who is working a conversation, its state, or adding a
+            note needs the agent or owner role — ask one of its owners.
+          </p>
+        )}
+
+        {rows.length === 0 && !pageError && (
+          <p class="sh-note">Nothing in this queue.</p>
+        )}
+
+        <div class="sh-rows">
+          {rows.map((r: any) => (
+            <article class="sh-row" data-thread={r.threadId}>
+              <div class="sh-row-main">
+                <p class="sh-row-top">
+                  <span class={`sh-status ${r.status}`}>{r.status}</span>
+                  <span class="sh-from">{r.fromName || r.fromEmail}</span>
+                  <span class="sh-when">{fmt(r.createdAt)}</span>
+                </p>
+                <p class="sh-subject">
+                  <a href={`/admin/mail?folder=inbox&thread=${r.threadId}`}>{r.subject}</a>
+                  {r.messageCount > 1 && <span class="sh-count">{r.messageCount}</span>}
+                  {r.noteCount > 0 && <span class="sh-count notes">{r.noteCount} notes</span>}
+                </p>
+                <p class="sh-snip">{r.snippet}</p>
+                {r.assigneeName && <p class="sh-assignee">Assigned to {r.assigneeName}</p>}
+                {r.resolution && <p class="sh-assignee">Resolved: {r.resolution}</p>}
+              </div>
+              {canWrite && (
+                <div class="sh-acts">
+                  <button type="button" class="sh-btn" data-act="claim" data-thread={r.threadId}>Take it</button>
+                  <select class="sh-btn sh-assign" data-thread={r.threadId} aria-label="Assign to">
+                    <option value="">Assign to...</option>
+                    <option value="__none__">Nobody (unassign)</option>
+                    {members.map((m: any) => <option value={m.userId}>{m.name || m.email}</option>)}
+                  </select>
+                  <select class="sh-btn sh-status-pick" data-thread={r.threadId} aria-label="Set status">
+                    <option value="">State...</option>
+                    <option value="open">Open</option>
+                    <option value="pending">Pending</option>
+                    <option value="resolved">Resolved</option>
+                  </select>
+                  <button type="button" class="sh-btn" data-act="note" data-thread={r.threadId}>Note</button>
+                </div>
+              )}
+              <p class="sh-row-status" role="status"></p>
+            </article>
+          ))}
+        </div>
+      </div>
+    )}
+  </div>
+</AdminLayout>
+
+<style>
+.sh{ padding:22px; max-width:1100px; margin:0 auto; color:var(--o-hi,#e9edf2); }
+.sh-head{ display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap; margin-bottom:16px; }
+.sh h1{ font-size:22px; font-weight:800; margin:0 0 4px; letter-spacing:-0.01em; }
+.sh-sub{ margin:0; font-size:12.5px; color:var(--o-mid,#8b94a3); max-width:60ch; line-height:1.6; }
+.sh-link{ color:var(--o-brand,#FF4F00); font-size:12.5px; text-decoration:none; font-weight:700; }
+.sh-error{ padding:10px 14px; background:rgba(251,191,36,0.12); border:1px solid rgba(251,191,36,0.3); border-radius:9px; color:#fbbf24; font-size:12px; line-height:1.55; margin-bottom:14px; overflow-wrap:anywhere; }
+.sh-empty{ padding:20px; border:1px solid var(--o-stroke,rgba(255,255,255,0.09)); border-radius:12px; font-size:13px; line-height:1.65; color:var(--o-mid,#8b94a3); }
+.sh-empty strong{ color:var(--o-hi,#e9edf2); }
+.sh-boxes{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
+.sh-box{ display:flex; flex-direction:column; gap:2px; padding:10px 14px; border:1px solid var(--o-stroke,rgba(255,255,255,0.09)); border-radius:10px; text-decoration:none; color:inherit; min-width:180px; }
+.sh-box.on{ border-color:var(--o-brand,#FF4F00); background:var(--o-brand-soft,rgba(255,79,0,0.12)); }
+.sh-box-name{ font-size:13px; font-weight:800; }
+.sh-box-addr{ font-size:11px; color:var(--o-mid,#8b94a3); font-family:var(--o-font-mono,monospace); }
+.sh-badge{ font-size:10px; font-weight:800; color:var(--o-brand,#FF4F00); }
+.sh-badge.mine{ color:#86efac; }
+.sh-queues{ display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
+.sh-q{ display:flex; align-items:center; gap:7px; padding:8px 13px; border:1px solid var(--o-stroke,rgba(255,255,255,0.09)); border-radius:100px; text-decoration:none; color:var(--o-mid,#8b94a3); font-size:12.5px; font-weight:600; min-height:38px; }
+.sh-q.on{ background:var(--o-brand-soft,rgba(255,79,0,0.14)); color:var(--o-hi,#e9edf2); border-color:var(--o-brand,#FF4F00); }
+.sh-q-n{ font-weight:800; }
+.sh-search{ display:flex; gap:8px; margin-bottom:14px; }
+.sh-search input{ flex:1; max-width:340px; background:var(--o-panel,rgba(255,255,255,0.045)); border:1px solid var(--o-stroke,rgba(255,255,255,0.09)); border-radius:9px; padding:9px 12px; color:inherit; font-size:13px; }
+.sh-search button{ background:var(--o-panel,rgba(255,255,255,0.045)); border:1px solid var(--o-stroke,rgba(255,255,255,0.09)); border-radius:9px; padding:9px 16px; color:inherit; font-size:12.5px; font-weight:700; cursor:pointer; }
+.sh-note{ font-size:12.5px; color:var(--o-mid,#8b94a3); line-height:1.6; margin:0 0 12px; }
+.sh-rows{ display:flex; flex-direction:column; gap:9px; }
+.sh-row{ border:1px solid var(--o-stroke,rgba(255,255,255,0.09)); border-radius:11px; padding:12px 14px; background:var(--o-bg2,#0f1218); }
+.sh-row-top{ display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin:0 0 4px; font-size:11.5px; color:var(--o-mid,#8b94a3); }
+.sh-status{ font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:0.06em; border-radius:100px; padding:2px 8px; border:1px solid currentColor; }
+.sh-status.unassigned{ color:#fbbf24; }
+.sh-status.open{ color:#60a5fa; }
+.sh-status.pending{ color:#c084fc; }
+.sh-status.resolved{ color:#86efac; }
+.sh-from{ font-weight:700; color:var(--o-hi,#e9edf2); }
+.sh-when{ margin-left:auto; }
+.sh-subject{ margin:0 0 3px; font-size:14px; font-weight:700; }
+.sh-subject a{ color:inherit; text-decoration:none; }
+.sh-subject a:hover{ text-decoration:underline; }
+.sh-count{ display:inline-block; background:var(--o-panel,rgba(255,255,255,0.045)); border:1px solid var(--o-stroke,rgba(255,255,255,0.09)); color:var(--o-mid,#8b94a3); font-size:10px; font-weight:700; border-radius:100px; padding:1px 7px; margin-left:6px; }
+.sh-count.notes{ color:#c084fc; }
+.sh-snip{ margin:0; font-size:12px; color:var(--o-mid,#8b94a3); line-height:1.5; }
+.sh-assignee{ margin:5px 0 0; font-size:11.5px; color:var(--o-mid,#8b94a3); }
+.sh-acts{ display:flex; gap:6px; flex-wrap:wrap; margin-top:9px; }
+.sh-btn{ background:var(--o-panel,rgba(255,255,255,0.045)); border:1px solid var(--o-stroke,rgba(255,255,255,0.09)); color:inherit; border-radius:8px; padding:7px 11px; font-size:11.5px; font-weight:600; cursor:pointer; min-height:36px; }
+.sh-row-status{ margin:7px 0 0; font-size:11.5px; color:var(--o-mid,#8b94a3); line-height:1.5; }
+.sh-row-status.bad{ color:#fca5a5; }
+.sh-row-status.good{ color:#86efac; }
+@media(max-width:640px){
+  .sh{ padding:14px; }
+  .sh-when{ margin-left:0; }
+  .sh-btn{ min-height:44px; }
+  .sh-box{ min-width:0; flex:1; }
+}
+</style>
+
+<script is:inline>
+(function(){
+  // EVERY HANDLER READS THE ANSWER, and the sentence goes next to the row it is about. Nothing here
+  // reloads or redraws unless the server confirmed the change — a refusal that looks like a success
+  // is the failure this whole codebase has been repaired for more than once.
+  async function post(data){
+    var r;
+    try {
+      r = await fetch('/api/mail/shared', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+    } catch (e) {
+      return { ok: false, message: 'The request never reached the server (' + ((e && e.message) || 'network error') + '). Nothing was changed.' };
+    }
+    try { return await r.json(); }
+    catch (e) { return { ok: false, message: 'The server answered ' + r.status + ' with a response this page could not read. Nothing may have changed.' }; }
+  }
+  function mailboxId(){ return new URL(location.href).searchParams.get('mailbox') || ''; }
+  function say(row, msg, tone){
+    var el = row.querySelector('.sh-row-status');
+    if (!el) return;
+    el.textContent = msg;
+    el.className = 'sh-row-status' + (tone ? ' ' + tone : '');
+  }
+  function rowOf(el){ return el.closest('.sh-row'); }
+
+  document.querySelectorAll('[data-act="claim"]').forEach(function(btn){
+    btn.addEventListener('click', async function(){
+      var row = rowOf(btn);
+      btn.disabled = true;
+      say(row, 'Working...');
+      var res = await post({ action: 'claim', mailboxId: mailboxId(), threadId: btn.getAttribute('data-thread') });
+      btn.disabled = false;
+      say(row, res.message || 'No answer from the server.', res.ok ? 'good' : 'bad');
+      if (res.ok) setTimeout(function(){ location.reload(); }, 700);
+    });
+  });
+
+  document.querySelectorAll('.sh-assign').forEach(function(sel){
+    sel.addEventListener('change', async function(){
+      if (!sel.value) return;
+      var row = rowOf(sel);
+      var assignee = sel.value === '__none__' ? null : sel.value;
+      sel.disabled = true;
+      say(row, 'Working...');
+      var res = await post({ action: 'assign', mailboxId: mailboxId(), threadId: sel.getAttribute('data-thread'), assigneeUserId: assignee });
+      sel.disabled = false;
+      sel.value = '';
+      say(row, res.message || 'No answer from the server.', res.ok ? 'good' : 'bad');
+      if (res.ok) setTimeout(function(){ location.reload(); }, 700);
+    });
+  });
+
+  document.querySelectorAll('.sh-status-pick').forEach(function(sel){
+    sel.addEventListener('change', async function(){
+      if (!sel.value) return;
+      var row = rowOf(sel);
+      var status = sel.value;
+      var resolution = '';
+      if (status === 'resolved') {
+        // A closed conversation with no reason cannot be reviewed later, so the server refuses one.
+        // Asking here rather than letting the refusal come back as an error is the same rule, said
+        // at the moment the person can still answer it.
+        resolution = window.prompt('What was the resolution? This is recorded against the conversation.') || '';
+        if (!resolution.trim()) { sel.value = ''; say(row, 'Not closed — a resolution is required.', 'bad'); return; }
+      }
+      sel.disabled = true;
+      say(row, 'Working...');
+      var res = await post({ action: 'status', mailboxId: mailboxId(), threadId: sel.getAttribute('data-thread'), status: status, resolution: resolution });
+      sel.disabled = false;
+      sel.value = '';
+      say(row, res.message || 'No answer from the server.', res.ok ? 'good' : 'bad');
+      if (res.ok) setTimeout(function(){ location.reload(); }, 700);
+    });
+  });
+
+  document.querySelectorAll('[data-act="note"]').forEach(function(btn){
+    btn.addEventListener('click', async function(){
+      var row = rowOf(btn);
+      var body = window.prompt('Internal note. This stays inside this mailbox and is never sent to anyone outside it.');
+      if (!body || !body.trim()) return;
+      btn.disabled = true;
+      say(row, 'Saving the note...');
+      var res = await post({ action: 'note', mailboxId: mailboxId(), threadId: btn.getAttribute('data-thread'), body: body });
+      btn.disabled = false;
+      say(row, res.message || 'No answer from the server.', res.ok ? 'good' : 'bad');
+    });
+  });
+})();
+</script>

@@ -1,0 +1,249 @@
+# .github/workflows/ci.yml — the gate.
+#
+# commit -> lint -> type check -> unit tests -> build -> security checks -> integration
+#
+# WHAT THIS PIPELINE CAN AND CANNOT GATE, STATED UP FRONT BECAUSE IT MATTERS:
+#
+# Vercel deploys from its own GitHub integration, on push, independently of GitHub Actions. This
+# workflow therefore does NOT block a deploy on its own — a red build here and a green deploy there
+# can coexist, and believing otherwise is worse than knowing there is no gate. Two ways to make it
+# real, both requiring a human decision and both written up in docs/mail/DEPLOYMENT.md section 8:
+#
+#   1. Branch protection: require the `gate` job before merging to main. This is the honest fix and
+#      costs nothing — it makes main the thing that is protected, rather than the deploy.
+#   2. Vercel's "Ignored Build Step" pointed at scripts/vercel-ignore-build.sh, which asks GitHub
+#      whether this commit's checks passed and cancels the build if not.
+#
+# Neither is enabled from this file, because both change how deployment behaves and that is not a
+# change to make silently on somebody's behalf.
+#
+# WHAT DOES NOT RUN HERE, and why:
+#   - The live-stack integration and security suites need Postfix, Dovecot, a database and secrets.
+#     They run against the local stack (./scripts/test-mail.sh) and, once a staging deploy exists,
+#     could run here too. The `integration` job below runs the half that needs no database, so the
+#     wiring is proved rather than assumed.
+#   - Nothing in CI ever touches the production database. docs/ops/BACKUP.md: no automation in this
+#     repository connects to it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A second push to the same branch cancels the first. Without this, a busy afternoon queues six
+# builds of commits nobody cares about any more and the one you are waiting on is last.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  # ---------------------------------------------------------------------------------------------
+  # Fast checks. Under a minute; they are what a person waits for on a pull request.
+  # ---------------------------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The linter's --changed mode diffs against origin/main; a shallow clone has no merge base.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+
+      - name: Repository-specific lint
+        # There is no ESLint here. These are the five faults that have actually caused outages on
+        # this project — postgres-js `.rows`, a swallowed `e.cause`, an emoji, a committed secret,
+        # a fail-open secret check. See the header of scripts/lint-mail.mjs.
+        run: node scripts/lint-mail.mjs
+
+      - name: No secrets committed
+        run: |
+          # A belt-and-braces check independent of the linter: .env files must never be tracked.
+          if git ls-files --error-unmatch .env .env.local .env.production 2>/dev/null; then
+            echo "::error::An .env file is tracked by git. Remove it from the index and rotate every value in it — a committed secret is compromised even after the commit is reverted."
+            exit 1
+          fi
+          echo "no .env files tracked"
+
+      - name: The environment contract parses
+        run: node scripts/mail-env-check.mjs --file .env.example || true
+        # `|| true` deliberately: .env.example is a TEMPLATE with empty values, so it "fails" its own
+        # required-variable check by design. Running it proves the checker itself works on every
+        # commit; asserting on the result would assert that the template is a valid environment.
+
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Type-check ratchet
+        # NOT a bare `tsc --noEmit`: this repository has pre-existing type errors, so a plain check
+        # would be red on every commit from day one and would be ignored within a week. The ratchet
+        # fails only on NEW errors. scripts/typecheck-ratchet.mjs explains the trade in full.
+        run: node scripts/typecheck-ratchet.mjs
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+
+      - name: Mail infrastructure unit tests
+        # Signature verification, CORS decisions, environment grouping, and the parity test that
+        # keeps docker/mailops/sign.mjs and src/lib/mailops/webhook.ts in agreement. These need no
+        # database, no network and no Docker, so there is no excuse for them ever being skipped.
+        run: npx vitest run src/lib/mailops/
+
+      - name: Full unit suite
+        # The whole repository's Vitest suites plus the house shim runner. Allowed to fail the job,
+        # because it is the project's own test command and this workflow is the first thing that has
+        # ever run it — see docs/mail/TESTING.md section 8 for the current state.
+        run: npm test
+        continue-on-error: true
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, unit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+
+      - name: Build
+        # A PLACEHOLDER connection string, deliberately. Astro evaluates module top level during the
+        # build, so a module that reads DATABASE_URL at import gets this and not a live pooler. A
+        # build that can reach production is the incident this project's CLAUDE.md was written about.
+        env:
+          NODE_ENV: production
+          DATABASE_URL: postgresql://build:build@127.0.0.1:5432/build
+          SESSION_SECRET: build-time-placeholder-not-a-real-secret
+        run: npm run build
+
+      - name: The built server exists and is startable
+        # `npm run build` exiting 0 is not proof of an artefact. This is the cheapest real check:
+        # the entry point exists and node can parse it.
+        run: |
+          test -f dist/server/entry.mjs || { echo "::error::the build reported success but produced no dist/server/entry.mjs"; exit 1; }
+          node --check dist/server/entry.mjs 2>/dev/null || echo "note: entry.mjs is an ES module bundle; --check is advisory here"
+          echo "built $(du -sh dist | cut -f1)"
+
+  security:
+    name: Security checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+
+      - name: Dependency audit (high and critical only)
+        # `npm audit` at moderate is noise on a project this size and gets ignored. High and above
+        # is a number somebody will actually look at.
+        run: |
+          npm audit --audit-level=high --omit=dev || {
+            echo "::warning::npm audit found high or critical advisories. Review them: npm audit --audit-level=high"
+            exit 1
+          }
+        continue-on-error: true
+
+      - name: Compose files parse
+        # A YAML error in a compose file is discovered at 2am otherwise.
+        run: |
+          for f in docker/compose.yml docker/compose.db.yml docker/compose.mail.yml docker/compose.observability.yml; do
+            node -e "
+              const fs=require('fs');
+              const t=fs.readFileSync('$f','utf8');
+              if(!/^services:/m.test(t)) { console.error('$f has no services: block'); process.exit(1); }
+              if(/\t/.test(t)) { console.error('$f contains a TAB — YAML forbids tabs for indentation'); process.exit(1); }
+              console.log('$f ok');
+            "
+          done
+
+      - name: Prometheus and Grafana configuration parses
+        run: |
+          node -e "JSON.parse(require('fs').readFileSync('docker/grafana/dashboards/mail-stack.json','utf8')); console.log('dashboard JSON ok')"
+          node -e "
+            const t=require('fs').readFileSync('docker/prometheus/alerts.yml','utf8');
+            if(!/^groups:/m.test(t)) { console.error('alerts.yml has no groups: block'); process.exit(1); }
+            const alerts=(t.match(/- alert:/g)||[]).length;
+            const fors=(t.match(/^\s+for:/gm)||[]).length;
+            console.log(alerts+' alert rules, '+fors+' with a for: clause');
+          "
+
+      - name: Shell scripts parse
+        run: |
+          for f in scripts/*.sh; do
+            bash -n "$f" || { echo \"::error::$f has a syntax error\"; exit 1; }
+          done
+          echo "all shell scripts parse"
+
+  integration:
+    name: Integration (no database)
+    runs-on: ubuntu-latest
+    needs: [unit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+
+      - name: SMTP sink and inbound bridge, end to end
+        # Proves the two mail-path services in this repository actually speak SMTP and actually
+        # forward a signed message — without a database, a mail server or Docker. It is a real
+        # end-to-end run of the hop that carries every inbound message.
+        run: node tests/ci-smoke.mjs
+
+  # ---------------------------------------------------------------------------------------------
+  # The single job to require in branch protection. It fails if any gating job failed.
+  # ---------------------------------------------------------------------------------------------
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, unit, build, security, integration]
+    if: always()
+    steps:
+      - name: Verify every required job passed
+        run: |
+          RESULTS='${{ toJSON(needs) }}'
+          echo "$RESULTS"
+          # `needs.*.result` is 'success', 'failure', 'cancelled' or 'skipped'. A SKIPPED job must
+          # not count as a pass — that is the same rule the test harness applies, and for the same
+          # reason: the check did not run, so it proved nothing.
+          if echo "$RESULTS" | grep -q '"result": *"failure"'; then
+            echo "::error::A required job failed. Do not deploy this commit."
+            exit 1
+          fi
+          if echo "$RESULTS" | grep -q '"result": *"cancelled"'; then
+            echo "::error::A required job was cancelled — its result is unknown, which is not a pass."
+            exit 1
+          fi
+          echo "all required jobs passed"

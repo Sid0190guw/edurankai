@@ -1,0 +1,185 @@
+# docker/compose.yml — the base stack. App, queue worker, inbound bridge, test sink, health.
+#
+# WHAT THIS FILE DELIBERATELY DOES NOT DO: run a database. The default (LOCAL_DB_MODE=supabase) is
+# that development talks to the SAME Supabase project the deployed app uses, because this system has
+# no migration runner — 343 `CREATE TABLE IF NOT EXISTS` statements self-bootstrap across
+# application modules, and no file in this repository reconstructs the live schema. A local Postgres
+# would therefore be a DIFFERENT database with a different shape, and every "works locally, breaks
+# deployed" bug would start there. If you want one anyway (offline work, destructive tests), it is
+# in compose.db.yml behind the `localdb` profile and the trade-off is written up in
+# docs/mail/DEPLOYMENT.md section 3.
+#
+# PROFILES, so you start only what you need:
+#   (default)       app + worker + ingest + sink + mailops        — the development stack
+#   localdb         adds Postgres + Redis                          (compose.db.yml)
+#   mail            adds the real MTA: Postfix/Dovecot/Rspamd      (compose.mail.yml)
+#   observability   adds Prometheus + Grafana                      (compose.observability.yml)
+#
+# Everything is driven from ../.env.local — the same file `npm run dev` reads. One environment,
+# not two that drift.
+#
+# Usage is wrapped by ./scripts/start-mail.sh; the raw form is:
+#   docker compose --env-file ../.env.local -f compose.yml -f compose.mail.yml up -d
+
+name: edurankai-mail
+
+services:
+  # -------------------------------------------------------------------------------------------
+  # The Astro application. Same source, same build, node adapter instead of the Vercel adapter.
+  # -------------------------------------------------------------------------------------------
+  app:
+    build:
+      context: ..
+      dockerfile: docker/app/Dockerfile
+    image: edurankai/app:local
+    restart: unless-stopped
+    ports:
+      - "${PORT_APP:-4321}:4321"
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "4321"
+      # Supabase by default. compose.db.yml overrides this to the local container.
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required — copy .env.example to .env.local and fill it in}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-era_session}
+      CRON_SECRET: ${CRON_SECRET:?CRON_SECRET is required — the worker cannot drain the queue without it}
+      MAIL_DOMAIN: ${MAIL_DOMAIN:-edurankai.in}
+      EMAIL_FROM: ${EMAIL_FROM:-EduRankAI <noreply@edurankai.in>}
+      # In the local stack, outbound goes to the sink by default and reaches nobody.
+      SMTP_HOST: ${LOCAL_SMTP_MODE:-sink}
+      SMTP_PORT: "1025"
+      SMTP_SECURE: "false"
+      MAIL_INBOUND_SECRET: ${MAIL_INBOUND_SECRET:-}
+      MAIL_WEBHOOK_SECRET: ${MAIL_WEBHOOK_SECRET:-}
+      MAIL_ALLOWED_ORIGINS: ${MAIL_ALLOWED_ORIGINS:-http://localhost:4321}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      BLOB_READ_WRITE_TOKEN: ${BLOB_READ_WRITE_TOKEN:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4321/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 3
+    networks: [mail]
+
+  # -------------------------------------------------------------------------------------------
+  # Queue worker. Drains edu_jobs continuously instead of once a day.
+  # -------------------------------------------------------------------------------------------
+  mail-worker:
+    build:
+      context: ..
+      dockerfile: docker/mailops/Dockerfile
+    image: edurankai/mailops:local
+    command: ["node", "worker.mjs"]
+    restart: unless-stopped
+    environment:
+      APP_URL: http://app:4321
+      CRON_SECRET: ${CRON_SECRET:?CRON_SECRET is required}
+      QUEUE_POLL_INTERVAL_MS: ${QUEUE_POLL_INTERVAL_MS:-5000}
+      QUEUE_BATCH_SIZE: ${QUEUE_BATCH_SIZE:-25}
+      WORKER_HTTP_PORT: "1082"
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      # /ready, not /health: a worker whose every poll 403s is "running" and useless. /ready is
+      # false until it has actually drained once.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:1082/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    networks: [mail]
+
+  # -------------------------------------------------------------------------------------------
+  # Inbound bridge. SMTP in from the MTA, signed raw MIME out to /api/mail/inbound.
+  # -------------------------------------------------------------------------------------------
+  mail-parser:
+    build:
+      context: ..
+      dockerfile: docker/mailops/Dockerfile
+    image: edurankai/mailops:local
+    command: ["node", "ingest.mjs"]
+    restart: unless-stopped
+    environment:
+      APP_URL: http://app:4321
+      INGEST_SMTP_PORT: "1025"
+      INGEST_HTTP_PORT: "1081"
+      MAIL_WEBHOOK_SECRET: ${MAIL_WEBHOOK_SECRET:-}
+      MAIL_INBOUND_SECRET: ${MAIL_INBOUND_SECRET:-}
+      MAIL_HOST: ${MAIL_HOST:-mail.edurankai.in}
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:1081/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [mail]
+
+  # -------------------------------------------------------------------------------------------
+  # Test sink. Accepts outbound mail, writes .eml to a volume, DELIVERS NOTHING.
+  # This is what makes a 100k-message load test safe: there is no delivery path in the process.
+  # -------------------------------------------------------------------------------------------
+  smtp-sink:
+    build:
+      context: ..
+      dockerfile: docker/mailops/Dockerfile
+    image: edurankai/mailops:local
+    command: ["node", "sink.mjs"]
+    restart: unless-stopped
+    ports:
+      # Bound to loopback on the host. An SMTP port on 0.0.0.0 of a laptop is an open SMTP port to
+      # whatever network that laptop is on.
+      - "127.0.0.1:${PORT_SMTP:-1025}:1025"
+      - "127.0.0.1:1080:1080"
+    environment:
+      MAIL_SINK_SMTP_PORT: "1025"
+      MAIL_SINK_HTTP_PORT: "1080"
+      MAIL_SINK_DIR: /data/sink
+      MAIL_SINK_MAX: ${MAIL_SINK_MAX:-5000}
+    volumes:
+      - ./data/sink:/data/sink
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:1080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [mail]
+
+  # -------------------------------------------------------------------------------------------
+  # Health aggregator. One URL for the whole stack: /health, /ready, /metrics.
+  # -------------------------------------------------------------------------------------------
+  mailops:
+    build:
+      context: ..
+      dockerfile: docker/mailops/Dockerfile
+    image: edurankai/mailops:local
+    command: ["node", "health.mjs"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT_MAILOPS:-9100}:9100"
+    environment:
+      MAILOPS_PORT: "9100"
+      APP_URL: http://app:4321
+      # Which components this stack is expected to have. Without the `mail` profile there is no MTA,
+      # so smtp/imap are NOT expected and their absence must not read as an outage.
+      MAILOPS_EXPECT: ${MAILOPS_EXPECT:-app,ingest,worker,sink}
+      PROBE_INGEST_URL: http://mail-parser:1081
+      PROBE_WORKER_URL: http://mail-worker:1082
+      PROBE_SINK_URL: http://smtp-sink:1080
+      PROBE_REDIS_HOST: redis
+      PROBE_SMTP_HOST: mta
+      PROBE_IMAP_HOST: mta
+    networks: [mail]
+
+networks:
+  mail:
+    driver: bridge

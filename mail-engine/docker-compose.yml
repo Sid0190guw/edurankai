@@ -1,0 +1,143 @@
+# mail-engine/docker-compose.yml — the whole mail stack, one command.
+#
+#   docker compose -f mail-engine/docker-compose.yml up -d
+#
+# WHAT EACH CONTAINER IS FOR
+#   postfix    the MTA. Listens on 25 (MX) and 587 (submission), speaks TLS, refuses to relay,
+#              hands every message to rspamd for a verdict and to opendkim for a signature.
+#   rspamd     spam filtering, as a milter. Postfix asks it about every inbound message.
+#   opendkim   signs mail that leaves through Postfix. Mail submitted to the ENGINE is signed by the
+#              engine itself; both use the same key files and the same selector, so a message is
+#              signed identically whichever door it came in by.
+#   dovecot    the mailbox store and the IMAP server. Postfix delivers into it over LMTP.
+#   engine     this repository's Node service: the queue, the retry engine, the classifier, the
+#              event stream and the bridge to the application.
+#   redis      rspamd's storage for greylisting, ratelimits and bayes. Small and optional-ish —
+#              rspamd runs without it but forgets everything on restart.
+#
+# THE LAPTOP CAVEAT, STATED HERE BECAUSE IT IS WHERE PEOPLE LOOK FIRST. Bringing this up on the
+# ZBook gives you a complete, working mail system that the public Internet cannot reach and that
+# most of the Internet will not accept mail from. Port 25 inbound needs a public IP and an MX
+# record; port 25 outbound is blocked by essentially every ISP; and PTR (reverse DNS) cannot be set
+# on a domestic connection at all. That is a network fact, not a configuration mistake — see
+# docs/dns.md. For local work, set MAIL_RELAY_HOST to a smarthost and use MailHog/Mailpit as the
+# destination, or leave MAIL_DELIVERY_ENABLED off and watch the queue.
+
+name: edurankai-mail
+
+services:
+  postfix:
+    build:
+      context: ./docker/postfix
+    image: edurankai/postfix:local
+    hostname: ${MAIL_HOSTNAME:-mail.edurankai.in}
+    restart: unless-stopped
+    environment:
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME:-mail.edurankai.in}
+      MAIL_DOMAINS: ${MAIL_DOMAINS:-edurankai.in}
+      MAIL_MAX_MESSAGE_BYTES: ${MAIL_MAX_MESSAGE_BYTES:-26214400}
+      # Where accepted mail goes. lmtp:dovecot:24 stores it in a real mailbox; the alternative,
+      # documented in docs/operations.md, pipes it straight to the engine instead.
+      VIRTUAL_TRANSPORT: ${VIRTUAL_TRANSPORT:-lmtp:inet:dovecot:24}
+      RELAYHOST: ${MAIL_RELAY_HOST_WITH_PORT:-}
+    ports:
+      # 25 is the MX port: other mail servers connect here. 587 is submission: your own clients do.
+      # 465 (implicit TLS submission) is included because many clients still prefer it.
+      - "${POSTFIX_SMTP_PORT:-25}:25"
+      - "${POSTFIX_SUBMISSION_PORT:-587}:587"
+      - "${POSTFIX_SUBMISSIONS_PORT:-465}:465"
+    volumes:
+      - postfix-spool:/var/spool/postfix
+      - ./docker/certs:/etc/mail/certs:ro
+      - ./keys:/etc/opendkim/keys:ro
+    depends_on:
+      - rspamd
+      - opendkim
+      - dovecot
+    networks: [mail]
+
+  rspamd:
+    build:
+      context: ./docker/rspamd
+    image: edurankai/rspamd:local
+    restart: unless-stopped
+    environment:
+      RSPAMD_REJECT_SCORE: ${MAIL_SPAM_REJECT_SCORE:-15}
+      RSPAMD_QUARANTINE_SCORE: ${MAIL_SPAM_QUARANTINE_SCORE:-6}
+    volumes:
+      - rspamd-data:/var/lib/rspamd
+    depends_on:
+      - redis
+    networks: [mail]
+
+  opendkim:
+    build:
+      context: ./docker/opendkim
+    image: edurankai/opendkim:local
+    restart: unless-stopped
+    environment:
+      MAIL_DOMAINS: ${MAIL_DOMAINS:-edurankai.in}
+      MAIL_DKIM_SELECTOR: ${MAIL_DKIM_SELECTOR:-era1}
+    volumes:
+      # The SAME key files the Node engine signs with. One key, one selector, one DNS record.
+      - ./keys:/etc/opendkim/keys:ro
+    networks: [mail]
+
+  dovecot:
+    build:
+      context: ./docker/dovecot
+    image: edurankai/dovecot:local
+    restart: unless-stopped
+    environment:
+      MAIL_DOMAINS: ${MAIL_DOMAINS:-edurankai.in}
+    ports:
+      - "${DOVECOT_IMAPS_PORT:-993}:993"
+    volumes:
+      - dovecot-mail:/var/mail
+      - ./docker/dovecot/users:/etc/dovecot/users:ro
+      - ./docker/certs:/etc/mail/certs:ro
+    networks: [mail]
+
+  engine:
+    build:
+      context: ../
+      dockerfile: mail-engine/docker/engine/Dockerfile
+    image: edurankai/mail-engine:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Inside the compose network the engine binds to every interface so postfix can pipe to it.
+      # On the host it stays on loopback — see the note in src/server.ts about the submission API.
+      MAIL_ENGINE_HOST: 0.0.0.0
+      MAIL_SPOOL_DIR: /var/spool/mail-engine
+      MAIL_DKIM_KEY_DIR: /etc/opendkim/keys
+      MAIL_IMAP_HOST: ${MAIL_IMAP_HOST:-dovecot}
+    ports:
+      - "127.0.0.1:${MAIL_ENGINE_PORT:-2580}:2580"
+    volumes:
+      # The queue. This volume IS the durability promise — everything else can be rebuilt.
+      - engine-spool:/var/spool/mail-engine
+      - ./keys:/etc/opendkim/keys:ro
+    depends_on:
+      - postfix
+    networks: [mail]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+    volumes:
+      - redis-data:/data
+    networks: [mail]
+
+volumes:
+  postfix-spool:
+  dovecot-mail:
+  rspamd-data:
+  redis-data:
+  engine-spool:
+
+networks:
+  mail:
+    driver: bridge

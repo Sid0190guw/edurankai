@@ -10,8 +10,17 @@
 // Props: user (Astro.locals.user), basePath ('/admin/mail' | '/portal/employee/mail').
 // basePath drives navigation only; the three write endpoints are absolute (/api/mail/{send,draft,
 // action}) and each authorises through denyMailApi(), so both mounts meet the same gate.
-import { getFolderCounts, getMailboxAddress, listFolder, getThreadMessages, markThreadRead, deliveryWording, FOLDERS } from '@/lib/mail';
-import type { FolderListing } from '@/lib/mail';
+import { getFolderCounts, getMailboxAddress, getUserLabels, getThreadMessages, markThreadRead, deliveryWording, FOLDERS } from '@/lib/mail';
+// PATCH 11 — the advanced layer. The listing no longer goes through listFolder(): that ran a
+// window function over the WHOLE filtered mailbox to pick one row per conversation, which is a sort
+// of everything to draw fifty rows. searchMailbox() walks the existing
+// mail_box(user_id, folder, created_at DESC) index from a keyset cursor and collapses conversations
+// inside the page, so the cost is the page rather than the mailbox. It also carries the larger
+// grammar (body:, filename:, domain:, larger:, negation) — one parser for the box and the listing.
+import { searchMailbox, SEARCH_HELP, isBroadQuery, type SearchPage } from '@/lib/mail-search';
+import { assembleConversation, flattenConversation, summarizeConversation, splitQuoted, participantLine } from '@/lib/mail-threading';
+import { classifyAttachment } from '@/lib/mail-attachments';
+import { snoozePresets, maybeWakeDue } from '@/lib/mail-snooze';
 
 const { user, basePath = '/admin/mail' } = Astro.props as { user: any; basePath?: string };
 
@@ -25,7 +34,8 @@ const threadId = url.searchParams.get('thread') || '';
 
 let counts: Record<string, number> = {};
 let myAddress = '';
-let listing: FolderListing | null = null;
+let listing: SearchPage | null = null;
+let userLabels: string[] = [];
 let dbReady = true;
 // The reason, kept, so the banner can say what went wrong instead of guessing.
 let mailError = '';
@@ -40,19 +50,49 @@ try {
   // listing ignored the folder you clicked and the terms you searched), and `list` then held an
   // object, so `list.length === 0` was `undefined === 0` — false, hiding the empty state — and
   // `list.map(...)` threw TypeError while rendering. Both mail mounts answered 500.
-  listing = await listFolder(user.id, { folder, starred, label, query: q });
+  // withTotal is asked for ONLY when something is narrowing the list, because that is when the
+  // number is worth a second statement — it is what "select all N results" needs a number for.
+  listing = await searchMailbox(user.id, {
+    query: q,
+    scope: { folder, starred, label },
+    limit: 50,
+    withTotal: !!q || !!label || starred,
+  });
+  userLabels = await getUserLabels(user.id);
+  // Bring back anything whose snooze is up. Server-side, bounded and throttled per process — see
+  // maybeWakeDue() for why the daily cron alone is not enough to make "later today" mean it.
+  await maybeWakeDue();
 } catch (e: any) {
   // NOT SWALLOWED. The real Postgres reason is on e.cause; e.message is only the failed SQL.
   dbReady = false;
   mailError = String(e?.cause?.message || e?.message || 'unknown error');
   console.error('[MailClient] listing failed:', mailError);
 }
-const list: any[] = listing ? listing.rows : [];
+// The engine returns camelCase hits; the markup below has always read snake_case rows. Mapped here
+// rather than renaming forty template expressions — one function, one place, and the extra fields
+// the advanced list needs (snooze, size, participants) come along with it.
+const list: any[] = (listing ? listing.hits : []).map((h) => ({
+  thread_id: h.threadId, message_id: h.messageId, subject: h.subject, snippet: h.snippet,
+  from_name: h.fromName, from_email: h.fromEmail, from_user_id: h.fromUserId,
+  created_at: h.createdAt, is_read: h.isRead, is_starred: h.isStarred,
+  has_attachments: h.hasAttachments, folder: h.folder, labels: h.labels,
+  thread_count: h.threadCount, direction: h.direction, is_draft: h.isDraft,
+  participants: h.participants, snoozed_until: h.snoozedUntil,
+}));
 // What is actually on screen, from the listing itself rather than from the folder in the URL: a
 // search with `in:anywhere` or a label pseudo-folder does not return the folder you are standing in.
 const scopeLabel = listing ? listing.scopeLabel : '';
-const filtered = !!(listing && listing.filtered);
+const filtered = !!(listing && (listing.query.active || !!label));
 const queryNote = listing && listing.query && listing.query.active ? listing.query.describe : '';
+// Operators that parsed to nothing usable, and an engine that had to fall back. Both are SHOWN. A
+// search that quietly ignored half of what was typed is how somebody concludes their mail is gone.
+const queryWarnings: string[] = listing ? listing.query.warnings : [];
+const searchDegraded = listing ? listing.degraded : null;
+const nextCursor = listing ? listing.nextCursor : null;
+const resultTotal = listing && listing.total != null ? listing.total : null;
+const resultTotalCapped = !!(listing && listing.totalIsCapped);
+const queryIsBroad = !!(listing && isBroadQuery(listing.query));
+const snoozeMenu = snoozePresets().map((p) => ({ key: p.key, label: p.label, when: p.when, at: p.at ? p.at.toISOString() : null }));
 
 let thread: any[] = [];
 let threadSubject = '';
@@ -89,12 +129,54 @@ if (threadId && dbReady) {
   }
   const first = thread[0];
   threadSubject = first?.subject || '(no subject)';
+  // fall through to the conversation assembly below
   const last = thread[thread.length - 1] || {};
   const myEmail = (myAddress || '').toLowerCase();
   threadOtherParty = (last.from_email && last.from_email.toLowerCase() !== myEmail)
     ? last.from_email
     : ((last.recipients || []).find((r: any) => (r.email || '').toLowerCase() !== myEmail)?.email || last.from_email || '');
 }
+
+// ------------------------------------------------------------------------------------------------
+// THE CONVERSATION, AS A CONVERSATION.
+//
+// getThreadMessages() returns a flat list in date order. Three things were missing from that and
+// each of them is why a long exchange was hard to read:
+//
+//   1. SHAPE. A reply-all to an older message belongs UNDER that message. assembleConversation()
+//      works the nesting out from In-Reply-To and References (src/lib/mail-threading.ts).
+//   2. WHAT IS NEW versus WHAT IS A REPEAT. splitQuoted() separates the sentence somebody wrote
+//      from the three screens of history their client stapled underneath it, so "show quoted text"
+//      can exist at all — before this, every reply redisplayed the entire thread inside itself.
+//   3. WHICH MESSAGES START OPEN. summarizeConversation() decides once — latest, unread, drafts —
+//      instead of the markup inventing a rule of its own.
+//
+// Done on the SERVER, so the first paint is the finished conversation. /api/mail/conversation
+// returns the same structure for the client-side paths (prefetch, mobile back-and-forth).
+const convo = thread.length ? flattenConversation(assembleConversation(thread as any[])) : [];
+const convoSummary = thread.length ? summarizeConversation(thread as any[]) : null;
+const convoParticipants = convoSummary ? participantLine(convoSummary.participants) : '';
+const selfHost = url.hostname;
+const messages = convo.map((node: any) => {
+  const m = node.message;
+  const split = splitQuoted(m.body_text || stripTags(m.body_html));
+  return {
+    m,
+    depth: node.depth,
+    via: node.via,
+    visible: split.visible,
+    quoted: split.quoted,
+    signature: split.signature,
+    hasQuoted: !!split.quoted,
+    expanded: convoSummary ? convoSummary.expandedIds.includes(m.id) : true,
+    // Every attachment goes through ONE policy (src/lib/mail-attachments.ts). The markup never
+    // decides for itself whether something is safe to render.
+    atts: (m.attachments || []).map((a: any) => ({
+      raw: a,
+      v: classifyAttachment({ filename: a.filename, url: a.url, mime: a.mime, sizeBytes: a.size_bytes }, selfHost),
+    })),
+  };
+});
 
 // ------------------------------------------------------------------------------------------------
 // TEMPLATE PREFILL - the missing half of /admin/mail/templates.
@@ -210,19 +292,66 @@ const folderLinks = [
           </a>
         );
       })}
+      {/* LABELS ARE A PLACE YOU CAN STAND, not just a chip on a row. Built from the labels actually
+          in use (getUserLabels), so the rail and the label picker cannot disagree. */}
+      {userLabels.length > 0 && (
+        <div class="mc-rail-group">
+          <p class="mc-rail-head">Labels</p>
+          {userLabels.map((l: string) => (
+            <a href={`${basePath}?label=${encodeURIComponent(l)}`} class={`mc-rail-item ${label === l ? 'on' : ''}`}>
+              <span class="mc-rail-label">{l}</span>
+            </a>
+          ))}
+        </div>
+      )}
     </nav>
 
     <!-- Thread list -->
-    <div class="mc-list">
+    <div class="mc-list" id="mcList">
       {/* What this list is actually showing. A search for `in:anywhere`, or a label, returns mail
           from outside the folder highlighted in the rail, and without this line the rail is simply
           wrong about where you are. */}
       {dbReady && filtered && (
         <div class="mc-scope">
-          {scopeLabel}{queryNote ? ' - ' + queryNote : ''}
+          <span>
+            {scopeLabel}{queryNote ? ' - ' + queryNote : ''}
+            {resultTotal != null && <span class="mc-scope-n">{resultTotal.toLocaleString('en-IN')}{resultTotalCapped ? '+' : ''} found</span>}
+          </span>
           <a href={`${basePath}?folder=${folderParam}`}>clear</a>
         </div>
       )}
+      {/* AN OPERATOR THAT PARSED TO NOTHING IS SAID OUT LOUD. Before this, a mistyped `after:` was
+          simply dropped and the search silently answered a different question. */}
+      {queryWarnings.length > 0 && (
+        <div class="mc-warn">{queryWarnings.map((w: string) => <p>{w}</p>)}</div>
+      )}
+      {searchDegraded && <div class="mc-warn"><p>{searchDegraded}</p></div>}
+
+      {/* THE BULK BAR. Hidden until something is ticked. "Select all N results" posts the QUERY,
+          not ten thousand ids — see src/lib/mail-bulk.ts. */}
+      <div class="mc-bulk" id="mcBulk" hidden>
+        <label class="mc-bulk-all">
+          <input type="checkbox" id="mcSelectPage" aria-label="Select everything on this page" />
+          <span id="mcBulkCount">0 selected</span>
+        </label>
+        <div class="mc-bulk-acts">
+          <button type="button" class="mc-bulk-btn" data-op="read">Read</button>
+          <button type="button" class="mc-bulk-btn" data-op="unread">Unread</button>
+          <button type="button" class="mc-bulk-btn" data-op="star">Star</button>
+          <button type="button" class="mc-bulk-btn" data-op="archive">Archive</button>
+          <button type="button" class="mc-bulk-btn" data-op="spam">Spam</button>
+          <button type="button" class="mc-bulk-btn" data-op="trash">Delete</button>
+          <button type="button" class="mc-bulk-btn" id="mcBulkLabel">Label</button>
+          <button type="button" class="mc-bulk-btn" id="mcBulkSnooze">Snooze</button>
+        </div>
+        <p class="mc-bulk-all-results" id="mcAllResults" hidden>
+          <span id="mcAllResultsText"></span>
+          <button type="button" id="mcSelectAllResults">Select all results</button>
+          <button type="button" id="mcClearSelection">Clear</button>
+        </p>
+        <p class="mc-bulk-status" id="mcBulkStatus" role="status"></p>
+      </div>
+
       {list.length === 0 && (
         <div class="mc-empty">
           <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.5"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 5L2 7"/></svg>
@@ -231,25 +360,38 @@ const folderLinks = [
           <p>{!dbReady ? 'This list could not be loaded - see the message above.' : (filtered ? 'No mail matches that.' : 'Nothing here yet.')}</p>
         </div>
       )}
+      <div id="mcRows">
       {list.map((t: any) => (
-        <a href={`${basePath}?folder=${folderParam}&thread=${t.thread_id}`} class={`mc-row ${t.is_read ? '' : 'unread'} ${threadId === t.thread_id ? 'sel' : ''}`}>
+        <div class={`mc-row ${t.is_read ? '' : 'unread'} ${threadId === t.thread_id ? 'sel' : ''}`} data-thread={t.thread_id} data-href={`${basePath}?folder=${folderParam}&thread=${t.thread_id}`} tabindex="0" role="link">
+          <input type="checkbox" class="mc-pick" data-thread={t.thread_id} aria-label={'Select conversation: ' + (t.subject || 'no subject')} />
           <button type="button" class={`mc-star ${t.is_starred ? 'on' : ''}`} data-thread={t.thread_id} data-action={t.is_starred ? 'unstar' : 'star'} aria-label="Star">
             <svg width="16" height="16" viewBox="0 0 24 24" fill={t.is_starred ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="1.7"><path d="M12 2l3 6.3 6.9 1-5 4.9 1.2 6.8L12 17.8 5.9 21l1.2-6.8-5-4.9 6.9-1z"/></svg>
           </button>
           <div class="mc-avatar" aria-hidden="true">{initialOf(folder === 'sent' || folder === 'drafts' ? (t.from_name || myAddress) : t.from_name)}</div>
-          <div class="mc-row-main">
+          <a class="mc-row-main" href={`${basePath}?folder=${folderParam}&thread=${t.thread_id}`}>
             <div class="mc-row-top">
-              <span class="mc-from">{t.from_name || t.from_email}</span>
+              <span class="mc-from">{t.participants || t.from_name || t.from_email}</span>
               <span class="mc-time">{timeAgo(t.created_at)}</span>
             </div>
             <p class="mc-subj">{t.subject || '(no subject)'}{t.thread_count > 1 && <span class="mc-count">{t.thread_count}</span>}</p>
             <p class="mc-snip">{t.snippet}</p>
-          </div>
+            {(t.labels || []).length > 0 && (
+              <p class="mc-row-labels">{(t.labels as string[]).slice(0, 4).map((l: string) => <span class="mc-chip">{l}</span>)}</p>
+            )}
+          </a>
           <div class="mc-row-icons">
+            {t.snoozed_until && <span class="mc-chip snoozed" title={'Comes back ' + fullTime(t.snoozed_until)}>snoozed</span>}
             {t.has_attachments && <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.4 11.05 12.25 20.2a5 5 0 0 1-7.07-7.07l9.19-9.19a3 3 0 0 1 4.24 4.24l-9.2 9.19a1 1 0 0 1-1.41-1.41l8.49-8.49"/></svg>}
           </div>
-        </a>
+        </div>
       ))}
+      </div>
+      {/* INCREMENTAL LOADING. The cursor is opaque and comes from the engine; the button posts it
+          back to /api/mail/search and appends. No OFFSET, so page 200 costs what page 1 costs. */}
+      {nextCursor && (
+        <button type="button" class="mc-more" id="mcMore" data-cursor={nextCursor}>Load more</button>
+      )}
+      <p class="mc-list-end" id="mcListEnd" hidden></p>
     </div>
 
     <!-- Reading pane -->
@@ -277,6 +419,9 @@ const folderLinks = [
               <button type="button" class="mc-act" data-thread={threadId} data-action="unread" title="Mark unread">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 5L2 7"/></svg>
               </button>
+              <button type="button" class="mc-act" id="mcThreadSnooze" data-thread={threadId} title="Snooze">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+              </button>
               <button type="button" class="mc-act" data-thread={threadId} data-action="spam" title="Report spam">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
               </button>
@@ -289,33 +434,53 @@ const folderLinks = [
               messages": {threadError}
             </div>
           )}
+          {convoSummary && convoSummary.messageCount > 1 && (
+            <div class="mc-convo-bar">
+              <span class="mc-convo-people" title={convoSummary.participants.map((p: any) => p.email).join(', ')}>{convoParticipants}</span>
+              <span class="mc-convo-count">{convoSummary.messageCount} messages{convoSummary.unreadCount > 0 ? ' · ' + convoSummary.unreadCount + ' unread' : ''}{convoSummary.attachmentCount > 0 ? ' · ' + convoSummary.attachmentCount + ' attached' : ''}</span>
+              <button type="button" class="mc-convo-btn" id="mcExpandAll">Expand all</button>
+              <button type="button" class="mc-convo-btn" id="mcCollapseAll">Collapse all</button>
+            </div>
+          )}
+          {/* THE CONTACT CARD. Filled by /api/mail/contact-context after the conversation is on
+              screen — deliberately not part of this render, so four extra lookups can never hold up
+              the messages. If it fails, the conversation is still here. */}
+          <div class="mc-contact" id="mcContact" data-email={threadOtherParty} hidden></div>
           <div class="mc-msgs">
-            {thread.map((m: any) => (
-              <div class="mc-msg">
-                <div class="mc-msg-head">
+            {messages.map((row: any) => {
+              const m = row.m;
+              return (
+              <div class={'mc-msg d' + row.depth + (row.expanded ? ' open' : ' shut')} data-msg={m.id}>
+                {/* The whole header is the collapse control. A conversation of twenty messages that
+                    can only be opened by hitting a small chevron is a conversation nobody opens. */}
+                <button type="button" class="mc-msg-head" aria-expanded={row.expanded ? 'true' : 'false'} aria-controls={'body-' + m.id}>
                   <div class="mc-avatar sm">{initialOf(m.from_name || m.from_email)}</div>
                   <div class="mc-msg-meta">
                     <p class="mc-msg-from">{m.from_name || m.from_email} <span class="mc-msg-email">&lt;{m.from_email}&gt;</span></p>
                     <p class="mc-msg-to">to {(m.recipients || []).map((r: any) => r.name || r.email).join(', ') || 'me'}</p>
+                    <p class="mc-msg-peek">{row.visible.replace(/\s+/g, ' ').slice(0, 120)}</p>
                   </div>
                   <span class="mc-msg-time">{fullTime(m.created_at)}</span>
-                </div>
-                <div class="mc-msg-body">{bodyToText(m)}</div>
+                  {m.is_read === false && <span class="mc-msg-new">new</span>}
+                </button>
+                <div class="mc-msg-body" id={'body-' + m.id}>
+                  <div class="mc-msg-text">{row.visible}</div>
+                  {row.signature && <div class="mc-msg-sig">{row.signature}</div>}
+                  {/* QUOTED TEXT IS HIDDEN, NOT DELETED. It is one click away and it says how much
+                      there is, because a reply whose quoted history is silently dropped is a reply
+                      you cannot check. */}
+                  {row.hasQuoted && (
+                    <div class="mc-quoted">
+                      <button type="button" class="mc-quoted-btn" aria-expanded="false">Show quoted text ({row.quoted.split('\n').length} lines)</button>
+                      <pre class="mc-quoted-text" hidden>{row.quoted}</pre>
+                    </div>
+                  )}
                 {m.from_user_id === user.id && (
                   <div class="mc-status">
                     {/* "Delivered" USED TO BE THE DEFAULT. Anything without a `failed` row in
                         email_logs was labelled delivered — including a message with NO log row at
                         all, which is what an external send that never reached a transport looks
                         like. Three states now, and the third one does not claim anything. */}
-                    {/* READ THE FIELD THAT EXISTS, THROUGH THE ONE WORDING FUNCTION.
-                        This read `m.delivery?.status` — a property of the raw email_logs row the
-                        deleted frontmatter block used to attach. getDeliveryStatuses() returns a
-                        DeliveryStatus whose verdict is on `state`, so that expression was ALWAYS
-                        undefined: the `failed` arm could never be taken and a hard-failed external
-                        send rendered the green "Delivered" badge — the exact default mail.ts says
-                        it removed. deliveryWording() is the module's own one-sentence-per-state
-                        table, written so "the composer's toast and the thread badge cannot
-                        disagree"; the badge now asks it instead of re-deciding here. */}
                     {(() => {
                       if (!m.delivery) return <span class="mc-st none" title="This message is stored in the mailbox. No external delivery was recorded for it, which is normal for mail that never left this system.">Stored, no delivery record</span>;
                       const w = deliveryWording(m.delivery);
@@ -344,18 +509,41 @@ const folderLinks = [
                     })}
                   </div>
                 )}
-                {(m.attachments || []).length > 0 && (
+                {/* ATTACHMENTS, THROUGH THE POLICY. `inline` is a raster image this site serves
+                    itself; `link` opens in a new tab so the browser's own viewer and sandbox handle
+                    it; `blocked` is listed with its name and NOT made clickable — you can still see
+                    what you were sent. Nothing here is decided in the markup. */}
+                {row.atts.length > 0 && (
                   <div class="mc-atts">
-                    {m.attachments.map((a: any) => (
-                      <a href={a.url} target="_blank" rel="noopener" class="mc-att">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.4 11.05 12.25 20.2a5 5 0 0 1-7.07-7.07l9.19-9.19a3 3 0 0 1 4.24 4.24l-9.2 9.19a1 1 0 0 1-1.41-1.41l8.49-8.49"/></svg>
-                        <span>{a.filename}</span>
-                      </a>
+                    {row.atts.map((a: any) => (
+                      a.v.preview === 'blocked' ? (
+                        <div class="mc-att blocked" title={a.v.reason}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></svg>
+                          <span>{a.v.safeName}</span>
+                          {a.v.displaySize && <span class="mc-att-size">{a.v.displaySize}</span>}
+                        </div>
+                      ) : a.v.preview === 'inline' ? (
+                        <figure class="mc-att-img">
+                          <img src={a.raw.url} alt={a.v.safeName} loading="lazy" />
+                          <figcaption>{a.v.safeName}{a.v.displaySize ? ' · ' + a.v.displaySize : ''}</figcaption>
+                        </figure>
+                      ) : (
+                        <a href={a.raw.url} target="_blank" rel="noopener noreferrer" class="mc-att" title={a.v.reason}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.4 11.05 12.25 20.2a5 5 0 0 1-7.07-7.07l9.19-9.19a3 3 0 0 1 4.24 4.24l-9.2 9.19a1 1 0 0 1-1.41-1.41l8.49-8.49"/></svg>
+                          <span>{a.v.safeName}</span>
+                          {a.v.displaySize && <span class="mc-att-size">{a.v.displaySize}</span>}
+                        </a>
+                      )
                     ))}
                   </div>
                 )}
+                {row.atts.filter((a: any) => a.v.warning).map((a: any) => (
+                  <p class="mc-att-warn">{a.v.safeName}: {a.v.warning}</p>
+                ))}
+                </div>
               </div>
-            ))}
+              );
+            })}
           </div>
 
           <div class="mc-reply" data-thread={threadId} data-to={threadOtherParty} data-subject={threadSubject}>
@@ -367,6 +555,34 @@ const folderLinks = [
           </div>
         </div>
       )}
+    </div>
+  </div>
+
+  {/* KEYBOARD SHORTCUTS, AND THE WAY TO FIND OUT THEY EXIST.
+      A shortcut nobody can discover is a shortcut for the person who wrote it. This opens on "?",
+      and every action it lists is also reachable by a button — the keyboard is a faster route to
+      the same thing, never the only route, which is what makes it an accessibility feature rather
+      than a barrier. */}
+  <div class="mc-keys" id="mcKeys" hidden role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <div class="mc-keys-card">
+      <h3>Keyboard shortcuts</h3>
+      <div class="mc-keys-row"><span>Next conversation</span><kbd>j</kbd></div>
+      <div class="mc-keys-row"><span>Previous conversation</span><kbd>k</kbd></div>
+      <div class="mc-keys-row"><span>Open</span><kbd>Enter</kbd></div>
+      <div class="mc-keys-row"><span>Tick the box</span><kbd>x</kbd></div>
+      <div class="mc-keys-row"><span>Reply</span><kbd>r</kbd></div>
+      <div class="mc-keys-row"><span>Forward</span><kbd>f</kbd></div>
+      <div class="mc-keys-row"><span>Compose</span><kbd>c</kbd></div>
+      <div class="mc-keys-row"><span>Archive</span><kbd>e</kbd></div>
+      <div class="mc-keys-row"><span>Mark unread</span><kbd>u</kbd></div>
+      <div class="mc-keys-row"><span>Star</span><kbd>s</kbd></div>
+      <div class="mc-keys-row"><span>Search</span><kbd>/</kbd></div>
+      <div class="mc-keys-row"><span>This list</span><kbd>?</kbd></div>
+      <p class="mc-keys-note">
+        Shortcuts are off while you are typing, so a letter in the middle of a sentence never files
+        the conversation behind the composer. Every one of them is also a button on screen.
+      </p>
+      <button type="button" class="mc-convo-btn" id="mcKeysClose">Close</button>
     </div>
   </div>
 
@@ -532,9 +748,135 @@ const folderLinks = [
   .mc-has-thread .mc-read{ display:block; }
   .mc-back{ display:inline-flex; }
 }
+
+/* ---- PATCH 11: the advanced layer ---------------------------------------------------------- */
+
+/* Labels as a place you can stand. */
+.mc-rail-group{ margin-top:10px; padding-top:8px; border-top:1px solid var(--mc-border); display:flex; flex-direction:column; gap:2px; }
+.mc-rail-head{ font-size:10px; text-transform:uppercase; letter-spacing:0.08em; color:var(--mc-mid); margin:0 0 4px; padding:0 12px; font-weight:800; }
+
+/* Search feedback. A warning is never a decoration here — it is the only sign that an operator was
+   not understood, and it sits directly above the results it changed. */
+.mc-warn{ padding:8px 14px; background:rgba(251,191,36,0.10); border-bottom:1px solid rgba(251,191,36,0.24); }
+.mc-warn p{ margin:0 0 3px; font-size:11px; color:#fbbf24; line-height:1.5; }
+.mc-warn p:last-child{ margin-bottom:0; }
+.mc-scope-n{ margin-left:8px; color:var(--mc-text); font-weight:700; }
+.mc-scope span{ min-width:0; }
+
+/* Bulk bar. */
+.mc-bulk{ position:sticky; top:0; z-index:6; background:var(--mc-card); border-bottom:1px solid var(--mc-border); padding:8px 12px; display:flex; flex-direction:column; gap:7px; }
+.mc-bulk[hidden]{ display:none !important; }
+.mc-bulk-all{ display:flex; align-items:center; gap:8px; font-size:12px; font-weight:700; color:var(--mc-text); cursor:pointer; }
+.mc-bulk-acts{ display:flex; flex-wrap:wrap; gap:5px; }
+.mc-bulk-btn{ background:var(--mc-soft); border:1px solid var(--mc-border); color:var(--mc-text); border-radius:7px; padding:6px 10px; font-size:11.5px; font-weight:600; cursor:pointer; min-height:32px; }
+.mc-bulk-btn:hover{ border-color:var(--mc-accent); }
+.mc-bulk-btn:disabled{ opacity:0.5; cursor:progress; }
+.mc-bulk-all-results{ margin:0; font-size:11.5px; color:var(--mc-mid); display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.mc-bulk-all-results[hidden]{ display:none !important; }
+.mc-bulk-all-results button{ background:none; border:none; color:var(--mc-accent); font-size:11.5px; font-weight:700; cursor:pointer; text-decoration:underline; text-underline-offset:2px; padding:4px 0; }
+.mc-bulk-status{ margin:0; font-size:11.5px; color:var(--mc-mid); line-height:1.5; }
+.mc-bulk-status.bad{ color:#fca5a5; }
+.mc-bulk-status.good{ color:#86efac; }
+
+/* Rows: now a div with a link inside, so a checkbox and a star are not nested in an anchor. */
+.mc-row{ cursor:pointer; }
+.mc-row:focus-visible{ outline:2px solid var(--mc-accent); outline-offset:-2px; }
+.mc-row.cursor{ box-shadow:inset 3px 0 0 var(--mc-accent-bright); }
+.mc-row.picked{ background:var(--o-brand-soft, rgba(255,79,0,0.16)); }
+.mc-row-main{ text-decoration:none; color:inherit; }
+.mc-pick{ margin-top:6px; flex-shrink:0; width:16px; height:16px; accent-color:var(--mc-accent); cursor:pointer; }
+.mc-row-labels{ margin:3px 0 0; display:flex; gap:4px; flex-wrap:wrap; }
+.mc-chip{ display:inline-block; background:var(--mc-soft); border:1px solid var(--mc-border); color:var(--mc-mid); font-size:10px; font-weight:700; border-radius:100px; padding:1px 7px; }
+.mc-chip.snoozed{ border-color:rgba(251,191,36,0.4); color:#fbbf24; }
+.mc-more{ display:block; width:calc(100% - 24px); margin:12px; padding:11px; background:var(--mc-soft); border:1px solid var(--mc-border); border-radius:9px; color:var(--mc-text); font-size:12.5px; font-weight:700; cursor:pointer; min-height:44px; }
+.mc-more:disabled{ opacity:0.6; cursor:progress; }
+.mc-list-end{ margin:12px; font-size:11.5px; color:var(--mc-mid); text-align:center; }
+.mc-list-end[hidden]{ display:none !important; }
+
+/* Conversation. */
+.mc-convo-bar{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:9px 18px; border-bottom:1px solid var(--mc-border); font-size:11.5px; color:var(--mc-mid); }
+.mc-convo-people{ font-weight:700; color:var(--mc-text); }
+.mc-convo-count{ flex:1; min-width:0; }
+.mc-convo-btn{ background:var(--mc-soft); border:1px solid var(--mc-border); color:var(--mc-text); border-radius:7px; padding:5px 10px; font-size:11px; font-weight:600; cursor:pointer; min-height:32px; }
+.mc-msg{ border:1px solid var(--mc-border); border-radius:11px; background:var(--mc-card); overflow:hidden; }
+.mc-msg.d1{ margin-left:14px; } .mc-msg.d2{ margin-left:28px; } .mc-msg.d3{ margin-left:42px; }
+.mc-msg.d4{ margin-left:56px; } .mc-msg.d5{ margin-left:70px; } .mc-msg.d6{ margin-left:84px; }
+.mc-msg-head{ display:flex; align-items:flex-start; gap:10px; width:100%; text-align:left; background:none; border:none; color:inherit; font:inherit; padding:12px 14px; cursor:pointer; }
+.mc-msg-head:focus-visible{ outline:2px solid var(--mc-accent); outline-offset:-2px; }
+.mc-msg-meta{ flex:1; min-width:0; }
+.mc-msg-peek{ display:none; font-size:11.5px; color:var(--mc-mid); margin:2px 0 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.mc-msg.shut .mc-msg-peek{ display:block; }
+.mc-msg.shut .mc-msg-to{ display:none; }
+.mc-msg.shut .mc-msg-body{ display:none; }
+.mc-msg-new{ background:var(--mc-accent); color:#fff; font-size:9.5px; font-weight:800; border-radius:100px; padding:1px 7px; text-transform:uppercase; letter-spacing:0.06em; align-self:center; }
+.mc-msg-body{ padding:0 14px 14px; }
+.mc-msg-text{ font-size:14px; line-height:1.65; white-space:pre-wrap; overflow-wrap:anywhere; }
+.mc-msg-sig{ margin-top:10px; padding-top:8px; border-top:1px dashed var(--mc-border); font-size:12px; color:var(--mc-mid); white-space:pre-wrap; }
+.mc-quoted{ margin-top:10px; }
+.mc-quoted-btn{ background:var(--mc-soft); border:1px solid var(--mc-border); color:var(--mc-mid); border-radius:7px; padding:5px 10px; font-size:11px; cursor:pointer; min-height:32px; }
+.mc-quoted-text{ margin:8px 0 0; padding:10px 12px; background:var(--mc-soft); border-left:2px solid var(--mc-border); border-radius:0 8px 8px 0; font-size:12.5px; line-height:1.6; color:var(--mc-mid); white-space:pre-wrap; overflow-x:auto; font-family:inherit; }
+.mc-quoted-text[hidden]{ display:none !important; }
+
+/* Attachments, per the policy in src/lib/mail-attachments.ts. */
+.mc-att.blocked{ opacity:0.75; cursor:not-allowed; border-style:dashed; }
+.mc-att-size{ margin-left:auto; font-size:10.5px; color:var(--mc-mid); }
+.mc-att-img{ margin:0; border:1px solid var(--mc-border); border-radius:9px; overflow:hidden; background:var(--mc-soft); }
+.mc-att-img img{ display:block; max-width:100%; height:auto; }
+.mc-att-img figcaption{ padding:6px 10px; font-size:11px; color:var(--mc-mid); }
+.mc-att-warn{ margin:6px 0 0; font-size:11px; color:#fbbf24; line-height:1.5; }
+
+/* Contact card. */
+.mc-contact{ margin:12px 18px 0; padding:10px 12px; border:1px solid var(--mc-border); border-radius:10px; background:var(--mc-soft); font-size:11.5px; color:var(--mc-mid); line-height:1.6; }
+.mc-contact[hidden]{ display:none !important; }
+.mc-contact strong{ color:var(--mc-text); font-size:12.5px; }
+.mc-contact .mc-chip{ margin-right:4px; }
+.mc-contact .mc-withheld{ margin:6px 0 0; font-size:10.5px; opacity:0.85; }
+
+/* Snooze and label menus. */
+.mc-menu{ position:fixed; z-index:60; background:var(--mc-card); border:1px solid var(--mc-border); border-radius:11px; padding:6px; min-width:230px; box-shadow:0 18px 44px rgba(0,0,0,0.5); }
+.mc-menu[hidden]{ display:none !important; }
+.mc-menu button, .mc-menu a{ display:flex; justify-content:space-between; gap:12px; width:100%; background:none; border:none; color:var(--mc-text); font:inherit; font-size:12.5px; text-align:left; padding:9px 10px; border-radius:7px; cursor:pointer; min-height:40px; align-items:center; text-decoration:none; }
+.mc-menu button:hover, .mc-menu a:hover{ background:var(--mc-soft); }
+.mc-menu .mc-menu-when{ color:var(--mc-mid); font-size:11px; }
+.mc-menu input{ width:100%; background:var(--mc-soft); border:1px solid var(--mc-border); border-radius:7px; color:var(--mc-text); font-size:12.5px; padding:8px; margin:4px 0; }
+.mc-menu-head{ font-size:10px; text-transform:uppercase; letter-spacing:0.08em; color:var(--mc-mid); font-weight:800; padding:6px 10px 2px; margin:0; }
+
+/* Keyboard help. */
+.mc-keys{ position:fixed; inset:0; z-index:70; background:rgba(0,0,0,0.6); display:flex; align-items:center; justify-content:center; padding:20px; }
+.mc-keys[hidden]{ display:none !important; }
+.mc-keys-card{ background:var(--mc-card); border:1px solid var(--mc-border); border-radius:14px; padding:18px; max-width:460px; width:100%; max-height:80vh; overflow-y:auto; }
+.mc-keys-card h3{ margin:0 0 10px; font-size:15px; font-weight:800; }
+.mc-keys-row{ display:flex; justify-content:space-between; gap:14px; padding:6px 0; border-bottom:1px solid var(--mc-border); font-size:12.5px; }
+.mc-keys-row kbd{ background:var(--mc-soft); border:1px solid var(--mc-border); border-radius:5px; padding:1px 7px; font-family:var(--o-font-mono,monospace); font-size:11.5px; }
+.mc-keys-note{ font-size:11.5px; color:var(--mc-mid); margin:12px 0 0; line-height:1.6; }
+
+/* Search help. */
+.mc-help{ position:absolute; z-index:20; margin-top:6px; background:var(--mc-card); border:1px solid var(--mc-border); border-radius:11px; padding:10px 12px; max-width:420px; box-shadow:0 18px 44px rgba(0,0,0,0.5); }
+.mc-help[hidden]{ display:none !important; }
+.mc-help-row{ display:flex; gap:10px; font-size:11.5px; padding:3px 0; }
+.mc-help-row code{ font-family:var(--o-font-mono,monospace); color:var(--mc-accent-bright); white-space:nowrap; }
+.mc-help-row span{ color:var(--mc-mid); }
+
+.mc-recover{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:9px 12px; background:rgba(255,79,0,0.10); border-bottom:1px solid var(--mc-border); font-size:11.5px; color:var(--mc-text); line-height:1.5; }
+.mc-recover button{ background:var(--mc-soft); border:1px solid var(--mc-border); color:var(--mc-text); border-radius:7px; padding:5px 10px; font-size:11px; font-weight:700; cursor:pointer; min-height:32px; }
+
+/* Motion is a preference, not a decision this component makes for people. */
+@media (prefers-reduced-motion: reduce){ .mailc *{ transition:none !important; animation:none !important; } }
+
+/* Mobile. The bulk bar wraps, the conversation loses its indent (there is no room for it and the
+   nesting is a hint, not information), and every control keeps a 44px target. */
+@media(max-width:720px){
+  .mc-msg.d1,.mc-msg.d2,.mc-msg.d3,.mc-msg.d4,.mc-msg.d5,.mc-msg.d6{ margin-left:0; }
+  .mc-msgs{ padding:12px; gap:10px; }
+  .mc-contact{ margin:10px 12px 0; }
+  .mc-convo-bar{ padding:9px 12px; }
+  .mc-bulk-btn, .mc-more, .mc-convo-btn, .mc-quoted-btn{ min-height:44px; }
+  .mc-menu{ left:12px !important; right:12px; width:auto; min-width:0; }
+  .mc-msg-time{ font-size:10.5px; }
+}
 </style>
 
-<script is:inline define:vars={{ basePath, myAddress, templateSubject, templateHtml, templateNote, openMessageIds: (thread || []).filter((m: any) => m.from_user_id !== user.id).map((m: any) => m.id) }}>
+<script is:inline define:vars={{ basePath, myAddress, templateSubject, templateHtml, templateNote, openMessageIds: (thread || []).filter((m: any) => m.from_user_id !== user.id).map((m: any) => m.id), mcScope: { folder: folderParam, label, starred, q, threadId }, mcSnooze: snoozeMenu, mcLabels: userLabels, mcHelp: SEARCH_HELP, mcTotal: resultTotal, mcTotalCapped: resultTotalCapped, mcBroad: queryIsBroad }}>
 (function(){
   // Log an "open" event for every message the current user did NOT author
   // when a thread is shown - server logs it with IP + geolocation.
@@ -698,20 +1040,12 @@ const folderLinks = [
   // action therefore looked identical to a completed one: you landed on a freshly-drawn inbox with
   // the mail exactly as it had been, and nothing said why. Neither navigates now unless the server
   // confirmed the change, and a refusal is printed at the top of the client.
-  document.querySelectorAll('.mc-star').forEach(function(btn){
-    btn.addEventListener('click', async function(e){
-      e.preventDefault(); e.stopPropagation();
-      const thread = btn.getAttribute('data-thread'); const action = btn.getAttribute('data-action');
-      btn.disabled = true;
-      const res = await post('/api/mail/action', { action: action, threadId: thread });
-      if (!res || res.ok !== true) {
-        btn.disabled = false;
-        showAlert('This conversation was not ' + (action === 'star' ? 'starred' : 'unstarred') + ', and nothing was changed: ' + ((res && res.error) || 'the server did not confirm it') + '.');
-        return;
-      }
-      location.reload();
-    });
-  });
+  // THE STAR HANDLER MOVED, IT DID NOT DISAPPEAR. It now lives in bindStar() further down, for one
+  // reason: rows appended by "load more" are created after this line has already run, so a
+  // querySelectorAll here would leave every control on an appended row inert — the button would be
+  // there, it would look identical, and clicking it would do nothing at all. bindStar() is called
+  // for the server-rendered rows AND for each row the client builds, and it guards on a data-bound
+  // attribute so a row can never end up with two handlers posting the same change twice.
   const ACTION_DONE = { archive: 'archived', trash: 'deleted', unread: 'marked unread', spam: 'reported as spam' };
   document.querySelectorAll('.mc-act').forEach(function(btn){
     btn.addEventListener('click', async function(){
@@ -726,5 +1060,688 @@ const folderLinks = [
       location.href = basePath + '?folder=inbox';
     });
   });
+
+  // ==============================================================================================
+  // PATCH 11 — the advanced client.
+  //
+  // EVERY HANDLER BELOW READS THE ANSWER. That is the rule this component was repaired for once
+  // already: a button that fires a request and then reloads whichever way it went makes a refusal
+  // look exactly like a success. Nothing here navigates or redraws unless the server confirmed it,
+  // and a refusal is printed where the person is looking.
+  //
+  // NOTHING HERE ENUMERATES A LARGE SELECTION. "Select all results" posts the QUERY; the server
+  // resolves it. Ten thousand ids never cross the wire and there is never a request per row.
+  // ==============================================================================================
+
+  var selected = new Set();
+  var allResults = false;   // true when the selection is "everything matching", not a list of ids
+  var excluded = new Set(); // ticked off by hand after choosing all results
+
+  function $$(sel){ return Array.prototype.slice.call(document.querySelectorAll(sel)); }
+  function setStatus(el, msg, tone){
+    if (!el) return;
+    el.textContent = msg || '';
+    el.className = 'mc-bulk-status' + (tone ? ' ' + tone : '');
+  }
+
+  // ---- Rows: click, keyboard focus, and the checkbox that must not follow the link ------------
+  function rowHref(row){ return row.getAttribute('data-href'); }
+  $$('.mc-row').forEach(function(row){
+    row.addEventListener('click', function(e){
+      // A click on the checkbox, the star or the inner link is that control's business.
+      if (e.target.closest('.mc-pick') || e.target.closest('.mc-star') || e.target.closest('a')) return;
+      var href = rowHref(row);
+      if (href) location.href = href;
+    });
+    row.addEventListener('keydown', function(e){
+      if (e.key === 'Enter' || e.key === ' ') {
+        if (e.target !== row) return;
+        e.preventDefault();
+        var href = rowHref(row);
+        if (href) location.href = href;
+      }
+    });
+  });
+
+  // ---- Selection --------------------------------------------------------------------------------
+  function pickedThreads(){
+    return $$('.mc-pick').filter(function(c){ return c.checked; }).map(function(c){ return c.getAttribute('data-thread'); });
+  }
+  function refreshSelection(){
+    var picks = pickedThreads();
+    selected = new Set(picks);
+    var bar = document.getElementById('mcBulk');
+    var count = document.getElementById('mcBulkCount');
+    var all = document.getElementById('mcAllResults');
+    var allText = document.getElementById('mcAllResultsText');
+    if (!bar) return;
+    var n = allResults ? ((mcTotal == null ? picks.length : mcTotal) - excluded.size) : picks.length;
+    bar.hidden = picks.length === 0 && !allResults;
+    if (count) {
+      count.textContent = allResults
+        ? ('All ' + (mcTotal == null ? picks.length : mcTotal).toLocaleString('en-IN') + (mcTotalCapped ? '+' : '') + ' results selected' + (excluded.size ? ' (' + excluded.size + ' removed)' : ''))
+        : (picks.length + (picks.length === 1 ? ' selected' : ' selected'));
+    }
+    // The offer to widen the selection only appears when there IS more than this page, and it says
+    // the real number rather than implying one.
+    if (all && allText) {
+      var more = mcTotal != null && mcTotal > picks.length && picks.length > 0 && !allResults;
+      all.hidden = !(more || allResults);
+      allText.textContent = allResults
+        ? 'Operations will apply to every conversation matching this search, on the server.'
+        : (mcTotal != null ? (mcTotal.toLocaleString('en-IN') + (mcTotalCapped ? '+' : '') + ' conversations match this search.') : '');
+    }
+    $$('.mc-row').forEach(function(r){
+      var c = r.querySelector('.mc-pick');
+      r.classList.toggle('picked', !!(c && c.checked));
+    });
+  }
+  $$('.mc-pick').forEach(function(c){
+    c.addEventListener('change', function(){
+      if (allResults) {
+        // Un-ticking a row while "all results" is chosen is an EXCLUSION, posted with the query.
+        var id = c.getAttribute('data-thread');
+        if (c.checked) excluded.delete(id); else excluded.add(id);
+      }
+      refreshSelection();
+    });
+  });
+  var selectPage = document.getElementById('mcSelectPage');
+  if (selectPage) selectPage.addEventListener('change', function(){
+    allResults = false; excluded.clear();
+    $$('.mc-pick').forEach(function(c){ c.checked = selectPage.checked; });
+    refreshSelection();
+  });
+  var selectAllBtn = document.getElementById('mcSelectAllResults');
+  if (selectAllBtn) selectAllBtn.addEventListener('click', function(){
+    allResults = true; excluded.clear();
+    $$('.mc-pick').forEach(function(c){ c.checked = true; });
+    refreshSelection();
+  });
+  var clearBtn = document.getElementById('mcClearSelection');
+  if (clearBtn) clearBtn.addEventListener('click', function(){
+    allResults = false; excluded.clear();
+    if (selectPage) selectPage.checked = false;
+    $$('.mc-pick').forEach(function(c){ c.checked = false; });
+    refreshSelection();
+  });
+
+  // ---- The bulk request -------------------------------------------------------------------------
+  function selectionPayload(){
+    if (allResults) {
+      return { mode: 'query', query: mcScope.q || '', scope: { folder: mcScope.folder, label: mcScope.label, starred: mcScope.starred }, exclude: Array.from(excluded) };
+    }
+    return { mode: 'ids', threadIds: Array.from(selected) };
+  }
+  async function runBulk(op, extra){
+    var status = document.getElementById('mcBulkStatus');
+    var sel = selectionPayload();
+    if (sel.mode === 'ids' && !sel.threadIds.length) { setStatus(status, 'Nothing is selected.', 'bad'); return; }
+    var body = Object.assign({ op: op, selection: sel }, extra || {});
+
+    // A destructive operation over a selection the person cannot see is CONFIRMED FIRST, with the
+    // count the server itself will act on — not a number this page guessed.
+    if (allResults && (op === 'trash' || op === 'spam' || op === 'delete' || op === 'archive')) {
+      var pre = await post('/api/mail/bulk', Object.assign({ preview: true }, body));
+      if (!pre || pre.ok !== true) { setStatus(status, 'That selection could not be counted, so nothing was done: ' + ((pre && pre.error) || 'no answer from the server'), 'bad'); return; }
+      if (!window.confirm(pre.message + '\n\nApply "' + op + '" to all of them?')) { setStatus(status, 'Cancelled. Nothing was changed.'); return; }
+    }
+
+    $$('.mc-bulk-btn').forEach(function(b){ b.disabled = true; });
+    setStatus(status, 'Working...');
+    var res = await post('/api/mail/bulk', body);
+    $$('.mc-bulk-btn').forEach(function(b){ b.disabled = false; });
+    if (!res || res.ok !== true) {
+      setStatus(status, (res && res.message) || 'That did not go through, and your mail is unchanged.', 'bad');
+      return;
+    }
+    setStatus(status, res.message, 'good');
+    // Reloaded only after the server confirmed, and only then — the list on screen is now stale.
+    setTimeout(function(){ location.reload(); }, 700);
+  }
+  $$('.mc-bulk-btn[data-op]').forEach(function(btn){
+    btn.addEventListener('click', function(){ runBulk(btn.getAttribute('data-op')); });
+  });
+
+  // ---- Menus (snooze, label) --------------------------------------------------------------------
+  var openMenu = null;
+  function closeMenu(){ if (openMenu) { openMenu.remove(); openMenu = null; } }
+  document.addEventListener('click', function(e){
+    if (openMenu && !openMenu.contains(e.target)) closeMenu();
+  });
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeMenu(); });
+
+  function showMenu(anchor, build){
+    closeMenu();
+    var menu = document.createElement('div');
+    menu.className = 'mc-menu';
+    build(menu);
+    document.body.appendChild(menu);
+    var r = anchor.getBoundingClientRect();
+    menu.style.top = Math.min(r.bottom + 6, window.innerHeight - menu.offsetHeight - 10) + 'px';
+    menu.style.left = Math.min(r.left, window.innerWidth - menu.offsetWidth - 10) + 'px';
+    openMenu = menu;
+    var first = menu.querySelector('button, input');
+    if (first) first.focus();
+  }
+
+  function snoozeMenuFor(anchor, threadIds){
+    showMenu(anchor, function(menu){
+      var head = document.createElement('p'); head.className = 'mc-menu-head'; head.textContent = 'Snooze until'; menu.appendChild(head);
+      mcSnooze.forEach(function(p){
+        var b = document.createElement('button'); b.type = 'button';
+        b.innerHTML = '<span></span><span class="mc-menu-when"></span>';
+        b.firstChild.textContent = p.label;
+        b.lastChild.textContent = p.when || '';
+        b.addEventListener('click', async function(){
+          if (p.key === 'custom') { customSnooze(menu, threadIds); return; }
+          closeMenu();
+          await doSnooze(threadIds, { preset: p.key });
+        });
+        menu.appendChild(b);
+      });
+    });
+  }
+  function customSnooze(menu, threadIds){
+    menu.innerHTML = '';
+    var head = document.createElement('p'); head.className = 'mc-menu-head'; head.textContent = 'Pick a date and time'; menu.appendChild(head);
+    var input = document.createElement('input'); input.type = 'datetime-local'; menu.appendChild(input);
+    var go = document.createElement('button'); go.type = 'button'; go.textContent = 'Snooze'; menu.appendChild(go);
+    input.focus();
+    go.addEventListener('click', async function(){
+      if (!input.value) return;
+      var dt = new Date(input.value);
+      if (isNaN(dt.getTime())) return;
+      closeMenu();
+      await doSnooze(threadIds, { until: dt.toISOString() });
+    });
+  }
+  async function doSnooze(threadIds, when){
+    var res = await post('/api/mail/snooze', Object.assign({ threadIds: threadIds }, when));
+    if (!res || res.ok !== true) {
+      showAlert('That conversation was not snoozed, and nothing was changed: ' + ((res && res.error) || 'the server did not confirm it') + '.');
+      return;
+    }
+    showAlert(res.message);
+    setTimeout(function(){ location.reload(); }, 800);
+  }
+  var bulkSnooze = document.getElementById('mcBulkSnooze');
+  if (bulkSnooze) bulkSnooze.addEventListener('click', function(e){
+    e.stopPropagation();
+    // Snooze over "all results" would need a query-mode bulk call; the menu here is for the ticked
+    // rows, and it says so rather than pretending to cover a selection it did not send.
+    var ids = Array.from(selected);
+    if (!ids.length) { setStatus(document.getElementById('mcBulkStatus'), 'Tick the conversations to snooze first.', 'bad'); return; }
+    snoozeMenuFor(bulkSnooze, ids);
+  });
+
+  var bulkLabel = document.getElementById('mcBulkLabel');
+  if (bulkLabel) bulkLabel.addEventListener('click', function(e){
+    e.stopPropagation();
+    showMenu(bulkLabel, function(menu){
+      var head = document.createElement('p'); head.className = 'mc-menu-head'; head.textContent = 'Apply a label'; menu.appendChild(head);
+      (mcLabels || []).forEach(function(l){
+        var b = document.createElement('button'); b.type = 'button'; b.textContent = l;
+        b.addEventListener('click', function(){ closeMenu(); runBulk('label-add', { label: l }); });
+        menu.appendChild(b);
+      });
+      var input = document.createElement('input'); input.type = 'text'; input.placeholder = 'New label'; menu.appendChild(input);
+      input.addEventListener('keydown', function(ev){
+        if (ev.key === 'Enter' && input.value.trim()) { closeMenu(); runBulk('label-add', { label: input.value.trim() }); }
+      });
+    });
+  });
+
+  // ---- Incremental loading ----------------------------------------------------------------------
+  //
+  // Appends the next page from the keyset cursor. No OFFSET anywhere: page two hundred costs what
+  // page one costs, which is the whole reason a 100,000-message mailbox stays usable.
+  var moreBtn = document.getElementById('mcMore');
+  if (moreBtn) moreBtn.addEventListener('click', async function(){
+    moreBtn.disabled = true;
+    var prev = moreBtn.textContent;
+    moreBtn.textContent = 'Loading...';
+    var params = new URLSearchParams({ q: mcScope.q || '', folder: mcScope.folder || 'inbox', cursor: moreBtn.getAttribute('data-cursor') || '', limit: '50' });
+    if (mcScope.label) params.set('label', mcScope.label);
+    if (mcScope.starred) params.set('starred', '1');
+    var res;
+    try {
+      var r = await fetch('/api/mail/search?' + params.toString(), { credentials: 'same-origin' });
+      res = await r.json();
+    } catch (err) {
+      res = { ok: false, error: (err && err.message) || 'the request never reached the server' };
+    }
+    if (!res || res.ok !== true) {
+      moreBtn.disabled = false;
+      moreBtn.textContent = prev;
+      showAlert('More mail could not be loaded, and nothing on this list has changed: ' + ((res && res.error) || 'the server did not answer') + '.');
+      return;
+    }
+    var rows = document.getElementById('mcRows');
+    res.hits.forEach(function(h){ rows.appendChild(buildRow(h)); });
+    if (res.nextCursor) {
+      moreBtn.setAttribute('data-cursor', res.nextCursor);
+      moreBtn.disabled = false;
+      moreBtn.textContent = prev;
+    } else {
+      moreBtn.remove();
+      var end = document.getElementById('mcListEnd');
+      if (end) { end.textContent = 'That is the end of this folder.'; end.hidden = false; }
+    }
+  });
+
+  function esc(s){ var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+  function shortTime(iso){
+    var diff = Date.now() - new Date(iso).getTime();
+    var m = Math.floor(diff / 60000);
+    if (m < 1) return 'now';
+    if (m < 60) return m + 'm';
+    var h = Math.floor(m / 60);
+    if (h < 24) return h + 'h';
+    var d = Math.floor(h / 24);
+    if (d < 7) return d + 'd';
+    return new Date(iso).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short' });
+  }
+  function buildRow(h){
+    var el = document.createElement('div');
+    el.className = 'mc-row' + (h.isRead ? '' : ' unread');
+    var href = basePath + '?folder=' + encodeURIComponent(mcScope.folder || 'inbox') + '&thread=' + encodeURIComponent(h.threadId);
+    el.setAttribute('data-thread', h.threadId);
+    el.setAttribute('data-href', href);
+    el.setAttribute('tabindex', '0');
+    el.setAttribute('role', 'link');
+    var initial = ((h.fromName || h.fromEmail || '?').trim().charAt(0) || '?').toUpperCase();
+    el.innerHTML =
+      '<input type="checkbox" class="mc-pick" data-thread="' + esc(h.threadId) + '" aria-label="Select conversation" />' +
+      '<button type="button" class="mc-star ' + (h.isStarred ? 'on' : '') + '" data-thread="' + esc(h.threadId) + '" data-action="' + (h.isStarred ? 'unstar' : 'star') + '" aria-label="Star">' +
+        '<svg width="16" height="16" viewBox="0 0 24 24" fill="' + (h.isStarred ? 'currentColor' : 'none') + '" stroke="currentColor" stroke-width="1.7"><path d="M12 2l3 6.3 6.9 1-5 4.9 1.2 6.8L12 17.8 5.9 21l1.2-6.8-5-4.9 6.9-1z"/></svg>' +
+      '</button>' +
+      '<div class="mc-avatar" aria-hidden="true">' + esc(initial) + '</div>' +
+      '<a class="mc-row-main" href="' + esc(href) + '">' +
+        '<div class="mc-row-top"><span class="mc-from">' + esc(h.participants || h.fromName || h.fromEmail) + '</span><span class="mc-time">' + esc(shortTime(h.createdAt)) + '</span></div>' +
+        '<p class="mc-subj">' + esc(h.subject || '(no subject)') + (h.threadCount > 1 ? '<span class="mc-count">' + h.threadCount + '</span>' : '') + '</p>' +
+        '<p class="mc-snip">' + esc(h.snippet) + '</p>' +
+      '</a>' +
+      '<div class="mc-row-icons"></div>';
+    el.addEventListener('click', function(e){
+      if (e.target.closest('.mc-pick') || e.target.closest('.mc-star') || e.target.closest('a')) return;
+      location.href = href;
+    });
+    var pick = el.querySelector('.mc-pick');
+    pick.addEventListener('change', function(){
+      if (allResults) { if (pick.checked) excluded.delete(h.threadId); else excluded.add(h.threadId); }
+      refreshSelection();
+    });
+    if (allResults) pick.checked = !excluded.has(h.threadId);
+    bindStar(el.querySelector('.mc-star'));
+    return el;
+  }
+
+  // The star handler, extracted so a row appended by "load more" behaves like one rendered on the
+  // server. Before this existed, every control on an appended row was inert.
+  function bindStar(btn){
+    if (!btn || btn.getAttribute('data-bound')) return;
+    btn.setAttribute('data-bound', '1');
+    btn.addEventListener('click', async function(e){
+      e.preventDefault(); e.stopPropagation();
+      var thread = btn.getAttribute('data-thread'); var action = btn.getAttribute('data-action');
+      btn.disabled = true;
+      var res = await post('/api/mail/action', { action: action, threadId: thread });
+      if (!res || res.ok !== true) {
+        btn.disabled = false;
+        showAlert('This conversation was not ' + (action === 'star' ? 'starred' : 'unstarred') + ', and nothing was changed: ' + ((res && res.error) || 'the server did not confirm it') + '.');
+        return;
+      }
+      // Redrawn in place rather than reloading the page, so the scroll position and the selection
+      // survive what is a one-bit change.
+      var on = action === 'star';
+      btn.classList.toggle('on', on);
+      btn.setAttribute('data-action', on ? 'unstar' : 'star');
+      var svg = btn.querySelector('svg');
+      if (svg) svg.setAttribute('fill', on ? 'currentColor' : 'none');
+      btn.disabled = false;
+    });
+  }
+  $$('.mc-star').forEach(bindStar);
+
+  // ---- Conversation: collapse, expand, quoted text -----------------------------------------------
+  $$('.mc-msg-head').forEach(function(head){
+    head.addEventListener('click', function(){
+      var msg = head.closest('.mc-msg');
+      var open = msg.classList.toggle('open');
+      msg.classList.toggle('shut', !open);
+      head.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+  });
+  function setAll(open){
+    $$('.mc-msg').forEach(function(msg){
+      msg.classList.toggle('open', open);
+      msg.classList.toggle('shut', !open);
+      var h = msg.querySelector('.mc-msg-head');
+      if (h) h.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+  }
+  var expandAll = document.getElementById('mcExpandAll');
+  if (expandAll) expandAll.addEventListener('click', function(){ setAll(true); });
+  var collapseAll = document.getElementById('mcCollapseAll');
+  if (collapseAll) collapseAll.addEventListener('click', function(){ setAll(false); });
+
+  $$('.mc-quoted-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var pre = btn.parentElement.querySelector('.mc-quoted-text');
+      var show = pre.hidden;
+      pre.hidden = !show;
+      btn.setAttribute('aria-expanded', show ? 'true' : 'false');
+      btn.textContent = show ? 'Hide quoted text' : ('Show quoted text (' + pre.textContent.split('\n').length + ' lines)');
+    });
+  });
+
+  // ---- Contact context ---------------------------------------------------------------------------
+  //
+  // Fetched AFTER the conversation is on screen. If it fails the card simply does not appear; the
+  // messages are never held up by it and never removed by it.
+  var contactBox = document.getElementById('mcContact');
+  if (contactBox && contactBox.getAttribute('data-email')) {
+    (async function(){
+      try {
+        var r = await fetch('/api/mail/contact-context?email=' + encodeURIComponent(contactBox.getAttribute('data-email')), { credentials: 'same-origin' });
+        var res = await r.json();
+        if (!res || res.ok !== true || !res.context) return;
+        var c = res.context;
+        var html = '<strong>' + esc(c.name) + '</strong>';
+        if (c.isInternal) html += ' <span class="mc-chip">colleague</span>';
+        if (res.line) html += '<br/>' + esc(res.line);
+        if (c.tags && c.tags.length) html += '<br/>' + c.tags.map(function(t){ return '<span class="mc-chip">' + esc(t) + '</span>'; }).join('');
+        if (c.lists && c.lists.length) html += '<br/>Lists: ' + esc(c.lists.join(', '));
+        if (c.campaigns && c.campaigns.length) html += '<br/>Campaigns: ' + esc(c.campaigns.join(', '));
+        if (c.recent && c.recent.length > 1) {
+          html += '<br/>Recent: ' + c.recent.slice(0, 3).map(function(x){
+            return '<a href="' + esc(basePath + '?folder=' + (mcScope.folder || 'inbox') + '&thread=' + x.threadId) + '">' + esc(x.subject) + '</a>';
+          }).join(' · ');
+        }
+        // What this viewer was NOT shown, and why. A panel that silently omits half of itself
+        // teaches people the data does not exist.
+        if (c.withheld && c.withheld.length) html += '<p class="mc-withheld">' + esc(c.withheld.join(' ')) + '</p>';
+        contactBox.innerHTML = html;
+        contactBox.hidden = false;
+      } catch (err) {
+        console.error('[MailClient] contact context not loaded:', (err && err.message) || err);
+      }
+    })();
+  }
+
+  // ---- Keyboard ----------------------------------------------------------------------------------
+  //
+  // j/k move, Enter opens, r replies, f forwards, e archives, u marks unread, s stars, x ticks the
+  // box, ? shows the list. Shortcuts NEVER fire while somebody is typing — the guard below is what
+  // stops "e" in the middle of a sentence archiving the conversation behind the composer.
+  var cursorIndex = -1;
+  function rows(){ return $$('.mc-row'); }
+  function moveCursor(delta){
+    var all = rows();
+    if (!all.length) return;
+    cursorIndex = Math.max(0, Math.min(all.length - 1, cursorIndex + delta));
+    all.forEach(function(r, i){ r.classList.toggle('cursor', i === cursorIndex); });
+    var el = all[cursorIndex];
+    el.scrollIntoView({ block: 'nearest' });
+    el.focus({ preventScroll: true });
+  }
+  function currentThread(){
+    var all = rows();
+    if (cursorIndex >= 0 && all[cursorIndex]) return all[cursorIndex].getAttribute('data-thread');
+    return mcScope.threadId || null;
+  }
+  function isTyping(el){
+    if (!el) return false;
+    var tag = (el.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+  }
+  async function actOnCurrent(action, done){
+    var thread = currentThread();
+    if (!thread) return;
+    var res = await post('/api/mail/action', { action: action, threadId: thread });
+    if (!res || res.ok !== true) {
+      showAlert('That conversation was not ' + done + ', and nothing was changed: ' + ((res && res.error) || 'the server did not confirm it') + '.');
+      return;
+    }
+    location.reload();
+  }
+  document.addEventListener('keydown', function(e){
+    if (isTyping(e.target) || e.metaKey || e.ctrlKey || e.altKey) return;
+    var modalOpen = modal && !modal.hidden;
+    if (modalOpen) return;
+    switch (e.key) {
+      case 'j': e.preventDefault(); moveCursor(1); break;
+      case 'k': e.preventDefault(); moveCursor(-1); break;
+      case 'Enter': {
+        var all = rows();
+        if (cursorIndex >= 0 && all[cursorIndex]) { e.preventDefault(); location.href = all[cursorIndex].getAttribute('data-href'); }
+        break;
+      }
+      case 'x': {
+        var all2 = rows();
+        if (cursorIndex >= 0 && all2[cursorIndex]) {
+          e.preventDefault();
+          var box = all2[cursorIndex].querySelector('.mc-pick');
+          if (box) { box.checked = !box.checked; box.dispatchEvent(new Event('change')); }
+        }
+        break;
+      }
+      case 'r': {
+        var rb = document.getElementById('mcReplyBtn');
+        if (rb) { e.preventDefault(); rb.click(); }
+        break;
+      }
+      case 'f': {
+        var fb = document.getElementById('mcForwardBtn');
+        if (fb) { e.preventDefault(); fb.click(); }
+        break;
+      }
+      case 'c': {
+        var cb = document.getElementById('mcComposeBtn');
+        if (cb) { e.preventDefault(); cb.click(); }
+        break;
+      }
+      case 'e': e.preventDefault(); actOnCurrent('archive', 'archived'); break;
+      case 'u': e.preventDefault(); actOnCurrent('unread', 'marked unread'); break;
+      case 's': e.preventDefault(); actOnCurrent('star', 'starred'); break;
+      case '/': {
+        var box2 = document.querySelector('.mc-search input');
+        if (box2) { e.preventDefault(); box2.focus(); }
+        break;
+      }
+      case '?': {
+        e.preventDefault();
+        var help = document.getElementById('mcKeys');
+        if (help) { help.hidden = !help.hidden; if (!help.hidden) { var c2 = help.querySelector('button'); if (c2) c2.focus(); } }
+        break;
+      }
+      default: break;
+    }
+  });
+
+  // ---- Search help ---------------------------------------------------------------------------------
+  //
+  // The operator list comes from the PARSER'S OWN module, so the help cannot describe a grammar the
+  // search box does not have.
+  var searchInput = document.querySelector('.mc-search input');
+  if (searchInput && Array.isArray(mcHelp)) {
+    var helpBox = document.createElement('div');
+    helpBox.className = 'mc-help';
+    helpBox.hidden = true;
+    helpBox.innerHTML = mcHelp.map(function(h){
+      return '<div class="mc-help-row"><code>' + esc(h.op) + '</code><span>' + esc(h.means) + '</span></div>';
+    }).join('');
+    searchInput.parentElement.appendChild(helpBox);
+    searchInput.addEventListener('focus', function(){ helpBox.hidden = false; });
+    searchInput.addEventListener('blur', function(){ setTimeout(function(){ helpBox.hidden = true; }, 180); });
+  }
+
+  var keysClose = document.getElementById('mcKeysClose');
+  if (keysClose) keysClose.addEventListener('click', function(){ document.getElementById('mcKeys').hidden = true; });
+  var keysBox = document.getElementById('mcKeys');
+  if (keysBox) keysBox.addEventListener('click', function(e){ if (e.target === keysBox) keysBox.hidden = true; });
+
+
+  // ---- The snooze button on a conversation --------------------------------------------------------
+  var threadSnooze = document.getElementById('mcThreadSnooze');
+  if (threadSnooze) threadSnooze.addEventListener('click', function(e){
+    e.stopPropagation();
+    snoozeMenuFor(threadSnooze, [threadSnooze.getAttribute('data-thread')]);
+  });
+
+  // ================================================================================================
+  // DRAFT AUTOSAVE.
+  //
+  // THE THING THIS IS BUILT AROUND: a save must never be able to destroy what it is saving.
+  // /api/mail/draft does DELETE-then-INSERT, so a failure between the two loses the message, and the
+  // window is widest exactly when somebody has written the most. /api/mail/autosave updates in place
+  // and carries the version the edit was made against, so a stale save is REFUSED rather than
+  // silently overwriting newer text from another tab.
+  //
+  // DEBOUNCED, AND QUIET WHEN NOTHING CHANGED. The timer fires on a schedule, not on a change, so
+  // the server answers `unchanged: true` for an idle composer and no row and no revision is written.
+  //
+  // WHAT IT PROMISES ON SCREEN IS WHAT HAPPENED. "Saving..." while in flight, "Saved HH:MM" only
+  // after the server confirmed, and the reason in full when it did not. It never says saved on a
+  // request that failed.
+  // ================================================================================================
+  var AUTOSAVE_MS = 2500;
+  var draftId = null;
+  var draftVersion = 0;
+  var draftTimer = null;
+  var draftInFlight = false;
+  // A per-tab identity, so a conflict can say WHERE the other copy came from. Not used for
+  // authorisation anywhere — the server never trusts it.
+  var clientId = 'tab-' + Math.random().toString(36).slice(2, 10);
+
+  function draftStatus(msg){ var s = $('mcStatus'); if (s) s.textContent = msg; }
+  function draftPayload(){
+    return {
+      draftId: draftId,
+      version: draftVersion || null,
+      to: $('mcTo').value, cc: $('mcCc').value, bcc: $('mcBcc').value,
+      subject: $('mcSubject').value,
+      bodyText: htmlMode ? '' : $('mcBody').value,
+      bodyHtml: htmlMode ? $('mcBody').value : '',
+      threadId: $('mcThreadId').value || null,
+      inReplyTo: $('mcInReplyTo').value || null,
+      attachments: attachments,
+      clientId: clientId,
+    };
+  }
+  function draftIsEmpty(){
+    return !$('mcTo').value.trim() && !$('mcSubject').value.trim() && !$('mcBody').value.trim() && !attachments.length;
+  }
+  async function autosave(reason){
+    if (draftInFlight) return;
+    // An empty composer is not a draft. Saving one creates rows nobody wants and a recovery prompt
+    // offering to restore a blank message.
+    if (draftIsEmpty()) return;
+    draftInFlight = true;
+    if (reason !== 'quiet') draftStatus('Saving...');
+    var res = await post('/api/mail/autosave', draftPayload());
+    draftInFlight = false;
+
+    if (res && res.conflict) {
+      // NOT MERGED, AND NOT OVERWRITTEN. Both versions are kept and the person decides.
+      draftStatus('');
+      showAlert(res.message + ' The other version is in your Drafts folder; this window still holds exactly what you typed.');
+      return;
+    }
+    if (!res || res.ok !== true) {
+      draftStatus('');
+      showAlert((res && res.message) || 'This draft was not saved, and nothing was lost from this window.');
+      return;
+    }
+    draftId = res.draft.draftId;
+    draftVersion = res.draft.version;
+    if (!res.unchanged) {
+      draftStatus('Saved ' + new Date(res.draft.updatedAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' }));
+    }
+  }
+  function scheduleAutosave(){
+    if (draftTimer) clearTimeout(draftTimer);
+    draftTimer = setTimeout(function(){ autosave('typed'); }, AUTOSAVE_MS);
+  }
+  ['mcTo', 'mcCc', 'mcBcc', 'mcSubject', 'mcBody'].forEach(function(id){
+    var el = $(id);
+    if (el) el.addEventListener('input', scheduleAutosave);
+  });
+
+  // The last chance to save. `keepalive` is what makes this survive the page going away — an
+  // ordinary fetch is cancelled when the document unloads, which is precisely the moment the draft
+  // most needs to reach the server.
+  window.addEventListener('pagehide', function(){
+    if (draftIsEmpty() || draftInFlight) return;
+    try {
+      fetch('/api/mail/autosave', {
+        method: 'POST', credentials: 'same-origin', keepalive: true,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(draftPayload()),
+      });
+    } catch (err) { /* the page is going; there is nowhere left to report this */ }
+  });
+
+  // The composer's own Save draft button now goes through the same versioned path, so the two ways
+  // of saving cannot produce two different drafts.
+  var draftBtn2 = $('mcSaveDraft');
+  if (draftBtn2) {
+    var clone = draftBtn2.cloneNode(true);
+    draftBtn2.parentNode.replaceChild(clone, draftBtn2);
+    clone.addEventListener('click', async function(){
+      if (draftIsEmpty()) { draftStatus('Nothing to save yet.'); return; }
+      await autosave('button');
+      if (draftId) setTimeout(closeModal, 600);
+    });
+  }
+
+  // A sent message is no longer a draft. Told to the server so the Drafts folder does not keep a
+  // copy of something already in Sent — which is how the same message gets sent twice.
+  var sendBtn2 = $('mcSend');
+  if (sendBtn2) sendBtn2.addEventListener('click', function(){
+    if (!draftId) return;
+    var id = draftId;
+    setTimeout(function(){
+      post('/api/mail/autosave', { action: 'discard', draftId: id }).catch(function(){});
+    }, 1500);
+  });
+
+  // ---- Recovery after a crash ---------------------------------------------------------------------
+  //
+  // The draft is on the SERVER after the last autosave, so this works on a different machine, after
+  // a cleared profile, and in a window that was never opened before. Nothing here depends on
+  // localStorage, which survives none of those.
+  (async function(){
+    if (mcScope.threadId) return; // reading a conversation, not composing
+    var res = await post('/api/mail/autosave', { action: 'list' });
+    if (!res || res.ok !== true || !res.drafts || !res.drafts.length) return;
+    var d = res.drafts[0];
+    var bar = document.createElement('div');
+    bar.className = 'mc-recover';
+    bar.innerHTML = '<span></span>';
+    bar.firstChild.textContent = 'You have an unsent draft: "' + (d.subject || '(no subject)') + '", last saved '
+      + new Date(d.updatedAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + '.';
+    var open = document.createElement('button');
+    open.type = 'button'; open.textContent = 'Open it';
+    open.addEventListener('click', function(){
+      clearForm();
+      draftId = d.draftId; draftVersion = d.version;
+      $('mcTo').value = d.to; $('mcCc').value = d.cc; $('mcBcc').value = d.bcc;
+      $('mcSubject').value = d.subject; $('mcBody').value = d.bodyText || d.bodyHtml;
+      $('mcThreadId').value = d.threadId || '';
+      attachments = d.attachments || [];
+      renderAtts();
+      openModal('Unsent draft');
+      bar.remove();
+    });
+    var dismiss = document.createElement('button');
+    dismiss.type = 'button'; dismiss.textContent = 'Not now';
+    dismiss.addEventListener('click', function(){ bar.remove(); });
+    bar.appendChild(open); bar.appendChild(dismiss);
+    var list = document.getElementById('mcList');
+    if (list) list.insertBefore(bar, list.firstChild);
+  })();
+  refreshSelection();
 })();
 </script>

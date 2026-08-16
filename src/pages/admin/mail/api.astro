@@ -1,0 +1,350 @@
+---
+/**
+ * /admin/mail/api — the transactional API console: organizations, API keys, and what has been sent.
+ *
+ * A KEY IS SHOWN ONCE, HERE, AND NEVER AGAIN. Only its sha256 is stored, so there is no reveal button
+ * to build and no support process that can leak one. If somebody loses a key they rotate it; the
+ * rotation keeps the old one alive for a grace period so a deploy is not a race.
+ *
+ * EVERY ACTION ON THIS PAGE REPORTS WHAT ACTUALLY HAPPENED, not that a call returned. revokeKey()
+ * puts `revoked_at IS NULL` in its WHERE and answers whether THIS click did the revoking — the
+ * /admin/api-keys screen used to print "Key revoked." for an id that matched nothing, on the screen
+ * whose whole job is to answer whether a live credential still exists.
+ */
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { ensureMailApiSchema, rows, dbReason } from '@/lib/mailapi/schema';
+import { createOrg, listOrgs, listKeys, createKey, revokeKey, rotateKey, setOrgActive, ALL_SCOPES, DEFAULT_SCOPES, ENVIRONMENTS, isEnvironment, isUuid } from '@/lib/mailapi/keys';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+// Declared BEFORE the POST handler that reads them. `const` is not hoisted, and a handler reaching a
+// later declaration throws on its first line — the fault CLAUDE.md records for apply step 5 and the
+// roles Repair button, both of which reported "all checks passed" while throwing every time.
+let notice = '';
+let noticeKind: 'ok' | 'bad' = 'ok';
+let freshKey = '';
+let freshKeyLabel = '';
+const readFailures: string[] = [];
+
+let schemaOk = true;
+try {
+  await ensureMailApiSchema();
+} catch (e: any) {
+  schemaOk = false;
+  readFailures.push('Schema bootstrap: ' + dbReason(e));
+}
+
+if (Astro.request.method === 'POST' && schemaOk) {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || '');
+
+    if (action === 'create-org') {
+      const org = await createOrg({ name: String(form.get('name') || '').trim() });
+      notice = 'Organization "' + org.name + '" is ready (' + org.slug + ').'
+        + (org.mpOrgId ? ' Linked to the campaign platform, so suppression is shared.' : ' It could NOT be linked to a campaign-platform organization — suppression recorded there will not be visible to transactional sends until it is.');
+      noticeKind = org.mpOrgId ? 'ok' : 'bad';
+    } else if (action === 'toggle-org') {
+      const id = String(form.get('org_id') || '');
+      const active = String(form.get('active') || '') === 'true';
+      const changed = await setOrgActive(id, active);
+      notice = changed
+        ? (active ? 'Sending re-enabled for that organization.' : 'Sending disabled. Its keys now answer 403 organization_inactive.')
+        : 'Nothing changed — that organization was already in that state.';
+      noticeKind = changed ? 'ok' : 'bad';
+    } else if (action === 'create-key') {
+      const orgId = String(form.get('org_id') || '');
+      const environment = String(form.get('environment') || 'development');
+      if (!isUuid(orgId)) throw new Error('Choose an organization.');
+      if (!isEnvironment(environment)) throw new Error('Unknown environment.');
+      const scopes = form.getAll('scopes').map(String).filter(Boolean);
+      const created = await createKey({
+        orgId,
+        environment,
+        name: String(form.get('name') || '').trim() || null as any,
+        scopes: scopes.length ? scopes : DEFAULT_SCOPES,
+        createdBy: user.id,
+      });
+      freshKey = created.key;
+      freshKeyLabel = (created.record.name || 'New key') + ' (' + environment + ')';
+      notice = 'Key created. Copy it now — it is not stored and cannot be shown again.';
+    } else if (action === 'revoke-key') {
+      const id = String(form.get('key_id') || '');
+      const done = await revokeKey(id, 'revoked from the console by ' + (user.email || user.id));
+      notice = done ? 'Key revoked. It stops working on its next request.' : 'Nothing was revoked — that key does not exist, or somebody had already revoked it.';
+      noticeKind = done ? 'ok' : 'bad';
+    } else if (action === 'rotate-key') {
+      const id = String(form.get('key_id') || '');
+      const grace = Number(form.get('grace_minutes') || 60);
+      const rotated = await rotateKey(id, { graceMinutes: grace, createdBy: user.id });
+      if (!rotated) {
+        notice = 'Nothing was rotated — that key does not exist, or it is already revoked.';
+        noticeKind = 'bad';
+      } else {
+        freshKey = rotated.key;
+        freshKeyLabel = 'Rotated key (' + rotated.record.environment + ')';
+        notice = 'Rotated. The previous key keeps working until ' + new Date(rotated.oldExpiresAt!).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ', so you can deploy this one without a gap.';
+      }
+    }
+  } catch (e: any) {
+    notice = dbReason(e);
+    noticeKind = 'bad';
+  }
+}
+
+let orgs: any[] = [];
+let keys: any[] = [];
+let stats: any = null;
+if (schemaOk) {
+  try { orgs = await listOrgs(); } catch (e: any) { readFailures.push('Organizations: ' + dbReason(e)); }
+  try { keys = await listKeys({ includeRevoked: true }); } catch (e: any) { readFailures.push('API keys: ' + dbReason(e)); }
+  try {
+    stats = rows(await db.execute(sql`
+      SELECT
+        (SELECT COUNT(*)::int FROM mailapi_messages) AS messages,
+        (SELECT COUNT(*)::int FROM mailapi_messages WHERE status IN ('sent','delivered')) AS sent,
+        (SELECT COUNT(*)::int FROM mailapi_messages WHERE status IN ('failed','bounced')) AS failed,
+        (SELECT COUNT(*)::int FROM mailapi_messages WHERE status IN ('queued','processing','deferred')) AS pending,
+        (SELECT COUNT(*)::int FROM mailapi_webhook_deliveries WHERE status = 'dead') AS dead_hooks,
+        (SELECT COUNT(*)::int FROM mailapi_templates WHERE is_archived = false) AS templates,
+        (SELECT MAX(created_at) FROM mailapi_messages) AS last_message_at`))[0] || null;
+  } catch (e: any) { readFailures.push('Counters: ' + dbReason(e)); }
+}
+
+let recent: any[] = [];
+if (schemaOk) {
+  try {
+    recent = rows(await db.execute(sql`
+      SELECT m.id, m.status, m.environment, m.subject, m.to_emails, m.template_key, m.template_version,
+             m.last_error, m.created_at, o.slug AS org
+      FROM mailapi_messages m JOIN mailapi_orgs o ON o.id = m.org_id
+      ORDER BY m.created_at DESC LIMIT 25`));
+  } catch (e: any) { readFailures.push('Recent messages: ' + dbReason(e)); }
+}
+
+// COMPUTED HERE, NOT IN THE MARKUP. The `<=` comparison this needs is read by the .astro compiler
+// as the start of a JSX tag when it appears inside an expression block, and the build fails with a
+// Fragment error pointing at a line that looks fine. Same family as the no-arrow-characters rule.
+const keyRows = keys.map((k: any) => {
+  const expiresAt = k.expiresAt ? new Date(k.expiresAt).getTime() : 0;
+  const expired = expiresAt > 0 && expiresAt < Date.now() + 1;
+  return { ...k, state: k.revokedAt ? 'revoked' : (expired ? 'expired' : 'live') };
+});
+
+const trackingConfigured = !!String(process.env.MAILAPI_TRACK_SECRET || process.env.SESSION_SECRET || '').trim();
+const cronConfigured = !!process.env.CRON_SECRET;
+
+function when(d: any): string {
+  if (!d) return 'never';
+  try { return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); } catch { return ''; }
+}
+const STATUS_TONE: Record<string, string> = {
+  delivered: '#6ee7b7', sent: '#86efac', queued: '#fbbf24', processing: '#fbbf24',
+  deferred: '#fbbf24', bounced: '#fca5a5', failed: '#fca5a5', cancelled: '#8a8a94',
+};
+---
+<AdminLayout title="Transactional API" activeNav="mail-api">
+<div class="admin-page" style="max-width:1080px;">
+  <div class="admin-page-header" style="margin-bottom:18px;">
+    <div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">Mail</div>
+      <h1 class="admin-page-title">Transactional API</h1>
+      <p class="admin-page-sub">
+        Keys, organizations and the send log for the developer API.
+        <a href="/admin/mail/webhooks" style="color:#FF7040;text-decoration:none;">Webhooks</a> &middot;
+        <a href="/developers/mail" style="color:#FF7040;text-decoration:none;">Documentation</a> &middot;
+        <a href="/admin/mail/health" style="color:#FF7040;text-decoration:none;">Mail health</a>
+      </p>
+    </div>
+  </div>
+
+  {readFailures.length > 0 && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;margin-bottom:18px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fca5a5;margin:0 0 6px;">Part of this page could not be read, so what is below is not a measurement.</p>
+      <ul style="font-size:11.5px;color:#fca5a5;margin:0;padding-left:18px;line-height:1.7;font-family:'Geist Mono',monospace;">
+        {readFailures.map((f: any) => <li>{f}</li>)}
+      </ul>
+    </div>
+  )}
+
+  {notice && (
+    <div style={`background:${noticeKind === 'ok' ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.12)'};border:1px solid ${noticeKind === 'ok' ? 'rgba(16,185,129,0.35)' : 'rgba(239,68,68,0.35)'};border-radius:10px;padding:12px 14px;margin-bottom:16px;font-size:13px;color:${noticeKind === 'ok' ? '#6ee7b7' : '#fca5a5'};`}>
+      {notice}
+    </div>
+  )}
+
+  {freshKey && (
+    <div style="background:#11131a;border:1px solid #FF7040;border-radius:12px;padding:16px;margin-bottom:20px;">
+      <p style="font-size:11px;letter-spacing:0.12em;text-transform:uppercase;color:#FF7040;font-weight:700;margin:0 0 8px;font-family:'Geist Mono',monospace;">{freshKeyLabel} &mdash; shown once</p>
+      <code style="display:block;background:#0a0a0c;border:1px solid #2a2a35;border-radius:8px;padding:12px;font-family:'Geist Mono',monospace;font-size:12.5px;color:#fbbf24;word-break:break-all;">{freshKey}</code>
+      <p style="font-size:11.5px;color:#8a8a94;margin:8px 0 0;line-height:1.6;">Only a sha256 of this value is stored. Nothing on this site can show it again — if it is lost, rotate the key.</p>
+    </div>
+  )}
+
+  {stats && (
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:22px;">
+      {[
+        { label: 'Messages', value: stats.messages, tone: '#e8e8ee' },
+        { label: 'Sent', value: stats.sent, tone: '#86efac' },
+        { label: 'In flight', value: stats.pending, tone: '#fbbf24' },
+        { label: 'Failed / bounced', value: stats.failed, tone: '#fca5a5' },
+        { label: 'Dead webhooks', value: stats.dead_hooks, tone: stats.dead_hooks > 0 ? '#fca5a5' : '#8a8a94' },
+        { label: 'Templates', value: stats.templates, tone: '#e8e8ee' },
+      ].map((s: any) => (
+        <div style="background:#15151a;border:1px solid #2a2a35;border-radius:10px;padding:12px 14px;">
+          <p style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:#8a8a94;margin:0 0 4px;font-family:'Geist Mono',monospace;">{s.label}</p>
+          <p style={`font-size:22px;font-weight:700;margin:0;color:${s.tone};`}>{s.value ?? 0}</p>
+        </div>
+      ))}
+    </div>
+  )}
+
+  <div style="background:#15151a;border:1px solid #2a2a35;border-radius:12px;padding:14px 16px;margin-bottom:22px;">
+    <p style="font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:#8a8a94;margin:0 0 8px;font-family:'Geist Mono',monospace;">Deployment facts</p>
+    <ul style="margin:0;padding-left:18px;font-size:12.5px;color:#b8b8c4;line-height:1.8;">
+      <li>Open/click tracking and unsubscribe links: <strong style={trackingConfigured ? 'color:#6ee7b7;' : 'color:#fca5a5;'}>{trackingConfigured ? 'available' : 'OFF — no MAILAPI_TRACK_SECRET or SESSION_SECRET'}</strong>. They fail closed rather than emitting unsigned links.</li>
+      <li>Worker authorisation: <strong style={cronConfigured ? 'color:#6ee7b7;' : 'color:#fca5a5;'}>{cronConfigured ? 'CRON_SECRET is set' : 'CRON_SECRET is NOT set'}</strong>. An ordinary send does not depend on the worker — it reaches SMTP inside the request — but scheduled sends, retries and webhook redelivery do.</li>
+      <li>Run it now: <a href="/api/v1/email/dispatch" style="color:#FF7040;">/api/v1/email/dispatch</a> (admins may call it signed in).</li>
+    </ul>
+  </div>
+
+  <h2 style="font-size:15px;font-weight:700;color:#e8e8ee;margin:0 0 10px;">Organizations</h2>
+  <p style="font-size:12.5px;color:#8a8a94;margin:0 0 12px;line-height:1.7;">A sending product: AquinTutor, Careers, HEI. Keys, templates, webhooks and messages all belong to one. Each is linked to the campaign platform's organization of the same slug, so an unsubscribe recorded there stops transactional mail here too.</p>
+
+  <form method="post" style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+    <input type="hidden" name="action" value="create-org" />
+    <input name="name" required placeholder="Organization name (e.g. EduRankAI Careers)" style="flex:1;min-width:240px;background:#0a0a0c;border:1px solid #2a2a35;border-radius:8px;padding:9px 12px;color:#e8e8ee;font-size:13px;" />
+    <button type="submit" style="background:#FF4F00;color:#fff;border:0;border-radius:8px;padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;">Add</button>
+  </form>
+
+  <div style="overflow-x:auto;margin-bottom:28px;">
+    <table style="width:100%;border-collapse:collapse;font-size:12.5px;">
+      <thead><tr>
+        {['Organization', 'Slug', 'Campaign link', 'Status', ''].map((h) => (
+          <th style="text-align:left;padding:8px 10px;border-bottom:1px solid #2a2a35;font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:#8a8a94;font-family:'Geist Mono',monospace;">{h}</th>
+        ))}
+      </tr></thead>
+      <tbody>
+        {orgs.length === 0 && <tr><td colspan="5" style="padding:14px 10px;color:#8a8a94;">No organizations yet. Add one above, then create a key for it.</td></tr>}
+        {orgs.map((o: any) => (
+          <tr>
+            <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#e8e8ee;">{o.name}</td>
+            <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#b8b8c4;font-family:'Geist Mono',monospace;">{o.slug}</td>
+            <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;">
+              {o.mpOrgId
+                ? <span style="color:#6ee7b7;">shared</span>
+                : <span style="color:#fbbf24;" title="Suppression recorded by the campaign platform is not visible to transactional sends for this organization.">not linked</span>}
+            </td>
+            <td style={`padding:9px 10px;border-bottom:1px solid #1a1a1f;color:${o.isActive ? '#6ee7b7' : '#fca5a5'};`}>{o.isActive ? 'active' : 'disabled'}</td>
+            <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;text-align:right;">
+              <form method="post" style="display:inline;">
+                <input type="hidden" name="action" value="toggle-org" />
+                <input type="hidden" name="org_id" value={o.id} />
+                <input type="hidden" name="active" value={o.isActive ? 'false' : 'true'} />
+                <button type="submit" style="background:transparent;border:1px solid #2a2a35;border-radius:6px;padding:5px 10px;color:#b8b8c4;font-size:11.5px;cursor:pointer;">{o.isActive ? 'Disable sending' : 'Enable'}</button>
+              </form>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+
+  <h2 style="font-size:15px;font-weight:700;color:#e8e8ee;margin:0 0 10px;">API keys</h2>
+  <p style="font-size:12.5px;color:#8a8a94;margin:0 0 12px;line-height:1.7;">A key carries its environment in the string itself: <code style="color:#fbbf24;">erm_dev_</code>, <code style="color:#fbbf24;">erm_stg_</code>, <code style="color:#fbbf24;">erm_live_</code>. A development key cannot read, edit or send a production template, message or webhook — the environment is in the query, not in a convention.</p>
+
+  {orgs.length > 0 && (
+    <form method="post" style="background:#15151a;border:1px solid #2a2a35;border-radius:12px;padding:14px 16px;margin-bottom:14px;">
+      <input type="hidden" name="action" value="create-key" />
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+        <select name="org_id" required style="background:#0a0a0c;border:1px solid #2a2a35;border-radius:8px;padding:9px 12px;color:#e8e8ee;font-size:13px;">
+          {orgs.map((o: any) => <option value={o.id}>{o.name}</option>)}
+        </select>
+        <select name="environment" style="background:#0a0a0c;border:1px solid #2a2a35;border-radius:8px;padding:9px 12px;color:#e8e8ee;font-size:13px;">
+          {ENVIRONMENTS.map((e: any) => <option value={e}>{e}</option>)}
+        </select>
+        <input name="name" placeholder="Label (e.g. Careers backend)" style="flex:1;min-width:200px;background:#0a0a0c;border:1px solid #2a2a35;border-radius:8px;padding:9px 12px;color:#e8e8ee;font-size:13px;" />
+      </div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px;">
+        {ALL_SCOPES.map((s: any) => (
+          <label style="font-size:12px;color:#b8b8c4;display:flex;align-items:center;gap:6px;font-family:'Geist Mono',monospace;">
+            <input type="checkbox" name="scopes" value={s} checked={DEFAULT_SCOPES.includes(s as any)} />{s}
+          </label>
+        ))}
+      </div>
+      <button type="submit" style="background:#FF4F00;color:#fff;border:0;border-radius:8px;padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;">Create key</button>
+    </form>
+  )}
+
+  <div style="overflow-x:auto;margin-bottom:28px;">
+    <table style="width:100%;border-collapse:collapse;font-size:12.5px;">
+      <thead><tr>
+        {['Prefix', 'Label', 'Org', 'Env', 'Scopes', 'Last used', 'Calls', 'State', ''].map((h) => (
+          <th style="text-align:left;padding:8px 10px;border-bottom:1px solid #2a2a35;font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:#8a8a94;font-family:'Geist Mono',monospace;">{h}</th>
+        ))}
+      </tr></thead>
+      <tbody>
+        {keyRows.length === 0 && <tr><td colspan="9" style="padding:14px 10px;color:#8a8a94;">No keys yet.</td></tr>}
+        {keyRows.map((k: any) => (
+            <tr>
+              <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;font-family:'Geist Mono',monospace;color:#fbbf24;">{k.prefix}&hellip;</td>
+              <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#e8e8ee;">{k.name || '&mdash;'}</td>
+              <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#b8b8c4;">{k.orgSlug}</td>
+              <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#b8b8c4;">{k.environment}</td>
+              <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#8a8a94;font-family:'Geist Mono',monospace;font-size:11px;">{k.scopes.join(' ')}</td>
+              <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#8a8a94;">{when(k.lastUsedAt)}</td>
+              <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#8a8a94;">{k.requestCount}</td>
+              <td style={`padding:9px 10px;border-bottom:1px solid #1a1a1f;color:${k.state === 'live' ? '#6ee7b7' : '#8a8a94'};`}>{k.state}{k.expiresAt && !k.revokedAt ? ' until ' + when(k.expiresAt) : ''}</td>
+              <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;text-align:right;white-space:nowrap;">
+                {k.state === 'live' && (
+                  <span>
+                    <form method="post" style="display:inline;">
+                      <input type="hidden" name="action" value="rotate-key" />
+                      <input type="hidden" name="key_id" value={k.id} />
+                      <input type="hidden" name="grace_minutes" value="60" />
+                      <button type="submit" style="background:transparent;border:1px solid #2a2a35;border-radius:6px;padding:5px 10px;color:#b8b8c4;font-size:11.5px;cursor:pointer;margin-right:6px;">Rotate</button>
+                    </form>
+                    <form method="post" style="display:inline;" onsubmit="return confirm('Revoke this key? Anything using it stops sending immediately.')">
+                      <input type="hidden" name="action" value="revoke-key" />
+                      <input type="hidden" name="key_id" value={k.id} />
+                      <button type="submit" style="background:transparent;border:1px solid rgba(239,68,68,0.4);border-radius:6px;padding:5px 10px;color:#fca5a5;font-size:11.5px;cursor:pointer;">Revoke</button>
+                    </form>
+                  </span>
+                )}
+              </td>
+            </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+
+  <h2 style="font-size:15px;font-weight:700;color:#e8e8ee;margin:0 0 10px;">Recent transactional messages</h2>
+  <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-size:12.5px;">
+      <thead><tr>
+        {['When', 'Org', 'Env', 'To', 'Subject', 'Template', 'Status'].map((h) => (
+          <th style="text-align:left;padding:8px 10px;border-bottom:1px solid #2a2a35;font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:#8a8a94;font-family:'Geist Mono',monospace;">{h}</th>
+        ))}
+      </tr></thead>
+      <tbody>
+        {recent.length === 0 && <tr><td colspan="7" style="padding:14px 10px;color:#8a8a94;">Nothing has been sent through the transactional API yet.</td></tr>}
+        {recent.map((m: any) => (
+          <tr>
+            <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#8a8a94;white-space:nowrap;">{when(m.created_at)}</td>
+            <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#b8b8c4;">{m.org}</td>
+            <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#8a8a94;">{m.environment}</td>
+            <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#b8b8c4;font-family:'Geist Mono',monospace;font-size:11px;">{(Array.isArray(m.to_emails) ? m.to_emails : []).join(', ')}</td>
+            <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#e8e8ee;">{m.subject}</td>
+            <td style="padding:9px 10px;border-bottom:1px solid #1a1a1f;color:#8a8a94;font-family:'Geist Mono',monospace;font-size:11px;">{m.template_key ? m.template_key + ' v' + m.template_version : 'inline'}</td>
+            <td style={`padding:9px 10px;border-bottom:1px solid #1a1a1f;color:${STATUS_TONE[m.status] || '#b8b8c4'};`} title={m.last_error || ''}>{m.status}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+</div>
+</AdminLayout>

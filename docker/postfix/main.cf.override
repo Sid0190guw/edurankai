@@ -1,0 +1,84 @@
+# docker/postfix/main.cf.override — appended to the generated Postfix main.cf.
+#
+# Only the settings this system actually needs. Everything else stays at the image's defaults,
+# which are maintained by people who watch Postfix releases; overriding a setting here means taking
+# responsibility for it forever.
+
+# --- inbound routing: accepted mail goes to the ingest bridge, not to a local mailbox -------------
+#
+# THE DESIGN. Postfix is the MX: it terminates SMTP from the internet, runs Rspamd, verifies DKIM
+# and SPF. It then hands the message to `mail-parser` (docker/mailops/ingest.mjs) over plain SMTP on
+# the compose network, which signs it and POSTs the raw MIME to /api/mail/inbound. The APP decides
+# who a message belongs to, threads it, and applies inbound rules — Postfix never needs to know that
+# a user exists, so adding a user is a database row and not a mail-server reload.
+#
+# The bridge answers 451 (temporary) when the app cannot take the message, so Postfix KEEPS it and
+# retries on its own schedule. That is what makes an app redeploy invisible to a sender instead of a
+# bounce.
+transport_maps = hash:/etc/postfix/era_transport
+relay_domains = $mydestination, edurankai.in
+
+# --- message size --------------------------------------------------------------------------------
+# Matched to MAIL_MAX_ATTACHMENT_BYTES. Postfix counts the message AFTER base64 encoding, so a 25MB
+# attachment is roughly 34MB on the wire; the limit here is deliberately above the app's own so the
+# app produces the clear error rather than Postfix producing a bounce.
+message_size_limit = 40960000
+mailbox_size_limit = 0
+
+# --- what we are willing to relay ----------------------------------------------------------------
+#
+# THE OPEN-RELAY RULE, WRITTEN OUT. `permit_mynetworks` trusts the compose network (the app and the
+# ingest bridge). `permit_sasl_authenticated` trusts anyone who logged in. `reject_unauth_destination`
+# is the line that makes this not an open relay: a client that is neither on our network nor
+# authenticated may only send TO domains we host, never THROUGH us to somewhere else.
+#
+# reject_unauth_destination MUST come last and MUST be present. Deleting it, or putting a `permit`
+# before it, turns this into an open relay within one reload — and an open relay is found by
+# scanners within hours, not days. tests/security/open-relay.mjs asserts the behaviour from outside.
+smtpd_relay_restrictions =
+    permit_mynetworks
+    permit_sasl_authenticated
+    reject_unauth_destination
+
+# --- basic sender-side hygiene -------------------------------------------------------------------
+smtpd_helo_required = yes
+smtpd_helo_restrictions =
+    permit_mynetworks
+    permit_sasl_authenticated
+    reject_invalid_helo_hostname
+    reject_non_fqdn_helo_hostname
+
+smtpd_sender_restrictions =
+    permit_mynetworks
+    permit_sasl_authenticated
+    reject_non_fqdn_sender
+    reject_unknown_sender_domain
+
+smtpd_recipient_restrictions =
+    permit_mynetworks
+    permit_sasl_authenticated
+    reject_non_fqdn_recipient
+    reject_unknown_recipient_domain
+
+# --- rate limits ---------------------------------------------------------------------------------
+# An anonymous client that opens 100 connections a minute is a scanner, not a mail server. These are
+# per-client-per-time-unit and apply to unauthenticated senders.
+smtpd_client_connection_rate_limit = 30
+smtpd_client_message_rate_limit = 100
+anvil_rate_time_unit = 60s
+
+# --- outbound concurrency ------------------------------------------------------------------------
+# Deliberately conservative. A new sending IP that opens 50 parallel connections to one receiver
+# looks exactly like a spam source; reputation is built slowly and lost in an afternoon.
+# docs/mail/SCALING.md section 2 covers raising these as volume and reputation grow.
+default_destination_concurrency_limit = 5
+default_destination_rate_delay = 0s
+smtp_destination_concurrency_limit = 5
+
+# --- TLS on the way out --------------------------------------------------------------------------
+# `may` means opportunistic: encrypt when the receiver offers it, deliver anyway when it does not.
+# `encrypt` would refuse to deliver to servers that do not support TLS, which still exist and which
+# would silently become undeliverable addresses.
+smtp_tls_security_level = may
+smtp_tls_loglevel = 1
+smtpd_tls_security_level = may

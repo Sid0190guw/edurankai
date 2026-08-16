@@ -1,0 +1,532 @@
+---
+/**
+ * /admin/mail/lists — static lists and dynamic segments.
+ *
+ * A LIST is a set somebody put people into. A SEGMENT is a question the database answers every time
+ * it is asked. Both can be a campaign audience; only the segment changes on its own. The page keeps
+ * them side by side because choosing the wrong one is the most common modelling mistake here —
+ * "IITG applicants" wants to be a segment, "September webinar attendees" wants to be a list.
+ *
+ * The builder posts a condition TREE to /api/mail/segments and the server compiles and counts it.
+ * Nothing on this page evaluates a segment in the browser.
+ */
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import {
+  ensureContactSchema, listsWithCounts, listStats, listSegments, createList, updateList, deleteList,
+  saveSegment, deleteSegment, countSegment, isUuid, dbReason, type Actor,
+} from '@/lib/mail-contacts';
+import { FIELDS, ACTIVITY_KINDS, OP_LABELS, describeSegment, validateSegment, EMPTY_SEGMENT } from '@/lib/mail-segments';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+const actor: Actor = { userId: user.id, name: user.name || user.email };
+
+const readFailures: { source: string; reason: string }[] = [];
+function noteFailure<T>(source: string, fallback: T) {
+  return (e: any): T => {
+    readFailures.push({ source, reason: dbReason(e) });
+    console.error('[admin/mail/lists] ' + source + ' read failed:', dbReason(e));
+    return fallback;
+  };
+}
+
+let okMsg = '';
+let errMsg = '';
+await ensureContactSchema().catch((e: any) => { errMsg = 'The contact tables could not be prepared: ' + dbReason(e); });
+
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('_action') || '');
+    if (action === 'create-list') {
+      const r = await createList({
+        name: String(fd.get('name') || ''),
+        description: String(fd.get('description') || ''),
+        kind: String(fd.get('kind') || 'static') === 'dynamic' ? 'dynamic' : 'static',
+        segmentId: String(fd.get('segmentId') || '') || null,
+      }, actor);
+      if (r.ok) okMsg = 'List created.';
+      else errMsg = r.error || 'The list was not created.';
+    } else if (action === 'update-list') {
+      const r = await updateList(String(fd.get('id') || ''), {
+        name: String(fd.get('name') || ''),
+        description: String(fd.get('description') || ''),
+        segmentId: String(fd.get('segmentId') || '') || null,
+        isArchived: fd.get('isArchived') === 'on',
+      });
+      if (r.ok) okMsg = 'List saved.';
+      else errMsg = r.error || 'Nothing was saved.';
+    } else if (action === 'delete-list') {
+      const r = await deleteList(String(fd.get('id') || ''));
+      if (r.ok) okMsg = 'List deleted. The contacts themselves are untouched.';
+      else errMsg = r.error || 'Nothing was deleted.';
+    } else if (action === 'save-segment') {
+      let definition: any = EMPTY_SEGMENT;
+      try { definition = JSON.parse(String(fd.get('definition') || '')); } catch { definition = null; }
+      if (!definition) errMsg = 'The segment could not be read, so nothing was saved.';
+      else {
+        const r = await saveSegment({
+          id: String(fd.get('id') || '') || null,
+          name: String(fd.get('name') || ''),
+          description: String(fd.get('description') || ''),
+          definition,
+        }, actor);
+        if (r.ok) okMsg = 'Segment saved.';
+        else errMsg = r.error || 'Nothing was saved.';
+      }
+    } else if (action === 'delete-segment') {
+      const r = await deleteSegment(String(fd.get('id') || ''));
+      if (r.ok) okMsg = 'Segment deleted.';
+      else errMsg = r.error || 'Nothing was deleted.';
+    }
+  } catch (e: any) {
+    okMsg = '';
+    console.error('[admin/mail/lists] write failed:', dbReason(e));
+    errMsg = 'Nothing was saved: ' + dbReason(e);
+  }
+}
+
+const lists = await listsWithCounts().catch(noteFailure('Lists', []));
+const segments = await listSegments().catch(noteFailure('Segments', []));
+
+const openId = Astro.url.searchParams.get('open') || '';
+const openList = isUuid(openId) ? lists.find((l: any) => l.id === openId) : null;
+const openStats = openList ? await listStats(openList.id).catch(noteFailure('List statistics', null)) : null;
+
+// Segment counts, each read separately so one broken definition does not blank the whole column.
+const segmentCounts: { id: string; count: number | null; reason: string }[] = [];
+for (const s of segments) {
+  const errs = validateSegment(s.definition).filter((i) => i.level === 'error');
+  if (errs.length) { segmentCounts.push({ id: s.id, count: null, reason: errs[0].message }); continue; }
+  try {
+    segmentCounts.push({ id: s.id, count: await countSegment(s.definition), reason: '' });
+  } catch (e: any) {
+    segmentCounts.push({ id: s.id, count: null, reason: dbReason(e) });
+    console.error('[admin/mail/lists] segment count failed for ' + s.id + ':', dbReason(e));
+  }
+}
+function countFor(id: string) {
+  return segmentCounts.find((c) => c.id === id) || { id, count: null, reason: 'not counted' };
+}
+
+const editSegmentId = Astro.url.searchParams.get('segment') || '';
+const editSegment = isUuid(editSegmentId) ? segments.find((s: any) => s.id === editSegmentId) : null;
+const builderStart = editSegment ? editSegment.definition : EMPTY_SEGMENT;
+
+// Serialised for the builder. Passed through a JSON script tag rather than define:vars, because
+// define:vars cannot combine with is:inline and the builder needs to be inline to run unbundled.
+const catalog = {
+  fields: FIELDS.map((f) => ({ key: f.key, label: f.label, kind: f.kind, ops: f.ops, options: f.options || null, hint: f.hint || '' })),
+  ops: OP_LABELS,
+  activityKinds: ACTIVITY_KINDS,
+  lists: lists.map((l: any) => ({ id: l.id, name: l.name })),
+  start: builderStart,
+  segmentId: editSegment ? editSegment.id : '',
+  segmentName: editSegment ? editSegment.name : '',
+  segmentDescription: editSegment ? (editSegment.description || '') : '',
+};
+---
+<AdminLayout title="Lists and segments" activeNav="mail">
+  <style>
+    .cw { padding: 18px; max-width: 1400px; }
+    .card { background: var(--o-panel2,#141418); border: 1px solid var(--o-stroke,#26262e); border-radius: 12px; padding: 16px; }
+    .grid { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 16px; align-items: start; }
+    @media (max-width: 1050px) { .grid { grid-template-columns: 1fr; } }
+    .lbl { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: #8a8a94; display: block; margin-bottom: 5px; }
+    .inp { width: 100%; background: #fff; color: #17181d; border: 1.5px solid #cbd0da; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+    .drop { background: #fff; color: #17181d; border: 1.5px solid #cbd0da; border-radius: 8px; padding: 7px 9px; font-size: 12.5px; }
+    .prim { background: #FF6A3D; color: #fff; border: none; font-weight: 700; padding: 9px 18px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+    .ghost { background: #262832; color: #e6e7ec; border: 1px solid #3a3c48; font-weight: 600; padding: 7px 13px; border-radius: 8px; cursor: pointer; font-size: 12.5px; }
+    .muted { color: #8a8a94; font-size: 11.5px; }
+    .banner { font-size: 12.5px; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; }
+    .b-ok { background: rgba(16,185,129,.1); border: 1px solid rgba(16,185,129,.3); color: #6ee7b7; }
+    .b-err { background: rgba(239,68,68,.1); border: 1px solid rgba(239,68,68,.3); color: #fca5a5; }
+    .b-warn { background: rgba(245,158,11,.1); border: 1px solid rgba(245,158,11,.3); color: #fcd34d; }
+    .row { display: flex; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid rgba(255,255,255,.05); font-size: 12.5px; color: #d4d4d8; }
+    .row:last-child { border-bottom: none; }
+    h2.sec { font-size: 14px; font-weight: 700; color: #fff; margin: 0 0 10px; }
+    .grp { border: 1px solid #3a3c48; border-radius: 10px; padding: 10px; margin: 8px 0; background: rgba(255,255,255,.015); }
+    .cond { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+    .big { font-size: 30px; font-weight: 800; color: #fff; line-height: 1; }
+    .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--o-stroke,#26262e); margin-bottom: 16px; flex-wrap: wrap; }
+    .tab { padding: 9px 14px; font-size: 12.5px; font-weight: 600; color: #8a8a94; border-bottom: 2px solid transparent; text-decoration: none; }
+  </style>
+
+  <div class="cw">
+    <div class="admin-page-header" style="margin-bottom:14px;">
+      <div class="admin-page-eyebrow">Mail</div>
+      <h1 class="admin-page-title">Lists and segments</h1>
+      <p class="admin-page-sub">
+        A <strong>list</strong> is a set somebody put people into and it stays as it is. A <strong>segment</strong> is a question the
+        database answers afresh every time a campaign resolves its audience. Either can be a campaign audience; only the segment
+        changes on its own as contacts change.
+      </p>
+    </div>
+
+    <div class="tabs">
+      <a class="tab" href="/admin/mail/contacts">Contacts</a>
+      <a class="tab" style="color:#fff;border-bottom-color:#FF6A3D;" href="/admin/mail/lists">Lists &amp; segments</a>
+      <a class="tab" href="/admin/mail/campaigns">Campaigns</a>
+    </div>
+
+    {okMsg && <div class="banner b-ok">{okMsg}</div>}
+    {errMsg && <div class="banner b-err">{errMsg}</div>}
+    {readFailures.length > 0 && (
+      <div class="banner b-warn">
+        <strong>Some of this page could not be read.</strong>
+        <ul style="margin:6px 0 0 16px;padding:0;">{readFailures.map((f) => <li>{f.source}: {f.reason}</li>)}</ul>
+      </div>
+    )}
+
+    <div class="grid">
+      <div style="display:grid;gap:16px;">
+        <div class="card">
+          <h2 class="sec">Lists</h2>
+          {lists.length === 0 && <p class="muted">No lists yet.</p>}
+          {lists.map((l: any) => (
+            <div class="row">
+              <span>
+                <a href={'/admin/mail/lists?open=' + l.id} style="color:#fff;text-decoration:none;font-weight:600;">{l.name}</a>
+                {l.is_archived ? <span class="muted"> (archived)</span> : null}
+                <div class="muted">{l.description || (l.kind === 'dynamic' ? 'Dynamic, driven by a segment' : 'Static list')}</div>
+              </span>
+              <span style="text-align:right;white-space:nowrap;">
+                <span style="color:#fff;font-weight:700;">{l.member_count}</span>
+                <div class="muted">members</div>
+              </span>
+            </div>
+          ))}
+
+          {openList && openStats && (
+            <div style="margin-top:14px;border-top:1px solid rgba(255,255,255,.08);padding-top:14px;">
+              <h2 class="sec">{openList.name}</h2>
+              <div class="muted" style="margin-bottom:10px;">
+                {openStats.total} members &middot; {openStats.subscribed} subscribed &middot; {openStats.unsubscribed} unsubscribed
+                &middot; {openStats.bounced} bounced &middot; {openStats.complained} complained &middot; {openStats.pending} pending
+              </div>
+              <p class="muted" style="margin:0 0 10px;">
+                Only the {openStats.subscribed} subscribed members are mailable, and suppression is applied on top of that when a campaign resolves.
+              </p>
+              <form method="POST" style="display:grid;gap:10px;">
+                <input type="hidden" name="_action" value="update-list" />
+                <input type="hidden" name="id" value={openList.id} />
+                <div><label class="lbl">Name</label><input class="inp" name="name" value={openList.name} /></div>
+                <div><label class="lbl">Description</label><input class="inp" name="description" value={openList.description || ''} /></div>
+                <div>
+                  <label class="lbl">Segment (for a dynamic list)</label>
+                  <select class="drop" name="segmentId" style="width:100%;">
+                    <option value="">none — this is a static list</option>
+                    {segments.map((s: any) => <option value={s.id} selected={openList.segment_id === s.id}>{s.name}</option>)}
+                  </select>
+                </div>
+                <label class="muted"><input type="checkbox" name="isArchived" checked={openList.is_archived} /> Archived</label>
+                <div style="display:flex;gap:8px;">
+                  <button class="prim" type="submit">Save list</button>
+                  <a class="ghost" style="text-decoration:none;" href={'/admin/mail/contacts?list=' + openList.id}>View members</a>
+                </div>
+              </form>
+              <form method="POST" style="margin-top:10px;">
+                <input type="hidden" name="_action" value="delete-list" />
+                <input type="hidden" name="id" value={openList.id} />
+                <button class="ghost" style="color:#fca5a5;border-color:rgba(239,68,68,.3);" type="submit" data-danger="Delete this list? The contacts on it are not deleted.">Delete list</button>
+              </form>
+            </div>
+          )}
+        </div>
+
+        <form method="POST" class="card">
+          <input type="hidden" name="_action" value="create-list" />
+          <h2 class="sec">New list</h2>
+          <div style="display:grid;gap:10px;">
+            <div><label class="lbl">Name</label><input class="inp" name="name" placeholder="e.g. EduRankAI Intern Applicants" required /></div>
+            <div><label class="lbl">Description</label><input class="inp" name="description" placeholder="what this list is for" /></div>
+            <div>
+              <label class="lbl">Kind</label>
+              <select class="drop" name="kind" style="width:100%;" id="newListKind">
+                <option value="static">Static — members are added by hand or by import</option>
+                <option value="dynamic">Dynamic — membership follows a segment</option>
+              </select>
+            </div>
+            <div>
+              <label class="lbl">Segment (dynamic lists only)</label>
+              <select class="drop" name="segmentId" style="width:100%;">
+                <option value="">none</option>
+                {segments.map((s: any) => <option value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+          </div>
+          <div style="margin-top:12px;"><button class="prim" type="submit">Create list</button></div>
+        </form>
+
+        <div class="card">
+          <h2 class="sec">Saved segments</h2>
+          {segments.length === 0 && <p class="muted">No segments yet. Build one on the right.</p>}
+          {segments.map((s: any) => (
+            <div class="row">
+              <span>
+                <a href={'/admin/mail/lists?segment=' + s.id} style="color:#fff;text-decoration:none;font-weight:600;">{s.name}</a>
+                <div class="muted">{describeSegment(s.definition).join(' / ')}</div>
+              </span>
+              <span style="text-align:right;white-space:nowrap;">
+                {countFor(s.id).count === null
+                  ? <span class="muted" title={countFor(s.id).reason}>not counted</span>
+                  : <span style="color:#fff;font-weight:700;">{countFor(s.id).count}</span>}
+                <div class="muted">{countFor(s.id).count === null ? countFor(s.id).reason : 'contacts'}</div>
+                <form method="POST" style="display:inline;">
+                  <input type="hidden" name="_action" value="delete-segment" />
+                  <input type="hidden" name="id" value={s.id} />
+                  <button class="ghost" style="padding:3px 8px;margin-top:4px;" type="submit" data-danger="Delete this segment?">Delete</button>
+                </form>
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 class="sec">Segment builder</h2>
+        <p class="muted" style="margin:0 0 12px;">
+          Conditions are evaluated on the server. Preview shows the live count and a few of the people it matches, so the audience
+          is checkable before it is a campaign.
+        </p>
+        <form method="POST" id="segForm" style="display:grid;gap:10px;">
+          <input type="hidden" name="_action" value="save-segment" />
+          <input type="hidden" name="id" id="segId" value="" />
+          <input type="hidden" name="definition" id="segDefinition" value="" />
+          <div><label class="lbl">Segment name</label><input class="inp" name="name" id="segName" placeholder="e.g. IITG applicants at stage 3 or later" required /></div>
+          <div><label class="lbl">Description</label><input class="inp" name="description" id="segDesc" placeholder="what this is for" /></div>
+
+          <div>
+            <label class="lbl">Conditions</label>
+            <div id="builder"></div>
+          </div>
+
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <button class="ghost" type="button" id="btnPreview">Preview count</button>
+            <button class="prim" type="submit">Save segment</button>
+            <a class="ghost" style="text-decoration:none;" href="/admin/mail/lists">Start a new one</a>
+          </div>
+        </form>
+        <div id="segOut" style="margin-top:14px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <script type="application/json" id="segCatalog" set:html={JSON.stringify(catalog)}></script>
+  <script is:inline>
+    (function () {
+      var el = document.getElementById('segCatalog');
+      if (!el) return;
+      var CAT = JSON.parse(el.textContent || '{}');
+      var tree = CAT.start && CAT.start.type ? CAT.start : { type: 'group', op: 'and', children: [] };
+      var root = document.getElementById('builder');
+      var out = document.getElementById('segOut');
+
+      var nameBox = document.getElementById('segName');
+      var descBox = document.getElementById('segDesc');
+      var idBox = document.getElementById('segId');
+      if (CAT.segmentId) {
+        idBox.value = CAT.segmentId;
+        nameBox.value = CAT.segmentName || '';
+        descBox.value = CAT.segmentDescription || '';
+      }
+
+      function esc(s) {
+        return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      }
+      function fieldDef(key) {
+        if (key.indexOf('custom:') === 0) return CAT.fields.filter(function (f) { return f.key === 'custom'; })[0];
+        if (key.indexOf('activity:') === 0) return CAT.fields.filter(function (f) { return f.key === 'activity'; })[0];
+        return CAT.fields.filter(function (f) { return f.key === key; })[0];
+      }
+      function opLabel(op) {
+        var hit = CAT.ops.filter(function (o) { return o[0] === op; })[0];
+        return hit ? hit[1] : op;
+      }
+      function at(path) {
+        var node = tree;
+        for (var i = 0; i < path.length; i++) node = node.children[path[i]];
+        return node;
+      }
+
+      function valueControl(node, pathStr) {
+        var def = fieldDef(node.field);
+        if (!def) return '';
+        if (node.op === 'is_set' || node.op === 'is_empty') return '';
+        if (def.kind === 'list') {
+          return '<select class="drop" data-path="' + pathStr + '" data-set="value">'
+            + CAT.lists.map(function (l) {
+              return '<option value="' + esc(l.id) + '"' + (node.value === l.id ? ' selected' : '') + '>' + esc(l.name) + '</option>';
+            }).join('') + '</select>';
+        }
+        if (def.kind === 'activity' || def.kind === 'usage') {
+          var v = node.value || {};
+          var campaignBox = def.kind === 'activity'
+            ? '<input class="drop" style="width:150px;" placeholder="campaign id (optional)" data-path="' + pathStr + '" data-set="value.campaignId" value="' + esc(v.campaignId || '') + '" />'
+            : '';
+          return '<input class="drop" style="width:110px;" type="number" min="0" placeholder="within days" data-path="' + pathStr + '" data-set="value.days" value="' + esc(v.days == null ? '' : v.days) + '" />' + campaignBox;
+        }
+        if (def.options && def.options.length) {
+          return '<select class="drop" data-path="' + pathStr + '" data-set="value">'
+            + def.options.map(function (o) {
+              return '<option value="' + esc(o.value) + '"' + (String(node.value) === String(o.value) ? ' selected' : '') + '>' + esc(o.label) + '</option>';
+            }).join('') + '</select>';
+        }
+        if (node.op === 'within_days' || node.op === 'older_than_days') {
+          return '<input class="drop" style="width:110px;" type="number" min="0" data-path="' + pathStr + '" data-set="value" value="' + esc(node.value == null ? '' : node.value) + '" />';
+        }
+        if (node.op === 'before' || node.op === 'after') {
+          return '<input class="drop" type="date" data-path="' + pathStr + '" data-set="value" value="' + esc(String(node.value || '').slice(0, 10)) + '" />';
+        }
+        if (node.op === 'in' || node.op === 'not_in') {
+          var joined = Array.isArray(node.value) ? node.value.join(', ') : (node.value || '');
+          return '<input class="drop" style="width:200px;" placeholder="value, value, value" data-path="' + pathStr + '" data-set="value.list" value="' + esc(joined) + '" />';
+        }
+        return '<input class="drop" style="width:180px;" data-path="' + pathStr + '" data-set="value" value="' + esc(node.value == null ? '' : node.value) + '" />';
+      }
+
+      function renderCond(node, path) {
+        var pathStr = path.join('.');
+        var def = fieldDef(node.field) || {};
+        var fieldOptions = CAT.fields.map(function (f) {
+          var key = f.key;
+          var selected = node.field === key || (key === 'custom' && node.field.indexOf('custom:') === 0) || (key === 'activity' && node.field.indexOf('activity:') === 0);
+          return '<option value="' + esc(key) + '"' + (selected ? ' selected' : '') + '>' + esc(f.label) + '</option>';
+        }).join('');
+        var ops = (def.ops || []).map(function (o) {
+          return '<option value="' + esc(o) + '"' + (node.op === o ? ' selected' : '') + '>' + esc(opLabel(o)) + '</option>';
+        }).join('');
+        var extra = '';
+        if (def.kind === 'custom') {
+          extra = '<input class="drop" style="width:130px;" placeholder="field name" data-path="' + pathStr + '" data-set="customKey" value="' + esc(node.field.slice(7)) + '" />';
+        }
+        if (def.kind === 'activity') {
+          extra = '<select class="drop" data-path="' + pathStr + '" data-set="activityKind">'
+            + CAT.activityKinds.map(function (k) {
+              return '<option value="' + esc(k) + '"' + (node.field === 'activity:' + k ? ' selected' : '') + '>' + esc(k) + '</option>';
+            }).join('') + '</select>';
+        }
+        return '<div class="cond">'
+          + '<select class="drop" data-path="' + pathStr + '" data-set="field">' + fieldOptions + '</select>'
+          + extra
+          + '<select class="drop" data-path="' + pathStr + '" data-set="op">' + ops + '</select>'
+          + valueControl(node, pathStr)
+          + '<label class="muted"><input type="checkbox" data-path="' + pathStr + '" data-set="not"' + (node.not ? ' checked' : '') + ' /> not</label>'
+          + '<button type="button" class="ghost" style="padding:3px 8px;" data-path="' + pathStr + '" data-act="remove">Remove</button>'
+          + '</div>';
+      }
+
+      function renderGroup(node, path) {
+        var pathStr = path.join('.');
+        var kids = (node.children || []).map(function (k, i) {
+          return k.type === 'group' ? renderGroup(k, path.concat([i])) : renderCond(k, path.concat([i]));
+        }).join('');
+        var head = '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">'
+          + '<select class="drop" data-path="' + pathStr + '" data-set="groupOp">'
+          + '<option value="and"' + (node.op === 'and' ? ' selected' : '') + '>match ALL of these (AND)</option>'
+          + '<option value="or"' + (node.op === 'or' ? ' selected' : '') + '>match ANY of these (OR)</option>'
+          + '</select>'
+          + '<label class="muted"><input type="checkbox" data-path="' + pathStr + '" data-set="groupNot"' + (node.not ? ' checked' : '') + ' /> invert this group (NOT)</label>'
+          + '<button type="button" class="ghost" style="padding:3px 8px;" data-path="' + pathStr + '" data-act="add-cond">+ condition</button>'
+          + '<button type="button" class="ghost" style="padding:3px 8px;" data-path="' + pathStr + '" data-act="add-group">+ group</button>'
+          + (path.length ? '<button type="button" class="ghost" style="padding:3px 8px;" data-path="' + pathStr + '" data-act="remove">Remove group</button>' : '')
+          + '</div>';
+        var empty = (node.children || []).length === 0
+          ? '<p class="muted" style="margin:8px 0 0;">' + (node.op === 'or' ? 'An OR group with no conditions matches nobody.' : 'With no conditions this matches EVERY contact.') + '</p>'
+          : '';
+        return '<div class="grp">' + head + kids + empty + '</div>';
+      }
+
+      function draw() {
+        root.innerHTML = renderGroup(tree, []);
+        document.getElementById('segDefinition').value = JSON.stringify(tree);
+      }
+
+      root.addEventListener('click', function (e) {
+        var btn = e.target.closest && e.target.closest('[data-act]');
+        if (!btn) return;
+        var path = btn.getAttribute('data-path');
+        var arr = path === '' ? [] : path.split('.').map(Number);
+        var act = btn.getAttribute('data-act');
+        if (act === 'add-cond') at(arr).children.push({ type: 'cond', field: 'email', op: 'contains', value: '' });
+        if (act === 'add-group') at(arr).children.push({ type: 'group', op: 'and', children: [] });
+        if (act === 'remove') {
+          var parent = at(arr.slice(0, -1));
+          parent.children.splice(arr[arr.length - 1], 1);
+        }
+        draw();
+      });
+
+      root.addEventListener('change', function (e) {
+        var t = e.target;
+        var set = t.getAttribute && t.getAttribute('data-set');
+        if (!set) return;
+        var path = t.getAttribute('data-path');
+        var arr = path === '' ? [] : path.split('.').map(Number);
+        var node = at(arr);
+        if (set === 'groupOp') node.op = t.value;
+        else if (set === 'groupNot') node.not = t.checked;
+        else if (set === 'not') node.not = t.checked;
+        else if (set === 'field') {
+          node.field = t.value === 'custom' ? 'custom:field' : t.value === 'activity' ? 'activity:opened' : t.value;
+          var def = fieldDef(node.field);
+          if (def && def.ops.indexOf(node.op) < 0) node.op = def.ops[0];
+          node.value = (def && (def.kind === 'activity' || def.kind === 'usage')) ? {} : '';
+        } else if (set === 'customKey') {
+          node.field = 'custom:' + t.value.toLowerCase().replace(/[^a-z0-9_]+/g, '_');
+        } else if (set === 'activityKind') {
+          node.field = 'activity:' + t.value;
+        } else if (set === 'op') {
+          node.op = t.value;
+          if (node.op === 'in' || node.op === 'not_in') node.value = [];
+        } else if (set === 'value') {
+          node.value = t.value;
+        } else if (set === 'value.list') {
+          node.value = t.value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+        } else if (set === 'value.days') {
+          node.value = Object.assign({}, node.value || {});
+          if (t.value === '') delete node.value.days; else node.value.days = Number(t.value);
+        } else if (set === 'value.campaignId') {
+          node.value = Object.assign({}, node.value || {});
+          if (t.value === '') delete node.value.campaignId; else node.value.campaignId = t.value;
+        }
+        draw();
+      });
+
+      document.getElementById('btnPreview').addEventListener('click', function () {
+        out.innerHTML = '<p class="muted">Counting…</p>';
+        fetch('/api/mail/segments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'preview', definition: tree }),
+        }).then(function (r) { return r.json(); }).then(function (d) {
+          if (!d.ok) {
+            out.innerHTML = '<div class="banner b-err">' + (d.errors || [d.error]).map(esc).join('<br />') + '</div>';
+            return;
+          }
+          var warn = (d.warnings && d.warnings.length)
+            ? '<div class="banner b-warn">' + d.warnings.map(esc).join('<br />') + '</div>' : '';
+          var sample = (d.sample || []).map(function (s) {
+            return '<div class="row"><span><span style="color:#fff;">' + esc(s.name || s.email) + '</span><div class="muted">' + esc(s.email) + '</div></span>'
+              + '<span class="muted">' + esc(s.organization || '') + ' &middot; ' + esc(s.status) + '</span></div>';
+          }).join('');
+          out.innerHTML = warn
+            + '<div class="big">' + d.count.toLocaleString('en-IN') + '</div>'
+            + '<p class="muted">contacts match right now. This is recomputed when a campaign resolves its audience, so it can change.</p>'
+            + '<p class="lbl" style="margin-top:12px;">Reads as</p><pre class="muted" style="white-space:pre-wrap;margin:0 0 12px;">' + esc(d.description.join('\n')) + '</pre>'
+            + (sample ? '<p class="lbl">A few of them</p>' + sample : '');
+        }).catch(function (e) {
+          out.innerHTML = '<div class="banner b-err">The preview did not run: ' + esc(e && e.message) + '</div>';
+        });
+      });
+
+      document.addEventListener('submit', function (e) {
+        var btn = e.submitter;
+        var ask = btn && btn.getAttribute('data-danger');
+        if (ask && !confirm(ask)) e.preventDefault();
+      });
+
+      draw();
+    })();
+  </script>
+</AdminLayout>

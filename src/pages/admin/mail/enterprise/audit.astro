@@ -1,0 +1,171 @@
+---
+// /admin/mail/enterprise/audit — the record of what administrators did, and proof it was not edited.
+//
+// READ-ONLY. There is no form on this page and no write endpoint behind it. The database refuses
+// UPDATE on the table outright; this screen is the other half of that — the surface that reads the
+// log cannot also change it.
+//
+// THE VERIFICATION IS HONEST ABOUT ITS SCOPE. It walks a WINDOW of the chain, anchored to the event
+// before it, and says how many events that was out of the total. A green tick that quietly means "the
+// last twenty" would be worse than no tick at all. The anchor line at the bottom is meant to be
+// copied somewhere outside this database — it is the only defence against somebody who can rewrite
+// the whole table, and it is the part everybody skips.
+import GovShell from '@/components/mailgov/GovShell.astro';
+import { pageGate } from '@/lib/mailgov/guard';
+import { auditActions, listAudit, verifyAuditChain, auditHead } from '@/lib/mailgov/audit';
+import { auditAnchor } from '@/lib/mailgov/audit-chain';
+import { getOrg } from '@/lib/mailgov/orgs';
+import { authorizeGov } from '@/lib/mailgov/policy';
+import { auditTriggerInstalled } from '@/lib/mailgov/schema';
+
+const orgParamRaw = (Astro.url.searchParams.get('org') || '').trim() || null;
+const { actor, decision } = await pageGate(Astro.locals, 'audit.view', { orgId: orgParamRaw || undefined }, Astro.request);
+const orgId = actor.orgId || orgParamRaw;
+
+const filterAction = Astro.url.searchParams.get('action') || null;
+const filterResult = Astro.url.searchParams.get('result') || null;
+
+let events: any[] = [];
+let readError: string | null = null;
+let facets: any[] = [];
+let org: any = null;
+let chain: Awaited<ReturnType<typeof verifyAuditChain>> | null = null;
+let head: { seq: number; hash: string } | null = null;
+let triggerOn = false;
+
+if (decision.allowed) {
+  const list = await listAudit({ orgId, action: filterAction, result: filterResult, limit: 200 });
+  if (list.ok) events = list.rows; else readError = list.reason;
+
+  const f = await auditActions(orgId);
+  if (f.ok) facets = f.rows;
+
+  if (orgId) {
+    const one = await getOrg(orgId);
+    if (one.ok) org = one.org;
+  }
+
+  // Verification spans every tenant, so it is offered only to an actor who may see the platform.
+  if (authorizeGov(actor, 'audit.verify', { platformWide: true }).allowed) {
+    chain = await verifyAuditChain({ limit: 500 });
+    head = await auditHead();
+    triggerOn = await auditTriggerInstalled();
+  }
+}
+
+const resultColour = (r: string): string => (r === 'ok' ? '#34d399' : r === 'denied' ? '#fbbf24' : '#f87171');
+const qs = (k: string, v: string | null): string => {
+  const p = new URLSearchParams(Astro.url.search);
+  if (v) p.set(k, v); else p.delete(k);
+  return '/admin/mail/enterprise/audit?' + p.toString();
+};
+---
+
+<GovShell
+  title="Audit log"
+  actor={actor}
+  capability="audit.view"
+  org={org ? { id: org.id, name: org.name } : null}
+  subtitle="Append-only, hash-chained, and readable by the organization it is about."
+>
+  {chain && (
+    <div style={'border-radius:12px;padding:14px 16px;margin-bottom:16px;'
+      + (chain.readError ? 'background:rgba(154,166,182,0.10);border:1px solid rgba(154,166,182,0.30);'
+        : chain.ok ? 'background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.30);'
+        : 'background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.40);')}>
+      <p style={'font-size:12.5px;font-weight:700;margin:0 0 6px;color:'
+        + (chain.readError ? '#9aa6b6' : chain.ok ? '#34d399' : '#fca5a5') + ';'}>
+        {chain.readError
+          ? 'The chain could not be read, so it was not verified.'
+          : chain.ok ? 'The chain verifies.' : 'THE CHAIN DOES NOT VERIFY.'}
+      </p>
+      <p style="font-size:12px;color:#d8d8de;margin:0 0 8px;line-height:1.6;">
+        {chain.readError
+          ? chain.readError + ' A log that could not be read is not the same as a log that is broken, and this screen will not say otherwise.'
+          : chain.ok
+            ? 'The most recent ' + (chain.verdict?.checked || 0) + ' of ' + chain.total + ' events each hash to their stored value and link to the one before. This is a proof about that window, not about the whole table.'
+            : (chain.verdict?.reason || 'An event no longer matches its recorded hash.') + ' Treat the log as compromised until this is explained.'}
+      </p>
+      {chain.contentMismatches.length > 0 && (
+        <p style="font-size:11.5px;color:#fca5a5;margin:0 0 8px;font-family:'Geist Mono',monospace;">
+          Content mismatch at seq: {chain.contentMismatches.join(', ')}
+        </p>
+      )}
+      <p style={'font-size:11.5px;margin:0 0 8px;color:' + (triggerOn ? '#9aa6b6' : '#fbbf24') + ';line-height:1.6;'}>
+        {triggerOn
+          ? 'The database itself refuses UPDATE on this table, and refuses DELETE outside a retention prune.'
+          : 'The database trigger is not installed here, so append-only rests on this codebase issuing no UPDATE. That is true today and is a weaker guarantee than the database enforcing it.'}
+      </p>
+      {chain.checkpoints.length > 0 && (
+        <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 8px;line-height:1.6;">
+          {chain.checkpoints.length} prune checkpoint(s) recorded. A checkpoint explains a deliberate gap: what was
+          removed, when, and the hash the surviving chain links back to.
+        </p>
+      )}
+      <code style="display:block;font-family:'Geist Mono',monospace;background:#08080a;border:1px solid #2a2a2f;color:#FF7040;padding:8px 10px;border-radius:6px;font-size:11px;word-break:break-all;">
+        {auditAnchor(head, new Date().toISOString())}
+      </code>
+      <p style="font-size:11px;color:#6e6e78;margin:6px 0 0;line-height:1.6;">
+        Write that line down somewhere this database cannot reach. If next month's chain does not contain
+        this hash, the log was rebuilt — and nothing inside the database can tell you that.
+      </p>
+    </div>
+  )}
+
+  {readError && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;margin-bottom:16px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fca5a5;margin:0 0 6px;">The audit log could not be read.</p>
+      <p style="font-size:12px;color:#d8d8de;margin:0 0 6px;font-family:'Geist Mono',monospace;">{readError}</p>
+      <p style="font-size:12px;color:#d8d8de;margin:0;line-height:1.6;">An empty list here would mean "nobody has done anything". This is not that.</p>
+    </div>
+  )}
+
+  <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;">
+    <a href={qs('result', null)} style={'font-size:11px;padding:4px 10px;border-radius:999px;text-decoration:none;' + (!filterResult ? 'background:#FF4F00;color:#fff;' : 'background:#0f0f14;color:#9aa6b6;border:1px solid #1a1a1f;')}>All results</a>
+    <a href={qs('result', 'ok')} style={'font-size:11px;padding:4px 10px;border-radius:999px;text-decoration:none;' + (filterResult === 'ok' ? 'background:#FF4F00;color:#fff;' : 'background:#0f0f14;color:#9aa6b6;border:1px solid #1a1a1f;')}>Performed</a>
+    <a href={qs('result', 'denied')} style={'font-size:11px;padding:4px 10px;border-radius:999px;text-decoration:none;' + (filterResult === 'denied' ? 'background:#FF4F00;color:#fff;' : 'background:#0f0f14;color:#9aa6b6;border:1px solid #1a1a1f;')}>Refused</a>
+    <a href={qs('result', 'failed')} style={'font-size:11px;padding:4px 10px;border-radius:999px;text-decoration:none;' + (filterResult === 'failed' ? 'background:#FF4F00;color:#fff;' : 'background:#0f0f14;color:#9aa6b6;border:1px solid #1a1a1f;')}>Failed</a>
+  </div>
+
+  {facets.length > 0 && (
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;">
+      <a href={qs('action', null)} style={'font-size:11px;padding:4px 10px;border-radius:999px;text-decoration:none;' + (!filterAction ? 'background:#1f1f26;color:#fff;' : 'background:#0f0f14;color:#9aa6b6;border:1px solid #1a1a1f;')}>every action</a>
+      {facets.slice(0, 24).map((f: any) => (
+        <a href={qs('action', f.action)}
+           style={'font-size:11px;padding:4px 10px;border-radius:999px;text-decoration:none;font-family:Geist Mono,monospace;'
+             + (filterAction === f.action ? 'background:#1f1f26;color:#fff;' : 'background:#0f0f14;color:#9aa6b6;border:1px solid #1a1a1f;')}>
+          {f.action} <span style="color:#6e6e78;">{f.count}</span>
+        </a>
+      ))}
+    </div>
+  )}
+
+  <div class="admin-card">
+    <div class="admin-card-title" style="margin-bottom:10px;">
+      {events.length} event{events.length === 1 ? '' : 's'}
+    </div>
+    {events.length === 0 && !readError && (
+      <p style="font-size:12px;color:#9aa6b6;margin:0;">No events match this filter.</p>
+    )}
+    {events.map((e: any) => (
+      <div style="padding:10px 0;border-bottom:1px solid #17171c;">
+        <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;">
+          <span style="font-family:'Geist Mono',monospace;font-size:11px;color:#6e6e78;">#{e.seq}</span>
+          <span style={'font-size:12.5px;font-weight:700;font-family:Geist Mono,monospace;color:' + resultColour(e.result) + ';'}>{e.action}</span>
+          <span style="font-size:11.5px;color:#fff;">{e.actorEmail || 'system'}</span>
+          {e.actorRole && <span style="font-size:10.5px;color:#9aa6b6;">{e.actorRole}</span>}
+          {e.targetType && (
+            <span style="font-size:11px;color:#9aa6b6;font-family:'Geist Mono',monospace;">{e.targetType}: {e.targetId || '-'}</span>
+          )}
+          <span style="margin-left:auto;font-size:10.5px;color:#6e6e78;font-family:'Geist Mono',monospace;">
+            {e.occurredAt.slice(0, 19).replace('T', ' ')}
+          </span>
+        </div>
+        {e.reason && <p style="font-size:11.5px;color:#d8d8de;margin:5px 0 0;line-height:1.6;">{e.reason}</p>}
+        <p style="font-size:10px;color:#4a4a52;margin:5px 0 0;font-family:'Geist Mono',monospace;word-break:break-all;">
+          {e.ip ? 'ip ' + e.ip + ' · ' : ''}{e.requestId ? 'request ' + e.requestId + ' · ' : ''}hash {e.hash.slice(0, 24)}
+        </p>
+      </div>
+    ))}
+  </div>
+</GovShell>

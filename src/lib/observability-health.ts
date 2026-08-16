@@ -227,6 +227,16 @@ export const CONFIGURED_CRONS: { path: string; schedule: string }[] = [
   // Deadline reminders for unsubmitted coursework. Idempotent by marker row, so a retry costs
   // nothing; see src/lib/lms/notify.ts sendDueReminders().
   { path: '/api/cron/lms-reminders', schedule: '0 6 * * *' },
+  // The mail automation and campaign runners. Present in vercel.json and missing from this list,
+  // which is exactly the drift the paired test exists to catch.
+  { path: '/api/mail/automation/tick', schedule: '15 6 * * *' },
+  { path: '/api/mail/campaign-cron', schedule: '30 7 * * *' },
+  // The transactional worker: scheduled sends that have come due, deferred retries, and webhook
+  // redelivery. A daily run is all a Hobby plan allows and is enough for the housekeeping only —
+  // an ordinary send reaches SMTP inside its own request and never waits for this. Point an
+  // external scheduler at it every minute or two for retries to be timely; see
+  // docs/mail-transactional-api.md.
+  { path: '/api/v1/email/dispatch', schedule: '15 7 * * *' },
 ];
 
 /**

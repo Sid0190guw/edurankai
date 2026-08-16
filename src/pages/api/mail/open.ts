@@ -11,7 +11,26 @@ function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 
+/**
+ * GEOLOCATION IS OFF UNLESS SOMEBODY TURNED IT ON, AND THAT IS A CHANGE OF DEFAULT.
+ *
+ * This function sends the READER'S IP ADDRESS to a third-party service on every open, and stores
+ * the city it returns. For an internal open that is a colleague's location; through the sibling
+ * pixel route it is an external recipient's, and they were never asked and are never told.
+ *
+ * This codebase's own rules forbid reading private data without consent and require oversight
+ * screens to be aggregate-only. A per-open city, per person, is neither. The sovereignty directive
+ * also says core capability should be first-party, and this is a request path with a dependency on
+ * somebody else's API.
+ *
+ * So the default is off. Set MAIL_GEOLOCATE_OPENS=true to restore the previous behaviour — the
+ * read receipt itself (who opened, when) is unaffected either way; only country/region/city stop
+ * being filled.
+ */
+const GEO_ENABLED = process.env.MAIL_GEOLOCATE_OPENS === 'true';
+
 async function geo(ip: string | null): Promise<{ country?: string; region?: string; city?: string }> {
+  if (!GEO_ENABLED) return {};
   if (!ip) return {};
   // Tight 1.5s timeout — we don't want a slow ipapi to delay the open response.
   try {
@@ -40,7 +59,17 @@ async function logOpens(ids: string[], userId: string, ip: string | null, ua: st
         await db.execute(sql`
           INSERT INTO mail_reads (message_id, user_id, kind, ip_address, country, region, city, user_agent)
           SELECT ${id}, ${userId}, 'internal', ${ip || null}, ${g.country || null}, ${g.region || null}, ${g.city || null}, ${ua}
-          WHERE EXISTS (SELECT 1 FROM mail_messages WHERE id = ${id} AND from_user_id <> ${userId})
+          -- A READ RECEIPT MAY ONLY BE RECORDED BY SOMEBODY WHO ACTUALLY HAS THE MESSAGE.
+          -- This used to check only that the caller was not the SENDER, so any mailbox holder who
+          -- learned a message id — and every recipient of a tracked message holds one, it is in the
+          -- pixel and link URLs — could insert 'read' rows against a message they were never sent.
+          -- The sender's read receipts were therefore forgeable by anyone. Joining mail_box binds
+          -- the receipt to a copy the caller genuinely owns.
+          WHERE EXISTS (
+            SELECT 1 FROM mail_messages m
+            JOIN mail_box b ON b.message_id = m.id AND b.user_id = ${userId}
+            WHERE m.id = ${id} AND m.from_user_id <> ${userId}
+          )
             AND NOT EXISTS (
               SELECT 1 FROM mail_reads WHERE message_id = ${id} AND user_id = ${userId}
                 AND read_at > NOW() - INTERVAL '30 minutes'
@@ -59,7 +88,15 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
   const user = (locals as any).user;
   if (!user) return json({ ok: false }, 401);
   let body: any = {}; try { body = await request.json(); } catch {}
-  const ids: string[] = Array.isArray(body?.messageIds) ? body.messageIds.filter((x: any) => typeof x === 'string') : [];
+  // BOUNDED, AND SHAPE-CHECKED. `messageIds` had no length limit and no format check, and each
+  // entry became one INSERT plus (previously) one outbound geo lookup, fire-and-forget. A single
+  // request could therefore ask for ten thousand of both from any account with a mailbox. A reading
+  // pane shows a handful of messages at a time; 100 is far above the real ceiling and far below a
+  // useful amount of amplification.
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const ids: string[] = (Array.isArray(body?.messageIds) ? body.messageIds : [])
+    .filter((x: any) => typeof x === 'string' && UUID.test(x))
+    .slice(0, 100);
   if (!ids.length) return json({ ok: true, logged: 0 });
 
   const ua = (request.headers.get('user-agent') || '').slice(0, 500);

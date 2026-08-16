@@ -1,0 +1,228 @@
+# ops/prometheus/mail-alerts.yml — alert rules for EduRankAI Mail (Patch 8 §3, §13).
+#
+# THESE ARE THE SAME RULES THE APPLICATION ALREADY EVALUATES. src/lib/mailplatform/queue-observability.ts
+# implements queue growth, worker failure, stalled messages, retry storms and dead letters as PURE
+# functions with unit tests; /admin/mail/performance renders them. This file is the same logic for a
+# Prometheus deployment, so an alert can page somebody instead of waiting for a human to open a page.
+#
+# THE TWO KINDS OF SERIES IN THIS SUBSYSTEM ARE NOT INTERCHANGEABLE, AND MIXING THEM SILENTLY BREAKS
+# ALERTS:
+#
+#   edurankai_mail_queue_*         read from POSTGRES on every scrape. Cluster-wide and correct.
+#   everything else (counters,     PROCESS-LOCAL to one serverless instance, reset on every cold
+#   latency histograms)            start. Never alert on their ABSOLUTE value; rate() over a window
+#                                  shorter than an instance's lifetime is the only safe read, and
+#                                  even then a deploy will show as a dip.
+#
+# So every rule below that must be reliable uses a queue_* gauge. The latency rules are marked as
+# best-effort and are severity: warning, never page-worthy on their own.
+#
+# ABSENT IS NOT ZERO. `edurankai_mail_queue_oldest_age_seconds` is deliberately NOT emitted when the
+# queue is empty, because an empty queue and a fresh head are different facts. Rules therefore use
+# the series' presence, and `absent()` is used where the ABSENCE itself is the incident.
+#
+# THE HOBBY-CRON CAVEAT IS LOAD-BEARING. On Vercel's Hobby plan cron runs DAILY, so "nothing is
+# draining the queue" is the NORMAL state for most of the day. MailWorkerNotDraining is written with
+# a long `for:` for exactly that reason; on a minute-level scheduler, shorten it to 10m or it will be
+# far too slow to be useful. Read docs/mail-scaling.md before tuning.
+
+groups:
+  - name: edurankai-mail-queue
+    interval: 60s
+    rules:
+      # ---------------------------------------------------------------------
+      # Telemetry integrity — checked FIRST, because every rule below it is
+      # meaningless when this one is firing.
+      # ---------------------------------------------------------------------
+      - alert: MailTelemetryUnreadable
+        expr: edurankai_mail_telemetry_readable{source="queue"} == 0
+        for: 5m
+        labels: { severity: critical, subsystem: mail }
+        annotations:
+          summary: "Mail queue telemetry cannot be read"
+          description: >-
+            The queue reads failed, so every queue number in this scrape is a default rather than a
+            measurement. Silence from the other mail alerts is NOT evidence of health right now.
+          runbook: "Check /api/health first — this is almost always database reachability."
+
+      - alert: MailMetricsEndpointDown
+        expr: absent(edurankai_mail_registry_age_seconds)
+        for: 10m
+        labels: { severity: warning, subsystem: mail }
+        annotations:
+          summary: "No mail metrics scraped for 10 minutes"
+          description: >-
+            /api/metrics is returning nothing. Either the deployment is down, or METRICS_TOKEN was
+            rotated and the scraper is now getting a 403 — the endpoint fails CLOSED by design, so a
+            rotated secret looks exactly like an outage from here.
+
+      # ---------------------------------------------------------------------
+      # Queue depth and age. Cluster-wide, read from Postgres.
+      # ---------------------------------------------------------------------
+      - alert: MailQueueBacklogWarning
+        expr: edurankai_mail_queue_depth{status="pending", kind=""} > 1000
+        for: 10m
+        labels: { severity: warning, subsystem: mail }
+        annotations:
+          summary: "Mail queue backlog above 1,000"
+          description: "{{ $value | humanize }} jobs pending for 10 minutes."
+          runbook: "Compare arrival against drain: if enqueue > processed, scale workers now rather than waiting for the age alert."
+
+      - alert: MailQueueBacklogCritical
+        expr: edurankai_mail_queue_depth{status="pending", kind=""} > 10000
+        for: 5m
+        labels: { severity: critical, subsystem: mail }
+        annotations:
+          summary: "Mail queue backlog above 10,000"
+          description: "{{ $value | humanize }} jobs pending."
+
+      # Growth, not depth. A deep queue that is draining is fine; a shallow one that is filling is not.
+      - alert: MailQueueGrowing
+        expr: >-
+          edurankai_mail_queue_rate_per_second{op="enqueue"}
+            > edurankai_mail_queue_rate_per_second{op="processed"}
+          and edurankai_mail_queue_depth{status="pending", kind=""} > 100
+        for: 15m
+        labels: { severity: warning, subsystem: mail }
+        annotations:
+          summary: "Mail queue arrival rate exceeds drain rate"
+          description: "Backlog has been growing for 15 minutes. It will keep growing until drain >= arrival."
+
+      - alert: MailQueueHeadStale
+        expr: edurankai_mail_queue_oldest_age_seconds{state="pending"} > 1800
+        for: 10m
+        labels: { severity: critical, subsystem: mail }
+        annotations:
+          summary: "Oldest queued mail has waited over 30 minutes"
+          description: "Head of queue is {{ $value | humanizeDuration }} old. Recipients are waiting this long."
+          runbook: "Pause campaign enqueues to let transactional mail through, then scale workers."
+
+      # ---------------------------------------------------------------------
+      # Worker health
+      # ---------------------------------------------------------------------
+      - alert: MailWorkerNotDraining
+        expr: >-
+          edurankai_mail_queue_depth{status="pending", kind=""} > 0
+          and edurankai_mail_queue_rate_per_second{op="processed"} < 0.01
+        for: 1h
+        labels: { severity: critical, subsystem: mail }
+        annotations:
+          summary: "Work is queued but nothing is completing"
+          description: >-
+            Jobs are pending and the drain rate is effectively zero. On a MINUTE-LEVEL scheduler this
+            means the worker is down. On Vercel Hobby, cron is DAILY and this is the normal state for
+            most of the day — if you are on Hobby, this alert is expected and the `for:` above should
+            be raised past your cron interval, or the plan upgraded.
+          runbook: "Confirm the cron fired (/admin/ops) and that /api/jobs/run returns 200."
+
+      # The crashed-worker gap: claimBatch() flips a row to `processing` and nothing flips it back.
+      # These rows are invisible to both the pending queue and the retry sweep.
+      - alert: MailJobsStalledInProcessing
+        expr: edurankai_mail_queue_oldest_age_seconds{state="processing"} > 900
+        for: 10m
+        labels: { severity: critical, subsystem: mail }
+        annotations:
+          summary: "Jobs claimed but never acknowledged"
+          description: >-
+            A job has been in `processing` for {{ $value | humanizeDuration }}. Nothing reclaims these
+            automatically: a worker killed mid-batch leaves the row permanently claimed, where no
+            worker will take it and no retry sweep will find it. It is counted as work in flight.
+          runbook: "Reclaim from /admin/mail/performance with a threshold longer than your longest legitimate job."
+
+      - alert: MailRetryStorm
+        expr: >-
+          edurankai_mail_queue_rate_per_second{op="retried"} > 1
+          and edurankai_mail_queue_rate_per_second{op="retried"}
+              > edurankai_mail_queue_rate_per_second{op="processed"}
+        for: 10m
+        labels: { severity: warning, subsystem: mail }
+        annotations:
+          summary: "More retries than successes"
+          description: >-
+            Backoff is exponential and capped at 5 minutes, so this does not resolve itself while the
+            dependency stays down. The cause is usually ONE dependency, not the jobs.
+          runbook: "Read last_error for the dominant kind in the per-kind table on /admin/mail/performance."
+
+      - alert: MailDeadLetters
+        expr: edurankai_mail_queue_depth{status="failed", kind=""} > 25
+        for: 30m
+        labels: { severity: warning, subsystem: mail }
+        annotations:
+          summary: "Dead-lettered jobs are accumulating"
+          description: "{{ $value | humanize }} jobs exhausted their retries and will never run again without an operator."
+          runbook: "Read them BEFORE requeueing — retryFailed() resets all of them at once, so a poison job returns with the rest."
+
+  - name: edurankai-mail-delivery
+    interval: 60s
+    rules:
+      # NOTE ON EVERY RULE IN THIS GROUP: these are process-local counters. rate() over 15m is
+      # meaningful; the absolute value is not, and a deploy will show as a dip. Warning severity only.
+      - alert: MailBounceRateHigh
+        expr: >-
+          sum(rate(edurankai_mail_messages_bounced_total[30m]))
+          / clamp_min(sum(rate(edurankai_mail_messages_delivered_total[30m]))
+                      + sum(rate(edurankai_mail_messages_bounced_total[30m])), 0.001) > 0.05
+        for: 15m
+        labels: { severity: warning, subsystem: mail, area: deliverability }
+        annotations:
+          summary: "Bounce rate above 5%"
+          description: >-
+            Sustained bounces above ~5% put sending reputation at risk, and reputation damage takes
+            weeks of careful sending to undo. This is usually list quality, not infrastructure.
+
+      - alert: MailDeferralSpike
+        expr: >-
+          sum(rate(edurankai_mail_messages_deferred_total[15m]))
+          / clamp_min(sum(rate(edurankai_mail_messages_delivered_total[15m]))
+                      + sum(rate(edurankai_mail_messages_deferred_total[15m])), 0.001) > 0.20
+        for: 15m
+        labels: { severity: warning, subsystem: mail, area: deliverability }
+        annotations:
+          summary: "Deferral rate above 20%"
+          description: >-
+            A receiving provider is throttling. This is THEIR rate limit, not a fault here, and it must
+            not be treated as node failure — slow down rather than retrying harder.
+          runbook: "Lower the per-domain rate for the affected domain in the MTA pool config."
+
+      - alert: MailNodesUnhealthy
+        expr: edurankai_mail_mta_nodes_healthy == 0
+        for: 5m
+        labels: { severity: critical, subsystem: mail }
+        annotations:
+          summary: "No healthy MTA node"
+          description: "Every delivery node is disabled, draining or circuit-open. Nothing can be delivered; mail is queueing."
+
+      - alert: MailEventsDropped
+        expr: rate(edurankai_mail_events_dropped_total[15m]) > 0
+        for: 15m
+        labels: { severity: warning, subsystem: mail, area: analytics }
+        annotations:
+          summary: "Analytics events are being dropped"
+          description: >-
+            The event buffer is shedding rows — either the sink is failing or the buffer cap is being
+            hit. Mail delivery is unaffected by design; analytics are undercounting, and the counter
+            firing at all is what makes that visible rather than silent.
+
+  - name: edurankai-mail-latency
+    interval: 60s
+    rules:
+      # Best-effort: process-local histograms. Useful for a trend, not for a page.
+      - alert: MailApiLatencyHigh
+        expr: >-
+          histogram_quantile(0.99,
+            sum by (le) (rate(edurankai_mail_api_request_duration_seconds_bucket[15m]))) > 2
+        for: 15m
+        labels: { severity: warning, subsystem: mail }
+        annotations:
+          summary: "Mail API p99 above 2s"
+          description: "Per-instance estimate. Read it next to the pool panel — on a transaction pooler, request latency rises under connection pressure before any query gets slower."
+
+      - alert: MailDatabaseLatencyHigh
+        expr: >-
+          histogram_quantile(0.99,
+            sum by (le) (rate(edurankai_mail_db_query_duration_seconds_bucket[15m]))) > 0.5
+        for: 15m
+        labels: { severity: warning, subsystem: mail }
+        annotations:
+          summary: "Database p99 above 500ms"
+          description: "Includes connection CHECKOUT time on the transaction pooler, so this rises under pool saturation even when every query is fast."

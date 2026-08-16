@@ -1,0 +1,178 @@
+---
+/**
+ * /mail/mailboxes — who on this platform has a mailbox, and what is behind it.
+ *
+ * A READ-ONLY SCREEN, ON PURPOSE. Mailbox addresses are derived by the mail engine
+ * (getMailboxAddress in src/lib/mail.ts) from the person's internal handle or their login email, and
+ * granting a mailbox is a consequence of holding an employee record — not a switch on this page.
+ * Putting an "add mailbox" button here would be a second, contradictory way to answer a question
+ * src/lib/auth/mail-access.ts already answers.
+ *
+ * IT SHOWS THE ADDRESS AND THE VOLUME, NOT THE MAIL. There is no path from here into anybody's
+ * messages: every read in the mail engine is keyed by mail_box.user_id, and a screen that listed one
+ * person's subjects to another person is the screen that must not exist.
+ */
+import MailShell from '@/components/mail/MailShell.astro';
+import MailIcon from '@/components/mail/MailIcon.astro';
+import { canUseMailbox } from '@/lib/auth/mail-access';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { MAIL_DOMAIN, ensureMailSchema } from '@/lib/mail';
+import { transportStatus } from '@/lib/mail-transport';
+import { rowsOf, reasonOf, num, timeAgo, initials, avatarColour, str, clampInt } from '@/lib/mail-product/common';
+
+const user = Astro.locals.user;
+const access = await canUseMailbox(user as any);
+const url = new URL(Astro.request.url);
+const q = str(url.searchParams.get('q'), 120);
+const page = clampInt(url.searchParams.get('page'), 1, 500, 1);
+const PER = 40;
+
+let boxes: any[] = [];
+let total = 0;
+let transport = { mode: 'none', detail: '' };
+let error = '';
+
+if (access.allowed) {
+  try {
+    await ensureMailSchema();
+    // COUNTS ONLY. No subject, no snippet, no sender — see the header.
+    const like = '%' + q.toLowerCase() + '%';
+    const where = q
+      ? sql`u.mailbox_address IS NOT NULL AND (lower(u.mailbox_address) LIKE ${like} OR lower(coalesce(u.name,'')) LIKE ${like} OR lower(coalesce(u.email,'')) LIKE ${like})`
+      : sql`u.mailbox_address IS NOT NULL`;
+
+    const [cr, rr, ts] = await Promise.all([
+      db.execute(sql`SELECT count(*)::int AS n FROM users u WHERE ${where}`),
+      db.execute(sql`
+        SELECT u.id, u.name, u.email, u.mailbox_address, u.internal_handle, u.role,
+               (SELECT count(*)::int FROM mail_box b WHERE b.user_id = u.id) AS message_count,
+               (SELECT count(*)::int FROM mail_box b WHERE b.user_id = u.id AND b.is_read = false AND b.folder = 'inbox') AS unread,
+               (SELECT max(b.created_at) FROM mail_box b WHERE b.user_id = u.id) AS last_activity
+        FROM users u WHERE ${where}
+        ORDER BY u.mailbox_address ASC
+        LIMIT ${PER} OFFSET ${(page - 1) * PER}`),
+      transportStatus().catch(() => ({ mode: 'none' as const, detail: 'Could not be read' })),
+    ]);
+    total = Number(rowsOf(cr)[0]?.n ?? 0);
+    boxes = rowsOf(rr);
+    transport = ts as any;
+  } catch (e: any) {
+    error = reasonOf(e);
+    console.error('[mail/mailboxes] read failed:', error);
+  }
+}
+
+const pages = Math.max(1, Math.ceil(total / PER));
+function pageLink(p: number): string {
+  const u = new URL(url.href);
+  u.searchParams.set('page', String(p));
+  return u.pathname + u.search;
+}
+---
+<MailShell title="Mailboxes" active="mailboxes" subtitle={`@${MAIL_DOMAIN}`}>
+  <div class="em-wrap em-stack">
+    {error && (
+      <div class="em-alert bad"><MailIcon name="warning" size={16} />
+        <p><strong>Mailboxes could not be read.</strong> {error}</p></div>
+    )}
+
+    <div class="em-alert info">
+      <MailIcon name="info" size={16} />
+      <p>
+        A mailbox address is <strong>derived</strong>, not granted here — from the person&rsquo;s internal
+        handle, or from their login email. Who may open one is decided by
+        <code class="em-mono"> canUseMailbox()</code>: an internal role, admin access, or an active
+        employee record. This screen shows addresses and volumes only; there is no path from it into
+        anybody&rsquo;s messages.
+      </p>
+    </div>
+
+    <div class="em-grid c3">
+      <div class="em-stat"><p class="em-stat-k">Mailboxes</p><p class="em-stat-v">{num(total)}</p>
+        <p class="em-stat-d">on <code class="em-mono">{MAIL_DOMAIN}</code></p></div>
+      <div class="em-stat">
+        <p class="em-stat-k">Outbound transport</p>
+        <p class="em-stat-v" style={transport.mode === 'none' ? 'color:var(--em-bad);font-size:20px' : 'font-size:20px'}>
+          {transport.mode === 'none' ? 'Not configured' : transport.mode.toUpperCase()}
+        </p>
+        <p class="em-stat-d">{transport.detail}</p>
+      </div>
+      <div class="em-stat">
+        <p class="em-stat-k">Inbound</p>
+        <p class="em-stat-v" style="font-size:20px">IMAP poll</p>
+        <p class="em-stat-d">External mail is pulled in on a schedule, not pushed. <a href="/admin/mail/settings">Configure</a></p>
+      </div>
+    </div>
+
+    <div class="em-card">
+      <div class="em-card-head">
+        <form class="em-search" role="search" method="get" style="flex:1;max-width:340px">
+          <MailIcon name="search" size={15} />
+          <input type="search" name="q" value={q} placeholder="Search by address or name" aria-label="Search mailboxes" />
+        </form>
+        <span class="em-note em-push">{num(total)} total</span>
+      </div>
+
+      {boxes.length === 0 ? (
+        <div class="em-empty">
+          <MailIcon name="mailboxes" size={34} strokeWidth={1.3} />
+          <h3>{q ? 'No mailbox matches that' : 'No mailboxes yet'}</h3>
+          <p>
+            {q ? 'Try a different search.'
+               : 'Addresses are assigned automatically to people with an internal handle or an employee record.'}
+          </p>
+          {q && <a class="em-btn" href="/mail/mailboxes">Clear the search</a>}
+        </div>
+      ) : (
+        <>
+          <div class="em-card-body flush"><div class="em-tablewrap">
+            <table class="em-table">
+              <thead><tr>
+                <th scope="col">Person</th><th scope="col">Address</th><th scope="col">Role</th>
+                <th scope="col" class="num">Messages</th><th scope="col" class="num">Unread</th>
+                <th scope="col">Last activity</th>
+              </tr></thead>
+              <tbody>
+                {boxes.map((b: any) => (
+                  <tr>
+                    <td>
+                      <span class="em-row tight" style="flex-wrap:nowrap">
+                        <span class="em-avatar sm" aria-hidden="true" style={`background:${avatarColour(String(b.mailbox_address || b.email))}`}>
+                          {initials(b.name, b.email)}
+                        </span>
+                        <span style="min-width:0">
+                          <strong style="font-size:13px">{b.name || '(no name)'}</strong>
+                          <div class="em-note em-mono">{b.email}</div>
+                        </span>
+                      </span>
+                    </td>
+                    <td><code class="em-mono">{b.internal_handle && String(b.internal_handle).includes('@') ? b.internal_handle : b.mailbox_address}</code></td>
+                    <td><span class="em-badge">{b.role || '—'}</span></td>
+                    <td class="num">{num(b.message_count)}</td>
+                    <td class="num">
+                      {b.unread > 0
+                        ? <span class="em-badge accent">{num(b.unread)}</span>
+                        : <span class="em-note">0</span>}
+                    </td>
+                    <td><span class="em-note">{b.last_activity ? timeAgo(b.last_activity) : 'never used'}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div></div>
+
+          {pages > 1 && (
+            <div class="em-card-foot">
+              <span class="em-note">Page {page} of {pages}</span>
+              <span class="em-row tight em-push">
+                {page > 1 && <a class="em-btn sm" href={pageLink(page - 1)}><MailIcon name="chevronLeft" size={13} /> Previous</a>}
+                {page < pages && <a class="em-btn sm" href={pageLink(page + 1)}>Next <MailIcon name="chevronRight" size={13} /></a>}
+              </span>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  </div>
+</MailShell>

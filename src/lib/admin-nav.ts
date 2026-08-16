@@ -197,12 +197,71 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       { id: 'mail',           label: 'Inbox',             href: '/admin/mail',           icon: 'inbox',    section: 'settings' },
       // NEWLY MAPPED (all six). These are mail CONFIGURATION — SMTP/IMAP credentials, signatures,
       // templates, deliverability. 'settings' keeps them exactly where they are today: super admin only.
+      // Registered HERE because the sidebar renders from this catalogue: a page added anywhere else
+      // is a page nobody can find, which is how an engine ends up with no openable surface. The
+      // shared-inbox queues, assignment, status and internal notes all live behind this one link.
+      // Gated on 'settings' like its siblings; membership of a PARTICULAR shared mailbox is a
+      // second question, asked per request by requireSharedAccess() in src/lib/mail-shared.ts.
+      { id: 'mail-shared',    label: 'Shared mailboxes',  href: '/admin/mail/shared',    icon: 'users',    section: 'settings' },
       { id: 'mail-rules',     label: 'Signature & rules', href: '/admin/mail/rules',     icon: 'document', section: 'settings' },
       { id: 'mail-templates', label: 'Templates',         href: '/admin/mail/templates', icon: 'document', section: 'settings' },
       { id: 'mail-analytics', label: 'Analytics',         href: '/admin/mail/analytics', icon: 'document', section: 'settings' },
+      // Contacts, segmentation and campaigns (Patch 5). Registered HERE because the sidebar renders
+      // from this catalogue: a page added anywhere else is a page nobody can find. Same 'settings'
+      // gate as the rest of the mail configuration -- these three screens between them decide who
+      // receives bulk mail from this domain, which is the same level of trust as holding the SMTP
+      // credentials. The API routes behind them additionally require the `mail.manage` capability.
+      { id: 'mail-contacts',  label: 'Contacts',          href: '/admin/mail/contacts',  icon: 'users',    section: 'settings' },
+      { id: 'mail-lists',     label: 'Lists & segments',  href: '/admin/mail/lists',     icon: 'users',    section: 'settings' },
+      { id: 'mail-campaigns', label: 'Campaigns',         href: '/admin/mail/campaigns', icon: 'document', section: 'settings' },
       { id: 'mail-groups',    label: 'Groups',            href: '/admin/mail/groups',    icon: 'users',    section: 'settings' },
+      // Registered HERE because the sidebar renders from this catalogue: a page added anywhere else
+      // is a page nobody can find. Same 'settings' gate as the rest of the mail configuration -- an
+      // automation is a machine that sends from the company mailbox without anybody watching.
+      { id: 'mail-automation', label: 'Automation',       href: '/admin/mail/automation', icon: 'shield',  section: 'settings' },
       { id: 'mail-setup',     label: 'Setup wizard',      href: '/admin/mail/setup',     icon: 'shield',   section: 'settings' },
       { id: 'mail-health',    label: 'Health',            href: '/admin/mail/health',    icon: 'shield',   section: 'settings' },
+      // The commercial layer. 'settings' for the same reason as the six above: these are mail
+      // PLATFORM screens (tenants, plans, quotas, invoices), super admin only.
+      { id: 'mail-tenants',   label: 'Tenants & teams',   href: '/admin/mail/tenants',   icon: 'users',    section: 'settings' },
+      { id: 'mail-billing',   label: 'Billing & usage',   href: '/admin/mail/billing',   icon: 'document', section: 'settings' },
+      // The transactional developer platform (Patch 9). Registered HERE because the sidebar renders
+      // from this catalogue: a page added anywhere else is a page nobody can find, which is the
+      // defect that buried about fifty surfaces until the layout was changed to read this list.
+      { id: 'mail-api',       label: 'Transactional API', href: '/admin/mail/api',       icon: 'cog',      section: 'settings' },
+      { id: 'mail-webhooks',  label: 'Webhooks',          href: '/admin/mail/webhooks',  icon: 'globe',    section: 'settings' },
+      // The integration platform (Patch 15). Registered HERE because the sidebar renders from this
+      // catalogue: a page added anywhere else is a page nobody can find, which is the defect that
+      // buried about fifty surfaces until the layout was changed to read this list. Same 'settings'
+      // gate as the rest of the mail platform — these two screens between them hold integration
+      // credentials and decide which events cause mail to be sent to a person.
+      { id: 'mail-integrations', label: 'Integrations',    href: '/admin/mail/integrations', icon: 'globe', section: 'settings' },
+      { id: 'mail-event-bus', label: 'Event bus',          href: '/admin/mail/event-bus', icon: 'chart',    section: 'settings' },
+      { id: 'mail-continuity',label: 'Continuity & DR',   href: '/admin/mail/continuity', icon: 'shield', section: 'settings' },
+      // Performance & capacity (Patch 8). Gated on `settings` like its siblings so it appears in the
+      // same place in the menu; the PAGE itself additionally requires `administer` on the platform,
+      // the same capability behind /admin/ops and /api/health/deep, because it discloses queue
+      // contents, connection-pool internals and a traffic profile. The menu decides what is OFFERED,
+      // never what is permitted — see this file's header.
+      { id: 'mail-performance', label: 'Performance',     href: '/admin/mail/performance', icon: 'shield', section: 'settings' },
+      // The enterprise control plane (Patch 14). Registered HERE for the same reason as everything
+      // above it: a page that is not in this catalogue is a page nobody can find.
+      //
+      // Gated on 'settings' like its siblings, which is super-admin only today — deliberately NARROWER
+      // than the console's own authorisation. A support engineer or an auditor holds a governance grant
+      // (mailapi_platform_admins) and reaches these pages directly; the sidebar offers them only to the
+      // accounts that already administer mail. The menu decides what is OFFERED; src/lib/mailgov/guard.ts
+      // decides what is PERMITTED, and every one of these pages calls it before it reads anything.
+      //
+      // The audit entry is the exception, gated on 'audit' rather than 'settings': the audit log is
+      // exactly the surface that should be reachable by somebody who oversees administrators without
+      // being one.
+      { id: 'mail-gov',       label: 'Enterprise console', href: '/admin/mail/enterprise',           icon: 'shield',   section: 'settings' },
+      { id: 'mail-gov-audit', label: 'Mail audit log',     href: '/admin/mail/enterprise/audit',     icon: 'document', section: 'audit' },
+      { id: 'mail-gov-sec',   label: 'Mail security',      href: '/admin/mail/enterprise/security',  icon: 'shield',   section: 'settings' },
+      { id: 'mail-gov-ret',   label: 'Mail retention',     href: '/admin/mail/enterprise/retention', icon: 'document', section: 'settings' },
+      { id: 'mail-gov-data',  label: 'Export & deletion',  href: '/admin/mail/enterprise/data',      icon: 'document', section: 'settings' },
+      { id: 'mail-gov-holds', label: 'Legal holds',        href: '/admin/mail/enterprise/holds',     icon: 'shield',   section: 'settings' },
     ],
   },
   // NEWLY MAPPED. A messaging surface, gated like the other one (DMs).

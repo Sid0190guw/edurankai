@@ -1,0 +1,464 @@
+---
+// /admin/mail/performance — the screen Patch 8 terminates in.
+//
+// EVERYTHING BUILT IN THIS PATCH IS READ FROM HERE. Queue observability, the alert rules, the
+// measured-operation catalogue, MTA node health, the capacity ladder, the database findings and the
+// failure-mode coverage. An engine that is not reachable from a page an operator can open does not
+// count as built on this project, and this is the page.
+//
+// NO CLIENT JAVASCRIPT AND NO POLLING. Refresh is a link. /admin/ops already carries the note about
+// why: a dashboard on a timer is how leaked intervals exhausted the connection pooler and took the
+// whole site down. The one interactive control is a form POST.
+//
+// A PANEL THAT CANNOT READ SAYS SO, IN WORDS. Every read on this page carries its own success flag
+// and every zero is checked against it before it is drawn. This is the failure mode CLAUDE.md names
+// and that /admin/mail/health was already bitten by: a queue panel rendering a confident "0 pending"
+// because the COUNT threw is worse than a blank panel, because the operator stops looking.
+//
+// AND THE HARDEST RULE ON THE PAGE: the capacity ladder shows `unmeasured` until a real benchmark
+// has been posted. It does not extrapolate from nothing, and it does not print an aspiration in the
+// same typeface as a measurement.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/rbac';
+import { readQueueSnapshot, evaluateQueueAlerts, formatAge, DEFAULT_QUEUE_THRESHOLDS } from '@/lib/mailplatform/queue-observability';
+import { MEASURED_OPERATIONS, unmeasuredOperations } from '@/lib/mailplatform/instrument';
+import { getRegistry, histogramQuantile } from '@/lib/mailplatform/metrics';
+import { NO_MEASUREMENT, assessAll, buildCapacityReport, headline, bottleneckNotes, formatBytes, resourcesFor, SCALE_TIERS, ESTIMATED_RESOURCES, PEAK_FACTOR } from '@/lib/mailplatform/capacity';
+import { latestBenchReport, benchHistory } from '@/lib/mailplatform/bench-store';
+import { dbPerfReport } from '@/lib/mailplatform/db-perf';
+import { coverage, openGaps, FAILURE_MODES } from '@/lib/mailplatform/failure-modes';
+import { eventStoreStats } from '@/lib/mailplatform/events';
+import { singleNodePool, poolSummary } from '@/lib/mailplatform/mta-pool';
+import { getMailConfig } from '@/lib/mail';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+const gate = await can(user, 'administer', { type: 'platform' });
+if (!gate.allow) return Astro.redirect('/admin');
+
+// Declared before anything that writes to it — `const` is not hoisted, and that has taken pages
+// down on this project more than once.
+const readFailures: string[] = [];
+let actionMessage = '';
+let actionTone: 'ok' | 'bad' = 'ok';
+
+// The one action on this page: return abandoned `processing` rows to `pending`. It is an operator
+// decision rather than an automatic sweep because the safe timeout depends on how long the longest
+// legitimate job runs, which this code cannot know — set it too low and a slow-but-working job is
+// claimed twice.
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+    if (form.get('action') === 'reclaim') {
+      const { reclaimStalled } = await import('@/lib/mailplatform/queue-observability');
+      const minutes = Math.max(1, Number(form.get('minutes') || 15));
+      const r = await reclaimStalled(minutes * 60_000);
+      if (r.ok) {
+        actionMessage = r.reclaimed.length
+          ? 'Reclaimed ' + r.reclaimed.length + ' job(s) older than ' + minutes + ' minutes: ids ' + r.reclaimed.slice(0, 20).join(', ') + (r.reclaimed.length > 20 ? ' …' : '') + '. Attempt counts were left alone, so a job that keeps killing its worker still walks toward dead-letter rather than cycling forever.'
+          : 'Nothing to reclaim: no job has been stuck in processing for more than ' + minutes + ' minutes.';
+      } else { actionMessage = 'Reclaim failed: ' + (r.error || 'unknown error'); actionTone = 'bad'; }
+    }
+  } catch (e: any) {
+    actionMessage = 'Reclaim failed: ' + String(e?.cause?.message || e?.message || 'unknown error');
+    actionTone = 'bad';
+  }
+}
+
+const WINDOW = 300;
+const queue = await readQueueSnapshot(WINDOW);
+const alerts = evaluateQueueAlerts(queue, DEFAULT_QUEUE_THRESHOLDS);
+if (queue.errors.length) readFailures.push(...queue.errors.map((e) => 'Queue: ' + e));
+
+const bench = await latestBenchReport();
+if (!bench.ok) readFailures.push('Benchmark history: ' + (bench.error || 'unknown'));
+const history = await benchHistory(8);
+
+// NO MEASUREMENT IS THE DEFAULT, AND IT IS THE HONEST ONE. Until a benchmark has been posted, every
+// tier reads `unmeasured` and no worker count is derived from anything.
+const report = bench.report?.report ?? buildCapacityReport({
+  configuration: { cpu: null, ramGB: null, storage: null, workers: null, concurrency: null, environment: null, target: null },
+  measurement: NO_MEASUREMENT,
+});
+const tiers = bench.report ? report.tiers : assessAll(NO_MEASUREMENT);
+
+const dbPerf = await dbPerfReport();
+if (dbPerf.unreadable.length) readFailures.push(...dbPerf.unreadable.map((u) => 'Database: ' + u));
+
+const events = await eventStoreStats();
+if (!events.ok) readFailures.push('Event store: ' + (events.error || 'unknown') + ' (the table is created on first write; "does not exist" simply means no event has been recorded yet)');
+
+const cfg = await getMailConfig();
+const pool = singleNodePool({ host: cfg.smtpHost || 'not configured', port: cfg.smtpPort || 0, label: cfg.smtpHost ? 'Primary relay' : 'No relay configured' });
+const nodes = poolSummary(pool, Date.now());
+
+// Latency, read from THIS process's registry. It is per-instance and since-last-cold-start, which is
+// said on the panel rather than implied away.
+const registry = getRegistry();
+const registryAgeSec = Math.round((Date.now() - registry.createdAt) / 1000);
+const unmeasured = unmeasuredOperations();
+const latency = MEASURED_OPERATIONS.map((op) => {
+  const h = registry.has(op.metric) ? registry.histogram(op.metric, op.help, op.buckets, 'ms') : null;
+  const series = h ? h.snapshot().series : [];
+  const merged = series.length
+    ? series.reduce((acc, s) => ({
+        labels: {}, count: acc.count + s.count, sum: acc.sum + s.sum,
+        cumulative: acc.cumulative.length ? acc.cumulative.map((v, i) => v + s.cumulative[i]) : s.cumulative.slice(),
+        min: acc.min === null ? s.min : Math.min(acc.min, s.min ?? Infinity),
+        max: acc.max === null ? s.max : Math.max(acc.max, s.max ?? -Infinity),
+      }), { labels: {}, count: 0, sum: 0, cumulative: [] as number[], min: null as number | null, max: null as number | null })
+    : null;
+  const p50 = merged ? histogramQuantile(merged, op.buckets, 0.5) : null;
+  const p95 = merged ? histogramQuantile(merged, op.buckets, 0.95) : null;
+  const p99 = merged ? histogramQuantile(merged, op.buckets, 0.99) : null;
+  return { op, count: merged?.count ?? 0, p50, p95, p99 };
+});
+
+const gaps = openGaps();
+const cov = coverage();
+const metricsTokenSet = String(process.env.METRICS_TOKEN || '').trim().length >= 32;
+
+const num = (v: number | null | undefined, digits = 2): string => (v === null || v === undefined || !Number.isFinite(v) ? '—' : Number(v).toFixed(digits));
+const ms = (q: { value: number | null; saturated: boolean; bucket: { lower: number | null; upper: number | null } | null } | null): string => {
+  if (!q || q.value === null) return '—';
+  if (q.saturated) return '> ' + Math.round(q.value) + 'ms';
+  return Math.round(q.value) + 'ms';
+};
+const VERDICT_STYLE: Record<string, { fg: string; bg: string; word: string }> = {
+  sustained: { fg: '#6ee7b7', bg: 'rgba(52,211,153,0.12)', word: 'Sustained' },
+  projected: { fg: '#fbbf24', bg: 'rgba(251,191,36,0.12)', word: 'Projection only' },
+  insufficient_evidence: { fg: '#fca5a5', bg: 'rgba(239,68,68,0.10)', word: 'Insufficient evidence' },
+  unmeasured: { fg: '#8a8a94', bg: 'rgba(138,138,148,0.10)', word: 'Not measured' },
+};
+const SEV_STYLE: Record<string, { fg: string; bd: string; bg: string }> = {
+  critical: { fg: '#fca5a5', bd: 'rgba(239,68,68,0.35)', bg: 'rgba(239,68,68,0.10)' },
+  warning: { fg: '#fbbf24', bd: 'rgba(251,191,36,0.30)', bg: 'rgba(251,191,36,0.08)' },
+  info: { fg: '#9bd1ff', bd: 'rgba(155,209,255,0.25)', bg: 'rgba(155,209,255,0.07)' },
+};
+const CARD = 'background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;';
+const HD = "font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 10px;";
+const MONO = "font-family:'Geist Mono',monospace;";
+const TILE = 'background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;';
+---
+<AdminLayout title="Mail Performance" activeNav="mail">
+<div class="admin-page" style="max-width:1080px;">
+  <div class="admin-page-header" style="margin-bottom:16px;">
+    <div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">Mail &middot; scale</div>
+      <h1 class="admin-page-title">Performance &amp; capacity</h1>
+      <p class="admin-page-sub">
+        Queue observability, measured latency, database findings and the capacity ladder.
+        <a href="/admin/mail/health" style="color:#FF7040;text-decoration:none;">Mail health</a> &middot;
+        <a href="/admin/ops" style="color:#FF7040;text-decoration:none;">Platform ops</a> &middot;
+        <a href="/admin/mail/performance" style="color:#FF7040;text-decoration:none;">Refresh</a>
+      </p>
+    </div>
+  </div>
+
+  {actionMessage && (
+    <div style={`border-radius:12px;padding:12px 14px;margin-bottom:16px;background:${actionTone === 'ok' ? 'rgba(52,211,153,0.10)' : 'rgba(239,68,68,0.10)'};border:1px solid ${actionTone === 'ok' ? 'rgba(52,211,153,0.30)' : 'rgba(239,68,68,0.35)'};`}>
+      <p style={`font-size:12.5px;margin:0;line-height:1.6;color:${actionTone === 'ok' ? '#6ee7b7' : '#fca5a5'};`}>{actionMessage}</p>
+    </div>
+  )}
+
+  {readFailures.length > 0 && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;margin-bottom:16px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fca5a5;margin:0 0 6px;">Part of this page could not be read. Treat the affected numbers as unknown, not as zero.</p>
+      <ul style={`font-size:11.5px;color:#fca5a5;margin:0;padding-left:18px;line-height:1.7;${MONO}`}>
+        {readFailures.map((f) => <li>{f}</li>)}
+      </ul>
+    </div>
+  )}
+
+  <!-- ALERTS -->
+  <div style={CARD + 'margin-bottom:16px;'}>
+    <p style={HD}>Alerts &middot; last {WINDOW}s</p>
+    {alerts.length === 0 ? (
+      <p style="font-size:12.5px;color:#6ee7b7;margin:0;">
+        No alert conditions. {queue.read.depth && queue.read.rates && queue.read.ages
+          ? 'All four queue reads answered, so this is a measurement and not a default.'
+          : 'Note: at least one queue read failed, so this silence is not evidence.'}
+      </p>
+    ) : (
+      <div style="display:flex;flex-direction:column;gap:10px;">
+        {alerts.map((a) => {
+          const s = SEV_STYLE[a.severity];
+          return (
+            <div style={`border:1px solid ${s.bd};background:${s.bg};border-radius:10px;padding:11px 13px;`}>
+              <p style={`font-size:12.5px;font-weight:700;margin:0 0 4px;color:${s.fg};`}>{a.severity.toUpperCase()} &middot; {a.title}</p>
+              <p style="font-size:12px;color:#d8d8de;margin:0 0 5px;line-height:1.6;">{a.detail}</p>
+              <p style="font-size:11.5px;color:#9aa6b6;margin:0;line-height:1.6;"><b style="color:#d6d6de;">Do:</b> {a.action}</p>
+            </div>
+          );
+        })}
+      </div>
+    )}
+  </div>
+
+  <!-- QUEUE -->
+  <div style={CARD + 'margin-bottom:16px;'}>
+    <p style={HD}>Queue &middot; edu_jobs</p>
+    {!queue.read.depth && <p style="font-size:11.5px;color:#fca5a5;margin:0 0 10px;line-height:1.6;">Depth could not be read. The figures below are the empty defaults, not counts.</p>}
+    <div style={`display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;${MONO}`}>
+      {[
+        { k: 'Pending', v: queue.depth.pending, ok: queue.read.depth },
+        { k: 'Processing', v: queue.depth.processing, ok: queue.read.depth },
+        { k: 'Dead letters', v: queue.deadLetterCount, ok: queue.read.depth },
+        { k: 'Oldest pending', v: queue.read.ages ? (queue.oldestPendingAgeMs === null ? 'empty' : formatAge(queue.oldestPendingAgeMs)) : '?', ok: queue.read.ages },
+        { k: 'Oldest processing', v: queue.read.ages ? (queue.oldestProcessingAgeMs === null ? 'none' : formatAge(queue.oldestProcessingAgeMs)) : '?', ok: queue.read.ages },
+      ].map((t) => (
+        <div style={TILE}>
+          <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 3px;">{t.k}</p>
+          <p style={`font-size:17px;font-weight:700;margin:0;color:${t.ok ? '#fff' : '#fca5a5'};`}>{t.ok ? t.v : 'unknown'}</p>
+        </div>
+      ))}
+    </div>
+
+    <p style={HD + 'margin-top:14px;'}>Rates &middot; per second over {WINDOW}s</p>
+    {!queue.read.rates ? (
+      <p style="font-size:11.5px;color:#fca5a5;margin:0;">Rates could not be read.</p>
+    ) : (
+      <div style={`display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;${MONO}`}>
+        {[
+          { k: 'Enqueue', v: queue.rates.enqueuePerSec },
+          { k: 'Processed', v: queue.rates.processedPerSec },
+          { k: 'Dequeue*', v: queue.rates.dequeuePerSec },
+          { k: 'Retried', v: queue.rates.retriedPerSec },
+          { k: 'Failed', v: queue.rates.failedPerSec },
+        ].map((t) => (
+          <div style={TILE}>
+            <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 3px;">{t.k}</p>
+            <p style="font-size:17px;font-weight:700;color:#fff;margin:0;">{num(t.v)}</p>
+          </div>
+        ))}
+      </div>
+    )}
+    <p style="font-size:11px;color:#6e6e78;margin:8px 0 0;line-height:1.6;">
+      * Dequeue is an approximation. edu_jobs records no claim timestamp — claimBatch bumps updated_at, which every later transition also bumps — so the claim rate is not recoverable from the table. This is the rate jobs LEFT the worker (one edu_job_log row each), which equals the claim rate in steady state and understates it during a burst.
+    </p>
+
+    {queue.read.byKind && queue.byKind.length > 0 && (
+      <>
+        <p style={HD + 'margin-top:14px;'}>By job kind</p>
+        <table style={`width:100%;border-collapse:collapse;font-size:11.5px;${MONO}`}>
+          <thead><tr style="text-align:left;color:#8a8a94;">
+            <th style="padding:5px 8px;font-weight:600;">Kind</th><th style="padding:5px 8px;font-weight:600;">Pending</th>
+            <th style="padding:5px 8px;font-weight:600;">Processing</th><th style="padding:5px 8px;font-weight:600;">Failed</th>
+            <th style="padding:5px 8px;font-weight:600;">Oldest</th>
+          </tr></thead>
+          <tbody>
+            {queue.byKind.map((k) => (
+              <tr style="border-top:1px solid #1a1a1f;color:#d6d6de;">
+                <td style="padding:5px 8px;">{k.kind}</td>
+                <td style="padding:5px 8px;">{k.pending}</td>
+                <td style={`padding:5px 8px;${k.processing > 0 ? 'color:#fbbf24;' : ''}`}>{k.processing}</td>
+                <td style={`padding:5px 8px;${k.failed > 0 ? 'color:#fca5a5;' : ''}`}>{k.failed}</td>
+                <td style="padding:5px 8px;">{k.oldestPendingAgeMs === null ? '—' : formatAge(k.oldestPendingAgeMs)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </>
+    )}
+
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid #1a1a1f;">
+      <p style="font-size:12px;color:#d8d8de;margin:0 0 8px;line-height:1.6;">
+        <b style="color:#fff;">Reclaim stalled jobs.</b> claimBatch() flips a row to <code style={MONO + 'color:#9bd1ff;'}>processing</code> and nothing flips it back. A worker killed mid-batch — a timeout, an OOM, a deploy — leaves that row there permanently: not pending, so no worker claims it; not failed, so no retry sweep finds it. It is counted as work in flight, which on a healthy system is a small and unremarkable number.
+      </p>
+      <form method="POST" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <input type="hidden" name="action" value="reclaim" />
+        <label style="font-size:11.5px;color:#8a8a94;">Older than
+          <input type="number" name="minutes" value="15" min="1" max="1440" style={`width:70px;margin-left:6px;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:5px 8px;border-radius:6px;font-size:12px;${MONO}`} />
+          minutes
+        </label>
+        <button type="submit" style="background:#FF4F00;color:#fff;border:none;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Reclaim</button>
+      </form>
+      <p style="font-size:11px;color:#6e6e78;margin:8px 0 0;line-height:1.6;">Attempt counts are NOT reset, so a job that keeps killing its worker still walks toward dead-letter instead of cycling forever. Choose a threshold longer than your longest legitimate job: set it too low and a slow-but-working job gets claimed twice.</p>
+    </div>
+  </div>
+
+  <!-- LATENCY -->
+  <div style={CARD + 'margin-bottom:16px;'}>
+    <p style={HD}>Latency &middot; P50 / P95 / P99</p>
+    <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 10px;line-height:1.6;">
+      Read from this serverless instance's registry, which is <b style="color:#d6d6de;">{registryAgeSec}s</b> old. These are per-instance and since-last-cold-start, not cluster totals — a low count after a deploy is a young process, not a traffic collapse. Percentiles are bucket interpolations, so the resolution is the bucket width, never better.
+      {unmeasured.length > 0 && <> <b style="color:#fbbf24;">{unmeasured.length} of {MEASURED_OPERATIONS.length} declared operations have never been observed.</b> A declared operation with no observations and a genuinely fast one look identical on most monitoring systems; here they do not.</>}
+    </p>
+    <div style="overflow-x:auto;">
+      <table style={`width:100%;border-collapse:collapse;font-size:11.5px;${MONO}`}>
+        <thead><tr style="text-align:left;color:#8a8a94;">
+          <th style="padding:5px 8px;font-weight:600;">Operation</th><th style="padding:5px 8px;font-weight:600;">Layer</th>
+          <th style="padding:5px 8px;font-weight:600;">N</th><th style="padding:5px 8px;font-weight:600;">P50</th>
+          <th style="padding:5px 8px;font-weight:600;">P95</th><th style="padding:5px 8px;font-weight:600;">P99</th>
+        </tr></thead>
+        <tbody>
+          {latency.map((l) => (
+            <tr style="border-top:1px solid #1a1a1f;color:#d6d6de;">
+              <td style="padding:5px 8px;" title={l.op.meaning}>{l.op.key}</td>
+              <td style="padding:5px 8px;color:#8a8a94;">{l.op.layer}</td>
+              <td style={`padding:5px 8px;${l.count === 0 ? 'color:#6e6e78;' : ''}`}>{l.count === 0 ? 'never observed' : l.count}</td>
+              <td style="padding:5px 8px;">{ms(l.p50)}</td>
+              <td style="padding:5px 8px;">{ms(l.p95)}</td>
+              <td style="padding:5px 8px;">{ms(l.p99)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+    <p style="font-size:11px;color:#6e6e78;margin:10px 0 0;line-height:1.6;">
+      Machine-readable at <a href="/api/metrics" style="color:#9bd1ff;">/api/metrics</a> (Prometheus exposition).
+      {metricsTokenSet
+        ? ' A METRICS_TOKEN is configured, so a scraper can reach it with a bearer token.'
+        : ' METRICS_TOKEN is NOT set, so the token door does not exist and only an operator session can read it — a Prometheus scraper cannot. Set a token of 32+ characters to enable scraping.'}
+    </p>
+  </div>
+
+  <!-- CAPACITY -->
+  <div style={CARD + 'margin-bottom:16px;'}>
+    <p style={HD}>Capacity ladder</p>
+    <p style={`font-size:13px;font-weight:700;margin:0 0 4px;color:${bench.report ? '#fff' : '#fbbf24'};`}>{headline(report)}</p>
+    <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 12px;line-height:1.6;">
+      {bench.report
+        ? <>Last run {new Date(bench.report.generatedAt).toLocaleString()} on <b style="color:#d6d6de;">{bench.report.environment || 'an unnamed environment'}</b>{bench.report.label ? ' (' + bench.report.label + ')' : ''}. Peak sizing uses a {PEAK_FACTOR}× peak-to-average factor, which is an assumption, not this deployment's measured diurnal curve.</>
+        : <>No benchmark has been posted. Every tier below reads "not measured", and that is the accurate state — nothing here is extrapolated from nothing. Run <code style={MONO + 'color:#9bd1ff;'}>node scripts/mail-bench.mjs</code> and post the result; see <code style={MONO + 'color:#9bd1ff;'}>docs/mail-benchmarking.md</code>.</>}
+    </p>
+    <div style="overflow-x:auto;">
+      <table style={`width:100%;border-collapse:collapse;font-size:11.5px;${MONO}`}>
+        <thead><tr style="text-align:left;color:#8a8a94;">
+          <th style="padding:6px 8px;font-weight:600;">Target</th><th style="padding:6px 8px;font-weight:600;">Peak msg/s</th>
+          <th style="padding:6px 8px;font-weight:600;">Verdict</th><th style="padding:6px 8px;font-weight:600;">Workers</th>
+          <th style="padding:6px 8px;font-weight:600;">Storage/yr</th><th style="padding:6px 8px;font-weight:600;">Events/day</th>
+        </tr></thead>
+        <tbody>
+          {tiers.map((t, i) => {
+            const v = VERDICT_STYLE[t.verdict];
+            const res = resourcesFor(SCALE_TIERS[i], report.measurement, ESTIMATED_RESOURCES);
+            return (
+              <tr style="border-top:1px solid #1a1a1f;color:#d6d6de;">
+                <td style="padding:6px 8px;">{t.tier.label}</td>
+                <td style="padding:6px 8px;">{num(t.requiredPeakPerSec)}</td>
+                <td style="padding:6px 8px;"><span style={`background:${v.bg};color:${v.fg};padding:2px 8px;border-radius:20px;font-size:10.5px;font-weight:700;`}>{v.word}</span></td>
+                <td style="padding:6px 8px;">{t.workersForPeak === null ? '—' : t.workersForPeak}</td>
+                <td style="padding:6px 8px;color:#8a8a94;">{formatBytes(res.storagePerYearBytes)}</td>
+                <td style="padding:6px 8px;color:#8a8a94;">{res.eventsPerDay.toLocaleString()}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+    <p style="font-size:11px;color:#6e6e78;margin:10px 0 0;line-height:1.6;">Storage and event volumes use <b style="color:#8a8a94;">estimated</b> per-message costs ({formatBytes(ESTIMATED_RESOURCES.bytesPerMessage)}/message, {ESTIMATED_RESOURCES.eventsPerMessage} events/message), not measured ones. Worker counts assume linear scaling; the bottleneck list below names what is expected to bind first, and each entry invalidates linearity from the tier it names.</p>
+
+    {history.ok && history.runs.length > 1 && (
+      <>
+        <p style={HD + 'margin-top:14px;'}>Benchmark history</p>
+        <table style={`width:100%;border-collapse:collapse;font-size:11.5px;${MONO}`}>
+          <tbody>
+            {history.runs.map((r) => (
+              <tr style="border-top:1px solid #1a1a1f;color:#d6d6de;">
+                <td style="padding:5px 8px;color:#8a8a94;">{new Date(r.generatedAt).toLocaleString()}</td>
+                <td style="padding:5px 8px;">{r.environment || '—'}</td>
+                <td style="padding:5px 8px;">{num(r.messagesPerSec)} msg/s</td>
+                <td style="padding:5px 8px;color:#8a8a94;">{r.highestSustainedTier || 'none demonstrated'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </>
+    )}
+  </div>
+
+  <!-- BOTTLENECKS -->
+  <div style={CARD + 'margin-bottom:16px;'}>
+    <p style={HD}>What binds first</p>
+    <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 10px;line-height:1.6;">Constraints that are real and already present on this deployment, not generic scaling cautions. A projection printed without these is the kind of number that gets committed to in a meeting.</p>
+    <div style="display:flex;flex-direction:column;gap:9px;">
+      {bottleneckNotes().map((b) => (
+        <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:9px;padding:10px 12px;">
+          <p style="font-size:12px;font-weight:700;color:#fff;margin:0 0 3px;">{b.component} <span style={`color:#8a8a94;font-weight:400;font-size:11px;${MONO}`}>binds at {b.bindsAt}</span></p>
+          <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 3px;line-height:1.6;">{b.limit}</p>
+          <p style="font-size:11.5px;color:#d8d8de;margin:0 0 3px;line-height:1.6;">{b.consequence}</p>
+          <p style="font-size:11.5px;color:#6ee7b7;margin:0;line-height:1.6;">{b.remedy}</p>
+        </div>
+      ))}
+    </div>
+  </div>
+
+  <!-- DATABASE + MTA + EVENTS -->
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin-bottom:16px;">
+    <div style={CARD}>
+      <p style={HD}>Database</p>
+      <div style={`font-size:11.5px;color:#d6d6de;line-height:1.9;${MONO}`}>
+        <div>Pool: {dbPerf.pool.available ? <>{dbPerf.pool.active} active / {dbPerf.pool.idle} idle / <span style={dbPerf.pool.idleInTransaction > 0 ? 'color:#fbbf24;' : ''}>{dbPerf.pool.idleInTransaction} idle-in-txn</span>{dbPerf.pool.maxConnections ? ' of ' + dbPerf.pool.maxConnections : ''}</> : <span style="color:#fca5a5;">unreadable</span>}</div>
+        <div>Locks waiting: {dbPerf.locks.ok ? dbPerf.locks.waiting : <span style="color:#fca5a5;">unreadable</span>}</div>
+        <div>Deadlocks (cumulative): {dbPerf.locks.deadlocks === null ? 'not exposed' : dbPerf.locks.deadlocks}</div>
+        <div>Slow-query data: {dbPerf.slow.available ? dbPerf.slow.rows.length + ' statements' : <span style="color:#fbbf24;">pg_stat_statements not installed</span>}</div>
+      </div>
+      {dbPerf.findings.length > 0 ? (
+        <div style="margin-top:10px;display:flex;flex-direction:column;gap:7px;">
+          {dbPerf.findings.slice(0, 6).map((f) => {
+            const s = SEV_STYLE[f.severity];
+            return (
+              <div style={`border-left:2px solid ${s.fg};padding-left:9px;`}>
+                <p style={`font-size:11.5px;font-weight:700;margin:0 0 2px;color:${s.fg};`}>{f.kind.replace(/_/g, ' ')} &middot; {f.table}</p>
+                <p style="font-size:11px;color:#9aa6b6;margin:0;line-height:1.55;">{f.detail}</p>
+                <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;line-height:1.55;">{f.recommendation}</p>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <p style="font-size:11.5px;margin:10px 0 0;line-height:1.6;color:#9aa6b6;">
+          {dbPerf.tables.ok
+            ? 'No findings across ' + dbPerf.tables.tables.length + ' mail tables. Nothing here changes a schema — findings print SQL for a human to run.'
+            : 'Table statistics could not be read, so this is not a clean bill of health.'}
+        </p>
+      )}
+    </div>
+
+    <div style={CARD}>
+      <p style={HD}>Delivery nodes</p>
+      <div style={`font-size:11.5px;color:#d6d6de;line-height:1.9;${MONO}`}>
+        <div>Nodes: {nodes.total} &middot; healthy {nodes.healthy} &middot; circuit open {nodes.open}</div>
+        <div>Relay: {cfg.smtpHost ? cfg.smtpHost + ':' + cfg.smtpPort : <span style="color:#fbbf24;">not configured</span>}</div>
+      </div>
+      <p style="font-size:11.5px;color:#9aa6b6;margin:10px 0 0;line-height:1.6;">
+        MTA-01 exists; MTA-02…MTA-N do not. The pool abstraction (selection, per-domain token-bucket throttling, circuit breaking, IP-pool separation for transactional vs marketing streams) is built and unit-tested against a simulated multi-node rack, so adding a node later is a row rather than an edit to every send path. With one node the correct failure behaviour is to queue and retry — there is nowhere to fail over to.
+      </p>
+
+      <p style={HD + 'margin-top:14px;'}>Event store</p>
+      <div style={`font-size:11.5px;color:#d6d6de;line-height:1.9;${MONO}`}>
+        {events.ok ? (
+          <>
+            <div>Rows: {events.total === null ? '—' : events.total.toLocaleString()} &middot; last 24h: {events.last24h === null ? '—' : events.last24h.toLocaleString()}</div>
+            <div>Range: {events.oldest ? new Date(events.oldest).toLocaleDateString() : '—'} → {events.newest ? new Date(events.newest).toLocaleDateString() : '—'}</div>
+            {events.defaultPartitionRows !== null && events.defaultPartitionRows > 0 && (
+              <div style="color:#fbbf24;">{events.defaultPartitionRows.toLocaleString()} rows in the DEFAULT partition — partition maintenance has stopped.</div>
+            )}
+          </>
+        ) : <span style="color:#8a8a94;">Not yet created. The table is built on first write.</span>}
+      </div>
+    </div>
+  </div>
+
+  <!-- FAILURE MODES -->
+  <div style={CARD}>
+    <p style={HD}>Failure-mode coverage</p>
+    <p style="font-size:12.5px;color:#d8d8de;margin:0 0 10px;line-height:1.6;">
+      <b style="color:#fff;">{cov.implemented} of {cov.total}</b> documented failure modes are fully implemented ({cov.percentImplemented}%); {cov.partial} are partial and {cov.intended} are intended-only. Every entry that is not fully implemented names its gap — a catalogue that flatters itself is worse than none, and a test enforces that rule.
+    </p>
+    <div style="display:flex;flex-direction:column;gap:9px;">
+      {gaps.map((g) => (
+        <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:9px;padding:10px 12px;">
+          <p style="font-size:12px;font-weight:700;margin:0 0 3px;color:#fff;">
+            {g.scenario} <span style={`font-weight:400;font-size:10.5px;padding:1px 7px;border-radius:20px;${MONO}background:${g.status === 'intended' ? 'rgba(239,68,68,0.12)' : 'rgba(251,191,36,0.12)'};color:${g.status === 'intended' ? '#fca5a5' : '#fbbf24'};`}>{g.status}</span>
+          </p>
+          <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 3px;line-height:1.6;"><b style="color:#d6d6de;">Gap:</b> {g.gap}</p>
+          <p style="font-size:11.5px;color:#6e6e78;margin:0;line-height:1.6;"><b style="color:#8a8a94;">Reproduce:</b> {g.reproduce}</p>
+        </div>
+      ))}
+    </div>
+    <p style="font-size:11px;color:#6e6e78;margin:10px 0 0;line-height:1.6;">Full catalogue of all {FAILURE_MODES.length} modes, with expected behaviour and what must never happen: <code style={MONO + 'color:#9bd1ff;'}>docs/mail-failure-modes.md</code>.</p>
+  </div>
+</div>
+</AdminLayout>

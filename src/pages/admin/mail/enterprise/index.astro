@@ -1,0 +1,205 @@
+---
+// /admin/mail/enterprise — the enterprise control plane's front page.
+//
+// Everything the brief asks this console to show, in one place: organizations, users, domains,
+// mailboxes, sending and receiving activity, campaigns, API usage, security events, abuse signals and
+// system health.
+//
+// THE AUTHORISATION HAPPENS BEFORE THE QUERIES, not in the layout. GovShell renders the refusal, but
+// a layout runs after this frontmatter — so if the data were loaded first, a tenant's rows would
+// already have been read for somebody who may not see them, whatever the screen ends up showing.
+// Every page in this console has the same shape: pageGate() first, `if (decision.allowed)` around
+// every read.
+//
+// A NUMBER THAT COULD NOT BE READ IS NOT ZERO. Every counter here comes back with an `ok` flag, and
+// a failed read is rendered as a stated failure rather than as a calm row of noughts. This project
+// has shipped that bug twice — a mail health screen reading "0 inbound, 0 outbound" over a working
+// server, and a bootstrap reporting success over ten missing tables.
+import GovShell from '@/components/mailgov/GovShell.astro';
+import { pageGate } from '@/lib/mailgov/guard';
+import { listOrgs, platformOverview } from '@/lib/mailgov/orgs';
+import { securitySummary } from '@/lib/mailgov/security-events';
+import { governanceHealth } from '@/lib/mailgov/health';
+import { listAudit } from '@/lib/mailgov/audit';
+import { authorizeGov } from '@/lib/mailgov/policy';
+
+const orgParamRaw = (Astro.url.searchParams.get('org') || '').trim() || null;
+const { actor, decision } = await pageGate(Astro.locals, 'org.view', { orgId: orgParamRaw || undefined }, Astro.request);
+
+const scopeOrg = actor.orgId || orgParamRaw;
+
+let overview: Awaited<ReturnType<typeof platformOverview>> | null = null;
+let orgs: { ok: boolean; rows: any[]; reason?: string } = { ok: true, rows: [] };
+let security: Awaited<ReturnType<typeof securitySummary>> | null = null;
+let health: Awaited<ReturnType<typeof governanceHealth>> | null = null;
+let recent: any[] = [];
+let auditError: string | null = null;
+
+if (decision.allowed) {
+  const list = await listOrgs({ orgId: actor.orgId, limit: 12 });
+  orgs = list.ok ? { ok: true, rows: list.rows } : { ok: false, rows: [], reason: list.reason };
+
+  if (!actor.orgId) overview = await platformOverview();
+  security = await securitySummary(scopeOrg, 168);
+
+  // Health describes the PLATFORM's own infrastructure, so a tenant administrator is not shown it —
+  // "your export storage is unconfigured" is our problem to fix, not a customer's to read.
+  if (authorizeGov(actor, 'health.view', { platformWide: true }).allowed) {
+    health = await governanceHealth();
+  }
+
+  if (authorizeGov(actor, 'audit.view', { orgId: scopeOrg || undefined }).allowed) {
+    const a = await listAudit({ orgId: scopeOrg, limit: 8 });
+    if (a.ok) recent = a.rows;
+    else auditError = a.reason;
+  }
+}
+
+const stateColour = (s: string): string =>
+  s === 'ok' ? '#34d399' : s === 'warn' ? '#fbbf24' : s === 'unknown' ? '#9aa6b6' : '#f87171';
+
+const num = (v: number | null | undefined): string =>
+  v === null || v === undefined ? 'unknown' : String(v);
+---
+
+<GovShell
+  title="Enterprise administration"
+  actor={actor}
+  capability="org.view"
+  subtitle="Organizations, people, activity, security and the platform's own health."
+>
+  {health && health.worstState !== 'ok' && (
+    <div style="background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.30);border-radius:12px;padding:14px 16px;margin-bottom:16px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fbbf24;margin:0 0 8px;">The platform is reporting something worth reading.</p>
+      <ul style="margin:0;padding-left:18px;font-size:12px;color:#d8d8de;line-height:1.7;">
+        {health.checks.filter((c) => c.state !== 'ok').map((c) => (
+          <li><strong style={'color:' + stateColour(c.state) + ';'}>{c.label}:</strong> {c.detail}</li>
+        ))}
+      </ul>
+    </div>
+  )}
+
+  {!orgs.ok && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;margin-bottom:16px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fca5a5;margin:0 0 6px;">The organization list could not be read.</p>
+      <p style="font-size:12px;color:#d8d8de;margin:0;font-family:'Geist Mono',monospace;">{orgs.reason}</p>
+      <p style="font-size:12px;color:#d8d8de;margin:8px 0 0;line-height:1.6;">An empty list below would mean "no organizations". This is not that.</p>
+    </div>
+  )}
+
+  {overview && (
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:18px;">
+      {[
+        { label: 'Organizations', value: num(overview.organizations), note: overview.suspended + ' suspended' },
+        { label: 'Members', value: num(overview.members), note: 'active memberships' },
+        { label: 'Sending domains', value: num(overview.domains), note: 'across all tenants' },
+        { label: 'Active API keys', value: num(overview.activeKeys), note: 'not revoked' },
+        { label: 'Sent (24h)', value: num(overview.messages24h), note: overview.failed24h + ' failed' },
+        { label: 'Mailboxes', value: num(overview.mailboxes), note: overview.mailboxes === null ? 'internal store absent here' : 'internal mail store' },
+        { label: 'Received (24h)', value: num(overview.inbound24h), note: overview.inbound24h === null ? 'internal store absent here' : 'inbound messages' },
+      ].map((t) => (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:12px 14px;">
+          <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 4px;">{t.label}</p>
+          <p style="font-size:20px;font-weight:700;color:#fff;margin:0;font-family:'Geist Mono',monospace;">{t.value}</p>
+          <p style="font-size:10.5px;color:#6e6e78;margin:4px 0 0;">{t.note}</p>
+        </div>
+      ))}
+    </div>
+  )}
+
+  {!overview && decision.allowed && (
+    <p style="font-size:12px;color:#9aa6b6;margin:0 0 16px;line-height:1.6;">
+      Platform-wide figures are not shown to a tenant-scoped account. The organization below is yours.
+    </p>
+  )}
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-bottom:18px;">
+    <div class="admin-card">
+      <div class="admin-card-title" style="margin-bottom:10px;">Organizations</div>
+      {orgs.rows.length === 0 && orgs.ok && (
+        <p style="font-size:12px;color:#9aa6b6;margin:0;line-height:1.6;">No organizations exist on this deployment yet.</p>
+      )}
+      {orgs.rows.map((o: any) => (
+        <a href={'/admin/mail/enterprise/organizations?org=' + o.id}
+           style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #17171c;text-decoration:none;">
+          <span style={'width:8px;height:8px;border-radius:50%;flex-shrink:0;background:'
+            + (o.status === 'suspended' || !o.isActive ? '#f87171' : '#34d399') + ';'}></span>
+          <span style="font-size:12.5px;color:#fff;font-weight:600;">{o.name}</span>
+          <span style="font-size:11px;color:#6e6e78;font-family:'Geist Mono',monospace;">{o.slug}</span>
+          <span style="margin-left:auto;font-size:10.5px;color:#9aa6b6;">
+            {[o.sendingEnabled ? null : 'sending off', o.receivingEnabled ? null : 'receiving off', o.campaignsEnabled ? null : 'campaigns off']
+              .filter(Boolean).join(' · ') || 'all controls on'}
+          </span>
+        </a>
+      ))}
+    </div>
+
+    <div class="admin-card">
+      <div class="admin-card-title" style="margin-bottom:10px;">Security, last 7 days</div>
+      {security && !security.ok && (
+        <p style="font-size:12px;color:#fca5a5;margin:0 0 8px;">These counts could not be read: {security.reason}</p>
+      )}
+      {security && security.ok && (
+        <div>
+          <div style="display:flex;gap:14px;margin-bottom:10px;font-family:'Geist Mono',monospace;">
+            <div>
+              <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 3px;">Events</p>
+              <p style="font-size:18px;font-weight:700;color:#fff;margin:0;">{security.total}</p>
+            </div>
+            <div>
+              <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 3px;">Open</p>
+              <p style={'font-size:18px;font-weight:700;margin:0;color:' + (security.open > 0 ? '#fbbf24' : '#34d399') + ';'}>{security.open}</p>
+            </div>
+          </div>
+          {security.worstOpen && (
+            <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">
+              <p style="font-size:11.5px;font-weight:700;color:#fff;margin:0 0 4px;">{security.worstOpen.label}</p>
+              <p style="font-size:11px;color:#9aa6b6;margin:0;line-height:1.6;">{security.worstOpen.recommendation}</p>
+            </div>
+          )}
+          <p style="font-size:11px;color:#6e6e78;margin:10px 0 0;line-height:1.6;">
+            Detection here is advisory. Nothing on this platform suspends an account or pauses a campaign on a score; a person decides.
+          </p>
+        </div>
+      )}
+    </div>
+  </div>
+
+  <div class="admin-card" style="margin-bottom:18px;">
+    <div class="admin-card-title" style="margin-bottom:10px;">Most recent administrative actions</div>
+    {auditError && (
+      <p style="font-size:12px;color:#fca5a5;margin:0 0 8px;">The audit log could not be read: {auditError}. That is not the same as nothing having happened.</p>
+    )}
+    {!auditError && recent.length === 0 && (
+      <p style="font-size:12px;color:#9aa6b6;margin:0;">No administrative actions have been recorded yet.</p>
+    )}
+    {recent.map((e: any) => (
+      <div style="display:flex;gap:10px;align-items:baseline;padding:6px 0;border-bottom:1px solid #17171c;font-size:11.5px;">
+        <span style="font-family:'Geist Mono',monospace;color:#6e6e78;">#{e.seq}</span>
+        <span style={'font-weight:700;color:' + (e.result === 'ok' ? '#fff' : e.result === 'denied' ? '#fbbf24' : '#fca5a5') + ';'}>{e.action}</span>
+        <span style="color:#9aa6b6;">{e.actorEmail || 'system'}</span>
+        <span style="margin-left:auto;color:#6e6e78;font-family:'Geist Mono',monospace;">{e.occurredAt.slice(0, 19).replace('T', ' ')}</span>
+      </div>
+    ))}
+    <p style="font-size:11px;color:#6e6e78;margin:10px 0 0;">
+      <a href="/admin/mail/enterprise/audit" style="color:#FF7040;text-decoration:none;">The whole audit log, with chain verification</a>
+    </p>
+  </div>
+
+  {health && (
+    <div class="admin-card">
+      <div class="admin-card-title" style="margin-bottom:10px;">System health</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;">
+        {health.checks.map((c) => (
+          <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+              <span style={'width:8px;height:8px;border-radius:50%;flex-shrink:0;background:' + stateColour(c.state) + ';'}></span>
+              <p style="font-size:11.5px;font-weight:700;color:#fff;margin:0;">{c.label}</p>
+            </div>
+            <p style="font-size:11px;color:#9aa6b6;margin:0;line-height:1.6;">{c.detail}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  )}
+</GovShell>

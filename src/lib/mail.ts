@@ -711,6 +711,17 @@ export interface ListFolderOptions {
   label?: string | null;
   query?: string;
   limit?: number;
+  /**
+   * KEYSET PAGING, ADDED FOR THE /mail PRODUCT SURFACE AND OPTIONAL EVERYWHERE ELSE.
+   *
+   * Return only threads whose latest message is strictly OLDER than this instant. That is what makes
+   * "load more" in a long mailbox a bounded, constant-cost request instead of either an OFFSET walk
+   * (which re-reads and discards every earlier row) or a limit that grows on every scroll.
+   *
+   * Omitting it is exactly the previous behaviour — MailClient.astro passes no cursor and is
+   * unchanged.
+   */
+  before?: string | null;
 }
 
 export interface FolderListing {
@@ -753,6 +764,14 @@ export async function listFolder(userId: string, opts: ListFolderOptions): Promi
   if (q.hasAttachment) where = sql`${where} AND m.has_attachments = true`;
   if (q.after) where = sql`${where} AND m.created_at >= ${q.after.toISOString()}::timestamptz`;
   if (q.before) where = sql`${where} AND m.created_at < ${q.before.toISOString()}::timestamptz`;
+  // The paging cursor, kept separate from the `before:` SEARCH operator above on purpose: one is
+  // what the reader asked for and is echoed on screen, the other is where the last page ended. A
+  // cursor that could not be parsed is ignored rather than throwing — the reader gets page one, not
+  // an error about a value they never typed.
+  if (opts.before) {
+    const cur = new Date(opts.before);
+    if (!isNaN(cur.getTime())) where = sql`${where} AND m.created_at < ${cur.toISOString()}::timestamptz`;
+  }
 
   for (const term of q.from) {
     const like = '%' + term + '%';

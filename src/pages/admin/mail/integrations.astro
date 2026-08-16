@@ -1,0 +1,377 @@
+---
+// /admin/mail/integrations — the connected systems, their credentials and their health.
+//
+// Sections 2, 6, 12 and 13 of the integration brief on one screen: the EduRankAI products that can
+// publish onto the event bus, the credentials each one holds (as metadata only — no stored secret is
+// readable from anywhere), the five health states, and the planned connectors listed honestly with
+// the specific thing that blocks each of them.
+//
+// THE PLANNED CONNECTORS HAVE NO CONNECT BUTTON. A screen that offers to connect Slack and then
+// fails is worse than one that says, in a sentence, that it needs a distribution review first. That
+// sentence comes from the connector's own metadata, so the page cannot say something the code does
+// not back up.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { ensureMailIntSchema, rows, dbReason } from '@/lib/mailint/schema';
+import { listConnectorMeta } from '@/lib/mailint/connectors';
+import { listIntegrations, listMappings } from '@/lib/mailint/integrations';
+import { listCredentials, vaultStatus } from '@/lib/mailint/credentials';
+import { computeHealth, credentialStatesOf } from '@/lib/mailint/connector';
+import { getOrCreateOrg } from '@/lib/mailint/router';
+
+export const prerender = false;
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+const mayView = await canAccessSection(user, 'settings', 'view');
+if (!mayView) return Astro.redirect('/admin?denied=settings');
+
+// Declared before every write to it — `const` is not hoisted.
+const readFailures: string[] = [];
+await ensureMailIntSchema().catch((e: any) => readFailures.push('Schema bootstrap: ' + dbReason(e)));
+
+const environment = (Astro.url.searchParams.get('env') === 'production') ? 'production' : 'development';
+const orgSlugParam = Astro.url.searchParams.get('org') || 'careers';
+
+let orgs: any[] = [];
+try {
+  orgs = rows(await db.execute(sql`SELECT id, slug, name FROM mailapi_orgs ORDER BY created_at ASC LIMIT 50`));
+} catch (e: any) {
+  readFailures.push('Organisations: ' + dbReason(e));
+}
+if (!orgs.length && !readFailures.length) {
+  const seeded = await getOrCreateOrg('careers', 'EduRankAI Careers');
+  if (seeded) orgs = [{ id: seeded.id, slug: seeded.slug, name: seeded.name }];
+}
+const org = orgs.find((o: any) => o.slug === orgSlugParam) || orgs[0] || null;
+
+const vault = vaultStatus();
+const connectors = listConnectorMeta();
+const available = connectors.filter((c) => c.availability === 'available');
+const planned = connectors.filter((c) => c.availability === 'planned');
+
+let integrations: any[] = [];
+const health: any[] = [];
+if (org) {
+  integrations = await listIntegrations(String(org.id), environment);
+  for (const i of integrations) {
+    // The health chip is computed from stored counters and credential states, NOT by calling out to
+    // anything: a page load must not depend on somebody else's server answering.
+    const creds = await listCredentials(String(org.id), i.id);
+    const meta = connectors.find((c) => c.key === i.connector);
+    const maps = await listMappings(String(org.id), i.id);
+    health.push({
+      id: i.id,
+      creds,
+      mappings: maps.length,
+      report: computeHealth({
+        disabled: !i.isEnabled,
+        credentialStates: credentialStatesOf(creds.map((c) => ({ kind: c.kind, expiresAt: c.expiresAt, revokedAt: c.revokedAt }))),
+        required: meta ? meta.requires : [],
+        consecutiveFailures: i.consecutiveFailures,
+        lastSuccessAt: i.lastSuccessAt,
+        lastFailureAt: i.lastFailureAt,
+        lastEventAt: i.lastEventAt,
+        expectedIntervalMs: i.expectedIntervalSeconds ? i.expectedIntervalSeconds * 1000 : null,
+      }),
+    });
+  }
+}
+
+let inbound: any[] = [];
+if (org) {
+  try {
+    inbound = rows(await db.execute(sql`
+      SELECT i.id, i.connector, i.status, i.detail, i.received_count, i.published_count, i.duplicate_count,
+             i.duration_ms, i.created_at, n.name AS integration_name
+      FROM mailint_inbound i
+      LEFT JOIN mailint_integrations n ON n.id = i.integration_id
+      WHERE i.org_id = ${String(org.id)}::uuid AND i.environment = ${environment}
+      ORDER BY i.created_at DESC LIMIT 25
+    `));
+  } catch (e: any) {
+    readFailures.push('Inbound log: ' + dbReason(e));
+  }
+}
+
+function healthColour(s: string): string {
+  if (s === 'connected') return '#34d399';
+  if (s === 'degraded') return '#fbbf24';
+  if (s === 'disabled') return '#6e6e78';
+  return '#f87171';
+}
+function fmt(d: any): string {
+  if (!d) return 'never';
+  try { return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); }
+  catch { return ''; }
+}
+---
+
+<AdminLayout title="Integrations" activeNav="mail">
+<div class="admin-page" style="max-width:1180px;">
+  <div class="admin-page-header" style="margin-bottom:16px;">
+    <div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">Mail &middot; Integrations</div>
+      <h1 class="admin-page-title">Integrations</h1>
+      <p class="admin-page-sub">
+        The systems that put facts onto the event bus, and what the platform holds for each of them.
+        <a href="/admin/mail/webhooks" style="color:#FF7040;text-decoration:none;">Webhook console</a> &middot;
+        <a href="/admin/mail/event-bus" style="color:#FF7040;text-decoration:none;">Event bus</a>
+      </p>
+    </div>
+  </div>
+
+  {readFailures.length > 0 && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;margin-bottom:18px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fca5a5;margin:0 0 6px;">Part of this page could not be read.</p>
+      <ul style="font-size:11.5px;color:#fca5a5;margin:0;padding-left:18px;line-height:1.7;font-family:'Geist Mono',monospace;">
+        {readFailures.map((f: string) => <li>{f}</li>)}
+      </ul>
+    </div>
+  )}
+
+  {!vault.configured && (
+    <div style="background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.30);border-radius:12px;padding:14px 16px;margin-bottom:18px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fbbf24;margin:0 0 6px;">The credential vault has no key on this deployment.</p>
+      <p style="font-size:12px;color:#d8d8de;margin:0;line-height:1.6;">{vault.detail}</p>
+    </div>
+  )}
+
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:18px;">
+    <div style="display:flex;gap:4px;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:4px;">
+      <a href={'/admin/mail/integrations?env=development&org=' + (org ? org.slug : '')}
+         style={'font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:7px;text-decoration:none;' + (environment === 'development' ? 'background:#FF4F00;color:#fff;' : 'color:#9aa6b6;')}>Development</a>
+      <a href={'/admin/mail/integrations?env=production&org=' + (org ? org.slug : '')}
+         style={'font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:7px;text-decoration:none;' + (environment === 'production' ? 'background:#FF4F00;color:#fff;' : 'color:#9aa6b6;')}>Production</a>
+    </div>
+    <select id="orgPicker" style="background:#0f0f14;border:1px solid #1a1a1f;color:#fff;font-size:12px;padding:8px 12px;border-radius:8px;">
+      {orgs.map((o: any) => <option value={o.slug} selected={org && o.slug === org.slug}>{o.name}</option>)}
+    </select>
+  </div>
+
+  <!-- Connect -->
+  <div class="admin-card" style="margin-bottom:18px;">
+    <div class="admin-card-title" style="margin-bottom:10px;">Connect a system</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+      <select id="connectorPick" style="background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12px;padding:9px 12px;border-radius:8px;min-width:220px;">
+        {available.map((c: any) => <option value={c.key}>{c.name}</option>)}
+      </select>
+      <input id="intName" type="text" placeholder="Name it (e.g. Careers production)"
+             style="background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12.5px;padding:9px 12px;border-radius:8px;flex:1;min-width:220px;" />
+      <button id="btnConnect" type="button" style="background:#FF4F00;color:#fff;border:none;font-size:12px;font-weight:700;padding:9px 20px;border-radius:8px;cursor:pointer;">Connect</button>
+      <span id="connectMsg" style="font-size:11.5px;"></span>
+    </div>
+    <p style="font-size:11.5px;color:#8a8a94;margin:10px 0 0;line-height:1.6;">
+      A new integration is seeded with its connector's default mappings and gets an inbound URL of
+      <code style="font-family:'Geist Mono',monospace;color:#FF7040;">/api/v1/ingest/&lt;slug&gt;</code>.
+    </p>
+  </div>
+
+  <!-- Integrations -->
+  <div class="admin-card" style="margin-bottom:18px;">
+    <div class="admin-card-title" style="margin-bottom:10px;">Connected ({integrations.length})</div>
+    {integrations.length === 0 && readFailures.length === 0 && (
+      <p style="font-size:12px;color:#8a8a94;margin:0;">Nothing is connected in the {environment} environment yet.</p>
+    )}
+    {integrations.map((i: any) => {
+      const h = health.find((x: any) => x.id === i.id);
+      const report = h ? h.report : { status: 'failed', detail: 'No health could be computed.' };
+      return (
+        <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;margin-bottom:10px;">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+            <span style={'width:8px;height:8px;border-radius:50%;flex-shrink:0;background:' + healthColour(report.status) + ';'}></span>
+            <strong style="font-size:13px;color:#fff;">{i.name}</strong>
+            <span style="font-size:10.5px;color:#8a8a94;font-family:'Geist Mono',monospace;">{i.connector}</span>
+            <span style={'font-size:10px;text-transform:uppercase;letter-spacing:0.08em;font-weight:700;color:' + healthColour(report.status) + ';'}>{report.status}</span>
+          </div>
+          <p style="font-size:12px;color:#d8d8de;margin:0 0 8px;line-height:1.6;">{report.detail}</p>
+          <p style="font-size:11px;color:#8a8a94;margin:0 0 8px;font-family:'Geist Mono',monospace;">
+            POST /api/v1/ingest/{i.slug} &middot; {h ? h.mappings : 0} mapping(s) &middot; last event {fmt(i.lastEventAt)}
+          </p>
+          {h && h.creds.length > 0 && (
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;">
+              {h.creds.map((c: any) => (
+                <span style="font-size:10.5px;font-family:'Geist Mono',monospace;background:#0f0f14;border:1px solid #2a2a2f;border-radius:5px;padding:3px 8px;color:#9aa6b6;">
+                  {c.kind} {c.hint || ''} &middot; <span style={'color:' + (c.state === 'active' ? '#34d399' : c.state === 'expiring' ? '#fbbf24' : '#f87171') + ';'}>{c.state}</span>
+                </span>
+              ))}
+            </div>
+          )}
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <input type="password" class="credVal" placeholder="Paste a secret to store" data-id={i.id}
+                   style="background:#0f0f14;border:1px solid #2a2a2f;color:#fff;font-size:11px;padding:6px 10px;border-radius:6px;min-width:200px;font-family:'Geist Mono',monospace;" />
+            <select class="credKind" style="background:#0f0f14;border:1px solid #2a2a2f;color:#fff;font-size:11px;padding:6px 10px;border-radius:6px;">
+              <option value="webhook_secret">webhook_secret</option>
+              <option value="api_key">api_key</option>
+              <option value="oauth_token">oauth_token</option>
+              <option value="smtp">smtp</option>
+              <option value="basic">basic</option>
+            </select>
+            <button type="button" class="btnCred" data-id={i.id} style="background:#1a1a1f;color:#d8d8de;border:1px solid #2a2a2f;font-size:11px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Store</button>
+            <button type="button" class="btnHealth" data-id={i.id} style="background:#1a1a1f;color:#d8d8de;border:1px solid #2a2a2f;font-size:11px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Check health</button>
+            <button type="button" class="btnToggle" data-id={i.id} data-enabled={i.isEnabled ? '1' : '0'} style="background:#1a1a1f;color:#9aa6b6;border:1px solid #2a2a2f;font-size:11px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">{i.isEnabled ? 'Disable' : 'Enable'}</button>
+            <button type="button" class="btnDrop" data-id={i.id} style="background:#1a1a1f;color:#f87171;border:1px solid rgba(248,113,113,0.35);font-size:11px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Disconnect</button>
+            <span class="rowMsg" style="font-size:11px;"></span>
+          </div>
+        </div>
+      );
+    })}
+  </div>
+
+  <!-- Inbound log -->
+  <div class="admin-card" style="margin-bottom:18px;">
+    <div class="admin-card-title" style="margin-bottom:4px;">Inbound calls</div>
+    <p style="font-size:11.5px;color:#8a8a94;margin:0 0 10px;line-height:1.6;">
+      Every call is recorded whether or not it worked, so "they say they are sending events" is answerable with evidence rather than argument.
+    </p>
+    {inbound.length === 0 && readFailures.length === 0 && (
+      <p style="font-size:12px;color:#8a8a94;margin:0;">No inbound call has been received in this environment.</p>
+    )}
+    {inbound.length > 0 && (
+      <div style="overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;font-size:11.5px;">
+          <thead>
+            <tr style="text-align:left;color:#8a8a94;font-size:10px;text-transform:uppercase;letter-spacing:0.08em;">
+              <th style="padding:6px 8px;">When</th>
+              <th style="padding:6px 8px;">Integration</th>
+              <th style="padding:6px 8px;">Status</th>
+              <th style="padding:6px 8px;">In / published / dup</th>
+              <th style="padding:6px 8px;">Detail</th>
+            </tr>
+          </thead>
+          <tbody>
+            {inbound.map((r: any) => (
+              <tr style="border-top:1px solid #1a1a1f;">
+                <td style="padding:7px 8px;color:#9aa6b6;font-family:'Geist Mono',monospace;white-space:nowrap;">{fmt(r.created_at)}</td>
+                <td style="padding:7px 8px;color:#fff;">{r.integration_name || r.connector}</td>
+                <td style={'padding:7px 8px;font-weight:700;color:' + (r.status === 'routed' ? '#34d399' : r.status === 'partial' ? '#fbbf24' : '#f87171') + ';'}>{r.status}</td>
+                <td style="padding:7px 8px;color:#9aa6b6;font-family:'Geist Mono',monospace;">{r.received_count} / {r.published_count} / {r.duplicate_count}</td>
+                <td style="padding:7px 8px;color:#8a8a94;max-width:380px;">{r.detail || (r.duration_ms ? r.duration_ms + 'ms' : '')}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+  </div>
+
+  <!-- Planned -->
+  <div class="admin-card">
+    <div class="admin-card-title" style="margin-bottom:4px;">Planned connectors</div>
+    <p style="font-size:11.5px;color:#8a8a94;margin:0 0 12px;line-height:1.6;">
+      The framework supports these; none of them is implemented. Each line says what is actually missing rather than "coming soon", so you can judge the distance yourself.
+      Any system with no connector of its own can be integrated today through <strong>Generic signed webhook</strong> plus a mapping — no code, no deployment.
+    </p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;">
+      {planned.map((c: any) => (
+        <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+            <span style="width:8px;height:8px;border-radius:50%;background:#3a3a42;flex-shrink:0;"></span>
+            <strong style="font-size:12.5px;color:#d8d8de;">{c.name}</strong>
+            <span style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.08em;color:#6e6e78;">{c.family}</span>
+          </div>
+          <p style="font-size:11.5px;color:#8a8a94;margin:0 0 6px;line-height:1.6;">{c.description}</p>
+          <p style="font-size:11px;color:#fbbf24;margin:0;line-height:1.6;">{c.blocked_on || c.blockedOn}</p>
+        </div>
+      ))}
+    </div>
+  </div>
+</div>
+
+<script define:vars={{ orgSlug: org ? org.slug : '', environment }}>
+  const API = '/api/admin/mail/integrations';
+
+  async function call(payload) {
+    const res = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ org_slug: orgSlug, environment }, payload)),
+    });
+    try { return await res.json(); }
+    catch (e) { return { ok: false, error: 'The server answered with something that is not JSON (HTTP ' + res.status + ').' }; }
+  }
+
+  const orgPicker = document.getElementById('orgPicker');
+  if (orgPicker) {
+    orgPicker.addEventListener('change', function () {
+      window.location.href = '/admin/mail/integrations?env=' + environment + '&org=' + encodeURIComponent(orgPicker.value);
+    });
+  }
+
+  const connectBtn = document.getElementById('btnConnect');
+  if (connectBtn) {
+    connectBtn.addEventListener('click', async function () {
+      const msg = document.getElementById('connectMsg');
+      const connector = document.getElementById('connectorPick').value;
+      const name = document.getElementById('intName').value.trim();
+      if (!name) { msg.textContent = 'Give it a name.'; msg.style.color = '#fca5a5'; return; }
+      connectBtn.disabled = true;
+      msg.textContent = 'Connecting...';
+      msg.style.color = '#9aa6b6';
+      const r = await call({ action: 'integration.create', connector: connector, name: name });
+      connectBtn.disabled = false;
+      if (!r.ok) { msg.textContent = r.error || 'It was not connected.'; msg.style.color = '#fca5a5'; return; }
+      msg.textContent = 'Connected.';
+      msg.style.color = '#34d399';
+      setTimeout(function () { window.location.reload(); }, 700);
+    });
+  }
+
+  function rowMessage(btn, text, ok) {
+    const holder = btn.parentElement.querySelector('.rowMsg');
+    if (!holder) return;
+    holder.textContent = text;
+    holder.style.color = ok ? '#34d399' : '#fca5a5';
+  }
+
+  document.querySelectorAll('.btnCred').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      const row = btn.parentElement;
+      const val = row.querySelector('.credVal');
+      const kind = row.querySelector('.credKind');
+      if (!val.value.trim()) { rowMessage(btn, 'Paste the secret first.', false); return; }
+      btn.disabled = true;
+      const r = await call({ action: 'credential.store', integration_id: btn.dataset.id, kind: kind.value, secret: val.value });
+      btn.disabled = false;
+      if (!r.ok) { rowMessage(btn, r.error || 'It was not stored.', false); return; }
+      // Cleared immediately: the value has been encrypted and there is no reason for it to stay in
+      // a form field where a screenshot or a browser autofill can pick it up.
+      val.value = '';
+      rowMessage(btn, 'Stored, ending ' + (r.credential ? r.credential.hint : '') + '.', true);
+    });
+  });
+
+  document.querySelectorAll('.btnHealth').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      const r = await call({ action: 'integration.health', integration_id: btn.dataset.id });
+      btn.disabled = false;
+      if (!r.ok) { rowMessage(btn, r.error || 'The check failed.', false); return; }
+      rowMessage(btn, r.health.status + ': ' + r.health.detail, r.health.status === 'connected');
+    });
+  });
+
+  document.querySelectorAll('.btnToggle').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      const r = await call({ action: 'integration.update', integration_id: btn.dataset.id, enabled: btn.dataset.enabled !== '1' });
+      btn.disabled = false;
+      if (!r.ok) { rowMessage(btn, r.error || 'Nothing changed.', false); return; }
+      window.location.reload();
+    });
+  });
+
+  document.querySelectorAll('.btnDrop').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      const r = await call({ action: 'integration.delete', integration_id: btn.dataset.id });
+      btn.disabled = false;
+      if (!r.ok) { rowMessage(btn, r.error || 'It was not disconnected.', false); return; }
+      window.location.reload();
+    });
+  });
+</script>
+</AdminLayout>

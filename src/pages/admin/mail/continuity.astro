@@ -1,0 +1,497 @@
+---
+// /admin/mail/continuity — the disaster-recovery posture of the mail system, stated honestly.
+//
+// WHAT THIS PAGE IS FOR. Two audiences, one screen. The founder, deciding whether the current
+// arrangement is good enough to keep running on a laptop; and whoever is holding the incident at
+// 2am, who needs the runbook and the decision points without cloning a repository.
+//
+// THE RULE THIS PAGE FOLLOWS, AND WHY IT LOOKS PESSIMISTIC. Every number here is labelled with what
+// it is: measured, intended, or aspired to. A backup set with no restore test says "never" in the
+// same typeface as one that passed yesterday says "verified". That is deliberate. This project has
+// shipped a mail health screen that drew "0 inbound, 0 outbound, last never" over a thrown query —
+// the most alarming state the system can be in, rendered identically to the calmest one. A
+// continuity page is the single easiest place in a codebase to make that mistake again, because
+// every empty table looks like good news.
+//
+// SO: no read on this page fails silently. Each one appends to `readFailures` and the banner lists
+// them. An empty ledger and an unreadable ledger are different facts and are shown differently.
+//
+// NOTHING HERE TOUCHES THE MAIL SYSTEM. No button starts a backup, restores anything, drains a
+// worker or changes DNS. The page reads the ledger that scripts/mailops/* reports into, and the one
+// thing it writes is the RPO/RTO targets — which are a policy preference, not an action.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import {
+  ALL_COMPONENTS,
+  FAILURE_MODES,
+  capabilityStatus,
+  componentLabel,
+  overallState,
+  suppressedClaims,
+  worstLoss,
+  type ComponentId,
+} from '@/lib/mailops/failure-model';
+import { DEFAULT_OBJECTIVES, formatDuration, objectiveStatus, posture, type Measurement } from '@/lib/mailops/objectives';
+import { BACKUP_SETS, applyRetention, artefactProblems, backupPosture, verificationState } from '@/lib/mailops/backup';
+import { RUNBOOKS, decisionPoints, orderedSections } from '@/lib/mailops/runbooks';
+import { MIGRATION_PLANS } from '@/lib/mailops/migration';
+import { SHUTDOWN_CONTRACT } from '@/lib/mailops/drain';
+import { AUTOMATION_POLICY } from '@/lib/mailops/dns-cutover';
+import {
+  listBackupArtefacts,
+  listComponentStatus,
+  listFailedBackupRuns,
+  listMigrationRuns,
+  listObjectiveOverrides,
+  listRestoreTests,
+  setObjective,
+} from '@/lib/mailops/continuity-store';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+// Gated on the same section as the rest of the mail CONFIGURATION screens. The inbox is universal;
+// the infrastructure posture is not — it names hosts, gaps and the places where a single copy of
+// something important lives, which is a disclosure even when every action behind it is read-only.
+const canView = await canAccessSection(user as any, 'settings', 'view');
+if (!canView) return Astro.redirect('/admin');
+const canEdit = await canAccessSection(user as any, 'settings', 'edit');
+
+// Declared before the POST handler that reads them. `const` is not hoisted, and getting this wrong
+// has taken two screens on this project down on their first line while reporting "all checks passed".
+const readFailures: string[] = [];
+let okMsg = '';
+let errorMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const form = await Astro.request.formData();
+  const action = String(form.get('action') || '');
+
+  if (action === 'set-objective') {
+    if (!canEdit) {
+      errorMsg = 'You do not have permission to change recovery targets.';
+    } else {
+      const assetClass = String(form.get('assetClass') || '');
+      const rpoHours = Number(form.get('rpoHours'));
+      const rtoHours = Number(form.get('rtoHours'));
+      if (!DEFAULT_OBJECTIVES.some((o) => o.assetClass === assetClass)) {
+        errorMsg = 'Unknown asset class.';
+      } else if (!Number.isFinite(rpoHours) || !Number.isFinite(rtoHours) || rpoHours < 0 || rtoHours < 0) {
+        errorMsg = 'Targets must be a number of hours, zero or more.';
+      } else {
+        const saved = await setObjective(assetClass as any, Math.round(rpoHours * 3600), Math.round(rtoHours * 3600), user.email || user.id);
+        if (saved.ok) {
+          okMsg = `Target updated for ${assetClass}. Note that changing a target does not change what has been demonstrated — the basis stays as it was.`;
+        } else {
+          errorMsg = `Could not save: ${saved.error}`;
+        }
+      }
+    }
+  }
+}
+
+const [artefactsRead, testsRead, componentsRead, overridesRead, failedRunsRead, migrationsRead] = await Promise.all([
+  listBackupArtefacts(500),
+  listRestoreTests(500),
+  listComponentStatus(),
+  listObjectiveOverrides(),
+  listFailedBackupRuns(10),
+  listMigrationRuns(20),
+]);
+
+if (!artefactsRead.ok) readFailures.push(`Backup artefacts: ${artefactsRead.error}`);
+if (!testsRead.ok) readFailures.push(`Restore tests: ${testsRead.error}`);
+if (!componentsRead.ok) readFailures.push(`Component status: ${componentsRead.error}`);
+if (!overridesRead.ok) readFailures.push(`Recovery targets: ${overridesRead.error}`);
+if (!failedRunsRead.ok) readFailures.push(`Failed backup runs: ${failedRunsRead.error}`);
+if (!migrationsRead.ok) readFailures.push(`Migration runs: ${migrationsRead.error}`);
+
+const artefacts = artefactsRead.data;
+const restoreTests = testsRead.data;
+const componentRows = componentsRead.data.statuses;
+const staleComponents = componentsRead.data.stale;
+const overrides = overridesRead.data;
+
+// -- live state -------------------------------------------------------------
+// A component nobody has reported on is NOT assumed healthy. On a single-laptop deployment silence
+// is the signature of the lid being closed, so anything unreported shows as 'never reported' and is
+// excluded from `down` rather than counted as up — we do not know, and the page says so.
+const reported = new Map(componentRows.map((c) => [c.component, c]));
+const downComponents = componentRows.filter((c) => c.state === 'down').map((c) => c.component) as ComponentId[];
+const unreported = ALL_COMPONENTS.filter((c) => !reported.has(c) && c !== 'redis');
+const capabilities = capabilityStatus(downComponents);
+const systemState = overallState(capabilities);
+const claims = suppressedClaims(downComponents);
+const lossNow = worstLoss(downComponents);
+
+// -- objectives -------------------------------------------------------------
+// A measurement comes from the newest PASSING restore test for that asset class. A failed test is
+// not a measurement of anything except the fact that the restore failed.
+function measurementFor(assetClass: string): Measurement | null {
+  const passing = restoreTests
+    .filter((t) => t.assetClass === assetClass && t.ok && t.finishedAt)
+    .sort((a, b) => Date.parse(b.finishedAt!) - Date.parse(a.finishedAt!));
+  const last = passing[0];
+  if (!last) return null;
+  return {
+    assetClass: assetClass as any,
+    measuredRpoSeconds: last.artefactAgeSeconds,
+    measuredRtoSeconds: last.durationSeconds,
+    at: last.finishedAt,
+    source: 'restore-test',
+  };
+}
+
+const objectives = DEFAULT_OBJECTIVES.map((o) => {
+  const override = overrides[o.assetClass];
+  const effective = override ? { ...o, rpoSeconds: override.rpoSeconds, rtoSeconds: override.rtoSeconds } : o;
+  return { status: objectiveStatus(effective, measurementFor(o.assetClass)), overridden: !!override };
+});
+const objectivePosture = posture(objectives.map((o) => o.status));
+
+// -- backups ----------------------------------------------------------------
+const backupStatuses = BACKUP_SETS.map((set) => {
+  const mine = artefacts.filter((a) => a.assetClass === set.id);
+  const retention = applyRetention(mine, set.retention);
+  const newest = mine.length ? mine.reduce((a, b) => (Date.parse(a.takenAt) > Date.parse(b.takenAt) ? a : b)) : null;
+  return {
+    set,
+    verification: verificationState(set, restoreTests),
+    artefactCount: mine.length,
+    newest,
+    toPrune: retention.filter((d) => !d.keep).length,
+    problems: newest ? artefactProblems(set, newest) : [],
+  };
+});
+const backupSummary = backupPosture(backupStatuses.map((b) => b.verification));
+
+const stateColour = (s: string): string =>
+  s === 'up' || s === 'verified' || s === 'proven' || s === 'protected' || s === 'met' ? '#1f7a4d'
+    : s === 'degraded' || s === 'stale' || s === 'partial' ? '#8a6100'
+      : s === 'unknown' || s === 'unmeasured' ? '#5c5c5c'
+        : '#a32020';
+
+const fmtDate = (iso: string | null): string => (iso ? new Date(iso).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' }) : 'never');
+const fmtBytes = (n: number | null): string => (n == null ? '—' : n < 1024 * 1024 ? `${Math.round(n / 1024)} KB` : `${(n / (1024 * 1024)).toFixed(1)} MB`);
+---
+
+<AdminLayout title="Mail Continuity" activeNav="mail">
+<div class="admin-page" style="max-width:1080px;">
+  <div class="admin-page-header" style="margin-bottom:18px;">
+    <div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">Mail</div>
+      <h1 class="admin-page-title">Continuity, backup and recovery</h1>
+      <p class="admin-page-sub">
+        What happens when each part of the mail system fails, what is backed up, and whether any of it has been proved.
+        <a href="/admin/mail/health" style="color:#FF7040;text-decoration:none;">Mail health</a> &middot;
+        <a href="/admin/mail/settings" style="color:#FF7040;text-decoration:none;">Settings</a>
+      </p>
+    </div>
+  </div>
+
+  {readFailures.length > 0 && (
+    <div class="admin-card" style="border-left:4px solid #a32020;margin-bottom:16px;">
+      <div class="admin-card-title" style="color:#a32020;">Some of this page could not be read</div>
+      <p style="margin:6px 0 8px;font-size:13px;">
+        The sections below are therefore incomplete. An empty table on this page normally means "nothing has been
+        recorded"; right now it may instead mean "we could not look".
+      </p>
+      <ul style="margin:0;padding-left:18px;font-size:13px;">
+        {readFailures.map((f) => <li>{f}</li>)}
+      </ul>
+    </div>
+  )}
+
+  {okMsg && <div class="admin-card" style="border-left:4px solid #1f7a4d;margin-bottom:16px;font-size:13px;">{okMsg}</div>}
+  {errorMsg && <div class="admin-card" style="border-left:4px solid #a32020;margin-bottom:16px;font-size:13px;">{errorMsg}</div>}
+
+  <!-- ---------------------------------------------------------------- -->
+  <!-- 1. Current state                                                  -->
+  <!-- ---------------------------------------------------------------- -->
+  <div class="admin-card" style="margin-bottom:16px;">
+    <div class="admin-card-title">Right now</div>
+    <p style="margin:4px 0 12px;font-size:13px;">
+      <strong style={`color:${stateColour(systemState)};`}>{systemState.toUpperCase()}</strong>
+      {' — '}
+      {downComponents.length === 0
+        ? 'nothing has been reported down.'
+        : `${downComponents.length} component(s) reported down: ${downComponents.map(componentLabel).join(', ')}.`}
+      {lossNow !== 'none' && ` Data-loss exposure while this holds: ${lossNow.replace('_', ' ')}.`}
+    </p>
+
+    {unreported.length > 0 && (
+      <p style="margin:0 0 12px;font-size:13px;color:#8a6100;">
+        {unreported.length} component(s) have never reported at all ({unreported.map(componentLabel).join(', ')}).
+        They are shown as unknown rather than healthy. Nothing polls the mail host today — see the gaps section.
+      </p>
+    )}
+    {staleComponents.length > 0 && (
+      <p style="margin:0 0 12px;font-size:13px;color:#8a6100;">
+        {staleComponents.length} component(s) last reported too long ago to be trusted and are treated as unknown.
+      </p>
+    )}
+
+    <table style="width:100%;border-collapse:collapse;font-size:13px;">
+      <thead><tr style="text-align:left;border-bottom:1px solid #ddd;"><th style="padding:6px 4px;">Capability</th><th style="padding:6px 4px;">State</th><th style="padding:6px 4px;">Why</th></tr></thead>
+      <tbody>
+        {capabilities.map((c) => (
+          <tr style="border-bottom:1px solid #f0f0f0;">
+            <td style="padding:6px 4px;">{c.label}</td>
+            <td style="padding:6px 4px;"><strong style={`color:${stateColour(c.state)};`}>{c.state}</strong></td>
+            <td style="padding:6px 4px;color:#555;">{c.because.length ? c.because.join('; ') : '—'}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+
+    {claims.length > 0 && (
+      <div style="margin-top:14px;padding:10px;background:#fff6f6;border-left:3px solid #a32020;">
+        <strong style="font-size:13px;">Do not display these claims while the current failures hold</strong>
+        <ul style="margin:6px 0 0;padding-left:18px;font-size:13px;">
+          {claims.map((c) => <li><em>{c.mode}:</em> {c.claim}</li>)}
+        </ul>
+      </div>
+    )}
+  </div>
+
+  <!-- ---------------------------------------------------------------- -->
+  <!-- 2. Backups                                                        -->
+  <!-- ---------------------------------------------------------------- -->
+  <div class="admin-card" style="margin-bottom:16px;">
+    <div class="admin-card-title">Backups</div>
+    <p style="margin:4px 0 12px;font-size:13px;">
+      <strong style={`color:${stateColour(backupSummary.state)};`}>{backupSummary.headline}</strong>
+    </p>
+    <p style="margin:0 0 12px;font-size:13px;color:#555;">
+      A backup that has never been restored is not counted as a backup on this page, however many copies exist.
+      Verification also expires — a restore proved against a schema that has since changed proves progressively less.
+    </p>
+
+    <table style="width:100%;border-collapse:collapse;font-size:13px;">
+      <thead><tr style="text-align:left;border-bottom:1px solid #ddd;">
+        <th style="padding:6px 4px;">Set</th><th style="padding:6px 4px;">Copies</th><th style="padding:6px 4px;">Newest</th><th style="padding:6px 4px;">Proof</th>
+      </tr></thead>
+      <tbody>
+        {backupStatuses.map((b) => (
+          <tr style="border-bottom:1px solid #f0f0f0;vertical-align:top;">
+            <td style="padding:6px 4px;">
+              <strong>{b.set.label}</strong>
+              <div style="color:#666;font-size:12px;margin-top:2px;">{b.set.cadence} &middot; encryption {b.set.encryption}</div>
+              <div style="color:#8a6100;font-size:12px;margin-top:4px;">{b.set.today}</div>
+              {b.problems.length > 0 && (
+                <ul style="margin:4px 0 0;padding-left:16px;color:#a32020;font-size:12px;">
+                  {b.problems.map((p) => <li>{p}</li>)}
+                </ul>
+              )}
+            </td>
+            <td style="padding:6px 4px;">{b.artefactCount}{b.toPrune > 0 && <div style="color:#666;font-size:12px;">{b.toPrune} prunable</div>}</td>
+            <td style="padding:6px 4px;">
+              {b.newest ? fmtDate(b.newest.takenAt) : '—'}
+              {b.newest && <div style="color:#666;font-size:12px;">{fmtBytes(b.newest.sizeBytes)}{b.newest.offsite ? ' · offsite' : ' · local only'}</div>}
+            </td>
+            <td style="padding:6px 4px;">
+              <strong style={`color:${stateColour(b.verification.state)};`}>{b.verification.state}</strong>
+              <div style="color:#555;font-size:12px;margin-top:2px;">{b.verification.summary}</div>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+
+    {failedRunsRead.data.length > 0 && (
+      <div style="margin-top:12px;">
+        <strong style="font-size:13px;color:#a32020;">Recent failed backup runs</strong>
+        <ul style="margin:6px 0 0;padding-left:18px;font-size:13px;">
+          {failedRunsRead.data.map((f) => <li>{fmtDate(f.takenAt)} — {f.assetClass}: {f.error}</li>)}
+        </ul>
+      </div>
+    )}
+  </div>
+
+  <!-- ---------------------------------------------------------------- -->
+  <!-- 3. Recovery objectives                                            -->
+  <!-- ---------------------------------------------------------------- -->
+  <div class="admin-card" style="margin-bottom:16px;">
+    <div class="admin-card-title">Recovery objectives (RPO / RTO)</div>
+    <p style="margin:4px 0 12px;font-size:13px;">
+      <strong style={`color:${stateColour(objectivePosture.state)};`}>{objectivePosture.headline}</strong>
+    </p>
+    <p style="margin:0 0 12px;font-size:13px;color:#555;">
+      Targets are editable. The <em>basis</em> is not, because it is a fact about what has been demonstrated rather
+      than a preference — it becomes "measured" when a restore test reports one, and not before.
+    </p>
+
+    {objectives.map(({ status, overridden }) => (
+      <div style="border-top:1px solid #f0f0f0;padding:10px 0;">
+        <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+          <div style="flex:1 1 340px;">
+            <strong style="font-size:13px;">{status.objective.label}</strong>
+            <span style="font-size:12px;color:#666;margin-left:8px;">basis: {status.objective.basis}{overridden ? ' · target overridden' : ''}</span>
+            <div style="font-size:13px;margin-top:4px;">
+              RPO <strong>{formatDuration(status.objective.rpoSeconds)}</strong>
+              <span style={`color:${stateColour(status.rpoState)};margin-left:6px;`}>{status.rpoState}</span>
+              {' · '}
+              RTO <strong>{formatDuration(status.objective.rtoSeconds)}</strong>
+              <span style={`color:${stateColour(status.rtoState)};margin-left:6px;`}>{status.rtoState}</span>
+            </div>
+            <div style="font-size:12px;color:#555;margin-top:4px;">{status.claim}</div>
+            <div style="font-size:12px;color:#666;margin-top:4px;">{status.objective.rationale}</div>
+            {status.objective.toProve && (
+              <div style="font-size:12px;color:#8a6100;margin-top:4px;">To prove it: {status.objective.toProve}</div>
+            )}
+          </div>
+          {canEdit && (
+            <form method="POST" style="flex:0 0 auto;display:flex;gap:6px;align-items:flex-start;">
+              <input type="hidden" name="action" value="set-objective" />
+              <input type="hidden" name="assetClass" value={status.objective.assetClass} />
+              <label style="font-size:12px;">RPO h<br /><input type="number" name="rpoHours" step="0.25" min="0" value={(status.objective.rpoSeconds / 3600).toFixed(2)} style="width:80px;" /></label>
+              <label style="font-size:12px;">RTO h<br /><input type="number" name="rtoHours" step="0.25" min="0" value={(status.objective.rtoSeconds / 3600).toFixed(2)} style="width:80px;" /></label>
+              <button type="submit" style="margin-top:16px;padding:4px 10px;font-size:12px;">Save</button>
+            </form>
+          )}
+        </div>
+      </div>
+    ))}
+  </div>
+
+  <!-- ---------------------------------------------------------------- -->
+  <!-- 4. Failure model                                                  -->
+  <!-- ---------------------------------------------------------------- -->
+  <div class="admin-card" style="margin-bottom:16px;">
+    <div class="admin-card-title">Failure model</div>
+    <p style="margin:4px 0 12px;font-size:13px;color:#555;">
+      What each failure does, what must not be claimed while it holds, and how anyone finds out. The Phase-1 column is
+      the truth on the current single-machine deployment, not a plan.
+    </p>
+    <div style="max-height:520px;overflow:auto;">
+      <table style="width:100%;border-collapse:collapse;font-size:12.5px;">
+        <thead><tr style="text-align:left;border-bottom:1px solid #ddd;position:sticky;top:0;background:#fff;">
+          <th style="padding:6px 4px;">Failure</th><th style="padding:6px 4px;">Expected behaviour</th><th style="padding:6px 4px;">Must not claim</th><th style="padding:6px 4px;">Loss</th>
+        </tr></thead>
+        <tbody>
+          {FAILURE_MODES.map((m) => (
+            <tr style="border-bottom:1px solid #f4f4f4;vertical-align:top;">
+              <td style="padding:6px 4px;width:20%;">
+                <strong>{m.label}</strong>
+                <div style="color:#666;margin-top:3px;">Detection: {m.detection}</div>
+                <div style="color:#8a6100;margin-top:3px;">Today: {m.phase1}</div>
+                {m.runbook && <div style="margin-top:3px;"><a href={`#${m.runbook}`} style="color:#FF7040;text-decoration:none;">runbook</a></div>}
+              </td>
+              <td style="padding:6px 4px;width:35%;color:#333;">{m.expected}</td>
+              <td style="padding:6px 4px;width:30%;color:#a32020;">{m.mustNotClaim}</td>
+              <td style="padding:6px 4px;width:15%;">{m.loss.replace('_', ' ')}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ---------------------------------------------------------------- -->
+  <!-- 5. Runbooks                                                       -->
+  <!-- ---------------------------------------------------------------- -->
+  <div class="admin-card" style="margin-bottom:16px;">
+    <div class="admin-card-title">Runbooks</div>
+    <p style="margin:4px 0 12px;font-size:13px;color:#555;">
+      Six sections each, in the same order, ending in rollback and post-incident actions. Steps marked
+      <strong>FOUNDER DECISION</strong> are the ones that are hard or impossible to undo.
+    </p>
+    {RUNBOOKS.map((rb) => (
+      <details id={rb.id} style="border-top:1px solid #f0f0f0;padding:8px 0;">
+        <summary style="cursor:pointer;font-size:13px;">
+          <strong>{rb.title}</strong>
+          <span style="color:#666;margin-left:8px;">~{rb.expectedMinutes} min · {decisionPoints(rb).length} decision point(s)</span>
+        </summary>
+        <p style="margin:8px 0;font-size:13px;"><em>Trigger:</em> {rb.trigger}</p>
+        <p style="margin:8px 0;padding:8px;background:#f7f7f5;font-size:13px;">{rb.keyFact}</p>
+        {orderedSections(rb).map((sec) => (
+          <div style="margin:10px 0;">
+            <strong style="font-size:12.5px;text-transform:uppercase;letter-spacing:0.04em;color:#444;">{sec.label}</strong>
+            <ol style="margin:6px 0 0;padding-left:20px;font-size:13px;">
+              {sec.steps.map((step) => (
+                <li style="margin-bottom:6px;">
+                  {step.decision && <strong style="color:#a32020;">[FOUNDER DECISION] </strong>}
+                  {step.do}
+                  {step.command && <div style="font-family:ui-monospace,monospace;font-size:12px;background:#f4f4f2;padding:4px 6px;margin-top:3px;overflow-x:auto;">{step.command}</div>}
+                  {step.why && <div style="color:#666;font-size:12px;margin-top:3px;">Why: {step.why}</div>}
+                </li>
+              ))}
+            </ol>
+          </div>
+        ))}
+      </details>
+    ))}
+  </div>
+
+  <!-- ---------------------------------------------------------------- -->
+  <!-- 6. Migration readiness                                            -->
+  <!-- ---------------------------------------------------------------- -->
+  <div class="admin-card" style="margin-bottom:16px;">
+    <div class="admin-card-title">Migration paths</div>
+    <p style="margin:4px 0 12px;font-size:13px;color:#555;">
+      Each of these ends in a verification gate. Cutover is refused while a gated entity count does not match, and the
+      original is not destroyed until verification has passed, the soak has elapsed and somebody has typed its name.
+    </p>
+    <table style="width:100%;border-collapse:collapse;font-size:13px;">
+      <thead><tr style="text-align:left;border-bottom:1px solid #ddd;">
+        <th style="padding:6px 4px;">Migration</th><th style="padding:6px 4px;">Principal risk</th><th style="padding:6px 4px;">Gated on</th><th style="padding:6px 4px;">Soak</th><th style="padding:6px 4px;">Status</th>
+      </tr></thead>
+      <tbody>
+        {MIGRATION_PLANS.map((p) => {
+          const run = migrationsRead.data.find((r) => r.migrationId === p.id);
+          return (
+            <tr style="border-bottom:1px solid #f0f0f0;vertical-align:top;">
+              <td style="padding:6px 4px;"><strong>{p.title}</strong><div style="color:#666;font-size:12px;margin-top:2px;">{p.moving}</div></td>
+              <td style="padding:6px 4px;color:#555;">{p.principalRisk}</td>
+              <td style="padding:6px 4px;color:#555;">{p.gateEntities.join(', ')}</td>
+              <td style="padding:6px 4px;">{p.soakDays} d</td>
+              <td style="padding:6px 4px;">
+                {run ? (<><strong>{run.status}</strong><div style="color:#666;font-size:12px;">{run.verified ? 'verified' : 'not verified'} · {fmtDate(run.updatedAt)}</div></>) : <span style="color:#666;">not started</span>}
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+    <p style="margin:12px 0 0;font-size:12px;color:#8a6100;">{AUTOMATION_POLICY}</p>
+  </div>
+
+  <!-- ---------------------------------------------------------------- -->
+  <!-- 7. Shutdown contract                                              -->
+  <!-- ---------------------------------------------------------------- -->
+  <div class="admin-card" style="margin-bottom:16px;">
+    <div class="admin-card-title">Worker shutdown contract</div>
+    <p style="margin:4px 0 10px;font-size:13px;color:#555;">
+      What a deploy or a restart must do to avoid duplicating mail. Readiness goes false first and liveness stays true —
+      a draining worker is doing its job, and a liveness probe that fails during a drain gets it killed mid-delivery.
+    </p>
+    <ol style="margin:0;padding-left:20px;font-size:13px;">
+      {SHUTDOWN_CONTRACT.map((s) => <li style="margin-bottom:4px;"><strong>{s.step}.</strong> {s.rule}</li>)}
+    </ol>
+  </div>
+
+  <!-- ---------------------------------------------------------------- -->
+  <!-- 8. What is not in place                                           -->
+  <!-- ---------------------------------------------------------------- -->
+  <div class="admin-card" style="border-left:4px solid #8a6100;">
+    <div class="admin-card-title">Not yet in place</div>
+    <p style="margin:4px 0 10px;font-size:13px;">
+      Read this before assuming any protection above exists. Every item here is absent today, not merely imperfect.
+    </p>
+    <ul style="margin:0;padding-left:18px;font-size:13px;">
+      <li><strong>Nothing polls the mail host.</strong> Every failure in the model above is currently detected by a person noticing.</li>
+      <li><strong>No scheduled database backup.</strong> Dumps are taken by hand, so the real RPO is "since somebody last remembered".</li>
+      <li><strong>The maildir tree is not backed up at all.</strong> Losing the host disk loses the IMAP copy of every message.</li>
+      <li><strong>DKIM private keys have one copy, unencrypted, on one disk.</strong> Losing them costs a DNS change and days of deliverability; leaking them lets a stranger sign mail as this domain.</li>
+      <li><strong>No object-storage versioning and no second bucket.</strong> There is exactly one copy of every attachment.</li>
+      <li><strong>No restore has ever been performed.</strong> Until one has, every RPO and RTO on this page is a target rather than a capability.</li>
+      <li><strong>The inbound MX is one laptop.</strong> This is the single largest availability risk in the system, and the fix is Phase 2 rather than any configuration change.</li>
+    </ul>
+    <p style="margin:10px 0 0;font-size:13px;">
+      The full write-up, including the phase plan and the tests that have and have not been run, is in
+      <code style="font-size:12px;">docs/mail/HA-DR.md</code>.
+    </p>
+  </div>
+</div>
+</AdminLayout>

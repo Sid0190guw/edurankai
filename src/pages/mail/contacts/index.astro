@@ -1,0 +1,286 @@
+---
+/**
+ * /mail/contacts — the audience list.
+ *
+ * BUILT FOR A TABLE THAT DOES NOT FIT IN A BROWSER. Every rule this screen follows:
+ *   - the first page is server-rendered (fast first paint), further pages arrive by keyset cursor
+ *   - the total is counted ONCE, on the first request, never per scroll
+ *   - filtering and searching happen in Postgres; nothing is filtered client-side
+ *   - bulk actions take explicit ids, never "everything matching this filter" — that is one
+ *     mis-click away from unsubscribing a whole database, and the dialog would be describing a set
+ *     nobody can see
+ *   - export streams from a separate route and never passes through this page
+ */
+import MailShell from '@/components/mail/MailShell.astro';
+import MailIcon from '@/components/mail/MailIcon.astro';
+import { canUseMailbox } from '@/lib/auth/mail-access';
+import { listContacts, listLists, listSegments, listCustomFields } from '@/lib/mail-product/contacts';
+import { audienceTotals } from '@/lib/mail-product/analytics';
+import { CONTACT_STATUSES } from '@/lib/mail-product/schema';
+import { num, initials, avatarColour, timeAgo, reasonOf, str } from '@/lib/mail-product/common';
+
+const user = Astro.locals.user;
+const access = await canUseMailbox(user as any);
+const url = new URL(Astro.request.url);
+
+const q = str(url.searchParams.get('q'), 120);
+const status = url.searchParams.get('status') || 'all';
+const listId = url.searchParams.get('listId');
+const segmentId = url.searchParams.get('segmentId');
+const tag = str(url.searchParams.get('tag'), 60);
+
+let page: any = { rows: [], nextCursor: null, total: 0 };
+let lists: any[] = [];
+let segments: any[] = [];
+let fields: any[] = [];
+let totals: Record<string, number> = {};
+let error = '';
+
+if (access.allowed) {
+  try {
+    const [p, l, s, f, t] = await Promise.all([
+      listContacts({ q: q || undefined, status: status as any, listId, segmentId, tag: tag || undefined, limit: 50, withTotal: true }),
+      listLists().catch(() => []),
+      listSegments().catch(() => []),
+      listCustomFields().catch(() => []),
+      audienceTotals().catch(() => ({} as Record<string, number>)),
+    ]);
+    page = p; lists = l; segments = s; fields = f; totals = t;
+  } catch (e: any) {
+    error = reasonOf(e);
+    console.error('[mail/contacts] read failed:', error);
+  }
+}
+
+const filtering = !!(q || (status && status !== 'all') || listId || segmentId || tag);
+const activeList = lists.find((l) => l.id === listId);
+const activeSegment = segments.find((s) => s.id === segmentId);
+const scope = activeList ? activeList.name : activeSegment ? activeSegment.name : 'All contacts';
+
+const STATUS_TONE: Record<string, string> = {
+  subscribed: 'ok', unconfirmed: 'warn', unsubscribed: '', bounced: 'bad', complained: 'bad',
+};
+
+/** Carry the current filter into a link. Otherwise "next page" quietly drops the filter. */
+function withParam(k: string, v: string | null): string {
+  const u = new URL(url.href);
+  if (v === null || v === '') u.searchParams.delete(k); else u.searchParams.set(k, v);
+  u.searchParams.delete('cursor');
+  return u.pathname + (u.search || '');
+}
+---
+<MailShell title="Contacts" active="contacts" subtitle={scope}>
+  <a slot="actions" class="em-btn" href="/mail/contacts/import"><MailIcon name="upload" size={15} /> Import</a>
+  <button slot="actions" type="button" class="em-btn" data-ct-export><MailIcon name="download" size={15} /> Export</button>
+  <button slot="actions" type="button" class="em-btn pri" data-ct-new><MailIcon name="plus" size={15} /> Add contact</button>
+
+  <div class="em-wrap em-stack" id="ctRoot"
+       data-filter={JSON.stringify({ q, status, listId, segmentId, tag })}>
+
+    {error && (
+      <div class="em-alert bad">
+        <MailIcon name="warning" size={16} />
+        <p><strong>The contact list could not be read.</strong> It is empty here for a reason that is not
+          &ldquo;no contacts&rdquo;, and nothing has been changed. {error}</p>
+      </div>
+    )}
+
+    <div class="em-grid c4">
+      <div class="em-stat"><p class="em-stat-k">Total</p><p class="em-stat-v">{num(totals.total || 0)}</p></div>
+      <div class="em-stat"><p class="em-stat-k">Subscribed</p><p class="em-stat-v">{num(totals.subscribed || 0)}</p>
+        <p class="em-stat-d">the only people a campaign can reach</p></div>
+      <div class="em-stat"><p class="em-stat-k">Unsubscribed</p><p class="em-stat-v">{num(totals.unsubscribed || 0)}</p>
+        <p class="em-stat-d">never re-added by an import</p></div>
+      <div class="em-stat"><p class="em-stat-k">Bounced or complained</p>
+        <p class="em-stat-v">{num((totals.bounced || 0) + (totals.complained || 0))}</p>
+        <p class="em-stat-d">suppressed to protect the sending domain</p></div>
+    </div>
+
+    <div class="em-card">
+      <div class="em-card-head">
+        <form class="em-search" role="search" method="get" style="flex:1;max-width:340px">
+          <MailIcon name="search" size={15} />
+          <input type="search" name="q" value={q} placeholder="Search name or address" aria-label="Search contacts" />
+          {status !== 'all' && <input type="hidden" name="status" value={status} />}
+          {listId && <input type="hidden" name="listId" value={listId} />}
+          {segmentId && <input type="hidden" name="segmentId" value={segmentId} />}
+        </form>
+
+        <div class="em-seg" role="group" aria-label="Filter by status">
+          <a href={withParam('status', null)} aria-current={status === 'all' ? 'true' : undefined}>All</a>
+          {CONTACT_STATUSES.map((s) => (
+            <a href={withParam('status', s)} aria-current={status === s ? 'true' : undefined}>
+              {s.charAt(0).toUpperCase() + s.slice(1)}
+            </a>
+          ))}
+        </div>
+
+        <div class="em-row tight em-push">
+          <label class="em-label" for="ctList" style="margin:0">List</label>
+          <select class="em-select" id="ctList" style="width:auto;min-width:150px" onchange="location.href=this.value">
+            <option value={withParam('listId', null)} selected={!listId}>Every list</option>
+            {lists.map((l) => (
+              <option value={withParam('listId', l.id)} selected={listId === l.id}>{l.name} ({num(l.member_count)})</option>
+            ))}
+          </select>
+          <select class="em-select" aria-label="Segment" style="width:auto;min-width:150px" onchange="location.href=this.value">
+            <option value={withParam('segmentId', null)} selected={!segmentId}>No segment</option>
+            {segments.map((s) => (
+              <option value={withParam('segmentId', s.id)} selected={segmentId === s.id}>{s.name}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      <div class="em-bulkbar" data-ct-bulk hidden>
+        <span data-ct-count class="em-h3" style="margin:0" aria-live="polite">0 selected</span>
+        <button type="button" class="em-btn sm" data-ct-bulk-act="bulk-list">Add to list</button>
+        <button type="button" class="em-btn sm" data-ct-bulk-act="bulk-tag">Tag</button>
+        <button type="button" class="em-btn sm" data-ct-bulk-act="unsubscribe">Unsubscribe</button>
+        <button type="button" class="em-btn ghost sm em-push" data-ct-bulk-clear>Clear</button>
+      </div>
+
+      {page.rows.length === 0 ? (
+        <div class="em-empty">
+          <MailIcon name="contacts" size={36} strokeWidth={1.3} />
+          <h3>{filtering ? 'No contacts match that' : 'No contacts yet'}</h3>
+          <p>
+            {filtering
+              ? 'Try a different search, or clear the filters. Segments match the audience as it is now, so a rule that matched yesterday may match nobody today.'
+              : 'A contact is one person and one address. Import a CSV, or add the first one by hand.'}
+          </p>
+          {filtering
+            ? <a class="em-btn" href="/mail/contacts">Clear filters</a>
+            : (
+              <span class="em-row" style="justify-content:center">
+                <a class="em-btn pri" href="/mail/contacts/import"><MailIcon name="upload" size={15} /> Import a CSV</a>
+                <button type="button" class="em-btn" data-ct-new>Add one by hand</button>
+              </span>
+            )}
+        </div>
+      ) : (
+        <>
+          <div class="em-card-body flush">
+            <div class="em-tablewrap">
+              <table class="em-table">
+                <thead>
+                  <tr>
+                    <th scope="col" class="pick">
+                      <input type="checkbox" data-ct-all aria-label="Select every contact on this page" />
+                    </th>
+                    <th scope="col">Contact</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Tags</th>
+                    <th scope="col">Added</th>
+                    <th scope="col"><span class="em-sr-only">Actions</span></th>
+                  </tr>
+                </thead>
+                <tbody data-ct-body>
+                  {page.rows.map((c: any) => (
+                    <tr data-id={c.id}>
+                      <td class="pick"><input type="checkbox" data-ct-pick value={c.id} aria-label={`Select ${c.email}`} /></td>
+                      <td>
+                        <span class="em-row tight" style="flex-wrap:nowrap">
+                          <span class="em-avatar sm" aria-hidden="true" style={`background:${avatarColour(c.email)}`}>
+                            {initials([c.first_name, c.last_name].filter(Boolean).join(' '), c.email)}
+                          </span>
+                          <span style="min-width:0">
+                            <a href={`/mail/contacts/${c.id}`}>{[c.first_name, c.last_name].filter(Boolean).join(' ') || c.email}</a>
+                            <div class="em-note em-mono">{c.email}</div>
+                          </span>
+                        </span>
+                      </td>
+                      <td><span class={'em-badge ' + (STATUS_TONE[c.status] || '')}>{c.status}</span></td>
+                      <td>
+                        {(c.tags || []).slice(0, 3).map((t: string) => (
+                          <a class="em-badge" href={withParam('tag', t)} style="text-decoration:none;margin-inline-end:4px">{t}</a>
+                        ))}
+                        {(c.tags || []).length > 3 && <span class="em-note">+{c.tags.length - 3}</span>}
+                      </td>
+                      <td><span class="em-note" title={c.created_at}>{timeAgo(c.created_at)}</span></td>
+                      <td><a class="em-btn ghost sm" href={`/mail/contacts/${c.id}`}>Open</a></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="em-card-foot">
+            <span class="em-note" data-ct-shown>
+              Showing {num(page.rows.length)} of {page.total === null ? 'many' : num(page.total)}
+            </span>
+            {page.nextCursor && (
+              <button type="button" class="em-btn sm em-push" data-ct-more data-cursor={page.nextCursor}>
+                Load 50 more
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+
+    <p class="em-note">
+      Lists and segments are managed on <a href="/mail/contacts/lists">Lists &amp; segments</a>.
+      {fields.length > 0 && <> Custom fields available as variables: {fields.map((f) => `{{${f.key}}}`).join(', ')}.</>}
+    </p>
+  </div>
+
+  <!-- Add / edit contact -->
+  <div class="em-modal" id="ctModal" hidden>
+    <div class="em-modal-card" role="dialog" aria-modal="true" aria-labelledby="ctModalTitle">
+      <div class="em-modal-head"><h2 id="ctModalTitle">Add a contact</h2></div>
+      <div class="em-modal-body">
+        <div class="em-alert bad" data-ct-error hidden><p></p></div>
+        <label class="em-field">
+          <span class="em-label">Email address <span class="req">*</span></span>
+          <input class="em-input" id="ctEmail" type="email" data-autofocus autocomplete="off" />
+          <span class="em-hint">If this address already exists, its details are updated — a duplicate is never created.</span>
+        </label>
+        <div class="em-grid c2">
+          <label class="em-field"><span class="em-label">First name</span><input class="em-input" id="ctFirst" /></label>
+          <label class="em-field"><span class="em-label">Last name</span><input class="em-input" id="ctLast" /></label>
+        </div>
+        <label class="em-field">
+          <span class="em-label">Tags</span>
+          <input class="em-input" id="ctTags" placeholder="comma, separated" />
+        </label>
+        {lists.length > 0 && (
+          <fieldset class="em-field" style="border:none;padding:0;margin-bottom:16px">
+            <legend class="em-label">Add to lists</legend>
+            <div class="em-row">
+              {lists.map((l) => (
+                <label class="em-check"><input type="checkbox" data-ct-listpick value={l.id} /> {l.name}</label>
+              ))}
+            </div>
+          </fieldset>
+        )}
+        {fields.length > 0 && (
+          <fieldset style="border:none;padding:0">
+            <legend class="em-label">Custom fields</legend>
+            {fields.map((f) => (
+              <label class="em-field">
+                <span class="em-label" style="font-weight:550">{f.label} <code class="em-mono">{`{{${f.key}}}`}</code></span>
+                <input class="em-input" data-ct-field={f.key} type={f.kind === 'number' ? 'number' : f.kind === 'date' ? 'date' : 'text'} />
+              </label>
+            ))}
+          </fieldset>
+        )}
+      </div>
+      <div class="em-modal-foot">
+        <button type="button" class="em-btn pri" data-ct-save>Save contact</button>
+        <button type="button" class="em-btn ghost" data-ct-cancel>Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="application/json" id="ctLists" set:html={JSON.stringify(lists.map((l) => ({ id: l.id, name: l.name })))}></script>
+  <script src="/mail/contacts.js" is:inline defer></script>
+</MailShell>
+
+<style>
+  .em-bulkbar { display: flex; align-items: center; gap: var(--em-2); padding: var(--em-3) var(--em-5);
+    background: var(--em-accent-soft); border-bottom: 1px solid var(--em-line); flex-wrap: wrap; }
+  .em-bulkbar[hidden] { display: none; }
+  .em-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
+</style>

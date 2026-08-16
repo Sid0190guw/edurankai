@@ -1,0 +1,387 @@
+---
+// /admin/mail/event-bus — the facts, the rules that interpret them, and what each fact caused.
+//
+// Sections 3, 8 and 10 of the integration brief. Three questions this page exists to answer, in the
+// order somebody actually asks them:
+//
+//   1. Did the fact arrive?                  the event stream
+//   2. What did it cause, and why?           the route runs on each event, including the routes that
+//                                            MATCHED and were held back, with the reason
+//   3. What stopped working, and can I fix it? the dead-letter list, replayable
+//
+// The second one is the point. Without it, "why did that candidate get that message?" is answered by
+// reading code and guessing.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { ensureMailIntSchema, rows, dbReason } from '@/lib/mailint/schema';
+import { CANONICAL_EVENTS, EVENT_CHANNELS } from '@/lib/mailint/events';
+import { getOrCreateOrg } from '@/lib/mailint/router';
+
+export const prerender = false;
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+const mayView = await canAccessSection(user, 'settings', 'view');
+if (!mayView) return Astro.redirect('/admin?denied=settings');
+
+const readFailures: string[] = [];
+await ensureMailIntSchema().catch((e: any) => readFailures.push('Schema bootstrap: ' + dbReason(e)));
+
+const environment = (Astro.url.searchParams.get('env') === 'production') ? 'production' : 'development';
+const orgSlugParam = Astro.url.searchParams.get('org') || 'careers';
+
+let orgs: any[] = [];
+try {
+  orgs = rows(await db.execute(sql`SELECT id, slug, name FROM mailapi_orgs ORDER BY created_at ASC LIMIT 50`));
+} catch (e: any) {
+  readFailures.push('Organisations: ' + dbReason(e));
+}
+if (!orgs.length && !readFailures.length) {
+  const seeded = await getOrCreateOrg('careers', 'EduRankAI Careers');
+  if (seeded) orgs = [{ id: seeded.id, slug: seeded.slug, name: seeded.name }];
+}
+const org = orgs.find((o: any) => o.slug === orgSlugParam) || orgs[0] || null;
+
+let events: any[] = [];
+let runs: any[] = [];
+let routes: any[] = [];
+let dead: any[] = [];
+let scheduled: any[] = [];
+
+if (org) {
+  try {
+    events = rows(await db.execute(sql`
+      SELECT id, event_type, source, entity_type, entity_id, payload, idempotency_key, occurred_at, created_at
+      FROM mailint_events
+      WHERE org_id = ${String(org.id)}::uuid AND environment = ${environment}
+      ORDER BY occurred_at DESC LIMIT 30
+    `));
+  } catch (e: any) { readFailures.push('Event stream: ' + dbReason(e)); }
+
+  try {
+    runs = rows(await db.execute(sql`
+      SELECT event_id, route_name, action, status, detail, duration_ms, created_at
+      FROM mailint_route_runs
+      WHERE org_id = ${String(org.id)}::uuid AND environment = ${environment}
+      ORDER BY created_at DESC LIMIT 200
+    `));
+  } catch (e: any) { readFailures.push('Route runs: ' + dbReason(e)); }
+
+  try {
+    routes = rows(await db.execute(sql`
+      SELECT id, name, event_pattern, action, config, conditions, is_active, priority, stop_on_match
+      FROM mailint_routes
+      WHERE org_id = ${String(org.id)}::uuid AND environment = ${environment}
+      ORDER BY priority ASC, name ASC LIMIT 100
+    `));
+  } catch (e: any) { readFailures.push('Routes: ' + dbReason(e)); }
+
+  try {
+    dead = rows(await db.execute(sql`
+      SELECT id, kind, event_type, attempts, last_error, last_failed_at, resolved_at
+      FROM mailint_dead_letter
+      WHERE org_id = ${String(org.id)}::uuid AND environment = ${environment} AND resolved_at IS NULL
+      ORDER BY last_failed_at DESC LIMIT 25
+    `));
+  } catch (e: any) { readFailures.push('Dead letters: ' + dbReason(e)); }
+
+  try {
+    scheduled = rows(await db.execute(sql`
+      SELECT id, workflow_key, step_index, status, run_at, attempts, last_error
+      FROM mailint_scheduled_actions
+      WHERE org_id = ${String(org.id)}::uuid AND environment = ${environment} AND status = 'pending'
+      ORDER BY run_at ASC LIMIT 25
+    `));
+  } catch (e: any) { readFailures.push('Scheduled steps: ' + dbReason(e)); }
+}
+
+function runsFor(eventId: string): any[] {
+  return runs.filter((r: any) => String(r.event_id) === String(eventId));
+}
+function fmt(d: any): string {
+  if (!d) return '';
+  try { return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); }
+  catch { return ''; }
+}
+const eventTypes = CANONICAL_EVENTS.map((e) => e.type);
+---
+
+<AdminLayout title="Event Bus" activeNav="mail">
+<div class="admin-page" style="max-width:1180px;">
+  <div class="admin-page-header" style="margin-bottom:16px;">
+    <div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">Mail &middot; Integrations</div>
+      <h1 class="admin-page-title">Event bus</h1>
+      <p class="admin-page-sub">
+        What the platform was told, what it did about it, and what is still owed.
+        <a href="/admin/mail/integrations" style="color:#FF7040;text-decoration:none;">Integrations</a> &middot;
+        <a href="/admin/mail/webhooks" style="color:#FF7040;text-decoration:none;">Webhook console</a>
+      </p>
+    </div>
+  </div>
+
+  {readFailures.length > 0 && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;margin-bottom:18px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fca5a5;margin:0 0 6px;">Part of this page could not be read, so an empty list below is not evidence of a quiet bus.</p>
+      <ul style="font-size:11.5px;color:#fca5a5;margin:0;padding-left:18px;line-height:1.7;font-family:'Geist Mono',monospace;">
+        {readFailures.map((f: string) => <li>{f}</li>)}
+      </ul>
+    </div>
+  )}
+
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:18px;">
+    <div style="display:flex;gap:4px;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:4px;">
+      <a href={'/admin/mail/event-bus?env=development&org=' + (org ? org.slug : '')}
+         style={'font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:7px;text-decoration:none;' + (environment === 'development' ? 'background:#FF4F00;color:#fff;' : 'color:#9aa6b6;')}>Development</a>
+      <a href={'/admin/mail/event-bus?env=production&org=' + (org ? org.slug : '')}
+         style={'font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:7px;text-decoration:none;' + (environment === 'production' ? 'background:#FF4F00;color:#fff;' : 'color:#9aa6b6;')}>Production</a>
+    </div>
+    <select id="orgPicker" style="background:#0f0f14;border:1px solid #1a1a1f;color:#fff;font-size:12px;padding:8px 12px;border-radius:8px;">
+      {orgs.map((o: any) => <option value={o.slug} selected={org && o.slug === org.slug}>{o.name}</option>)}
+    </select>
+    <button id="btnDispatch" type="button" style="background:#1a1a1f;color:#d8d8de;border:1px solid #2a2a2f;font-size:11.5px;font-weight:700;padding:8px 16px;border-radius:8px;cursor:pointer;margin-left:auto;">Run dispatcher now</button>
+    <span id="dispatchMsg" style="font-size:11.5px;"></span>
+  </div>
+
+  <!-- Routes -->
+  <div class="admin-card" style="margin-bottom:18px;">
+    <div class="admin-card-title" style="margin-bottom:4px;">Routes ({routes.length})</div>
+    <p style="font-size:11.5px;color:#8a8a94;margin:0 0 12px;line-height:1.6;">
+      A route maps an event pattern onto one of the five channels. Webhook endpoints do not need a route — an endpoint subscribes to events directly.
+      Patterns: <code style="font-family:'Geist Mono',monospace;color:#FF7040;">application.*</code> matches everything about applications, however deep;
+      <code style="font-family:'Geist Mono',monospace;color:#FF7040;">*</code> matches everything.
+    </p>
+
+    {routes.map((r: any) => (
+      <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:10px;padding:10px 14px;margin-bottom:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+        <span style={'width:8px;height:8px;border-radius:50%;flex-shrink:0;background:' + (r.is_active ? '#34d399' : '#6e6e78') + ';'}></span>
+        <strong style="font-size:12.5px;color:#fff;">{r.name}</strong>
+        <code style="font-family:'Geist Mono',monospace;font-size:11px;color:#FF7040;">{r.event_pattern}</code>
+        <span style="font-size:11px;color:#9aa6b6;">&rarr;</span>
+        <span style="font-size:11px;font-weight:700;color:#d8d8de;font-family:'Geist Mono',monospace;">{r.action}</span>
+        <span style="font-size:10.5px;color:#6e6e78;font-family:'Geist Mono',monospace;">priority {r.priority}</span>
+        <div style="margin-left:auto;display:flex;gap:6px;">
+          <button type="button" class="btnRouteToggle" data-id={r.id} data-active={r.is_active ? '1' : '0'} style="background:#1a1a1f;color:#9aa6b6;border:1px solid #2a2a2f;font-size:10.5px;font-weight:700;padding:4px 10px;border-radius:5px;cursor:pointer;">{r.is_active ? 'Pause' : 'Activate'}</button>
+          <button type="button" class="btnRouteDelete" data-id={r.id} style="background:#1a1a1f;color:#f87171;border:1px solid rgba(248,113,113,0.35);font-size:10.5px;font-weight:700;padding:4px 10px;border-radius:5px;cursor:pointer;">Delete</button>
+        </div>
+      </div>
+    ))}
+    {routes.length === 0 && readFailures.length === 0 && (
+      <p style="font-size:12px;color:#8a8a94;margin:0 0 12px;">No route is configured. Events are still stored, and webhook endpoints still receive what they subscribed to.</p>
+    )}
+
+    <details style="margin-top:10px;">
+      <summary style="font-size:12px;color:#FF7040;cursor:pointer;font-weight:700;">Add a route</summary>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-top:10px;">
+        <input id="rName" type="text" placeholder="Name" style="background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12px;padding:8px 10px;border-radius:7px;" />
+        <input id="rPattern" list="eventList" type="text" placeholder="application.stage.changed" style="background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12px;padding:8px 10px;border-radius:7px;font-family:'Geist Mono',monospace;" />
+        <datalist id="eventList">
+          {eventTypes.map((t: string) => <option value={t}></option>)}
+        </datalist>
+        <select id="rAction" style="background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12px;padding:8px 10px;border-radius:7px;">
+          {EVENT_CHANNELS.map((c: string) => <option value={c}>{c}</option>)}
+        </select>
+      </div>
+      <textarea id="rConfig" rows="5" placeholder='{"to":"$.email","subject":"You have reached {{stage_label}}","html":"<p>Hello {{name}}</p>"}'
+                style="width:100%;margin-top:8px;background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:11.5px;padding:8px 10px;border-radius:7px;font-family:'Geist Mono',monospace;"></textarea>
+      <p style="font-size:11px;color:#8a8a94;margin:6px 0 8px;line-height:1.6;">
+        Configuration is JSON. An <strong>email</strong> route needs <code style="font-family:'Geist Mono',monospace;color:#FF7040;">to</code> (a payload path such as $.email) and either a
+        <code style="font-family:'Geist Mono',monospace;color:#FF7040;">template</code> key or an inline <code style="font-family:'Geist Mono',monospace;color:#FF7040;">subject</code> and
+        <code style="font-family:'Geist Mono',monospace;color:#FF7040;">html</code>. A <strong>workflow</strong> route needs
+        <code style="font-family:'Geist Mono',monospace;color:#FF7040;">workflowKey</code> and <code style="font-family:'Geist Mono',monospace;color:#FF7040;">steps</code>, each with
+        <code style="font-family:'Geist Mono',monospace;color:#FF7040;">delayMinutes</code>. Merge fields use the event payload: {'{{name}}'}, {'{{stage_label}}'}.
+        In the development environment an email route renders and reports; it does not send.
+      </p>
+      <button id="btnRouteSave" type="button" style="background:#FF4F00;color:#fff;border:none;font-size:12px;font-weight:700;padding:8px 18px;border-radius:7px;cursor:pointer;">Save route</button>
+      <span id="routeMsg" style="font-size:11.5px;margin-left:10px;"></span>
+    </details>
+  </div>
+
+  <!-- Publish a test event -->
+  <div class="admin-card" style="margin-bottom:18px;">
+    <div class="admin-card-title" style="margin-bottom:4px;">Publish a test event</div>
+    <p style="font-size:11.5px;color:#8a8a94;margin:0 0 10px;line-height:1.6;">
+      Publishes a synthetic event with obviously fake values onto the real bus, so routes, webhook subscriptions and de-duplication can be exercised end to end.
+      Publish it twice: the second is reported as a duplicate and causes nothing.
+    </p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <select id="pubType" style="background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12px;padding:8px 12px;border-radius:7px;font-family:'Geist Mono',monospace;min-width:260px;">
+        {eventTypes.map((t: string) => <option value={t}>{t}</option>)}
+      </select>
+      <button id="btnPublish" type="button" style="background:#FF4F00;color:#fff;border:none;font-size:12px;font-weight:700;padding:8px 18px;border-radius:7px;cursor:pointer;">Publish</button>
+    </div>
+    <pre id="pubResult" style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;font-family:'Geist Mono',monospace;font-size:11px;color:#d8d8de;overflow-x:auto;max-height:220px;margin:10px 0 0;display:none;"></pre>
+  </div>
+
+  <!-- Owed work -->
+  {(dead.length > 0 || scheduled.length > 0) && (
+    <div class="admin-card" style="margin-bottom:18px;">
+      <div class="admin-card-title" style="margin-bottom:10px;">Owed work</div>
+      {scheduled.length > 0 && (
+        <div style="margin-bottom:12px;">
+          <p style="font-size:11px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 6px;">Scheduled steps ({scheduled.length})</p>
+          {scheduled.map((s: any) => (
+            <p style="font-size:11.5px;color:#d8d8de;margin:0 0 4px;font-family:'Geist Mono',monospace;">
+              {s.workflow_key} step {s.step_index} &middot; runs {fmt(s.run_at)} &middot; attempts {s.attempts}
+              {s.last_error && <span style="color:#fca5a5;"> &middot; {s.last_error}</span>}
+            </p>
+          ))}
+        </div>
+      )}
+      {dead.length > 0 && (
+        <div>
+          <p style="font-size:11px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 6px;">Dead letters ({dead.length})</p>
+          {dead.map((d: any) => (
+            <p style="font-size:11.5px;color:#fca5a5;margin:0 0 4px;font-family:'Geist Mono',monospace;">
+              {d.kind} &middot; {d.event_type} &middot; {d.attempts} attempts &middot; {fmt(d.last_failed_at)} &middot; {d.last_error}
+            </p>
+          ))}
+          <p style="font-size:11px;color:#8a8a94;margin:8px 0 0;line-height:1.6;">
+            Failed webhook deliveries are replayed from the <a href="/admin/mail/webhooks" style="color:#FF7040;text-decoration:none;">webhook console</a>. These entries are the other kinds: scheduled steps and inbound events.
+          </p>
+        </div>
+      )}
+    </div>
+  )}
+
+  <!-- Event stream -->
+  <div class="admin-card">
+    <div class="admin-card-title" style="margin-bottom:10px;">Recent events ({events.length})</div>
+    {events.length === 0 && readFailures.length === 0 && (
+      <p style="font-size:12px;color:#8a8a94;margin:0;">Nothing has been published in the {environment} environment yet.</p>
+    )}
+    {events.map((e: any) => {
+      const caused = runsFor(String(e.id));
+      return (
+        <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:10px;padding:11px 14px;margin-bottom:8px;">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <code style="font-family:'Geist Mono',monospace;font-size:12px;color:#FF7040;">{e.event_type}</code>
+            <span style="font-size:10.5px;color:#8a8a94;font-family:'Geist Mono',monospace;">{e.source}</span>
+            {e.entity_id && <span style="font-size:10.5px;color:#6e6e78;font-family:'Geist Mono',monospace;">{e.entity_type}:{String(e.entity_id).slice(0, 20)}</span>}
+            <span style="font-size:10.5px;color:#6e6e78;margin-left:auto;font-family:'Geist Mono',monospace;">{fmt(e.occurred_at)}</span>
+          </div>
+          {caused.length > 0 && (
+            <div style="margin-top:7px;padding-left:10px;border-left:2px solid #1a1a1f;">
+              {caused.map((c: any) => (
+                <p style="font-size:11px;margin:0 0 3px;font-family:'Geist Mono',monospace;color:#8a8a94;">
+                  <span style={'color:' + (c.status === 'ok' ? '#34d399' : '#f87171') + ';'}>{c.action}</span>
+                  {' '}&middot; {c.route_name} &middot; {c.detail}
+                </p>
+              ))}
+            </div>
+          )}
+          {caused.length === 0 && (
+            <p style="font-size:11px;color:#6e6e78;margin:6px 0 0;">No route claimed this event, and no endpoint was subscribed to it.</p>
+          )}
+        </div>
+      );
+    })}
+  </div>
+</div>
+
+<script define:vars={{ orgSlug: org ? org.slug : '', environment }}>
+  const API = '/api/admin/mail/integrations';
+
+  async function call(payload) {
+    const res = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ org_slug: orgSlug, environment }, payload)),
+    });
+    try { return await res.json(); }
+    catch (e) { return { ok: false, error: 'The server answered with something that is not JSON (HTTP ' + res.status + ').' }; }
+  }
+
+  const orgPicker = document.getElementById('orgPicker');
+  if (orgPicker) {
+    orgPicker.addEventListener('change', function () {
+      window.location.href = '/admin/mail/event-bus?env=' + environment + '&org=' + encodeURIComponent(orgPicker.value);
+    });
+  }
+
+  const saveBtn = document.getElementById('btnRouteSave');
+  if (saveBtn) {
+    saveBtn.addEventListener('click', async function () {
+      const msg = document.getElementById('routeMsg');
+      let config = {};
+      const raw = document.getElementById('rConfig').value.trim();
+      if (raw) {
+        try { config = JSON.parse(raw); }
+        catch (e) { msg.textContent = 'The configuration is not valid JSON.'; msg.style.color = '#fca5a5'; return; }
+      }
+      saveBtn.disabled = true;
+      const r = await call({
+        action: 'route.save',
+        name: document.getElementById('rName').value.trim(),
+        event_pattern: document.getElementById('rPattern').value.trim(),
+        route_action: document.getElementById('rAction').value,
+        config: config,
+      });
+      saveBtn.disabled = false;
+      if (!r.ok) { msg.textContent = r.error || 'The route was not saved.'; msg.style.color = '#fca5a5'; return; }
+      msg.textContent = 'Saved.';
+      msg.style.color = '#34d399';
+      setTimeout(function () { window.location.reload(); }, 700);
+    });
+  }
+
+  document.querySelectorAll('.btnRouteToggle').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      const r = await call({ action: 'route.toggle', route_id: btn.dataset.id, is_active: btn.dataset.active !== '1' });
+      btn.disabled = false;
+      if (!r.ok) { alert(r.error || 'Nothing changed.'); return; }
+      window.location.reload();
+    });
+  });
+
+  document.querySelectorAll('.btnRouteDelete').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      const r = await call({ action: 'route.delete', route_id: btn.dataset.id });
+      btn.disabled = false;
+      if (!r.ok) { alert(r.error || 'It was not deleted.'); return; }
+      window.location.reload();
+    });
+  });
+
+  const pubBtn = document.getElementById('btnPublish');
+  if (pubBtn) {
+    pubBtn.addEventListener('click', async function () {
+      const out = document.getElementById('pubResult');
+      pubBtn.disabled = true;
+      const r = await call({ action: 'event.publish', event_type: document.getElementById('pubType').value });
+      pubBtn.disabled = false;
+      out.style.display = 'block';
+      if (!r.ok) { out.textContent = r.error || 'It was not published.'; out.style.color = '#fca5a5'; return; }
+      const lines = ['event ' + r.event_id, r.duplicate ? 'DUPLICATE — nothing ran a second time' : 'published'];
+      (r.actions || []).forEach(function (a) { lines.push('  ' + a.action + ' via ' + a.route + ': ' + a.status + ' — ' + a.detail); });
+      (r.skipped || []).forEach(function (s) { lines.push('  held back: ' + s.routeName + ' — ' + s.reason); });
+      if (!(r.actions || []).length && !r.duplicate) lines.push('  nothing was subscribed to it');
+      out.textContent = lines.join('\n');
+      out.style.color = '#d8d8de';
+    });
+  }
+
+  const dispatchBtn = document.getElementById('btnDispatch');
+  if (dispatchBtn) {
+    dispatchBtn.addEventListener('click', async function () {
+      const msg = document.getElementById('dispatchMsg');
+      dispatchBtn.disabled = true;
+      msg.textContent = 'Running...';
+      msg.style.color = '#9aa6b6';
+      // The same endpoint the cron calls, so pressing this is not a different code path.
+      const res = await fetch('/api/cron/mailint-dispatch?manual=1', { method: 'POST' });
+      let data = {};
+      try { data = await res.json(); } catch (e) { data = { ok: false, error: 'HTTP ' + res.status }; }
+      dispatchBtn.disabled = false;
+      if (!data.ok) { msg.textContent = data.error || 'The dispatcher refused.'; msg.style.color = '#fca5a5'; return; }
+      msg.textContent = 'webhooks ' + data.webhooks.delivered + '/' + data.webhooks.attempted + ' delivered, steps ' + data.steps.sent + '/' + data.steps.claimed + ' sent';
+      msg.style.color = '#34d399';
+    });
+  }
+</script>
+</AdminLayout>

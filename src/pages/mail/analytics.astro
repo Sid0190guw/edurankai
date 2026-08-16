@@ -1,0 +1,277 @@
+---
+/**
+ * /mail/analytics — delivery, engagement and where mail is landing.
+ *
+ * EVERY NUMBER ON THIS PAGE IS AGGREGATED IN POSTGRES. Nothing here reads a raw event row into the
+ * page: mail_campaign_events grows by one row per recipient per event, so a single 50,000-recipient
+ * campaign is 150,000 rows before anybody opens anything.
+ *
+ * EVERY RATE SAYS WHAT IT IS A RATE OF. An open rate over "sent" and an open rate over "delivered"
+ * differ by exactly the bounce rate. rates() in analytics.ts decides the denominator once and hands
+ * back the basis; this page prints it under each figure rather than leaving the reader to assume.
+ */
+import MailShell from '@/components/mail/MailShell.astro';
+import MailIcon from '@/components/mail/MailIcon.astro';
+import Chart from '@/components/mail/Chart.astro';
+import { canUseMailbox } from '@/lib/auth/mail-access';
+import {
+  campaignTotals, transactionalTotals, dailySeries, campaignPerformance, domainPerformance, audienceTotals, rates,
+} from '@/lib/mail-product/analytics';
+import { num, pct, timeAgo, clampInt } from '@/lib/mail-product/common';
+
+const user = Astro.locals.user;
+const access = await canUseMailbox(user as any);
+const url = new URL(Astro.request.url);
+const days = clampInt(url.searchParams.get('days'), 1, 180, 30);
+
+let totals: any = { sent: 0, delivered: 0, deferred: 0, bounced: 0, opened: 0, clicked: 0, unsubscribed: 0, complained: 0, failed: 0 };
+let tx: any = {};
+let series: any[] = [];
+let performance: any[] = [];
+let domains: { rows: any[]; othersSent: number } = { rows: [], othersSent: 0 };
+let audience: Record<string, number> = {};
+let partial = false;
+
+if (access.allowed) {
+  const [ct, tt, ds, cp, dp, at] = await Promise.all([
+    campaignTotals(days),
+    transactionalTotals(days),
+    dailySeries(days),
+    campaignPerformance(15),
+    domainPerformance(days, 8),
+    audienceTotals(),
+  ]);
+  totals = ct.totals; partial = ct.partial;
+  tx = tt.totals; if (tt.partial) partial = true;
+  series = ds.rows; if (ds.partial) partial = true;
+  performance = cp;
+  domains = dp;
+  audience = at;
+}
+
+const derived = rates(totals);
+const RANGES = [7, 30, 90, 180];
+function rangeLink(d: number): string {
+  const u = new URL(url.href);
+  u.searchParams.set('days', String(d));
+  return u.pathname + u.search;
+}
+---
+<MailShell title="Analytics" active="analytics" subtitle={`Last ${days} days`}>
+  <div slot="actions" class="em-seg" role="group" aria-label="Time range">
+    {RANGES.map((d) => (
+      <a href={rangeLink(d)} aria-current={days === d ? 'true' : undefined}>{d}d</a>
+    ))}
+  </div>
+
+  <div class="em-wrap em-stack">
+    {partial && (
+      <div class="em-alert warn">
+        <MailIcon name="warning" size={16} />
+        <p>
+          <strong>Some figures could not be read</strong> from the database just now. Where that
+          happened the figure is blank rather than zero — a zero here would be a claim, and it would
+          be a false one. The reason is in the server log.
+        </p>
+      </div>
+    )}
+
+    <div class="em-grid c4">
+      <div class="em-stat"><p class="em-stat-k">Sent</p><p class="em-stat-v">{num(totals.sent)}</p>
+        <p class="em-stat-d">campaign messages accepted by the transport</p></div>
+      <div class="em-stat"><p class="em-stat-k">Opened</p><p class="em-stat-v">{num(totals.opened)}</p>
+        <p class="em-stat-d">{pct(totals.opened, totals.delivered || totals.sent)} of {totals.delivered ? 'delivered' : 'sent'}</p></div>
+      <div class="em-stat"><p class="em-stat-k">Clicked</p><p class="em-stat-v">{num(totals.clicked)}</p>
+        <p class="em-stat-d">{pct(totals.clicked, totals.opened)} of those who opened</p></div>
+      <div class="em-stat"><p class="em-stat-k">Bounced</p>
+        <p class="em-stat-v" style={totals.bounced ? 'color:var(--em-bad)' : ''}>{num(totals.bounced)}</p>
+        <p class="em-stat-d">{pct(totals.bounced, totals.sent)} of sent</p></div>
+    </div>
+
+    <div class="em-card">
+      <div class="em-card-head">
+        <div>
+          <h2 class="em-h2">Delivery over time</h2>
+          <p class="em-note">Campaign events only, grouped by day in IST. Days with nothing recorded are shown as zero rather than skipped.</p>
+        </div>
+      </div>
+      <div class="em-card-body">
+        <Chart
+          rows={series}
+          series={[
+            { key: 'sent', label: 'Sent' },
+            { key: 'opened', label: 'Opened' },
+            { key: 'clicked', label: 'Clicked' },
+            { key: 'bounced', label: 'Bounced' },
+            { key: 'unsubscribed', label: 'Unsubscribed' },
+          ]}
+          height={260}
+          summary={`Campaign messages sent, opened, clicked, bounced and unsubscribed per day over the last ${days} days`}
+        />
+      </div>
+    </div>
+
+    <div class="em-card">
+      <div class="em-card-head"><h2 class="em-h2">Rates</h2></div>
+      <div class="em-card-body">
+        <div class="em-grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+          {derived.map((r) => (
+            <div class="an-rate">
+              <span class="an-rate-v">{r.value !== null ? r.value.toFixed(2) + '%' : '—'}</span>
+              <span class="an-rate-k">{r.label}</span>
+              <span class="an-rate-b">of {r.basis}</span>
+            </div>
+          ))}
+        </div>
+        <p class="em-hint" style="margin-top:16px">
+          A dash means the denominator was zero — nothing to divide by, which is not the same as
+          &ldquo;0%&rdquo;. Delivery figures come from what the transport accepted; a provider that
+          accepts a message and silently discards it later cannot be seen from here, which is what
+          the domain table below is for.
+        </p>
+      </div>
+    </div>
+
+    <div class="em-grid c2">
+      <div class="em-card">
+        <div class="em-card-head">
+          <h2 class="em-h2">Where mail is going</h2>
+          <span class="em-note em-push">By recipient domain</span>
+        </div>
+        {domains.rows.length === 0 ? (
+          <div class="em-empty" style="padding:36px 20px">
+            <MailIcon name="domains" size={30} strokeWidth={1.3} />
+            <h3>No campaign sends in this period</h3>
+            <p>This table tells you when it is one provider rejecting you rather than &ldquo;email in general&rdquo;.</p>
+          </div>
+        ) : (
+          <div class="em-card-body flush"><div class="em-tablewrap">
+            <table class="em-table">
+              <thead><tr>
+                <th scope="col">Domain</th><th scope="col" class="num">Sent</th>
+                <th scope="col" class="num">Bounced</th><th scope="col" class="num">Bounce rate</th>
+              </tr></thead>
+              <tbody>
+                {domains.rows.map((d: any) => {
+                  const rate = d.sent > 0 ? (d.bounced / d.sent) * 100 : 0;
+                  return (
+                    <tr>
+                      <td><code class="em-mono">{d.domain}</code></td>
+                      <td class="num">{num(d.sent)}</td>
+                      <td class="num">{num(d.bounced)}</td>
+                      <td class="num">
+                        <span style={rate > 5 ? 'color:var(--em-bad);font-weight:640' : ''}>{d.sent ? rate.toFixed(1) + '%' : '—'}</span>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {domains.othersSent > 0 && (
+                  <tr>
+                    <td><span class="em-note">Everything else</span></td>
+                    <td class="num">{num(domains.othersSent)}</td>
+                    <td class="num"><span class="em-note">—</span></td>
+                    <td class="num"><span class="em-note">—</span></td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div></div>
+        )}
+      </div>
+
+      <div class="em-card">
+        <div class="em-card-head"><h2 class="em-h2">Audience health</h2></div>
+        <div class="em-card-body">
+          <Chart
+            rows={[
+              { day: 'Subscribed', n: audience.subscribed || 0 },
+              { day: 'Unconfirmed', n: audience.unconfirmed || 0 },
+              { day: 'Unsubscribed', n: audience.unsubscribed || 0 },
+              { day: 'Bounced', n: audience.bounced || 0 },
+              { day: 'Complained', n: audience.complained || 0 },
+            ]}
+            series={[{ key: 'n', label: 'Contacts' }]}
+            kind="bar"
+            height={180}
+            summary="Contacts by subscription status"
+          />
+          <p class="em-hint" style="margin-top:12px">
+            Only <strong>subscribed</strong> contacts can receive a campaign. Bounced and complained
+            addresses are suppressed to protect the sending domain, and an import will not bring them back.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="em-card">
+      <div class="em-card-head">
+        <h2 class="em-h2">Campaign performance</h2>
+        <a class="em-btn sm em-push" href="/mail/campaigns">All campaigns</a>
+      </div>
+      {performance.length === 0 ? (
+        <div class="em-empty" style="padding:36px 20px">
+          <MailIcon name="campaigns" size={30} strokeWidth={1.3} />
+          <h3>No campaigns have been sent yet</h3>
+          <p>Once one goes out, its numbers appear here beside the others.</p>
+          <a class="em-btn pri" href="/mail/campaigns?new=1">Create a campaign</a>
+        </div>
+      ) : (
+        <div class="em-card-body flush"><div class="em-tablewrap">
+          <table class="em-table">
+            <thead><tr>
+              <th scope="col">Campaign</th><th scope="col" class="num">Recipients</th>
+              <th scope="col" class="num">Sent</th><th scope="col" class="num">Failed</th>
+              <th scope="col" class="num">Open rate</th><th scope="col" class="num">Click rate</th>
+              <th scope="col" class="num">Unsub</th><th scope="col">When</th>
+            </tr></thead>
+            <tbody>
+              {performance.map((c: any) => (
+                <tr>
+                  <td><a href={`/mail/campaigns/${c.id}`}>{c.name}</a></td>
+                  <td class="num">{num(c.recipients_total)}</td>
+                  <td class="num">{num(c.sent_count)}</td>
+                  <td class="num">{c.failed_count > 0
+                    ? <span style="color:var(--em-bad);font-weight:640">{num(c.failed_count)}</span>
+                    : <span class="em-note">0</span>}</td>
+                  <td class="num">{pct(c.opened, c.sent_count)}</td>
+                  <td class="num">{pct(c.clicked, c.sent_count)}</td>
+                  <td class="num">{num(c.unsubscribed)}</td>
+                  <td><span class="em-note">{timeAgo(c.completed_at)}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div></div>
+      )}
+    </div>
+
+    <div class="em-card">
+      <div class="em-card-head"><h2 class="em-h2">Transactional mail</h2></div>
+      <div class="em-card-body">
+        <p class="em-lede" style="margin-bottom:16px">
+          Mail the platform sends by itself — offers, password resets, reminders. Recorded separately
+          from campaigns (in <code class="em-mono">email_logs</code>) and deliberately never added into
+          the figures above, so neither set double-counts the other.
+        </p>
+        <div class="em-grid c3">
+          <div class="em-stat"><p class="em-stat-k">Sent</p><p class="em-stat-v">{num(tx.sent || 0)}</p></div>
+          <div class="em-stat"><p class="em-stat-k">Failed</p>
+            <p class="em-stat-v" style={tx.failed ? 'color:var(--em-bad)' : ''}>{num(tx.failed || 0)}</p></div>
+          <div class="em-stat"><p class="em-stat-k">Queued or deferred</p><p class="em-stat-v">{num(tx.deferred || 0)}</p></div>
+        </div>
+      </div>
+      <div class="em-card-foot">
+        <a class="em-btn sm" href="/admin/mail/analytics">Per-message detail</a>
+        <a class="em-btn sm ghost" href="/admin/mail/health">Delivery health</a>
+      </div>
+    </div>
+  </div>
+</MailShell>
+
+<style>
+  .an-rate { display: flex; flex-direction: column; gap: 1px; padding: var(--em-3) 0; }
+  .an-rate-v { font-size: 22px; font-weight: 690; color: var(--em-ink); letter-spacing: -0.025em;
+    font-variant-numeric: tabular-nums; }
+  .an-rate-k { font-size: 12px; font-weight: 620; color: var(--em-ink-3); }
+  .an-rate-b { font-size: 10.5px; color: var(--em-ink-4); }
+</style>

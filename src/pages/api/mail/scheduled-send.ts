@@ -28,6 +28,8 @@ import { claimDueScheduled, markScheduled, rewriteLinksForTracking } from '@/lib
 import { deliverMessage, parseAddressList, logOutbound, getMailConfig, getMailboxAddress } from '@/lib/mail';
 import { sendExternal } from '@/lib/mail-transport';
 import { cronAuth } from '@/lib/auth/cron-auth';
+// Re-read at send time, not trusted from schedule time. See the block in run().
+import { suppressionReasons } from '@/lib/mailsec/sending';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -42,9 +44,47 @@ async function run() {
   let sent = 0, failed = 0;
   for (const s of due) {
     try {
-      const to = parseAddressList((s.to_list || '').split(',').map((x: string) => x.trim()).filter(Boolean));
-      const cc = parseAddressList((s.cc_list || '').split(',').map((x: string) => x.trim()).filter(Boolean));
-      const bcc = parseAddressList((s.bcc_list || '').split(',').map((x: string) => x.trim()).filter(Boolean));
+      let to = parseAddressList((s.to_list || '').split(',').map((x: string) => x.trim()).filter(Boolean));
+      let cc = parseAddressList((s.cc_list || '').split(',').map((x: string) => x.trim()).filter(Boolean));
+      let bcc = parseAddressList((s.bcc_list || '').split(',').map((x: string) => x.trim()).filter(Boolean));
+
+      // SUPPRESSION IS RE-CHECKED AT SEND TIME, NOT ONLY AT SCHEDULE TIME.
+      //
+      // /api/mail/send now checks the suppression list when the message is composed. A scheduled
+      // message is composed once and sent later — sometimes days later — and everything the list
+      // records can happen in between: the address hard-bounces, the person clicks unsubscribe, or
+      // they report an earlier message as spam. Checking only at schedule time would mean the one
+      // send path that is guaranteed to have stale information is the one that never re-checks.
+      //
+      // A hard bounce, a complaint and an invalid address block this unconditionally. An
+      // unsubscribe does not: a scheduled message is a person's own composed message to named
+      // recipients, which is the same transactional judgement /api/mail/send makes for a message
+      // with no distribution list in it.
+      //
+      // THROWS ON A FAILED READ, deliberately. The catch below marks the row failed with the reason
+      // and the message stays in the queue rather than going out unchecked — mail cannot be
+      // recalled, and 'we could not read the suppression list' is not 'nobody is suppressed'.
+      const blocked = await suppressionReasons([...to, ...cc, ...bcc]);
+      const hardBlock = (e: string) => {
+        const r = blocked.get(e);
+        return r === 'bounced' || r === 'complained' || r === 'invalid';
+      };
+      const before = to.length + cc.length + bcc.length;
+      to = to.filter((e) => !hardBlock(e));
+      cc = cc.filter((e) => !hardBlock(e));
+      bcc = bcc.filter((e) => !hardBlock(e));
+      const after = to.length + cc.length + bcc.length;
+      if (after === 0) {
+        // Not an error and not a success: nothing was sent, and the queue row says exactly why so
+        // the sender is not left believing a scheduled message went out.
+        await markScheduled(s.id, 'failed', undefined, 'Not sent: every recipient is on the suppression list (bounce or complaint).')
+          .catch((me: any) => console.error('[scheduled-send] status not recorded for ' + s.id + ':', me?.cause?.message || me?.message));
+        failed++;
+        continue;
+      }
+      if (after < before) {
+        console.warn('[scheduled-send] ' + (before - after) + ' recipient(s) of ' + s.id + ' were suppressed between scheduling and sending');
+      }
       const fromEmail = await getMailboxAddress(s.user_id);
       const uRows = await db.execute(sql`SELECT name FROM users WHERE id = ${s.user_id} LIMIT 1`);
       const u = (Array.isArray(uRows) ? uRows : ((uRows as any)?.rows || [])) as any[];

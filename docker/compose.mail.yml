@@ -1,0 +1,114 @@
+# docker/compose.mail.yml — the real MTA. Postfix, Dovecot, Rspamd, DKIM.
+#
+# ONE CONTAINER, NOT THREE, AND HERE IS WHY.
+#
+# The brief lists postfix, dovecot and rspamd as separate services. Three hand-written Dockerfiles
+# would match that list and would also be three untested mail servers: Postfix needs Dovecot's SASL
+# socket to authenticate submission, Dovecot needs Postfix's LMTP transport to receive, Rspamd needs
+# a milter socket on both, and every one of those is a shared-filesystem or shared-socket
+# arrangement that does not survive being split across containers without a lot of glue. The
+# maintained `docker-mailserver` image is that glue, already written and already run by a large
+# number of people. Choosing it over three of my own is the difference between a mail server and a
+# YAML file that looks like one.
+#
+# WHAT YOU LOSE: you cannot scale Postfix independently of Dovecot here. That does not matter at one
+# node and it is exactly what MODE C changes — docs/mail/SCALING.md section 4 covers splitting the
+# MTA out, and docs/mail/MIGRATION.md section 4 covers going to multiple MTA nodes. The interface
+# the rest of the system depends on (SMTP on 25/587, IMAP on 143/993, mail handed to `mail-parser`)
+# is identical either way, which is what makes that migration a deployment change rather than an
+# application change.
+#
+#   ./scripts/start-mail.sh --mail
+#
+# BEFORE THIS IS USEFUL FOR REAL MAIL you need DNS you control: an MX record, an A record for
+# MAIL_HOST with matching reverse DNS, SPF, the DKIM TXT record this container generates, and DMARC.
+# Without reverse DNS that matches, large receivers reject your mail outright and no amount of
+# configuration here changes that. docs/mail/DEPLOYMENT.md section 6.
+
+services:
+  mta:
+    # Pinned to a minor version, not `latest`. A mail server that silently changes underneath you
+    # is a mail server that stops delivering on a Tuesday for reasons nobody can reconstruct.
+    image: ghcr.io/docker-mailserver/docker-mailserver:14.0
+    hostname: ${MAIL_HOST:-mail.edurankai.in}
+    profiles: [mail]
+    restart: unless-stopped
+    ports:
+      # 25 inbound from other mail servers. On a home/office connection this port is very often
+      # blocked by the ISP in both directions — check before assuming the stack is broken.
+      - "${PORT_SMTP_MTA:-25}:25"
+      # 587 submission (STARTTLS, authenticated) — what a mail client and the app use.
+      - "${PORT_SUBMISSION:-587}:587"
+      # 143 IMAP (STARTTLS) and 993 IMAPS.
+      - "${PORT_IMAP:-143}:143"
+      - "${PORT_IMAPS:-993}:993"
+    volumes:
+      # Mail data. THIS IS THE MAILBOXES. Losing it loses every message stored on this host;
+      # ./scripts/backup.sh includes it for that reason.
+      - ./data/mta/mail:/var/mail
+      - ./data/mta/state:/var/mail-state
+      - ./data/mta/logs:/var/log/mail
+      # DKIM keys and generated config. The private key here is the most sensitive file in the
+      # stack — with it, anyone can sign mail as this domain. Mode 0600, gitignored, backed up
+      # separately and encrypted (docs/mail/BACKUP.md section 2).
+      - ./data/mta/config:/tmp/docker-mailserver
+      # Overrides applied on top of the image's generated config.
+      - ./postfix/main.cf.override:/tmp/docker-mailserver/postfix-main.cf:ro
+      - ./postfix/master.cf.override:/tmp/docker-mailserver/postfix-master.cf:ro
+      - ./dovecot/dovecot.cf.override:/tmp/docker-mailserver/dovecot.cf:ro
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      # --- what is switched on ---------------------------------------------------------------
+      ENABLE_RSPAMD: "1"            # spam filtering + DKIM signing
+      ENABLE_OPENDKIM: "0"          # Rspamd signs; running both would sign twice
+      ENABLE_OPENDMARC: "0"         # Rspamd checks DMARC
+      ENABLE_AMAVIS: "0"            # superseded by Rspamd here; it is the heavy one, ~1GB RAM
+      ENABLE_CLAMAV: "${ENABLE_CLAMAV:-0}"   # ~1GB RAM. Off by default on a 32GB laptop running everything else.
+      ENABLE_FAIL2BAN: "1"          # bans hosts that brute-force submission
+      ENABLE_POSTGREY: "0"          # greylisting delays first-contact mail by minutes; surprising in testing
+      ENABLE_SPAMASSASSIN: "0"
+      ENABLE_UPDATE_CHECK: "0"
+      SPOOF_PROTECTION: "1"         # an authenticated user cannot send as another user's address
+      PERMIT_DOCKER: "connected-networks"   # lets `mail-parser` and `app` relay from inside this network
+
+      # --- TLS ---------------------------------------------------------------------------------
+      # `self-signed` for local work. For real mail set SSL_TYPE=letsencrypt and mount the certs;
+      # a self-signed certificate on a public MTA means opportunistic TLS falls back to plaintext.
+      SSL_TYPE: ${SSL_TYPE:-self-signed}
+
+      # --- inbound routing ---------------------------------------------------------------------
+      # Everything accepted for our domains is handed to the ingest bridge over SMTP, which signs it
+      # and POSTs the raw MIME to /api/mail/inbound. See postfix/main.cf.override for the transport.
+      POSTFIX_INET_PROTOCOLS: ipv4
+      POSTFIX_MESSAGE_SIZE_LIMIT: ${MAIL_MAX_ATTACHMENT_BYTES:-26214400}
+      POSTMASTER_ADDRESS: postmaster@${MAIL_DOMAIN:-edurankai.in}
+      LOG_LEVEL: ${MTA_LOG_LEVEL:-info}
+    healthcheck:
+      # The image ships its own supervisor check; this asks the question that matters to us —
+      # does the SMTP port answer with a 220 greeting.
+      test: ["CMD-SHELL", "timeout 5 bash -c '</dev/tcp/127.0.0.1/25' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    # NET_ADMIN is required by fail2ban to write firewall rules. It is the only elevated capability
+    # in this stack; drop ENABLE_FAIL2BAN and you can drop this too.
+    cap_add: [NET_ADMIN]
+    networks: [mail]
+
+  # Rspamd's web UI, read-only, loopback only. Useful for reading why a message was scored the way
+  # it was. It runs INSIDE the mta container; this service only publishes the port.
+  # Left commented rather than deleted: exposing the Rspamd controller without a password set in
+  # rspamd/local.d/worker-controller.inc is an unauthenticated remote-configuration interface.
+  #
+  # rspamd-ui:
+  #   image: alpine/socat
+  #   profiles: [mail]
+  #   command: TCP-LISTEN:11334,fork,reuseaddr TCP:mta:11334
+  #   ports: ["127.0.0.1:11334:11334"]
+  #   networks: [mail]
+
+  # With a real MTA present, the health aggregator should expect SMTP and IMAP to answer.
+  mailops:
+    environment:
+      MAILOPS_EXPECT: app,ingest,worker,sink,smtp,submission,imap

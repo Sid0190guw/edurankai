@@ -191,6 +191,56 @@ export async function advanceStage(opts: { applicationId: string; toStage: strin
   } catch (e: any) {
     console.error('[application-stages] the candidate was NOT told about stage', opts.toStage, '-', e?.cause?.message || e?.message);
   }
+
+  // THE SAME FACT, STATED ONCE, FOR EVERYTHING ELSE THAT CARES.
+  //
+  // The notification above tells the candidate inside the portal. It cannot tell an email workflow,
+  // a partner's webhook endpoint or a report — each of those would otherwise need its own call
+  // added here, and the fifth one would be the one somebody forgot. The integration platform's
+  // event bus takes the fact once and decides what it causes (src/lib/mailint/router.ts), so a new
+  // consequence is a route in the console rather than an edit to this function.
+  //
+  // Deliberately after the notification and inside its own try: a routing fault must not stop a
+  // stage advance that has already been committed, and the failure is logged with the real
+  // Postgres reason rather than disappearing. emitProductEvent() does not throw, and the dynamic
+  // import keeps the mail platform out of this module's import graph for every caller that never
+  // advances a stage.
+  try {
+    const { emitProductEvent } = await import('@/lib/mailint/emit');
+    // The column names are the ones this table actually has — first_name/last_name and
+    // role_title_snapshot, not `name` and `role_key`. A guessed column here would throw into the
+    // catch below and the bus would silently receive nothing, which is the failure mode this whole
+    // patch exists to make impossible.
+    const applicant = await db.execute(sql`
+      SELECT email, first_name, last_name, role_title_snapshot
+      FROM applications WHERE id = ${opts.applicationId} LIMIT 1
+    `);
+    const aRows = Array.isArray(applicant) ? applicant : ((applicant as any)?.rows || []);
+    const app = aRows[0] || {};
+    const fullName = [app.first_name, app.last_name].filter(Boolean).join(' ').trim();
+    await emitProductEvent('careers', 'application.stage.changed', {
+      application_id: opts.applicationId,
+      stage: opts.toStage,
+      previous_stage: fromStage,
+      stage_index: stageIndex(opts.toStage) + 1,
+      stage_label: target.label,
+      email: app.email || undefined,
+      name: fullName || undefined,
+      role_title: app.role_title_snapshot || undefined,
+      actor_name: opts.actorName,
+      note: opts.note || undefined,
+    }, {
+      entityId: opts.applicationId,
+      actorType: actor ? 'user' : 'system',
+      actorId: actor,
+      // The natural key for this fact: one application entering one stage, once. A retried advance
+      // that lands on the same stage is the same fact and must not send the candidate two invitations.
+      idempotencyKey: 'idem_stage_' + opts.applicationId + '_' + opts.toStage,
+    });
+  } catch (e: any) {
+    console.error('[application-stages] the stage change was not published to the event bus:', e?.cause?.message || e?.message);
+  }
+
   return { ok: true, changed: true };
 }
 

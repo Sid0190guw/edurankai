@@ -1,0 +1,273 @@
+---
+// /admin/mail/enterprise/data — export and deletion.
+//
+// The two halves of data governance that actually move data, on one screen, because they are the two
+// an operator reaches for in the same conversation: "send us everything you hold" and "delete
+// everything you hold".
+//
+// THE DELETION PLAN IS SHOWN BEFORE THE CONFIRMATION, NOT AFTER. Every table that will be touched and
+// everything deliberately kept is printed from the pure planner, so the confirmation box is the last
+// step rather than the only one. The phrase to type is derived from the target: not "type DELETE",
+// which anybody can satisfy without reading, but the name of the thing being destroyed.
+//
+// THE DOWNLOAD TOKEN APPEARS ONCE, in the response to the request, and is stored only as a hash. If
+// it is lost the export is requested again — that is the correct outcome, not a gap.
+import GovShell from '@/components/mailgov/GovShell.astro';
+import GovActions from '@/components/mailgov/GovActions.astro';
+import { pageGate } from '@/lib/mailgov/guard';
+import { listExports } from '@/lib/mailgov/exports';
+import { listDeletions } from '@/lib/mailgov/deletion';
+import { DATASETS } from '@/lib/mailgov/export-plan';
+import { DELETION_SCOPES, confirmationPhraseFor, graceHours, requiredApprovals } from '@/lib/mailgov/deletion-plan';
+import { getOrg, listOrgs } from '@/lib/mailgov/orgs';
+import { authorizeGov } from '@/lib/mailgov/policy';
+import { storageBackend, storageProvisioned } from '@/lib/storage';
+
+const orgParamRaw = (Astro.url.searchParams.get('org') || '').trim() || null;
+const { actor, decision } = await pageGate(Astro.locals, 'export.view', { orgId: orgParamRaw || undefined }, Astro.request);
+const orgId = actor.orgId || orgParamRaw;
+
+let exports_: any[] = [];
+let exportError: string | null = null;
+let deletions: any[] = [];
+let deletionError: string | null = null;
+let org: any = null;
+let orgs: any[] = [];
+
+if (decision.allowed) {
+  const e = await listExports(orgId, 30);
+  if (e.ok) exports_ = e.rows; else exportError = e.reason;
+
+  if (authorizeGov(actor, 'deletion.view', { orgId: orgId || undefined }).allowed) {
+    const d = await listDeletions(orgId, 30);
+    if (d.ok) deletions = d.rows; else deletionError = d.reason;
+  }
+
+  if (orgId) {
+    const one = await getOrg(orgId);
+    if (one.ok) org = one.org;
+  } else {
+    const list = await listOrgs({ orgId: actor.orgId, limit: 200 });
+    if (list.ok) orgs = list.rows;
+  }
+}
+
+const mayExport = authorizeGov(actor, 'export.request', { orgId: orgId || undefined }).allowed;
+const mayDelete = authorizeGov(actor, 'deletion.request', { orgId: orgId || undefined }).allowed;
+const mayApprove = authorizeGov(actor, 'deletion.approve', { orgId: orgId || undefined }).allowed;
+const mayCancel = authorizeGov(actor, 'deletion.cancel', { orgId: orgId || undefined }).allowed;
+
+const inputStyle = 'background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:6px 9px;border-radius:6px;font-size:12px;';
+const btn = (bg: string): string =>
+  'background:' + bg + ';color:#fff;border:none;font-size:11px;font-weight:700;padding:6px 12px;border-radius:6px;cursor:pointer;';
+const statusColour = (s: string): string =>
+  s === 'ready' || s === 'completed' ? '#34d399'
+  : s === 'failed' || s === 'blocked' ? '#f87171'
+  : s === 'cancelled' || s === 'expired' || s === 'revoked' ? '#6e6e78' : '#fbbf24';
+---
+
+<GovShell
+  title="Export and deletion"
+  actor={actor}
+  capability="export.view"
+  org={org ? { id: org.id, name: org.name } : null}
+  subtitle="Asynchronous, authenticated, time-limited and audited — in both directions."
+>
+  {!storageProvisioned() && (
+    <div style="background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.30);border-radius:12px;padding:14px 16px;margin-bottom:16px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fbbf24;margin:0 0 6px;">No object storage is configured on this deployment.</p>
+      <p style="font-size:12px;color:#d8d8de;margin:0;line-height:1.6;">
+        The active backend is "{storageBackend()}", whose writes are discarded. Small exports are stored on the
+        job row instead so they still work; anything larger is refused with a reason rather than reported ready.
+        Set the S3_* variables to store artifacts properly.
+      </p>
+    </div>
+  )}
+
+  {!orgId && (
+    <div class="admin-card" style="margin-bottom:16px;">
+      <div class="admin-card-title" style="margin-bottom:10px;">Choose an organization</div>
+      {orgs.map((o: any) => (
+        <a href={'/admin/mail/enterprise/data?org=' + o.id}
+           style="display:block;padding:9px 0;border-bottom:1px solid #17171c;text-decoration:none;font-size:12.5px;color:#fff;">
+          {o.name} <span style="color:#6e6e78;font-family:'Geist Mono',monospace;font-size:11px;">{o.slug}</span>
+        </a>
+      ))}
+    </div>
+  )}
+
+  {orgId && mayExport && (
+    <div class="admin-card" style="margin-bottom:16px;">
+      <div class="admin-card-title" style="margin-bottom:8px;">Request an export</div>
+      <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 10px;line-height:1.6;">
+        Datasets marked "content" contain message bodies. Choosing one requires ticking the acknowledgement:
+        a routine metadata export and a copy of everything anybody has ever written are different acts.
+      </p>
+      <form data-gov-post="/api/mail/gov/export">
+        <input type="hidden" name="action" value="request" />
+        <input type="hidden" name="orgId" value={orgId} />
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:6px;margin-bottom:10px;">
+          {DATASETS.map((d) => (
+            <label style="display:flex;gap:6px;align-items:flex-start;font-size:11.5px;color:#d8d8de;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:8px 10px;">
+              <input type="checkbox" name="datasets" value={d.key} data-multi="1" style="margin-top:2px;" />
+              <span>
+                <strong style="color:#fff;">{d.label}</strong>
+                {d.content && <span style="color:#fca5a5;"> content</span>}
+                <br />
+                <span style="color:#6e6e78;font-size:10.5px;">{d.describes}</span>
+              </span>
+            </label>
+          ))}
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          <select name="format" style={inputStyle}>
+            <option value="jsonl">jsonl</option>
+            <option value="csv">csv</option>
+          </select>
+          <input name="since" type="date" style={inputStyle} />
+          <input name="until" type="date" style={inputStyle} />
+          <input name="reason" placeholder="Why this export is being taken" style={inputStyle + 'flex:1;min-width:200px;'} />
+          <label style="font-size:11px;color:#fca5a5;display:flex;align-items:center;gap:5px;">
+            <input type="checkbox" name="acknowledgedContent" /> I intend to take correspondence out of the platform
+          </label>
+          <button type="submit" style={btn('#FF4F00')}>Request export</button>
+        </div>
+      </form>
+    </div>
+  )}
+
+  <div class="admin-card" style="margin-bottom:16px;">
+    <div class="admin-card-title" style="margin-bottom:10px;">Exports</div>
+    {exportError && <p style="font-size:12px;color:#fca5a5;margin:0 0 8px;">The export list could not be read: {exportError}</p>}
+    {!exportError && exports_.length === 0 && <p style="font-size:12px;color:#9aa6b6;margin:0;">No exports have been requested.</p>}
+    {exports_.map((j: any) => (
+      <div style="padding:10px 0;border-bottom:1px solid #17171c;">
+        <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;">
+          <span style={'font-size:12px;font-weight:700;font-family:Geist Mono,monospace;color:' + statusColour(j.status) + ';'}>{j.status}</span>
+          <span style="font-size:11.5px;color:#fff;">{(j.datasets || []).join(', ')}</span>
+          <span style="font-size:11px;color:#9aa6b6;">{j.format}</span>
+          {j.includesContent && <span style="font-size:10.5px;color:#fca5a5;">includes message bodies</span>}
+          <span style="margin-left:auto;font-size:10.5px;color:#6e6e78;font-family:'Geist Mono',monospace;">{j.createdAt.slice(0, 19).replace('T', ' ')}</span>
+        </div>
+        <p style="font-size:11px;color:#9aa6b6;margin:5px 0 0;line-height:1.6;">
+          {j.status === 'ready'
+            ? 'Downloadable until ' + j.expiresAt + '. ' + j.downloadCount + ' download(s) so far. The token was shown once when it was requested.'
+            : j.status === 'failed' ? (j.error || 'It failed.')
+            : j.status === 'expired' ? 'The download window closed; request it again.'
+            : j.status === 'pending' ? 'Waiting for the worker.'
+            : ''}
+        </p>
+        {j.manifest && j.manifest.files && (
+          <p style="font-size:10.5px;color:#6e6e78;margin:4px 0 0;font-family:'Geist Mono',monospace;">
+            {j.manifest.files.map((f: any) => f.filename + ' (' + f.rows + ')').join(' · ')}
+          </p>
+        )}
+        {mayExport && (j.status === 'pending' || j.status === 'ready') && (
+          <div style="display:flex;gap:6px;margin-top:8px;">
+            {j.status === 'pending' && (
+              <form data-gov-post="/api/mail/gov/export">
+                <input type="hidden" name="action" value="run" />
+                <input type="hidden" name="jobId" value={j.id} />
+                <button type="submit" style={btn('#2563eb')}>Build it now</button>
+              </form>
+            )}
+            <form data-gov-post="/api/mail/gov/export" data-gov-confirm="Revoke this export? The artifacts stop being downloadable at once.">
+              <input type="hidden" name="action" value="revoke" />
+              <input type="hidden" name="jobId" value={j.id} />
+              <input name="reason" placeholder="reason" style={inputStyle + 'width:140px;margin-right:6px;'} />
+              <button type="submit" style={btn('#dc2626')}>Revoke</button>
+            </form>
+          </div>
+        )}
+      </div>
+    ))}
+  </div>
+
+  {orgId && mayDelete && (
+    <div class="admin-card" style="margin-bottom:16px;border-color:rgba(239,68,68,0.35);">
+      <div class="admin-card-title" style="margin-bottom:8px;">Request a deletion</div>
+      <p style="font-size:11.5px;color:#fca5a5;margin:0 0 10px;line-height:1.6;">
+        Irreversible. A contact erasure runs immediately; a mailbox waits {graceHours('mailbox')} hours and needs
+        {' '}{requiredApprovals('mailbox')} approval; an organization waits {graceHours('organization')} hours and needs
+        {' '}{requiredApprovals('organization')} approvals from people other than the requester. A legal hold blocks all
+        three, and is re-checked in the instant before anything is deleted.
+      </p>
+      <form data-gov-post="/api/mail/gov/deletion" data-gov-confirm="Submit this deletion request?">
+        <input type="hidden" name="action" value="request" />
+        <input type="hidden" name="orgId" value={orgId} />
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          <select name="scope" style={inputStyle}>
+            {DELETION_SCOPES.filter((s) => s !== 'mailbox').map((s) => <option value={s}>{s}</option>)}
+          </select>
+          <input name="target" placeholder="address, or the organization id" style={inputStyle + 'flex:1;min-width:220px;'} required />
+          <label style="font-size:11px;color:#fca5a5;display:flex;align-items:center;gap:5px;">
+            <input type="checkbox" name="alsoRemoveSuppression" /> also remove the suppression entry
+          </label>
+        </div>
+        <input name="reason" placeholder="Why (at least 15 characters) — the only record of why this was destroyed" style={inputStyle + 'width:100%;margin-top:8px;'} required minlength="15" />
+        <input name="typedPhrase" placeholder={'Type the confirmation, e.g. ' + confirmationPhraseFor('contact', 'someone@example.com')} style={inputStyle + 'width:100%;margin-top:8px;'} required />
+        <p style="font-size:10.5px;color:#6e6e78;margin:6px 0 0;line-height:1.6;">
+          The phrase is "erase &lt;address&gt;" for a contact, or "delete organization &lt;first 8 characters of the id&gt;".
+          Use "preview" on the API if you want the exact plan before committing.
+        </p>
+        <button type="submit" style={btn('#dc2626') + 'margin-top:8px;'}>Request deletion</button>
+      </form>
+    </div>
+  )}
+
+  <div class="admin-card">
+    <div class="admin-card-title" style="margin-bottom:10px;">Deletion jobs</div>
+    {deletionError && <p style="font-size:12px;color:#fca5a5;margin:0 0 8px;">The deletion list could not be read: {deletionError}</p>}
+    {!deletionError && deletions.length === 0 && <p style="font-size:12px;color:#9aa6b6;margin:0;">No deletions have been requested.</p>}
+    {deletions.map((j: any) => (
+      <div style="padding:10px 0;border-bottom:1px solid #17171c;">
+        <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;">
+          <span style={'font-size:12px;font-weight:700;font-family:Geist Mono,monospace;color:' + statusColour(j.status) + ';'}>{j.status}</span>
+          <span style="font-size:11.5px;color:#fff;">{j.scope}</span>
+          <span style="font-size:11.5px;color:#9aa6b6;font-family:'Geist Mono',monospace;">{j.targetLabel || j.target}</span>
+          <span style="margin-left:auto;font-size:10.5px;color:#6e6e78;font-family:'Geist Mono',monospace;">{j.createdAt.slice(0, 19).replace('T', ' ')}</span>
+        </div>
+        <p style="font-size:11px;color:#d8d8de;margin:5px 0 0;line-height:1.6;">{j.reason}</p>
+        {j.blockedReason && <p style="font-size:11px;color:#fbbf24;margin:5px 0 0;line-height:1.6;">Blocked: {j.blockedReason}</p>}
+        {j.error && <p style="font-size:11px;color:#fca5a5;margin:5px 0 0;">{j.error}</p>}
+        {j.scheduledFor && (j.status === 'scheduled' || j.status === 'pending_approval') && (
+          <p style="font-size:11px;color:#9aa6b6;margin:5px 0 0;">Runs after {j.scheduledFor}. Cancellable until then.</p>
+        )}
+        {j.counts && Object.keys(j.counts).length > 0 && (
+          <p style="font-size:10.5px;color:#6e6e78;margin:5px 0 0;font-family:'Geist Mono',monospace;">
+            {Object.keys(j.counts).map((k) => k + ': ' + (j.counts[k] < 0 ? 'not run' : j.counts[k])).join(' · ')}
+          </p>
+        )}
+        <p style="font-size:10.5px;color:#6e6e78;margin:5px 0 0;">
+          approvals: {(j.approvals || []).length} of {requiredApprovals(j.scope)} required
+        </p>
+        <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;">
+          {mayApprove && (j.status === 'pending_approval') && (
+            <form data-gov-post="/api/mail/gov/deletion" data-gov-confirm="Approve this deletion?">
+              <input type="hidden" name="action" value="approve" />
+              <input type="hidden" name="jobId" value={j.id} />
+              <button type="submit" style={btn('#b45309')}>Approve</button>
+            </form>
+          )}
+          {mayCancel && (j.status === 'pending_approval' || j.status === 'scheduled' || j.status === 'blocked') && (
+            <form data-gov-post="/api/mail/gov/deletion">
+              <input type="hidden" name="action" value="cancel" />
+              <input type="hidden" name="jobId" value={j.id} />
+              <input name="reason" placeholder="reason" style={inputStyle + 'width:140px;margin-right:6px;'} />
+              <button type="submit" style={btn('#059669')}>Cancel</button>
+            </form>
+          )}
+          {mayApprove && j.status === 'scheduled' && (
+            <form data-gov-post="/api/mail/gov/deletion" data-gov-confirm="Run this deletion now? The grace window is still re-checked and will refuse if it has not elapsed.">
+              <input type="hidden" name="action" value="run" />
+              <input type="hidden" name="jobId" value={j.id} />
+              <button type="submit" style={btn('#dc2626')}>Run now</button>
+            </form>
+          )}
+        </div>
+      </div>
+    ))}
+  </div>
+
+  <GovActions />
+</GovShell>

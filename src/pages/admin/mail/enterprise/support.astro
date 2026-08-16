@@ -1,0 +1,232 @@
+---
+// /admin/mail/enterprise/support — the support desk.
+//
+// EVERYTHING ON THIS PAGE BY DEFAULT IS METADATA. Status, timestamps, attempt counts, the SMTP error,
+// the recipient domain, and the local part of the address masked. That is enough to answer every
+// question support is actually asked: "my confirmation never arrived", "half our list bounced", "why
+// did that webhook fail".
+//
+// Reading what a message SAID is a separate act with a separate authorisation: requested here with a
+// written reason, approved by a different person, time-limited, use-limited, and audited on every
+// single read — including on the security screen, so it can never be done quietly.
+import GovShell from '@/components/mailgov/GovShell.astro';
+import GovActions from '@/components/mailgov/GovActions.astro';
+import { pageGate } from '@/lib/mailgov/guard';
+import { listContentGrants, lookupMessages, messageMetadata } from '@/lib/mailgov/support';
+import { getOrg } from '@/lib/mailgov/orgs';
+import { authorizeGov } from '@/lib/mailgov/policy';
+import { retryEligible } from '@/lib/mailgov/support-policy';
+
+const orgParamRaw = (Astro.url.searchParams.get('org') || '').trim() || null;
+const { actor, decision } = await pageGate(Astro.locals, 'support.metadata.view', { orgId: orgParamRaw || undefined }, Astro.request);
+const orgId = actor.orgId || orgParamRaw;
+
+const recipient = (Astro.url.searchParams.get('recipient') || '').trim() || null;
+const messageId = (Astro.url.searchParams.get('message') || '').trim() || null;
+
+let messages: any[] = [];
+let readError: string | null = null;
+let one: any = null;
+let events: any[] = [];
+let grants: any[] = [];
+let org: any = null;
+
+if (decision.allowed) {
+  if (messageId) {
+    const m = await messageMetadata(messageId);
+    if (m.ok) { one = m.message; events = m.events || []; } else readError = m.reason || null;
+  } else if (recipient) {
+    const list = await lookupMessages({ orgId, recipient, limit: 50 });
+    if (list.ok) messages = list.rows; else readError = list.reason;
+  } else {
+    const list = await lookupMessages({ orgId, limit: 30 });
+    if (list.ok) messages = list.rows; else readError = list.reason;
+  }
+
+  const g = await listContentGrants({ orgId, limit: 50 });
+  if (g.ok) grants = g.rows;
+
+  if (orgId) {
+    const o = await getOrg(orgId);
+    if (o.ok) org = o.org;
+  }
+}
+
+const mayRetry = authorizeGov(actor, 'support.message.retry', { orgId: orgId || undefined }).allowed;
+const mayRequest = authorizeGov(actor, 'support.content.request', { orgId: orgId || undefined }).allowed;
+const mayApprove = authorizeGov(actor, 'support.content.approve', { orgId: orgId || undefined }).allowed;
+
+const inputStyle = 'background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:6px 9px;border-radius:6px;font-size:12px;';
+const btn = (bg: string): string =>
+  'background:' + bg + ';color:#fff;border:none;font-size:11px;font-weight:700;padding:6px 12px;border-radius:6px;cursor:pointer;';
+const statusColour = (s: string): string =>
+  s === 'delivered' || s === 'sent' ? '#34d399' : s === 'failed' ? '#f87171' : s === 'suppressed' ? '#fb923c' : '#fbbf24';
+---
+
+<GovShell
+  title="Support"
+  actor={actor}
+  capability="support.metadata.view"
+  org={org ? { id: org.id, name: org.name } : null}
+  subtitle="Envelopes, delivery trails and retries. Message content needs a separate, approved authorisation."
+>
+  {readError && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;margin-bottom:16px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fca5a5;margin:0 0 6px;">This lookup could not be run.</p>
+      <p style="font-size:12px;color:#d8d8de;margin:0;font-family:'Geist Mono',monospace;">{readError}</p>
+    </div>
+  )}
+
+  <form method="get" style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;">
+    {orgId && <input type="hidden" name="org" value={orgId} />}
+    <input name="recipient" placeholder="Recipient address the customer gave you" value={recipient || ''} style={inputStyle + 'flex:1;min-width:260px;'} />
+    <button type="submit" style={btn('#374151')}>Find their messages</button>
+  </form>
+
+  {one && (
+    <div class="admin-card" style="margin-bottom:16px;">
+      <div class="admin-card-title" style="margin-bottom:10px;">Message {one.id.slice(0, 8)}</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;font-family:'Geist Mono',monospace;font-size:11.5px;">
+        {[
+          { k: 'status', v: one.status },
+          { k: 'from', v: one.from },
+          { k: 'to', v: (one.to || []).join(', ') },
+          { k: 'domains', v: (one.recipientDomains || []).join(', ') },
+          { k: 'template', v: one.templateKey || '-' },
+          { k: 'attempts', v: String(one.attempts) },
+          { k: 'queued', v: one.queuedAt || '-' },
+          { k: 'sent', v: one.sentAt || '-' },
+          { k: 'delivered', v: one.deliveredAt || '-' },
+          { k: 'failed', v: one.failedAt || '-' },
+        ].map((f) => (
+          <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:8px 10px;">
+            <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 3px;">{f.k}</p>
+            <p style="color:#fff;margin:0;word-break:break-all;">{f.v}</p>
+          </div>
+        ))}
+      </div>
+      {one.lastError && (
+        <p style="font-size:11.5px;color:#fca5a5;margin:10px 0 0;font-family:'Geist Mono',monospace;word-break:break-word;">{one.lastError}</p>
+      )}
+      <p style="font-size:11px;color:#6e6e78;margin:10px 0 0;line-height:1.6;">
+        The subject and body are not on this screen and were not fetched to build it. Addresses are shown with the
+        local part masked; the domain is what deliverability questions are actually about.
+      </p>
+
+      {events.length > 0 && (
+        <div style="margin-top:12px;">
+          <p style="font-size:11px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 6px;">Delivery trail</p>
+          {events.map((e: any) => (
+            <div style="display:flex;gap:10px;padding:5px 0;border-bottom:1px solid #17171c;font-size:11px;font-family:'Geist Mono',monospace;">
+              <span style="color:#fff;">{e.type}</span>
+              <span style="color:#9aa6b6;">{e.recipient || ''}</span>
+              <span style="margin-left:auto;color:#6e6e78;">{e.occurredAt.slice(0, 19).replace('T', ' ')}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+        {mayRetry && retryEligible({ status: one.status, attempts: one.attempts, max_attempts: 5 }).ok && (
+          <form data-gov-post="/api/mail/gov/support" data-gov-confirm="Retry delivery of this message?">
+            <input type="hidden" name="action" value="retry" />
+            <input type="hidden" name="orgId" value={one.orgId} />
+            <input type="hidden" name="messageId" value={one.id} />
+            <button type="submit" style={btn('#2563eb')}>Retry delivery</button>
+          </form>
+        )}
+        {mayRequest && one.contentAvailable && (
+          <form data-gov-post="/api/mail/gov/support" style="display:flex;gap:6px;flex:1;flex-wrap:wrap;">
+            <input type="hidden" name="action" value="request_content" />
+            <input type="hidden" name="orgId" value={one.orgId} />
+            <input type="hidden" name="subjectType" value="message" />
+            <input type="hidden" name="subjectId" value={one.id} />
+            <input name="matterRef" placeholder="ticket or matter" style={inputStyle + 'width:150px;'} />
+            <input name="reason" placeholder="Why reading the content is necessary (at least 30 characters)" style={inputStyle + 'flex:1;min-width:260px;'} required minlength="30" />
+            <button type="submit" style={btn('#b45309')}>Ask to read the content</button>
+          </form>
+        )}
+      </div>
+      {!mayRequest && one.contentAvailable && (
+        <p style="font-size:11px;color:#6e6e78;margin:8px 0 0;">This message has a body. Your role cannot request access to it.</p>
+      )}
+    </div>
+  )}
+
+  {!one && (
+    <div class="admin-card" style="margin-bottom:16px;">
+      <div class="admin-card-title" style="margin-bottom:10px;">{messages.length} message{messages.length === 1 ? '' : 's'}</div>
+      {messages.length === 0 && !readError && <p style="font-size:12px;color:#9aa6b6;margin:0;">Nothing found.</p>}
+      {messages.map((m: any) => (
+        <a href={'/admin/mail/enterprise/support?message=' + m.id + (orgId ? '&org=' + orgId : '')}
+           style="display:flex;gap:10px;align-items:baseline;padding:8px 0;border-bottom:1px solid #17171c;text-decoration:none;flex-wrap:wrap;">
+          <span style={'font-size:11.5px;font-weight:700;font-family:Geist Mono,monospace;color:' + statusColour(m.status) + ';'}>{m.status}</span>
+          <span style="font-size:11.5px;color:#fff;font-family:'Geist Mono',monospace;">{(m.to || []).join(', ')}</span>
+          {m.templateKey && <span style="font-size:10.5px;color:#9aa6b6;">{m.templateKey}</span>}
+          {m.lastError && <span style="font-size:10.5px;color:#fca5a5;">{String(m.lastError).slice(0, 60)}</span>}
+          <span style="margin-left:auto;font-size:10.5px;color:#6e6e78;font-family:'Geist Mono',monospace;">{(m.createdAt || '').slice(0, 19).replace('T', ' ')}</span>
+        </a>
+      ))}
+    </div>
+  )}
+
+  <div class="admin-card">
+    <div class="admin-card-title" style="margin-bottom:10px;">Content authorisations</div>
+    <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 10px;line-height:1.6;">
+      Each one covers a single record for a few hours and a limited number of reads. Requester and approver
+      are always different people, and every use is recorded here and on the security screen.
+    </p>
+    {grants.length === 0 && <p style="font-size:12px;color:#9aa6b6;margin:0;">No authorisations have been requested.</p>}
+    {grants.map((g: any) => (
+      <div style="padding:10px 0;border-bottom:1px solid #17171c;">
+        <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;">
+          <span style={'font-size:11.5px;font-weight:700;font-family:Geist Mono,monospace;color:'
+            + (g.status === 'approved' ? '#34d399' : g.status === 'requested' ? '#fbbf24' : '#6e6e78') + ';'}>{g.status}</span>
+          <span style="font-size:11.5px;color:#fff;">{g.subjectType} {String(g.subjectId).slice(0, 8)}</span>
+          <span style="font-size:10.5px;color:#9aa6b6;">{g.uses} of {g.maxUses} reads used</span>
+          {g.expiresAt && <span style="font-size:10.5px;color:#6e6e78;">until {g.expiresAt.slice(0, 19).replace('T', ' ')}</span>}
+          {g.matterRef && <span style="font-size:10.5px;color:#6e6e78;font-family:'Geist Mono',monospace;">{g.matterRef}</span>}
+        </div>
+        <p style="font-size:11px;color:#d8d8de;margin:5px 0 0;line-height:1.6;">{g.reason}</p>
+        <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;">
+          {mayApprove && g.status === 'requested' && (
+            <form data-gov-post="/api/mail/gov/support" data-gov-confirm="Authorise reading this message's content?">
+              <input type="hidden" name="action" value="approve" />
+              <input type="hidden" name="orgId" value={g.orgId} />
+              <input type="hidden" name="grantId" value={g.id} />
+              <button type="submit" style={btn('#059669')}>Approve</button>
+            </form>
+          )}
+          {mayApprove && g.status === 'requested' && (
+            <form data-gov-post="/api/mail/gov/support" style="display:flex;gap:4px;">
+              <input type="hidden" name="action" value="deny" />
+              <input type="hidden" name="orgId" value={g.orgId} />
+              <input type="hidden" name="grantId" value={g.id} />
+              <input name="reason" placeholder="reason" style={inputStyle + 'width:150px;'} />
+              <button type="submit" style={btn('#dc2626')}>Deny</button>
+            </form>
+          )}
+          {mayRequest && g.status === 'approved' && (
+            <form data-gov-post="/api/mail/gov/support" data-gov-confirm="Read the content under this authorisation? The read is recorded.">
+              <input type="hidden" name="action" value="read" />
+              <input type="hidden" name="orgId" value={g.orgId} />
+              <input type="hidden" name="grantId" value={g.id} />
+              <input type="hidden" name="messageId" value={g.subjectId} />
+              <button type="submit" style={btn('#b45309')}>Read once</button>
+            </form>
+          )}
+          {(mayApprove || mayRequest) && (g.status === 'approved' || g.status === 'requested') && (
+            <form data-gov-post="/api/mail/gov/support">
+              <input type="hidden" name="action" value="revoke" />
+              <input type="hidden" name="orgId" value={g.orgId} />
+              <input type="hidden" name="grantId" value={g.id} />
+              <button type="submit" style={btn('#374151')}>Revoke</button>
+            </form>
+          )}
+        </div>
+      </div>
+    ))}
+  </div>
+
+  <GovActions />
+</GovShell>

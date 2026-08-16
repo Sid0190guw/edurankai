@@ -1,0 +1,463 @@
+---
+// /admin/mail/webhooks — THE WEBHOOK TEST CONSOLE (section 5 of the integration brief).
+//
+// Create an endpoint, choose events, send a test event, read the exact request and the exact
+// response, retry a failed delivery, rotate the secret. Everything on this page drives the SHIPPED
+// webhook platform (src/lib/mailapi/webhooks.ts) through /api/admin/mail/integrations — the same
+// signer, the same delivery table, the same dispatcher as production traffic. A console that
+// exercised its own code path would prove nothing about the path that matters.
+//
+// A READ THAT FAILED IS NOT AN EMPTY LIST. Every query on this page reports its own failure, because
+// "no endpoints" and "the endpoints could not be read" look identical on a screen and mean opposite
+// things — the fault this repository has already paid for on /admin/mail/health.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { ensureMailIntSchema, rows, dbReason } from '@/lib/mailint/schema';
+import { EVENT_TYPES } from '@/lib/mailapi/webhooks';
+import { CANONICAL_EVENTS, EVENT_ENVELOPE_VERSION } from '@/lib/mailint/events';
+import { getOrCreateOrg } from '@/lib/mailint/router';
+
+export const prerender = false;
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+// Endpoint secrets and delivery bodies are configuration, gated like the rest of the mail settings.
+const mayView = await canAccessSection(user, 'settings', 'view');
+if (!mayView) return Astro.redirect('/admin?denied=settings');
+
+// Declared before everything that writes to it - `const` is not hoisted, and this project has taken
+// two outages from a declaration that sat below its first use.
+const readFailures: string[] = [];
+
+await ensureMailIntSchema().catch((e: any) => readFailures.push('Schema bootstrap: ' + dbReason(e)));
+
+const environment = (Astro.url.searchParams.get('env') === 'production') ? 'production' : 'development';
+const orgSlugParam = Astro.url.searchParams.get('org') || 'careers';
+
+let orgs: any[] = [];
+try {
+  orgs = rows(await db.execute(sql`SELECT id, slug, name FROM mailapi_orgs ORDER BY created_at ASC LIMIT 50`));
+} catch (e: any) {
+  readFailures.push('Organisations: ' + dbReason(e));
+}
+if (!orgs.length && !readFailures.length) {
+  const seeded = await getOrCreateOrg('careers', 'EduRankAI Careers');
+  if (seeded) orgs = [{ id: seeded.id, slug: seeded.slug, name: seeded.name }];
+}
+const org = orgs.find((o: any) => o.slug === orgSlugParam) || orgs[0] || null;
+
+let endpoints: any[] = [];
+if (org) {
+  try {
+    endpoints = rows(await db.execute(sql`
+      SELECT id, url, description, events, status, consecutive_failures, verified_at, disabled_reason,
+             grant_sensitive, previous_secret_expires_at, created_at,
+             right(secret, 4) AS secret_tail
+      FROM mailapi_webhooks
+      WHERE org_id = ${String(org.id)}::uuid AND environment = ${environment}
+      ORDER BY created_at DESC LIMIT 100
+    `));
+  } catch (e: any) {
+    readFailures.push('Endpoints: ' + dbReason(e));
+  }
+}
+
+let deliveries: any[] = [];
+if (org) {
+  try {
+    deliveries = rows(await db.execute(sql`
+      SELECT d.id, d.webhook_id, d.event_id, d.event_type, d.status, d.attempts, d.max_attempts,
+             d.response_status, d.error, d.duration_ms, d.next_attempt_at, d.delivered_at, d.created_at, w.url
+      FROM mailapi_webhook_deliveries d
+      LEFT JOIN mailapi_webhooks w ON w.id = d.webhook_id
+      WHERE d.org_id = ${String(org.id)}::uuid AND d.environment = ${environment}
+      ORDER BY d.created_at DESC LIMIT 40
+    `));
+  } catch (e: any) {
+    readFailures.push('Deliveries: ' + dbReason(e));
+  }
+}
+
+let counts: any = null;
+if (org) {
+  try {
+    counts = rows(await db.execute(sql`
+      SELECT
+        (SELECT COUNT(*)::int FROM mailapi_webhook_deliveries WHERE org_id = ${String(org.id)}::uuid AND environment = ${environment} AND status = 'pending') AS pending,
+        (SELECT COUNT(*)::int FROM mailapi_webhook_deliveries WHERE org_id = ${String(org.id)}::uuid AND environment = ${environment} AND status = 'delivered') AS delivered,
+        (SELECT COUNT(*)::int FROM mailapi_webhook_deliveries WHERE org_id = ${String(org.id)}::uuid AND environment = ${environment} AND status = 'dead') AS dead
+    `))[0] || null;
+  } catch (e: any) {
+    readFailures.push('Delivery counters: ' + dbReason(e));
+  }
+}
+
+// The picker offers BOTH vocabularies, grouped, because an endpoint usually wants one of each:
+// delivery facts about messages, and business facts about applications and candidates.
+const deliveryEvents = EVENT_TYPES.map((t) => ({ type: t, description: 'Delivery outcome for a message.' }));
+const businessEvents = CANONICAL_EVENTS.map((e) => ({ type: e.type, description: e.description, sensitive: !!e.sensitive }));
+
+function fmt(d: any): string {
+  if (!d) return '';
+  try {
+    return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+  } catch { return ''; }
+}
+function statusColour(s: string): string {
+  if (s === 'delivered' || s === 'active') return '#34d399';
+  if (s === 'pending' || s === 'sending' || s === 'pending_verification') return '#fbbf24';
+  return '#f87171';
+}
+---
+
+<AdminLayout title="Webhook Console" activeNav="mail">
+<div class="admin-page" style="max-width:1180px;">
+  <div class="admin-page-header" style="margin-bottom:16px;">
+    <div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">Mail &middot; Integrations</div>
+      <h1 class="admin-page-title">Webhook console</h1>
+      <p class="admin-page-sub">
+        Register an endpoint, send it a real signed test event, and read exactly what came back.
+        <a href="/admin/mail/integrations" style="color:#FF7040;text-decoration:none;">Integrations</a> &middot;
+        <a href="/admin/mail/event-bus" style="color:#FF7040;text-decoration:none;">Event bus</a>
+      </p>
+    </div>
+  </div>
+
+  {readFailures.length > 0 && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;margin-bottom:18px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fca5a5;margin:0 0 6px;">Part of this page could not be read, so what is below is not a measurement.</p>
+      <p style="font-size:12px;color:#d8d8de;margin:0 0 8px;line-height:1.6;">Nothing has been sent or lost because of this. Do not read an empty list here as "no endpoints".</p>
+      <ul style="font-size:11.5px;color:#fca5a5;margin:0;padding-left:18px;line-height:1.7;font-family:'Geist Mono',monospace;">
+        {readFailures.map((f: string) => <li>{f}</li>)}
+      </ul>
+    </div>
+  )}
+
+  <!-- Environment + organisation -->
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:18px;">
+    <div style="display:flex;gap:4px;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:4px;">
+      <a href={'/admin/mail/webhooks?env=development&org=' + (org ? org.slug : '')}
+         style={'font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:7px;text-decoration:none;' + (environment === 'development' ? 'background:#FF4F00;color:#fff;' : 'color:#9aa6b6;')}>Development</a>
+      <a href={'/admin/mail/webhooks?env=production&org=' + (org ? org.slug : '')}
+         style={'font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:7px;text-decoration:none;' + (environment === 'production' ? 'background:#FF4F00;color:#fff;' : 'color:#9aa6b6;')}>Production</a>
+    </div>
+    <select id="orgPicker" style="background:#0f0f14;border:1px solid #1a1a1f;color:#fff;font-size:12px;padding:8px 12px;border-radius:8px;">
+      {orgs.map((o: any) => <option value={o.slug} selected={org && o.slug === org.slug}>{o.name}</option>)}
+    </select>
+    {counts && (
+      <div style="display:flex;gap:14px;font-family:'Geist Mono',monospace;font-size:11.5px;color:#9aa6b6;margin-left:auto;">
+        <span>pending <strong style="color:#fbbf24;">{counts.pending}</strong></span>
+        <span>delivered <strong style="color:#34d399;">{counts.delivered}</strong></span>
+        <span>dead <strong style={'color:' + (Number(counts.dead) > 0 ? '#f87171' : '#6e6e78') + ';'}>{counts.dead}</strong></span>
+      </div>
+    )}
+  </div>
+
+  <!-- Create endpoint -->
+  <div class="admin-card" style="margin-bottom:18px;">
+    <div class="admin-card-title" style="margin-bottom:4px;">Register an endpoint</div>
+    <p style="font-size:11.5px;color:#8a8a94;margin:0 0 12px;line-height:1.6;">
+      HTTPS only, and never a private or link-local address: a customer-supplied URL is a request this server makes from inside the network.
+      The signing secret is shown once, here, and cannot be read back afterwards.
+    </p>
+    <div style="display:grid;grid-template-columns:1fr;gap:10px;">
+      <input id="epUrl" type="url" placeholder="https://example.com/hooks/edurankai"
+             style="background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12.5px;padding:9px 12px;border-radius:8px;font-family:'Geist Mono',monospace;" />
+      <input id="epDesc" type="text" placeholder="What is on the other end of this? (optional)"
+             style="background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12.5px;padding:9px 12px;border-radius:8px;" />
+      <div>
+        <p style="font-size:11px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 6px;">Business events</p>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;max-height:150px;overflow-y:auto;padding:2px;">
+          {businessEvents.map((e: any) => (
+            <label style="display:inline-flex;align-items:center;gap:5px;background:#08080a;border:1px solid #2a2a2f;border-radius:6px;padding:4px 9px;font-size:11px;color:#d8d8de;cursor:pointer;font-family:'Geist Mono',monospace;">
+              <input type="checkbox" class="evtBox" value={e.type} style="accent-color:#FF4F00;" />
+              {e.type}
+              {e.sensitive && <span title="Carries personal detail. Redacted unless this endpoint is granted the full payload." style="color:#fbbf24;font-size:9.5px;">restricted</span>}
+            </label>
+          ))}
+        </div>
+        <p style="font-size:11px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:10px 0 6px;">Delivery events</p>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;">
+          {deliveryEvents.map((e: any) => (
+            <label style="display:inline-flex;align-items:center;gap:5px;background:#08080a;border:1px solid #2a2a2f;border-radius:6px;padding:4px 9px;font-size:11px;color:#d8d8de;cursor:pointer;font-family:'Geist Mono',monospace;">
+              <input type="checkbox" class="evtBox" value={e.type} style="accent-color:#FF4F00;" />
+              {e.type}
+            </label>
+          ))}
+        </div>
+      </div>
+      <label style="display:flex;align-items:flex-start;gap:8px;font-size:11.5px;color:#d8d8de;line-height:1.6;">
+        <input id="epGrant" type="checkbox" style="accent-color:#FF4F00;margin-top:2px;" />
+        <span>
+          Send this endpoint the <strong>full payload</strong> of restricted events.
+          Rejection reasons and assessment scores are removed by default; tick this only for a system that has a reason to hold them.
+        </span>
+      </label>
+      <div>
+        <button id="createEp" type="button" style="background:#FF4F00;color:#fff;border:none;font-size:12px;font-weight:700;padding:9px 20px;border-radius:8px;cursor:pointer;">Register endpoint</button>
+        <span id="createMsg" style="font-size:11.5px;margin-left:10px;"></span>
+      </div>
+    </div>
+    <div id="secretBox" style="display:none;margin-top:12px;background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.30);border-radius:10px;padding:12px 14px;">
+      <p style="font-size:12px;font-weight:700;color:#fbbf24;margin:0 0 6px;">Copy this secret now. It is not shown again.</p>
+      <code id="secretVal" style="display:block;font-family:'Geist Mono',monospace;background:#08080a;border:1px solid #2a2a2f;color:#FF7040;padding:8px 12px;border-radius:6px;font-size:12px;word-break:break-all;"></code>
+      <p style="font-size:11px;color:#d8d8de;margin:8px 0 0;line-height:1.6;">
+        Verify a delivery by rebuilding <code style="font-family:'Geist Mono',monospace;color:#FF7040;">Webhook-Id + "." + Webhook-Timestamp + "." + body</code>,
+        computing HMAC-SHA256 with this secret, and comparing constant-time against each space-separated value in <code style="font-family:'Geist Mono',monospace;color:#FF7040;">Webhook-Signature</code>.
+      </p>
+    </div>
+  </div>
+
+  <!-- Endpoints -->
+  <div class="admin-card" style="margin-bottom:18px;">
+    <div class="admin-card-title" style="margin-bottom:10px;">Endpoints ({endpoints.length})</div>
+    {endpoints.length === 0 && readFailures.length === 0 && (
+      <p style="font-size:12px;color:#8a8a94;margin:0;">No endpoint is registered in the {environment} environment.</p>
+    )}
+    {endpoints.map((ep: any) => (
+      <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;margin-bottom:10px;" data-ep={ep.id}>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+          <span style={'width:8px;height:8px;border-radius:50%;flex-shrink:0;background:' + statusColour(String(ep.status)) + ';'}></span>
+          <code style="font-family:'Geist Mono',monospace;font-size:12px;color:#fff;word-break:break-all;">{ep.url}</code>
+          <span style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#8a8a94;">{ep.status}</span>
+          {ep.grant_sensitive && <span style="font-size:10px;color:#fbbf24;border:1px solid rgba(251,191,36,0.4);border-radius:4px;padding:1px 6px;">full payload</span>}
+        </div>
+        <p style="font-size:11px;color:#8a8a94;margin:0 0 8px;font-family:'Geist Mono',monospace;">
+          secret ****{ep.secret_tail} &middot; {(Array.isArray(ep.events) ? ep.events.length : 0)} event(s) &middot; failures {ep.consecutive_failures} &middot; created {fmt(ep.created_at)}
+          {ep.previous_secret_expires_at && <span style="color:#fbbf24;"> &middot; previous secret valid until {fmt(ep.previous_secret_expires_at)}</span>}
+        </p>
+        {ep.disabled_reason && (
+          <p style="font-size:11.5px;color:#fca5a5;margin:0 0 8px;line-height:1.6;">{ep.disabled_reason}</p>
+        )}
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          <select class="testEvent" style="background:#0f0f14;border:1px solid #2a2a2f;color:#fff;font-size:11px;padding:6px 10px;border-radius:6px;font-family:'Geist Mono',monospace;">
+            {(Array.isArray(ep.events) ? ep.events : []).map((t: string) => <option value={t}>{t}</option>)}
+          </select>
+          <button type="button" class="btnTest" data-id={ep.id} style="background:#FF4F00;color:#fff;border:none;font-size:11px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Send test event</button>
+          <button type="button" class="btnVerify" data-id={ep.id} style="background:#1a1a1f;color:#d8d8de;border:1px solid #2a2a2f;font-size:11px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Verify</button>
+          <button type="button" class="btnRotate" data-id={ep.id} style="background:#1a1a1f;color:#fbbf24;border:1px solid rgba(251,191,36,0.35);font-size:11px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Rotate secret</button>
+          <button type="button" class="btnDisable" data-id={ep.id} data-status={ep.status} style="background:#1a1a1f;color:#9aa6b6;border:1px solid #2a2a2f;font-size:11px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">{ep.status === 'disabled' ? 'Enable' : 'Disable'}</button>
+          <button type="button" class="btnDelete" data-id={ep.id} style="background:#1a1a1f;color:#f87171;border:1px solid rgba(248,113,113,0.35);font-size:11px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Delete</button>
+        </div>
+      </div>
+    ))}
+  </div>
+
+  <!-- Request / response viewer -->
+  <div class="admin-card" style="margin-bottom:18px;" id="viewerCard">
+    <div class="admin-card-title" style="margin-bottom:4px;">Last exchange</div>
+    <p style="font-size:11.5px;color:#8a8a94;margin:0 0 10px;line-height:1.6;">
+      The request is signed and sent by the production dispatcher's own code. Payload version {EVENT_ENVELOPE_VERSION}.
+    </p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;">
+      <div>
+        <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 6px;">Request</p>
+        <pre id="reqView" style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;font-family:'Geist Mono',monospace;font-size:11px;color:#d8d8de;overflow-x:auto;max-height:340px;margin:0;">Send a test event to see the exact request.</pre>
+      </div>
+      <div>
+        <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 6px;">Response</p>
+        <pre id="resView" style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;font-family:'Geist Mono',monospace;font-size:11px;color:#d8d8de;overflow-x:auto;max-height:340px;margin:0;">Nothing sent yet.</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- Deliveries -->
+  <div class="admin-card">
+    <div class="admin-card-title" style="margin-bottom:4px;">Recent deliveries</div>
+    <p style="font-size:11.5px;color:#8a8a94;margin:0 0 10px;line-height:1.6;">
+      A delivery stops retrying after its attempts are spent and is marked <strong>dead</strong>. Dead is not lost: a retry re-queues it with its
+      original payload and event id, so a receiver that de-duplicates on <code style="font-family:'Geist Mono',monospace;color:#FF7040;">Webhook-Id</code> is unharmed.
+    </p>
+    {deliveries.length === 0 && readFailures.length === 0 && (
+      <p style="font-size:12px;color:#8a8a94;margin:0;">Nothing has been delivered in this environment yet.</p>
+    )}
+    {deliveries.length > 0 && (
+      <div style="overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;font-size:11.5px;">
+          <thead>
+            <tr style="text-align:left;color:#8a8a94;font-size:10px;text-transform:uppercase;letter-spacing:0.08em;">
+              <th style="padding:6px 8px;">When</th>
+              <th style="padding:6px 8px;">Event</th>
+              <th style="padding:6px 8px;">Status</th>
+              <th style="padding:6px 8px;">HTTP</th>
+              <th style="padding:6px 8px;">Attempts</th>
+              <th style="padding:6px 8px;">Detail</th>
+              <th style="padding:6px 8px;"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {deliveries.map((d: any) => (
+              <tr style="border-top:1px solid #1a1a1f;">
+                <td style="padding:7px 8px;color:#9aa6b6;font-family:'Geist Mono',monospace;white-space:nowrap;">{fmt(d.created_at)}</td>
+                <td style="padding:7px 8px;color:#fff;font-family:'Geist Mono',monospace;">{d.event_type}</td>
+                <td style={'padding:7px 8px;font-weight:700;color:' + statusColour(String(d.status)) + ';'}>{d.status}</td>
+                <td style="padding:7px 8px;color:#9aa6b6;font-family:'Geist Mono',monospace;">{d.response_status || '-'}</td>
+                <td style="padding:7px 8px;color:#9aa6b6;font-family:'Geist Mono',monospace;">{d.attempts}/{d.max_attempts}</td>
+                <td style="padding:7px 8px;color:#8a8a94;max-width:320px;">{d.error || (d.delivered_at ? 'delivered in ' + (d.duration_ms || 0) + 'ms' : '')}</td>
+                <td style="padding:7px 8px;">
+                  {(d.status === 'dead' || d.status === 'pending') && (
+                    <button type="button" class="btnRetry" data-id={d.id} style="background:#1a1a1f;color:#FF7040;border:1px solid rgba(255,79,0,0.35);font-size:10.5px;font-weight:700;padding:4px 10px;border-radius:5px;cursor:pointer;">Retry</button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+  </div>
+</div>
+
+<script define:vars={{ orgSlug: org ? org.slug : '', environment }}>
+  const API = '/api/admin/mail/integrations';
+
+  async function call(payload) {
+    const res = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ org_slug: orgSlug, environment }, payload)),
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) { data = { ok: false, error: 'The server answered with something that is not JSON (HTTP ' + res.status + ').' }; }
+    return data;
+  }
+
+  function show(el, text, ok) {
+    el.textContent = text;
+    el.style.color = ok ? '#34d399' : '#fca5a5';
+  }
+
+  const orgPicker = document.getElementById('orgPicker');
+  if (orgPicker) {
+    orgPicker.addEventListener('change', function () {
+      window.location.href = '/admin/mail/webhooks?env=' + environment + '&org=' + encodeURIComponent(orgPicker.value);
+    });
+  }
+
+  const createBtn = document.getElementById('createEp');
+  if (createBtn) {
+    createBtn.addEventListener('click', async function () {
+      const msg = document.getElementById('createMsg');
+      const url = document.getElementById('epUrl').value.trim();
+      const desc = document.getElementById('epDesc').value.trim();
+      const grant = document.getElementById('epGrant').checked;
+      const events = Array.prototype.slice.call(document.querySelectorAll('.evtBox'))
+        .filter(function (b) { return b.checked; })
+        .map(function (b) { return b.value; });
+      if (!url) { show(msg, 'A URL is required.', false); return; }
+      if (!events.length) { show(msg, 'Choose at least one event, or this endpoint will never be called.', false); return; }
+      createBtn.disabled = true;
+      show(msg, 'Registering...', true);
+      const r = await call({ action: 'endpoint.create', url: url, description: desc, events: events, grant_sensitive: grant });
+      createBtn.disabled = false;
+      if (!r.ok) { show(msg, r.error || 'It was not registered.', false); return; }
+      show(msg, 'Registered.', true);
+      const box = document.getElementById('secretBox');
+      document.getElementById('secretVal').textContent = (r.endpoint && r.endpoint.secret) || '(not returned)';
+      box.style.display = 'block';
+      setTimeout(function () { window.location.reload(); }, 6000);
+    });
+  }
+
+  document.querySelectorAll('.btnTest').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      const card = btn.closest('[data-ep]');
+      const sel = card ? card.querySelector('.testEvent') : null;
+      const type = sel ? sel.value : 'application.stage.changed';
+      btn.disabled = true;
+      btn.textContent = 'Sending...';
+      const r = await call({ action: 'endpoint.test', endpoint_id: btn.dataset.id, event_type: type });
+      btn.disabled = false;
+      btn.textContent = 'Send test event';
+      const req = document.getElementById('reqView');
+      const res = document.getElementById('resView');
+      if (!r.ok) {
+        req.textContent = '';
+        res.textContent = r.error || 'The test could not be sent.';
+        res.style.color = '#fca5a5';
+        return;
+      }
+      req.textContent = r.request.method + ' ' + r.request.url + '\n\n'
+        + Object.keys(r.request.headers).map(function (k) { return k + ': ' + r.request.headers[k]; }).join('\n')
+        + '\n\n' + JSON.stringify(r.request.body, null, 2);
+      const lines = [
+        'HTTP ' + (r.response.status === null ? '(no response)' : r.response.status),
+        'classification: ' + r.response.classification,
+        'took: ' + r.response.duration_ms + 'ms',
+      ];
+      if (r.response.error) lines.push('', r.response.error);
+      if (!r.response.ok && r.response.next_retry_in_seconds) {
+        lines.push('', 'A real delivery would retry in ' + r.response.next_retry_in_seconds + 's.');
+      }
+      res.textContent = lines.join('\n');
+      res.style.color = r.response.ok ? '#34d399' : '#fca5a5';
+      document.getElementById('viewerCard').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  });
+
+  document.querySelectorAll('.btnVerify').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      const r = await call({ action: 'endpoint.verify', endpoint_id: btn.dataset.id });
+      btn.disabled = false;
+      const res = document.getElementById('resView');
+      if (!r.ok) { res.textContent = r.error || 'Verification failed.'; res.style.color = '#fca5a5'; return; }
+      res.textContent = 'Verification event: HTTP ' + (r.result.status === null ? '(no response)' : r.result.status)
+        + '\ntook: ' + r.result.durationMs + 'ms'
+        + (r.result.error ? '\n\n' + r.result.error : '');
+      res.style.color = r.result.ok ? '#34d399' : '#fca5a5';
+      if (r.result.ok) setTimeout(function () { window.location.reload(); }, 1200);
+    });
+  });
+
+  document.querySelectorAll('.btnRotate').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      const r = await call({ action: 'endpoint.rotate', endpoint_id: btn.dataset.id, overlap_minutes: 1440 });
+      btn.disabled = false;
+      if (!r.ok) { alert(r.error || 'The secret was not rotated.'); return; }
+      const box = document.getElementById('secretBox');
+      document.getElementById('secretVal').textContent = r.secret;
+      box.style.display = 'block';
+      box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  });
+
+  document.querySelectorAll('.btnDisable').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      const next = btn.dataset.status === 'disabled' ? 'active' : 'disabled';
+      btn.disabled = true;
+      const r = await call({ action: 'endpoint.update', endpoint_id: btn.dataset.id, status: next });
+      btn.disabled = false;
+      if (!r.ok) { alert(r.error || 'Nothing changed.'); return; }
+      window.location.reload();
+    });
+  });
+
+  document.querySelectorAll('.btnDelete').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      const r = await call({ action: 'endpoint.delete', endpoint_id: btn.dataset.id });
+      btn.disabled = false;
+      if (!r.ok) { alert(r.error || 'It was not deleted.'); return; }
+      window.location.reload();
+    });
+  });
+
+  document.querySelectorAll('.btnRetry').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      btn.textContent = 'Queued';
+      const r = await call({ action: 'delivery.retry', delivery_id: btn.dataset.id });
+      if (!r.ok) { btn.disabled = false; btn.textContent = 'Retry'; alert(r.error || 'It was not re-queued.'); return; }
+      const res = document.getElementById('resView');
+      res.textContent = r.note + '\n\nThe dispatcher picks it up on its next run, or press "Run dispatcher" on the event bus page.';
+      res.style.color = '#34d399';
+    });
+  });
+</script>
+</AdminLayout>

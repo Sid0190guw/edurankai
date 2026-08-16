@@ -1,0 +1,145 @@
+# docker/prometheus/alerts.yml — alerting rules.
+#
+# READ THIS FIRST: THERE IS NO ALERTMANAGER IN THIS STACK. Prometheus evaluates these rules and
+# shows them as firing on its own Alerts page. Nothing sends an email, nothing wakes anybody. That
+# is stated here rather than implied, because a rules file is exactly the artefact that makes people
+# believe they are covered. docs/mail/OBSERVABILITY.md section 5 is how to wire a destination.
+#
+# TWO METRIC NAMESPACES, AND THEY MEAN DIFFERENT THINGS:
+#
+#   edurankai_mail_*   comes from the APPLICATION (/api/metrics, src/lib/mailplatform/metrics.ts).
+#                      Its COUNTERS are PROCESS-LOCAL: on Vercel each instance keeps its own
+#                      registry and is recycled without warning, so a counter reflects one instance
+#                      since its cold start. `edurankai_mail_registry_age_seconds` is what tells you
+#                      whether a low number means "quiet" or "just restarted". Its queue_* GAUGES
+#                      are read from Postgres and ARE cluster-wide. Alert on the gauges. Alerting on
+#                      the counters as if they were cluster totals will produce false quiet.
+#
+#   era_*              comes from THIS STACK's own long-lived services on the ZBook (ingest bridge,
+#                      queue worker, sink, health aggregator). Those are ordinary processes that stay
+#                      up, so their counters behave normally and rate() is meaningful.
+#
+# EVERY RULE HAS A `for:` CLAUSE. A rule without one fires on a single bad scrape — one slow query,
+# one container restart — and an alert that cries wolf gets muted, after which none of them work.
+
+groups:
+  - name: mail-stack
+    rules:
+      # --- the ZBook stack ----------------------------------------------------------------------
+      - alert: MailComponentDown
+        expr: era_mailops_component_up == 0
+        for: 3m
+        labels: { severity: critical }
+        annotations:
+          summary: "Mail component {{ $labels.component }} is not answering"
+          description: >-
+            The health aggregator could not reach {{ $labels.component }} for 3 minutes.
+            Components that are not deployed emit no series at all, so this firing means the
+            component is EXPECTED and failing. Run ./scripts/status-mail.sh, then
+            `docker compose logs --tail=100 {{ $labels.component }}`.
+
+      - alert: WorkerNotDraining
+        expr: era_worker_consecutive_errors > 3
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Mail worker cannot drain the queue"
+          description: >-
+            Every poll to /api/jobs/run has failed for 5 minutes. The two causes that account for
+            almost all of these: the app is down, or CRON_SECRET on the worker does not match the
+            app's. Queued mail is NOT lost — it stays in edu_jobs — but nothing is being sent.
+
+      - alert: InboundMailRefused
+        expr: increase(era_ingest_refused[15m]) > 5
+        labels: { severity: critical }
+        annotations:
+          summary: "The app is permanently refusing inbound mail"
+          description: >-
+            The ingest bridge forwarded messages and /api/mail/inbound answered 4xx. The message is
+            NOT lost — the bridge answers 451 so the upstream MTA holds it — but it is not being
+            delivered either, and the upstream will bounce it eventually. Almost always a secret
+            mismatch: MAIL_WEBHOOK_SECRET on the bridge versus the app.
+            No `for:` clause: increase() already covers a window, and a single burst matters.
+
+      - alert: IngestBacklog
+        expr: increase(era_ingest_received[10m]) - increase(era_ingest_forwarded[10m]) > 20
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Inbound messages are being accepted faster than they are handed to the app"
+          description: >-
+            The bridge is retrying. Mail is safe (the upstream MTA holds anything not accepted) but
+            the app is slow or intermittently unreachable. Check era_ingest_retries.
+
+      # --- the application ------------------------------------------------------------------------
+      - alert: AppMetricsUnscrapable
+        expr: up{job="app"} == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Prometheus cannot scrape /api/metrics"
+          description: >-
+            This is a MONITORING failure, not necessarily an application failure — check
+            era_mailops_component_up{component="app"} before treating it as an outage. The usual
+            cause is the bearer token: /api/metrics requires METRICS_TOKEN of at least 32 characters
+            and answers 403 when the token is wrong. The token Prometheus sends lives in
+            docker/prometheus/metrics_token, written by ./scripts/start-mail.sh.
+
+      - alert: QueueTelemetryUnreadable
+        expr: edurankai_mail_telemetry_readable{source="queue"} == 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Queue numbers in this scrape are defaults, not measurements"
+          description: >-
+            The app could not read queue telemetry from Postgres. Every queue_* series is therefore
+            a default value. Treat the queue panels as blank, not as healthy — this alert exists so
+            a quiet queue and an unreadable one are never confused.
+
+      - alert: QueueBacklogGrowing
+        expr: sum(edurankai_mail_queue_depth{status="pending"}) > 500
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Queue backlog above 500 for 15 minutes"
+          description: >-
+            Jobs are arriving faster than they are drained. Check whether the worker is alive
+            (era_worker_ticks should be increasing) before assuming a capacity problem — a stopped
+            worker and an overloaded one look identical from backlog alone. If the worker is fine,
+            raise QUEUE_BATCH_SIZE or add a worker; docs/mail/SCALING.md section 2.
+
+      - alert: QueueJobsFailing
+        expr: sum(edurankai_mail_queue_depth{status="failed"}) > 25
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 25 jobs have exhausted their retries"
+          description: >-
+            These jobs will not run again without `/api/jobs/run?action=retry`. Find out WHY before
+            requeueing — a systematic failure (bad SMTP credentials, a schema change) will simply
+            exhaust the retries again, and the second failure is harder to see than the first.
+
+      - alert: QueueHeadStale
+        expr: max(edurankai_mail_queue_oldest_age_seconds{state="pending"}) > 1800
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "The oldest pending job has been waiting over 30 minutes"
+          description: >-
+            Depth can look fine while the head of the queue is stuck — a small number of jobs that
+            no worker will claim. This catches that; depth alone does not. Note the series is ABSENT
+            when the queue is empty, which is deliberate: absent and zero mean different things.
+
+      - alert: MessagesFailing
+        expr: >-
+          sum(rate(edurankai_mail_messages_failed_total[30m]) + rate(edurankai_mail_messages_bounced_total[30m]))
+          / clamp_min(sum(rate(edurankai_mail_messages_accepted_total[30m])), 0.001) > 0.1
+        for: 20m
+        labels: { severity: warning }
+        annotations:
+          summary: "Over 10% of accepted messages are failing or bouncing"
+          description: >-
+            These are PROCESS-LOCAL counters — check edurankai_mail_registry_age_seconds before
+            reading much into a sudden change, because a deploy resets every instance's registry.
+            A sustained ratio is still meaningful. Usual causes: credentials, a DNS/DKIM change, or
+            a receiver that started rejecting. /admin/mail/analytics shows which recipients.

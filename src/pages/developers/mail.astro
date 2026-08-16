@@ -1,0 +1,402 @@
+---
+/**
+ * /developers/mail — the public reference for the transactional email API.
+ *
+ * WRITTEN FOR SOMEBODY INTEGRATING AT 2AM. Every section that describes a behaviour also describes
+ * what happens when it goes wrong, because the failure is what the reader is actually looking for.
+ * Where a capability does not exist yet it says so — a documented webhook that can never fire costs
+ * more than an honest gap.
+ *
+ * No company other than EduRankAI is named anywhere on this page.
+ */
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { SITE } from '@/lib/site';
+import { PAYLOAD_VERSION } from '@/lib/mailapi/schema';
+import { ALL_SCOPES } from '@/lib/mailapi/keys';
+import { EVENT_TYPES } from '@/lib/mailapi/webhooks';
+import { LIMITS } from '@/lib/mailapi/validate';
+
+const base = SITE.url.replace(/\/$/, '');
+
+// Rendered from the same constants the API enforces, so the page cannot drift from the behaviour.
+const ENDPOINTS: { method: string; path: string; scope: string; note: string }[] = [
+  { method: 'POST', path: '/api/v1/email/send', scope: 'email.send', note: 'Send a message.' },
+  { method: 'GET', path: '/api/v1/messages', scope: 'email.read', note: 'List and correlate by metadata.' },
+  { method: 'GET', path: '/api/v1/messages/:id', scope: 'email.read', note: 'One message.' },
+  { method: 'GET', path: '/api/v1/messages/:id/status', scope: 'email.read', note: 'Status plus delivery events.' },
+  { method: 'DELETE', path: '/api/v1/messages/:id', scope: 'email.send', note: 'Cancel a scheduled send.' },
+  { method: 'GET', path: '/api/v1/events', scope: 'events.read', note: 'The event feed, for backfill and reconciliation.' },
+  { method: 'GET', path: '/api/v1/templates', scope: 'templates.read', note: 'List templates.' },
+  { method: 'POST', path: '/api/v1/templates', scope: 'templates.write', note: 'Create with a first version.' },
+  { method: 'GET', path: '/api/v1/templates/:id', scope: 'templates.read', note: 'One template and its versions.' },
+  { method: 'PATCH', path: '/api/v1/templates/:id', scope: 'templates.write', note: 'Rename, or add a draft version.' },
+  { method: 'DELETE', path: '/api/v1/templates/:id', scope: 'templates.write', note: 'Archive it.' },
+  { method: 'POST', path: '/api/v1/templates/:id/publish', scope: 'templates.write', note: 'Publish or unpublish a version.' },
+  { method: 'POST', path: '/api/v1/templates/:id/preview', scope: 'templates.read', note: 'Test render. Nothing is sent.' },
+  { method: 'POST', path: '/api/v1/templates/:id/copy', scope: 'templates.write', note: 'Promote to another environment.' },
+  { method: 'GET', path: '/api/v1/webhooks', scope: 'events.read', note: 'List endpoints.' },
+  { method: 'POST', path: '/api/v1/webhooks', scope: 'events.read + email.send', note: 'Register. The secret is shown once.' },
+  { method: 'PATCH', path: '/api/v1/webhooks/:id', scope: 'events.read + email.send', note: 'Change url, events, or re-enable.' },
+  { method: 'DELETE', path: '/api/v1/webhooks/:id', scope: 'events.read + email.send', note: 'Remove it.' },
+  { method: 'POST', path: '/api/v1/webhooks/:id/rotate', scope: 'events.read + email.send', note: 'New secret, with an overlap.' },
+  { method: 'POST', path: '/api/v1/webhooks/:id/test', scope: 'events.read', note: 'Send a signed verification event.' },
+  { method: 'GET', path: '/api/v1/webhooks/:id/deliveries', scope: 'events.read', note: 'Delivery log and dead letters.' },
+  { method: 'POST', path: '/api/v1/webhooks/:id/deliveries', scope: 'events.read + email.send', note: 'Replay a dead delivery.' },
+  { method: 'GET', path: '/api/v1/suppressions', scope: 'email.read', note: 'Addresses we have stopped mailing.' },
+  { method: 'POST', path: '/api/v1/suppressions', scope: 'email.send', note: 'Add one.' },
+  { method: 'DELETE', path: '/api/v1/suppressions', scope: 'email.send', note: 'Remove one.' },
+  { method: 'GET', path: '/api/v1/domains', scope: 'domains.read', note: 'Sending identities and DNS posture.' },
+  { method: 'POST', path: '/api/v1/domains', scope: 'domains.write', note: 'Register and check one.' },
+];
+
+const ERRORS: { code: string; status: number; meaning: string }[] = [
+  { code: 'invalid_request', status: 400, meaning: 'A field is missing or malformed. `param` names it.' },
+  { code: 'missing_api_key', status: 401, meaning: 'No key was presented.' },
+  { code: 'invalid_api_key', status: 401, meaning: 'Not a key we recognise.' },
+  { code: 'expired_api_key', status: 401, meaning: 'It had an expiry, or it was rotated and the grace period ended.' },
+  { code: 'revoked_api_key', status: 401, meaning: 'Somebody revoked it. Create a new one.' },
+  { code: 'insufficient_scope', status: 403, meaning: 'The response names the scope that was required.' },
+  { code: 'environment_mismatch', status: 403, meaning: 'The key and its record disagree. Refused rather than believed.' },
+  { code: 'organization_inactive', status: 403, meaning: 'Sending is disabled for this organization.' },
+  { code: 'template_not_found', status: 404, meaning: 'No such template in THIS environment.' },
+  { code: 'message_not_found', status: 404, meaning: 'Also the answer for another organization or environment.' },
+  { code: 'idempotency_key_reused', status: 409, meaning: 'That key was used for a different request.' },
+  { code: 'idempotency_in_progress', status: 409, meaning: 'The first call with that key is still running.' },
+  { code: 'payload_too_large', status: 413, meaning: 'Over 1 MB. Bodies are HTML and text; documents are links.' },
+  { code: 'template_not_published', status: 422, meaning: 'Production needs a published version, or options.allow_draft.' },
+  { code: 'template_variable_missing', status: 422, meaning: 'Named in missing_variables. Refused rather than rendered blank.' },
+  { code: 'all_recipients_suppressed', status: 422, meaning: 'Every recipient asked us to stop, or hard bounced.' },
+  { code: 'attachment_not_a_link', status: 422, meaning: 'File content was sent. Attachments are links.' },
+  { code: 'rate_limit_exceeded', status: 429, meaning: 'Retry-After says how long.' },
+  { code: 'no_transport', status: 503, meaning: 'No mail server is configured on this deployment.' },
+];
+
+const SCOPE_NOTES: { scope: string; what: string }[] = [
+  { scope: 'email.send', what: 'Send messages, cancel scheduled ones, manage suppression, register webhooks.' },
+  { scope: 'email.read', what: 'Read messages and their status.' },
+  { scope: 'templates.read', what: 'List, read and preview templates.' },
+  { scope: 'templates.write', what: 'Create, version, publish, archive and promote templates.' },
+  { scope: 'events.read', what: 'Read delivery events and manage webhook endpoints.' },
+  { scope: 'domains.read', what: 'Read sending identities and their DNS posture.' },
+  { scope: 'domains.write', what: 'Register and re-check sending domains.' },
+];
+---
+<BaseLayout title="Mail API - EduRankAI Developers" description="The transactional email API behind every EduRankAI product: send, templates, idempotency, delivery events and signed webhooks.">
+<style>
+  body { background: #0a0a0c; color: #e8e8ee; }
+  .dv { max-width: 940px; margin: 0 auto; padding: 48px 6vw 120px; }
+  .dv h1 { font-family: 'Cormorant Garamond', serif; font-size: clamp(34px, 6vw, 54px); font-weight: 600; letter-spacing: -0.02em; margin: 0 0 12px; }
+  .dv .eyebrow { font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: #67e8f9; font-weight: 700; }
+  .dv .lead { font-size: 16px; color: #b8b8c4; line-height: 1.75; max-width: 680px; }
+  .dv h2 { font-family: 'Cormorant Garamond', serif; font-size: 30px; font-weight: 600; margin: 52px 0 10px; scroll-margin-top: 80px; }
+  .dv h3 { font-family: 'Geist Mono', monospace; font-size: 12.5px; letter-spacing: 0.06em; color: #67e8f9; margin: 28px 0 6px; text-transform: uppercase; }
+  .dv p { color: #b8b8c4; line-height: 1.75; font-size: 14.5px; }
+  .dv li { color: #b8b8c4; line-height: 1.75; font-size: 14.5px; margin-bottom: 6px; }
+  .dv code.inl { background: #15151a; border: 1px solid #2a2a35; border-radius: 5px; padding: 2px 6px; font-family: 'Geist Mono', monospace; font-size: 12.5px; color: #fbbf24; }
+  .dv pre { background: #11131a; border: 1px solid #2a2a35; border-radius: 10px; padding: 16px; overflow-x: auto; font-size: 12.5px; color: #cfd6da; font-family: 'Geist Mono', monospace; line-height: 1.7; }
+  .dv table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; display: block; overflow-x: auto; }
+  .dv th, .dv td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #1a1a1f; vertical-align: top; }
+  .dv th { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: #8a8a94; white-space: nowrap; }
+  .dv a { color: #67e8f9; }
+  .dv .m { font-family: 'Geist Mono', monospace; font-size: 11.5px; }
+  .dv .note { background: #11131a; border-left: 2px solid #FF4F00; border-radius: 0 8px 8px 0; padding: 12px 16px; margin: 16px 0; }
+  .dv .note p { margin: 0; font-size: 13.5px; }
+  .dv .toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 28px 0 8px; }
+  .dv .toc a { font-family: 'Geist Mono', monospace; font-size: 11.5px; border: 1px solid #2a2a35; border-radius: 999px; padding: 5px 12px; text-decoration: none; color: #b8b8c4; }
+</style>
+<main class="dv">
+  <p class="eyebrow">EduRankAI Mail - Transactional API v1</p>
+  <h1>One sending API for every product.</h1>
+  <p class="lead">
+    Application confirmations, internship stage notifications, assessment instructions, interview
+    invitations, selection and rejection letters, password resets, account verification, invoices,
+    system notifications, and university and project communications - all through one contract, with
+    versioned templates, idempotent sends, delivery events and signed webhooks.
+  </p>
+
+  <div class="toc">
+    <a href="#auth">Authentication</a>
+    <a href="#send">Send</a>
+    <a href="#templates">Templates</a>
+    <a href="#idempotency">Idempotency</a>
+    <a href="#status">Status and events</a>
+    <a href="#webhooks">Webhooks</a>
+    <a href="#limits">Rate limits</a>
+    <a href="#errors">Errors</a>
+    <a href="#sdks">SDKs</a>
+    <a href="#reference">Full reference</a>
+  </div>
+
+  <h2 id="auth">Authentication</h2>
+  <p>Every request carries an API key, issued from the admin console. Send it as a bearer token, or in <code class="inl">x-api-key</code>. It is never accepted from the query string - a secret in a URL ends up in access logs, proxies and browser history.</p>
+  <pre>{`curl -X POST ${base}/api/v1/email/send \\
+  -H "Authorization: Bearer erm_live_xxxxxxxx" \\
+  -H "Content-Type: application/json" \\
+  -d '{ "to": "candidate@example.com", "subject": "Hello", "html": "<p>Hello</p>" }'`}</pre>
+
+  <h3>Environments</h3>
+  <p>The environment is part of the key itself and part of its record, and both must agree - a mismatch is refused rather than believed.</p>
+  <table>
+    <thead><tr><th>Prefix</th><th>Environment</th></tr></thead>
+    <tbody>
+      <tr><td class="m">erm_dev_</td><td>development</td></tr>
+      <tr><td class="m">erm_stg_</td><td>staging</td></tr>
+      <tr><td class="m">erm_live_</td><td>production</td></tr>
+    </tbody>
+  </table>
+  <p>Every query is scoped by organization <em>and</em> environment. A development key cannot read, edit or send a production template, message or webhook endpoint. Move a template between environments with <code class="inl">POST /api/v1/templates/:id/copy</code>.</p>
+
+  <h3>Scopes</h3>
+  <table>
+    <thead><tr><th>Scope</th><th>Grants</th></tr></thead>
+    <tbody>
+      {SCOPE_NOTES.map((s) => (
+        <tr><td class="m" style="color:#86efac;">{s.scope}</td><td>{s.what}</td></tr>
+      ))}
+    </tbody>
+  </table>
+  <p>A grant may use a namespace wildcard (<code class="inl">email.*</code>) or <code class="inl">*</code>. A prefix wildcard stops at its own namespace: <code class="inl">email.*</code> does not imply <code class="inl">templates.read</code>. There are {ALL_SCOPES.length} scopes in total.</p>
+
+  <div class="note">
+    <p><strong>Keys are shown once.</strong> Only a hash is stored, so nothing can display one again. If a key is lost, rotate it - rotation mints a replacement and keeps the old key working for a grace period, so deploying the new value is never a race.</p>
+  </div>
+
+  <h2 id="send">Send</h2>
+  <pre>{`POST /api/v1/email/send        scope: email.send
+
+{
+  "from": "talent@edurankai.in",
+  "to": ["candidate@example.com"],
+  "template_id": "internship-stage-update",
+  "variables": {
+    "candidate_name": "Candidate",
+    "role": "AI Engineering Intern",
+    "stage": 3,
+    "next_stage": "Technical assessment",
+    "deadline": "22 August 2026"
+  },
+  "metadata": { "application_id": "app_01H8" },
+  "tags": ["careers", "stage-3"]
+}`}</pre>
+  <p>Response <code class="inl">202</code>:</p>
+  <pre>{`{
+  "id": "4f1c4a2e-0e1b-4a5d-9f3e-2b6c8d0a1e5f",
+  "object": "message",
+  "status": "sent",
+  "environment": "production",
+  "to": ["candidate@example.com"],
+  "subject": "AI Engineering Intern - stage 3",
+  "template": { "key": "internship-stage-update", "version": 4, "state": "published" },
+  "metadata": { "application_id": "app_01H8" },
+  "queued_at": "2026-08-16T12:00:00.000Z",
+  "sent_at": "2026-08-16T12:00:01.480Z"
+}`}</pre>
+
+  <h3>Fields</h3>
+  <table>
+    <thead><tr><th>Field</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td class="m">from</td><td>Address, or Name and address. May be rewritten - see below.</td></tr>
+      <tr><td class="m">to, cc, bcc</td><td>String or array. {LIMITS.maxRecipients} recipients in total across all three.</td></tr>
+      <tr><td class="m">reply_to</td><td>Optional.</td></tr>
+      <tr><td class="m">subject</td><td>Required for an inline body; an optional override for a template.</td></tr>
+      <tr><td class="m">html, text</td><td>An inline body. Mutually exclusive with template_id.</td></tr>
+      <tr><td class="m">template_id</td><td>The template id or its key.</td></tr>
+      <tr><td class="m">template_version</td><td>Defaults to the published version.</td></tr>
+      <tr><td class="m">variables</td><td>Also accepted as template_variables. Sending both with different values is an error.</td></tr>
+      <tr><td class="m">attachments</td><td>Links only. See below.</td></tr>
+      <tr><td class="m">metadata</td><td>Up to {LIMITS.maxMetadataKeys} keys, {LIMITS.maxMetadataBytes / 1024} KB. Returned on every webhook, and filterable.</td></tr>
+      <tr><td class="m">tags</td><td>Up to {LIMITS.maxTags}.</td></tr>
+      <tr><td class="m">headers</td><td>X- prefixed, plus References, In-Reply-To, Importance, X-Priority, Auto-Submitted.</td></tr>
+      <tr><td class="m">idempotency_key</td><td>Or the Idempotency-Key header, which wins.</td></tr>
+      <tr><td class="m">scheduled_at</td><td>ISO 8601, in the future, at most {LIMITS.maxScheduleDays} days ahead.</td></tr>
+      <tr><td class="m">options</td><td>allow_draft, track_opens, track_clicks, include_unsubscribe, skip_suppression.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>What the response tells you</h3>
+  <ul>
+    <li><strong>The From address may be rewritten.</strong> A mail server rejects or spam-folders a From that does not match the account it authenticates as, so we normalise it and move your address to Reply-To. When that happens the response carries a <code class="inl">warnings</code> entry naming the substitution, rather than letting you find out from a recipient.</li>
+    <li><strong>Warnings</strong> also report recipients skipped for suppression, a draft template used under an override, tracking requested on a deployment where it is unavailable, and a first attempt that was deferred.</li>
+    <li><strong>A missing template variable is a 422, not a blank.</strong> "Dear ," in somebody's inbox cannot be recalled. A refusal can be fixed.</li>
+  </ul>
+
+  <h3>Attachments are links</h3>
+  <p>EduRankAI Mail does not accept uploaded file content. Documents of any kind travel as a shared link; the only stored upload anywhere in the product is a small profile photo.</p>
+  <pre>{`"attachments": [
+  { "filename": "Offer letter.pdf", "url": "https://drive.example/file/d/FILE_ID/view" }
+]`}</pre>
+  <p>An entry carrying <code class="inl">content</code>, <code class="inl">data</code> or <code class="inl">path</code> is refused with <code class="inl">attachment_not_a_link</code> and an explanation, never silently dropped. Set the link's sharing to anyone-with-the-link or the recipient cannot open it.</p>
+
+  <h2 id="templates">Templates</h2>
+  <p>A template is a <strong>name</strong>; its content is always a <strong>version</strong>. Editing produces a draft; publishing moves the pointer and archives the version that was published before it, so exactly one is published at a time. Every message records the version it rendered from, which is what makes "what exactly did we send this candidate in March?" answerable months later.</p>
+  <p><strong>Production refuses drafts.</strong> A production key sending against an unpublished version gets <code class="inl">422 template_not_published</code> unless the request sets <code class="inl">options.allow_draft</code> - which is then recorded on the message and in its queued event.</p>
+  <p><code class="inl">DELETE</code> archives rather than dropping rows. Messages point at their template, and an audit that cannot resolve the template a letter came from is not an audit.</p>
+
+  <h3>Syntax</h3>
+  <pre>{`{{ candidate_name }}                  substitute (escaped in a body, raw in a subject)
+{{{ pre_rendered_block }}}            substitute without escaping - you vouch for it
+{{ role.title }}                      dotted path
+{{#if deadline}} ... {{else}} ... {{/if}}
+{{#unless paid}} ... {{/unless}}
+{{#each steps}}{{@number}}. {{title}}{{/each}}     also {{this}}, {{@index}}`}</pre>
+  <p>Nothing is compiled to JavaScript. A mail body is attacker-adjacent input, and template engines that compile have a long history of turning a content edit into remote code execution.</p>
+  <p>A template's <code class="inl">variables</code> list is derived from its body rather than declared, so it cannot drift from the content. A name used inside <code class="inl">{'{{#each steps}}'}</code> is reported as <code class="inl">steps[].title</code>, because you cannot supply <code class="inl">title</code> at the top level.</p>
+
+  <h3>Preview before you send</h3>
+  <pre>{`POST /api/v1/templates/internship-stage-update/preview
+{ "variables": { "candidate_name": "Candidate", "stage": 3 } }
+
+{
+  "subject": "AI Engineering Intern - stage 3",
+  "html": "...",
+  "text": "...",
+  "required_variables": ["candidate_name", "deadline", "next_stage", "role", "stage"],
+  "missing_variables": ["deadline", "next_stage", "role"],
+  "would_send": false
+}`}</pre>
+
+  <h2 id="idempotency">Idempotency</h2>
+  <p>Send an <code class="inl">Idempotency-Key</code> header. A timeout at your end does not mean the mail was not sent, so an honest client retries - and without a key the candidate gets the rejection letter twice.</p>
+  <table>
+    <thead><tr><th>Situation</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Key never seen</td><td>Proceeds.</td></tr>
+      <tr><td>Same key, same request</td><td>Replays the original response byte for byte, with <code class="inl">Idempotent-Replayed: true</code>.</td></tr>
+      <tr><td>Same key, different request</td><td><code class="inl">409 idempotency_key_reused</code>. Refused loudly rather than guessed at.</td></tr>
+      <tr><td>Same key, first call still running</td><td><code class="inl">409 idempotency_in_progress</code>. Retry shortly.</td></tr>
+    </tbody>
+  </table>
+  <p>The hash is over the request's meaning: object keys are sorted first, so a serialiser that reorders fields between attempts is not accused of changing the request. Array order <em>is</em> meaning - two recipients in a different order is a different message. A request that fails validation releases its key, so your corrected retry is not refused as a conflict. Records expire after 24 hours.</p>
+
+  <h2 id="status">Status and events</h2>
+  <pre>{`GET /api/v1/messages/4f1c4a2e-0e1b-4a5d-9f3e-2b6c8d0a1e5f/status`}</pre>
+  <p>Statuses: <code class="inl">queued</code>, <code class="inl">processing</code>, <code class="inl">sent</code>, <code class="inl">delivered</code>, <code class="inl">deferred</code>, <code class="inl">bounced</code>, <code class="inl">failed</code>, <code class="inl">cancelled</code>. Status is derived from events and only ever moves forward, so a late confirmation cannot undo a bounce.</p>
+  <p><code class="inl">bcc</code> is not returned by default - a status URL gets pasted into tickets and chat. Ask for it with <code class="inl">?include_bcc=true</code>.</p>
+
+  <h3>Correlating an application with what was sent</h3>
+  <pre>{`GET /api/v1/messages?metadata_key=application_id&metadata_value=app_01H8`}</pre>
+  <p>Send with <code class="inl">metadata</code>, then ask for every message carrying that id. This is the join from an EduRankAI application to its email, its delivery and the recipient's events, without your product keeping its own copy of our message ids.</p>
+
+  <div class="note">
+    <p><strong>Stated plainly:</strong> <code class="inl">delivered</code> and <code class="inl">complained</code> require a delivery-status notification and a provider feedback loop on the receiving side. Until that inbound work reports them, no message reaches the <code class="inl">delivered</code> status - <code class="inl">sent</code> means we handed it to a mail server that accepted it. Documenting a status that can never arrive would cost you more than this paragraph does.</p>
+  </div>
+
+  <h2 id="webhooks">Webhooks</h2>
+  <p>Register an endpoint and we post every event you subscribe to. Leave the event list empty to receive everything, including types added later. Payload version <code class="inl">{PAYLOAD_VERSION}</code>.</p>
+  <p>Event types: {EVENT_TYPES.map((e) => <code class="inl" style="margin-right:6px;">{e}</code>)}</p>
+
+  <h3>Payload</h3>
+  <pre>{`{
+  "id": "evt_9f0b1c2d3e4f5a6b7c8d9e0f",
+  "type": "email.sent",
+  "api_version": "${PAYLOAD_VERSION}",
+  "created_at": "2026-08-16T12:00:01.480Z",
+  "environment": "production",
+  "organization": "careers",
+  "data": {
+    "message_id": "4f1c4a2e-0e1b-4a5d-9f3e-2b6c8d0a1e5f",
+    "status": "sent",
+    "recipient": "candidate@example.com",
+    "template": { "key": "internship-stage-update", "version": 4 },
+    "metadata": { "application_id": "app_01H8" }
+  }
+}`}</pre>
+
+  <h3>Headers and the signature</h3>
+  <pre>{`Webhook-Id: <delivery uuid>
+Webhook-Timestamp: <unix seconds>
+Webhook-Signature: v1,<base64 hmac> [v1,<second hmac during a rotation>]
+X-EduRankAI-Event: email.sent
+X-EduRankAI-Payload-Version: ${PAYLOAD_VERSION}
+X-EduRankAI-Attempt: 1
+
+signed content = {Webhook-Id}.{Webhook-Timestamp}.{raw request body}
+algorithm      = HMAC-SHA256, base64, prefixed "v1,"
+tolerance      = 300 seconds`}</pre>
+
+  <h3>Three rules for a receiver</h3>
+  <ul>
+    <li><strong>Verify against the raw body.</strong> Re-serialising a parsed object changes the bytes, and the signature will not match. This is the commonest cause of "your signatures are broken".</li>
+    <li><strong>Reject anything outside the timestamp tolerance.</strong> That turns a captured request into a five-minute problem instead of a permanent one. Both SDKs do this for you.</li>
+    <li><strong>Dedupe on Webhook-Id.</strong> A signature proves a delivery is ours, not that it is new. A retry reuses its id, so "have I processed this id?" is the complete answer - and it is what makes our retries and any dead-letter replay safe for you to receive.</li>
+  </ul>
+
+  <h3>Retries and the dead-letter queue</h3>
+  <p>The first attempt fires immediately, then 5s, 30s, 2m, 10m, 30m, 2h, 6h, 12h - eight retries spanning more than half a day, so an ordinary maintenance window costs you nothing. A 2xx is success. <code class="inl">410 Gone</code> stops permanently. A redirect is treated as a misconfiguration and never followed: a signed payload carrying recipient addresses must not reach a host you did not register.</p>
+  <p>Twenty consecutive failures disables the endpoint, with the reason recorded. Deliveries that exhaust their retries move to <code class="inl">dead</code> and are listed at <code class="inl">GET /api/v1/webhooks/:id/deliveries</code>; replaying one keeps its original payload and id.</p>
+
+  <h3>Rotating a secret</h3>
+  <p><code class="inl">POST /api/v1/webhooks/:id/rotate</code> returns a new secret and keeps the old one signing alongside it for <code class="inl">overlap_minutes</code> (default 24 hours). Both signatures travel in the same header, so nothing fails while you deploy. Pass <code class="inl">0</code> for an immediate cut if a secret is known to be compromised.</p>
+
+  <h2 id="limits">Rate limits</h2>
+  <p>Counted across five dimensions - organization, key, IP, endpoint per key, and sending identity - because a single per-key limit protects nothing: a leaked key can be replaced with a second key on the same organization, and one runaway staging script can spend the whole organization's budget.</p>
+  <pre>{`RateLimit-Limit: 300
+RateLimit-Remaining: 297
+RateLimit-Reset: 43`}</pre>
+  <p>On a <code class="inl">429</code> you also get <code class="inl">Retry-After</code>. Which dimension bound the request is not disclosed. The counters are on successful responses too - knowing your headroom only once you are blocked is knowing it too late.</p>
+
+  <h2 id="errors">Errors</h2>
+  <pre>{`{
+  "error": {
+    "type": "template_variable_missing",
+    "message": "Template \`internship-stage-update\` needs variables that were not supplied: deadline.",
+    "param": "variables",
+    "doc_url": "${base}/developers/mail",
+    "request_id": "req_m9x1k2p4"
+  },
+  "missing_variables": ["deadline"]
+}`}</pre>
+  <p>Branch on <code class="inl">type</code>, never on the message. The <code class="inl">request_id</code> also appears in the <code class="inl">X-Request-Id</code> header and is the line to quote when asking us about one specific failed call - it identifies the request in our logs without you having to send us a recipient's address.</p>
+  <table>
+    <thead><tr><th>Code</th><th>Status</th><th>Meaning</th></tr></thead>
+    <tbody>
+      {ERRORS.map((e) => (
+        <tr><td class="m" style="color:#fca5a5;">{e.code}</td><td class="m">{e.status}</td><td>{e.meaning}</td></tr>
+      ))}
+    </tbody>
+  </table>
+
+  <h2 id="sdks">SDKs</h2>
+  <p>TypeScript and Python clients are maintained in this repository under <code class="inl">sdk/</code>. Both are dependency-free, both generate an idempotency key when you do not supply one (which is what makes their automatic retries safe), and both ship the webhook verifier so nobody has to reimplement it.</p>
+  <pre>{`// TypeScript
+import { EduRankAIMail } from '@edurankai/mail';
+
+const mail = new EduRankAIMail(process.env['EDURANKAI_MAIL_KEY']);
+const message = await mail.sendEmail({
+  to: 'candidate@example.com',
+  template_id: 'internship-stage-update',
+  variables: { candidate_name: 'Candidate', stage: 3, role: 'AI Engineering Intern' },
+  metadata: { application_id: application.id },
+});`}</pre>
+  <pre>{`# Python
+from edurankai_mail import EduRankAIMail
+
+mail = EduRankAIMail(api_key=os.environ["EDURANKAI_MAIL_KEY"])
+message = mail.send_email(
+    to="candidate@example.com",
+    template_id="internship-stage-update",
+    variables={"candidate_name": "Candidate", "stage": 3, "role": "AI Engineering Intern"},
+    metadata={"application_id": application.id},
+)`}</pre>
+  <p>Go, Java, PHP and C# are not written. The API is shaped for generation - one resource per path, one JSON envelope, stable error codes, cursor pagination and rate-limit headers everywhere - so adding one is mechanical when somebody needs it. Publishing an empty package would be worse than publishing none.</p>
+
+  <h2 id="reference">Full endpoint reference</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Path</th><th>Scope</th><th>Purpose</th></tr></thead>
+    <tbody>
+      {ENDPOINTS.map((e) => (
+        <tr>
+          <td class="m" style="color:#86efac;">{e.method}</td>
+          <td class="m">{e.path}</td>
+          <td class="m" style="color:#8a8a94;">{e.scope}</td>
+          <td>{e.note}</td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+
+  <h2>Getting a key</h2>
+  <p>Keys are issued by an EduRankAI administrator from the mail console. Write to <a href={'mailto:' + SITE.emails.general}>{SITE.emails.general}</a> with the product, the environments you need and the scopes you expect to use.</p>
+</main>
+</BaseLayout>

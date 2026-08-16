@@ -294,3 +294,39 @@ believed.
 - **No release record on boot.** `recordRelease()` writes `edu_releases`, but only from
   `/api/health/deep` and `/admin/ops` — both of which require an operator to visit. A deploy nobody
   looked at leaves no trace in the database.
+
+---
+
+## 9. Mail subsystem (Patch 8)
+
+The mail platform has its own performance and capacity surface, sitting inside the ops view
+described above rather than replacing it.
+
+| | |
+| --- | --- |
+| Screen | `/admin/mail/performance` — capability `administer` on platform |
+| Machine-readable | `/api/metrics` — Prometheus exposition, same capability **or** a `METRICS_TOKEN` bearer |
+| Dashboards | `ops/grafana/mail-overview.json` |
+| Alert rules | `ops/prometheus/mail-alerts.yml` |
+| Docs | [`mail-performance.md`](../mail-performance.md), [`mail-scaling.md`](../mail-scaling.md), [`mail-failure-modes.md`](../mail-failure-modes.md) |
+
+Three things from that work that change how you read the rest of this document:
+
+- **`/api/metrics` mixes two kinds of series and labels them.** `edurankai_mail_queue_*` is read from
+  Postgres on every scrape and is cluster-wide. Everything else is process-local to one serverless
+  instance and resets on cold start — `edurankai_mail_registry_age_seconds` is emitted so a low
+  counter after a deploy is not misread as a traffic collapse. Alert on the queue gauges.
+
+- **A queue row can be lost without anything reporting it.** `claimBatch()` sets `status='processing'`
+  and nothing sets it back, so a worker killed mid-batch leaves rows that no worker will claim and no
+  retry sweep will find — counted as work in flight. The `stalled_messages` alert detects it and
+  **Reclaim stalled** on `/admin/mail/performance` fixes it. This affects every user of `edu_jobs`,
+  not only mail.
+
+- **The gap list in section 8 above gained a measurement.** "No query-level performance data" is now
+  reported per mail table with findings and the SQL to fix each one, and "the background job worker is
+  never called" is exactly the `worker_failure` alert condition — with the caveat that on Hobby, cron
+  is daily and that alert's normal state is firing.
+
+No scale target has been benchmarked. Every tier on the capacity ladder reads `unmeasured`, which is
+the accurate state and not an omission.

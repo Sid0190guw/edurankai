@@ -1,0 +1,316 @@
+---
+/**
+ * /admin/mail/automation - every workflow, what is running, and what stopped.
+ *
+ * The engine has one screen, not two: an operator who cannot see the runs cannot answer the only
+ * question anybody ever asks about an automation, which is "did it actually send that, and to whom".
+ * Everything here is read through src/lib/mailplatform/service.ts, so this page can never activate
+ * a workflow the JSON API would refuse.
+ *
+ * FAILED READS ARE STATED, NOT SWALLOWED. An unreadable workflow list rendered as "no workflows"
+ * reads as "nothing is set up", and the natural response is to build a second copy of something
+ * that already exists and is already mailing people.
+ */
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { pgStore } from '@/lib/mailplatform/pg-store';
+import { ORG_ID, installExample, listExamples, setWorkflowStatus } from '@/lib/mailplatform/service';
+import { validateWorkflow } from '@/lib/mailplatform/graph';
+import { channelStatus } from '@/lib/mailplatform/adapters';
+import { cronSecretConfigured } from '@/lib/auth/cron-auth';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+let okMsg = '';
+let errMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+  const id = String(fd.get('id') || '');
+  try {
+    if (action === 'install') {
+      const r = await installExample(pgStore, ORG_ID, String(fd.get('key') || ''), user.id);
+      if (r.ok) okMsg = 'Installed as a draft. Open it, check the copy, then switch it on. ' + r.message;
+      else errMsg = r.message;
+    } else if (action === 'activate' || action === 'pause' || action === 'archive') {
+      const status = action === 'activate' ? 'active' : action === 'pause' ? 'paused' : 'archived';
+      const r = await setWorkflowStatus(pgStore, ORG_ID, id, status as any);
+      if (r.ok) okMsg = r.message;
+      else errMsg = r.message + (r.problems.length ? ' ' + r.problems.filter((p) => p.level === 'error').map((p) => p.message).join(' ') : '');
+    }
+  } catch (e: any) {
+    // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    errMsg = 'Nothing was changed: ' + String(e?.cause?.message || e?.message || e);
+    console.error('[admin/mail/automation] ' + action + ' failed:', e?.cause?.message || e?.message);
+  }
+}
+
+let loadError = '';
+let workflows: any[] = [];
+let counts: any = { RUNNING: 0, WAITING: 0, COMPLETED: 0, FAILED: 0, CANCELLED: 0, PAUSED: 0 };
+let deadLetters: any[] = [];
+let recentRuns: any[] = [];
+let recentEvents: any[] = [];
+try {
+  workflows = await pgStore.listWorkflows(ORG_ID, {});
+  counts = await pgStore.countRuns(ORG_ID);
+  deadLetters = await pgStore.listRuns(ORG_ID, { deadLetterOnly: true, limit: 20 });
+  recentRuns = await pgStore.listRuns(ORG_ID, { limit: 15 });
+  recentEvents = await pgStore.listEvents(ORG_ID, { limit: 15 });
+} catch (e: any) {
+  loadError = String(e?.cause?.message || e?.message || e);
+  console.error('[admin/mail/automation] read failed:', loadError);
+}
+
+const channels = await channelStatus().catch(() => []);
+const examples = listExamples();
+const installedKeys = new Set(workflows.map((w: any) => w.key));
+const cronReady = cronSecretConfigured();
+
+function statusLabel(s: string) {
+  if (s === 'active') return 'On';
+  if (s === 'paused') return 'Paused';
+  if (s === 'archived') return 'Archived';
+  return 'Draft';
+}
+function when(d: any) {
+  if (!d) return '';
+  const t = d instanceof Date ? d : new Date(d);
+  return Number.isFinite(t.getTime()) ? t.toISOString().replace('T', ' ').slice(0, 16) : '';
+}
+function problemCount(def: any) {
+  const v = validateWorkflow(def);
+  return v.problems.filter((p) => p.level === 'error').length;
+}
+---
+<AdminLayout title="Automation" activeNav="mail">
+  <section class="page">
+    <div class="page-head">
+      <div>
+        <p class="eyebrow">Mail</p>
+        <h1>Automation</h1>
+        <p class="sub">
+          Event, condition, action, delay. A workflow reacts to something that happened and can wait days
+          before the next step. <a href="/admin/mail">Back to inbox</a>
+        </p>
+      </div>
+    </div>
+
+    {okMsg && <div class="flash ok">{okMsg}</div>}
+    {errMsg && <div class="flash err">{errMsg}</div>}
+    {loadError && (
+      <div class="flash err">
+        The automation tables could not be read, so anything empty below is empty for a reason that is not
+        "you have none": {loadError}. If this says a relation does not exist, run db/mail-automation-schema.sql.
+      </div>
+    )}
+
+    {!cronReady && (
+      <div class="flash err">
+        CRON_SECRET is not set on this deployment, so <strong>nothing runs on a timetable</strong>: a workflow
+        can start, but every delay stays parked and no scheduled trigger fires. Nothing is lost — each waiting
+        run keeps its appointment and continues once the secret is set and /api/mail/automation/tick is called.
+      </div>
+    )}
+
+    <div class="card">
+      <h2>Runs</h2>
+      <p class="card-sub">A run is one contact moving through one workflow.</p>
+      <div class="stat-row">
+        <div class="stat"><span class="n">{counts.RUNNING}</span><span class="l">Running</span></div>
+        <div class="stat"><span class="n">{counts.WAITING}</span><span class="l">Waiting on a delay</span></div>
+        <div class="stat"><span class="n">{counts.PAUSED}</span><span class="l">Paused</span></div>
+        <div class="stat"><span class="n">{counts.COMPLETED}</span><span class="l">Completed</span></div>
+        <div class="stat"><span class="n">{counts.FAILED}</span><span class="l">Failed</span></div>
+        <div class="stat"><span class="n">{counts.CANCELLED}</span><span class="l">Cancelled</span></div>
+      </div>
+    </div>
+
+    {deadLetters.length > 0 && (
+      <div class="card">
+        <h2>Stopped, and waiting for a person</h2>
+        <p class="card-sub">
+          These runs stopped in a way the engine would not resolve on its own. A step that was interrupted
+          part-way through a send is never repeated automatically, because a message cannot be recalled.
+          Check whether it went out, then retry or cancel from the run.
+        </p>
+        <table class="tbl">
+          <thead><tr><th>Run</th><th>Stopped at</th><th>Why</th><th>When</th></tr></thead>
+          <tbody>
+            {deadLetters.map((r: any) => (
+              <tr>
+                <td><a href={'/admin/mail/automation/' + r.workflowId + '?run=' + r.runId}>{r.runId.slice(0, 14)}</a></td>
+                <td>{r.currentNode || ''}</td>
+                <td class="wrap">{r.error || ''}</td>
+                <td>{when(r.updatedAt)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+
+    <div class="card">
+      <h2>Workflows</h2>
+      {workflows.length === 0 ? (
+        <p class="muted">No workflows yet. Install one of the examples below to see the shape of one.</p>
+      ) : (
+        <table class="tbl">
+          <thead><tr><th>Name</th><th>Trigger</th><th>Status</th><th>Version</th><th>Updated</th><th></th></tr></thead>
+          <tbody>
+            {workflows.map((w: any) => (
+              <tr>
+                <td>
+                  <a href={'/admin/mail/automation/' + w.id}><strong>{w.name}</strong></a>
+                  <div class="muted small">{w.key}</div>
+                  {problemCount(w.definition) > 0 && <div class="small err-text">{problemCount(w.definition)} error(s) to fix before it can be switched on</div>}
+                </td>
+                <td class="mono small">{w.triggerEvent || 'none'}</td>
+                <td><span class={'pill ' + w.status}>{statusLabel(w.status)}</span></td>
+                <td>{w.version}</td>
+                <td class="small">{when(w.updatedAt)}</td>
+                <td class="right">
+                  <form method="post" class="inline">
+                    <input type="hidden" name="id" value={w.id} />
+                    {w.status === 'active' ? (
+                      <button class="btn small" name="_action" value="pause">Pause</button>
+                    ) : (
+                      <button class="btn small primary" name="_action" value="activate">Switch on</button>
+                    )}
+                  </form>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+
+    <div class="card">
+      <h2>Start from an example</h2>
+      <p class="card-sub">Installed as a draft, always. An example that switched itself on would begin mailing candidates the moment somebody clicked it to see what it looked like.</p>
+      <table class="tbl">
+        <thead><tr><th>Example</th><th>Steps</th><th></th></tr></thead>
+        <tbody>
+          {examples.map((ex: any) => (
+            <tr>
+              <td><strong>{ex.name}</strong><div class="muted small">{ex.description}</div></td>
+              <td>{ex.nodes}</td>
+              <td class="right">
+                {installedKeys.has(ex.key) ? (
+                  <span class="muted small">Installed</span>
+                ) : (
+                  <form method="post" class="inline">
+                    <input type="hidden" name="key" value={ex.key} />
+                    <button class="btn small" name="_action" value="install">Install</button>
+                  </form>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Channels</h2>
+      <p class="card-sub">
+        A step pointing at a channel that is not built refuses to send rather than quietly sending nothing.
+      </p>
+      <table class="tbl">
+        <thead><tr><th>Channel</th><th>Usable</th><th>Why not</th></tr></thead>
+        <tbody>
+          {channels.map((c: any) => (
+            <tr>
+              <td>{c.label}</td>
+              <td>{c.available ? 'Yes' : 'No'}</td>
+              <td class="wrap muted small">{c.reason}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Recent runs</h2>
+      {recentRuns.length === 0 ? (
+        <p class="muted">Nothing has run yet.</p>
+      ) : (
+        <table class="tbl">
+          <thead><tr><th>Run</th><th>State</th><th>At step</th><th>Waiting until</th><th>Note</th></tr></thead>
+          <tbody>
+            {recentRuns.map((r: any) => (
+              <tr>
+                <td><a href={'/admin/mail/automation/' + r.workflowId + '?run=' + r.runId}>{r.runId.slice(0, 14)}</a></td>
+                <td>{r.state}</td>
+                <td class="mono small">{r.currentNode || ''}</td>
+                <td class="small">{when(r.waitUntil)}</td>
+                <td class="wrap small">{r.errorKind === 'business' ? 'Ended: ' + (r.error || '') : (r.error || '')}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+
+    <div class="card">
+      <h2>Recent events</h2>
+      <p class="card-sub">Every event is recorded whether or not it started anything. "Started 0 runs" is a normal answer and usually the one you are looking for.</p>
+      {recentEvents.length === 0 ? (
+        <p class="muted">No events yet.</p>
+      ) : (
+        <table class="tbl">
+          <thead><tr><th>Type</th><th>Source</th><th>Started</th><th>Received</th><th>Note</th></tr></thead>
+          <tbody>
+            {recentEvents.map((e: any) => (
+              <tr>
+                <td class="mono small">{e.type}</td>
+                <td class="small">{e.source}</td>
+                <td>{e.startedRuns}</td>
+                <td class="small">{when(e.receivedAt)}</td>
+                <td class="wrap small">{e.error || ''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  </section>
+</AdminLayout>
+
+<style>
+  .page { max-width: 1100px; margin: 0 auto; padding: 1rem; }
+  .page-head { margin-bottom: 1rem; }
+  .eyebrow { text-transform: uppercase; letter-spacing: .08em; font-size: .7rem; opacity: .7; margin: 0; }
+  h1 { margin: .2rem 0; font-size: 1.6rem; }
+  .sub { opacity: .8; margin: 0; }
+  .card { border: 1px solid rgba(128,128,128,.28); border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+  .card h2 { margin: 0 0 .2rem; font-size: 1.1rem; }
+  .card-sub { margin: 0 0 .8rem; opacity: .8; font-size: .9rem; }
+  .flash { padding: .7rem .9rem; border-radius: 8px; margin: .6rem 0; font-size: .92rem; }
+  .flash.ok { background: rgba(34,197,94,.14); border: 1px solid rgba(34,197,94,.4); }
+  .flash.err { background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.4); }
+  .stat-row { display: flex; flex-wrap: wrap; gap: .8rem; }
+  .stat { border: 1px solid rgba(128,128,128,.25); border-radius: 8px; padding: .6rem .9rem; min-width: 7.5rem; }
+  .stat .n { display: block; font-size: 1.5rem; font-weight: 600; }
+  .stat .l { display: block; font-size: .75rem; opacity: .75; }
+  .tbl { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  .tbl th, .tbl td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid rgba(128,128,128,.18); vertical-align: top; }
+  .tbl th { font-size: .75rem; text-transform: uppercase; letter-spacing: .05em; opacity: .7; }
+  .right { text-align: right; }
+  .wrap { max-width: 34rem; white-space: normal; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .small { font-size: .8rem; }
+  .muted { opacity: .7; }
+  .err-text { color: #ef4444; }
+  .inline { display: inline; }
+  .btn { border: 1px solid rgba(128,128,128,.4); background: transparent; color: inherit; border-radius: 6px; padding: .3rem .6rem; cursor: pointer; font: inherit; }
+  .btn.small { font-size: .82rem; }
+  .btn.primary { border-color: rgba(59,130,246,.6); }
+  .pill { border-radius: 999px; padding: .1rem .55rem; font-size: .75rem; border: 1px solid rgba(128,128,128,.4); }
+  .pill.active { border-color: rgba(34,197,94,.6); }
+  .pill.paused { border-color: rgba(234,179,8,.6); }
+  .pill.draft { opacity: .8; }
+  table { overflow-x: auto; display: block; }
+</style>

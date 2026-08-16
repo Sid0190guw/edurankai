@@ -1,0 +1,357 @@
+---
+/**
+ * /admin/mail/automation/[id] - one workflow: its steps, its problems, and every run it produced.
+ *
+ * THE DEFINITION IS EDITED AS JSON HERE, AND THAT IS A DELIBERATE STOPPING POINT RATHER THAN AN
+ * OVERSIGHT. A drag-and-drop canvas is a large piece of front-end work; what it needs from the
+ * server is a stable node/edge contract, a validator that explains itself, and an action palette it
+ * does not hard-code. All three exist (src/lib/mailplatform/graph.ts and
+ * /api/mail/automation/workflows), so the canvas can be built later without the engine changing.
+ * Until then this page edits the same structure the canvas would post, and validates it identically.
+ *
+ * The palette below is rendered FROM the catalogues. Nothing on this page lists an action, an
+ * operator or a trigger by hand, so adding one to src/lib/mailplatform/actions.ts shows up here.
+ */
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { pgStore } from '@/lib/mailplatform/pg-store';
+import { ORG_ID, enableWebhook, disableWebhook, saveWorkflow, setWorkflowStatus } from '@/lib/mailplatform/service';
+import { describeForBuilder } from '@/lib/mailplatform/graph';
+import { describeCondition, CONDITION_OPERATORS } from '@/lib/mailplatform/conditions';
+import { describeDelay } from '@/lib/mailplatform/delay';
+import { TRIGGER_TYPES } from '@/lib/mailplatform/triggers';
+import { actionCatalogue } from '@/lib/mailplatform/actions';
+import { controlRun } from '@/lib/mailplatform/worker';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+const id = String(Astro.params.id || '');
+let okMsg = '';
+let errMsg = '';
+let saveProblems: any[] = [];
+let freshWebhook: { token: string; secret: string } | null = null;
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+  try {
+    if (action === 'save') {
+      let definition: any = null;
+      try {
+        definition = JSON.parse(String(fd.get('definition') || '{}'));
+      } catch (pe: any) {
+        // A JSON syntax error is reported as a syntax error. Saving `{}` over a definition that
+        // failed to parse would silently delete an operator's workflow.
+        throw new Error('The steps are not valid JSON, so nothing was saved: ' + String(pe?.message || pe));
+      }
+      const r = await saveWorkflow(pgStore, ORG_ID, {
+        id,
+        key: String(fd.get('key') || ''),
+        name: String(fd.get('name') || ''),
+        description: String(fd.get('description') || ''),
+        definition,
+      }, user.id);
+      saveProblems = r.problems;
+      if (r.ok) okMsg = r.message;
+      else errMsg = r.message;
+    } else if (action === 'activate' || action === 'pause' || action === 'draft') {
+      const status = action === 'activate' ? 'active' : action === 'pause' ? 'paused' : 'draft';
+      const r = await setWorkflowStatus(pgStore, ORG_ID, id, status as any);
+      saveProblems = r.problems;
+      if (r.ok) okMsg = r.message;
+      else errMsg = r.message;
+    } else if (action === 'enable_webhook') {
+      const r = await enableWebhook(pgStore, ORG_ID, id);
+      if (r.ok && r.token && r.secret) { freshWebhook = { token: r.token, secret: r.secret }; okMsg = r.message; }
+      else errMsg = r.message;
+    } else if (action === 'disable_webhook') {
+      const r = await disableWebhook(pgStore, ORG_ID, id);
+      okMsg = r.ok ? r.message : '';
+      errMsg = r.ok ? '' : r.message;
+    } else if (action === 'run_control') {
+      const r = await controlRun(pgStore, ORG_ID, String(fd.get('runId') || ''), String(fd.get('control') || '') as any);
+      // changed:false is reported as a refusal, not as success. Telling somebody a run was cancelled
+      // when it had already been sent is the failure that matters on this screen.
+      if (r.ok) okMsg = r.message;
+      else errMsg = r.message;
+    }
+  } catch (e: any) {
+    errMsg = 'Nothing was changed: ' + String(e?.cause?.message || e?.message || e);
+    console.error('[admin/mail/automation/detail] ' + action + ' failed:', e?.cause?.message || e?.message);
+  }
+}
+
+let loadError = '';
+let wf: any = null;
+let runs: any[] = [];
+try {
+  wf = await pgStore.getWorkflow(ORG_ID, id);
+  if (wf) runs = await pgStore.listRuns(ORG_ID, { workflowId: wf.id, limit: 40 });
+} catch (e: any) {
+  loadError = String(e?.cause?.message || e?.message || e);
+  console.error('[admin/mail/automation/detail] read failed:', loadError);
+}
+
+const selectedRunId = String(Astro.url.searchParams.get('run') || '');
+let selectedRun: any = null;
+let steps: any[] = [];
+let runContact: any = null;
+if (selectedRunId && wf) {
+  try {
+    selectedRun = await pgStore.getRun(ORG_ID, selectedRunId);
+    if (selectedRun) {
+      steps = await pgStore.listSteps(selectedRun.runId);
+      if (selectedRun.contactId) runContact = await pgStore.getContact(ORG_ID, selectedRun.contactId);
+    }
+  } catch (e: any) {
+    if (!loadError) loadError = String(e?.cause?.message || e?.message || e);
+  }
+}
+
+const graph = wf ? describeForBuilder(wf.definition) : null;
+const problems = [...(graph ? graph.problems : []), ...saveProblems];
+const errorProblems = problems.filter((p: any) => p.level === 'error');
+const warnProblems = problems.filter((p: any) => p.level === 'warning');
+const actions = actionCatalogue();
+const origin = Astro.url.origin;
+const hookUrl = wf && wf.webhookToken ? origin + '/api/mail/automation/hook/' + wf.webhookToken : '';
+
+function when(d: any) {
+  if (!d) return '';
+  const t = d instanceof Date ? d : new Date(d);
+  return Number.isFinite(t.getTime()) ? t.toISOString().replace('T', ' ').slice(0, 16) : '';
+}
+function nodeSummary(n: any) {
+  if (n.kind === 'trigger') return 'when ' + (n.trigger && n.trigger.event ? n.trigger.event : 'nothing') + ' happens';
+  if (n.kind === 'condition') return describeCondition(n.condition);
+  if (n.kind === 'delay') return describeDelay(n.delay);
+  if (n.kind === 'action') return (n.action && n.action.type ? n.action.type : 'no action');
+  return 'end';
+}
+function stepSummary(s: any) {
+  const r = s.result || {};
+  if (r.summary) return String(r.summary);
+  if (r.branch) return 'answered ' + r.branch;
+  return s.error || '';
+}
+---
+<AdminLayout title={wf ? wf.name : 'Workflow'} activeNav="mail">
+  <section class="page">
+    <div class="page-head">
+      <div>
+        <p class="eyebrow"><a href="/admin/mail/automation">Automation</a></p>
+        <h1>{wf ? wf.name : 'Workflow not found'}</h1>
+        {wf && <p class="sub">Key <span class="mono">{wf.key}</span>, version {wf.version}, currently {wf.status}.</p>}
+      </div>
+    </div>
+
+    {okMsg && <div class="flash ok">{okMsg}</div>}
+    {errMsg && <div class="flash err">{errMsg}</div>}
+    {loadError && <div class="flash err">Something could not be read: {loadError}</div>}
+
+    {!wf ? (
+      <div class="card"><p class="muted">There is no workflow with that id here. <a href="/admin/mail/automation">Back to the list</a></p></div>
+    ) : (
+      <div>
+        {errorProblems.length > 0 && (
+          <div class="flash err">
+            <strong>This workflow cannot be switched on yet.</strong>
+            <ul>{errorProblems.map((p: any) => <li>{p.at ? p.at + ': ' : ''}{p.message}</li>)}</ul>
+          </div>
+        )}
+        {warnProblems.length > 0 && (
+          <div class="flash warn">
+            <ul>{warnProblems.map((p: any) => <li>{p.at ? p.at + ': ' : ''}{p.message}</li>)}</ul>
+          </div>
+        )}
+
+        <div class="card">
+          <h2>Steps</h2>
+          <p class="card-sub">
+            Each node has a stable id. A run records the id it is at, so renaming a step is fine and deleting
+            one that a parked run is waiting on is not.
+          </p>
+          <table class="tbl">
+            <thead><tr><th>Id</th><th>Kind</th><th>What it does</th><th>Goes to</th></tr></thead>
+            <tbody>
+              {graph && graph.nodes.map((n: any) => (
+                <tr>
+                  <td class="mono small">{n.id}</td>
+                  <td>{n.kind}</td>
+                  <td class="wrap">{n.label ? n.label + ' - ' : ''}{nodeSummary(n)}</td>
+                  <td class="small">
+                    {n.outgoing.length === 0 ? <span class="muted">ends here</span> : n.outgoing.map((o: any) => (
+                      <div class="mono">{o.branch ? o.branch + ': ' : ''}{o.to}</div>
+                    ))}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>Edit</h2>
+          <p class="card-sub">
+            Saving a changed set of steps creates a new version. Runs already in flight keep the version they
+            started on and finish on it, so an edit never re-points a waiting run at a different step.
+          </p>
+          <form method="post">
+            <label>Name <input type="text" name="name" value={wf.name} required /></label>
+            <label>Key <input type="text" name="key" value={wf.key} required /></label>
+            <label>Description <input type="text" name="description" value={wf.description} /></label>
+            <label>Steps (nodes and edges)
+              <textarea name="definition" rows="22" spellcheck="false">{JSON.stringify(wf.definition, null, 2)}</textarea>
+            </label>
+            <div class="row">
+              <button class="btn primary" name="_action" value="save">Save</button>
+              {wf.status === 'active'
+                ? <button class="btn" name="_action" value="pause">Pause</button>
+                : <button class="btn" name="_action" value="activate">Switch on</button>}
+            </div>
+          </form>
+        </div>
+
+        <div class="card">
+          <h2>Webhook</h2>
+          <p class="card-sub">
+            An outside system can post events here. A token alone is not enough: every request must also carry
+            an HMAC signature of its body and a timestamp within five minutes, and this address accepts only
+            "{wf.triggerEvent}" events.
+          </p>
+          {freshWebhook && (
+            <div class="flash ok">
+              <div>URL: <span class="mono">{origin + '/api/mail/automation/hook/' + freshWebhook.token}</span></div>
+              <div>Secret: <span class="mono">{freshWebhook.secret}</span></div>
+              <div>Copy the secret now. It is shown once; if it is lost, regenerate it here.</div>
+            </div>
+          )}
+          {wf.webhookToken ? (
+            <div>
+              <p class="small">URL <span class="mono">{hookUrl}</span></p>
+              <p class="small muted">
+                Sign as: hex HMAC-SHA256 of the string "&lt;timestamp&gt;.&lt;body&gt;" using the secret, sent as
+                X-Automation-Signature, with the unix seconds in X-Automation-Timestamp. Send your own
+                event_id — it is the idempotency key, and a sender that generates a fresh one per retry has none.
+              </p>
+              <form method="post" class="inline"><button class="btn" name="_action" value="enable_webhook">Regenerate</button></form>
+              <form method="post" class="inline"><button class="btn" name="_action" value="disable_webhook">Disable</button></form>
+            </div>
+          ) : (
+            <form method="post"><button class="btn" name="_action" value="enable_webhook">Enable webhook</button></form>
+          )}
+        </div>
+
+        <div class="card">
+          <h2>Runs</h2>
+          {runs.length === 0 ? (
+            <p class="muted">Nothing has run yet.</p>
+          ) : (
+            <table class="tbl">
+              <thead><tr><th>Run</th><th>State</th><th>At</th><th>Waiting until</th><th>Note</th><th></th></tr></thead>
+              <tbody>
+                {runs.map((r: any) => (
+                  <tr class={r.runId === selectedRunId ? 'sel' : ''}>
+                    <td><a href={'/admin/mail/automation/' + wf.id + '?run=' + r.runId}>{r.runId.slice(0, 14)}</a></td>
+                    <td>{r.state}{r.deadLetter ? ' (stopped)' : ''}</td>
+                    <td class="mono small">{r.currentNode || ''}</td>
+                    <td class="small">{when(r.waitUntil)}</td>
+                    <td class="wrap small">{r.errorKind === 'business' ? 'Ended: ' + (r.error || '') : (r.error || '')}</td>
+                    <td class="right">
+                      <form method="post" class="inline">
+                        <input type="hidden" name="runId" value={r.runId} />
+                        <input type="hidden" name="_action" value="run_control" />
+                        {r.state === 'WAITING' && <button class="btn small" name="control" value="pause">Pause</button>}
+                        {r.state === 'PAUSED' && <button class="btn small" name="control" value="resume">Resume</button>}
+                        {r.state === 'FAILED' && <button class="btn small" name="control" value="retry">Retry</button>}
+                        {(r.state === 'WAITING' || r.state === 'PAUSED' || r.state === 'RUNNING') && <button class="btn small" name="control" value="cancel">Cancel</button>}
+                      </form>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {selectedRun && (
+          <div class="card">
+            <h2>Run {selectedRun.runId}</h2>
+            <p class="card-sub">
+              {runContact ? 'Contact ' + runContact.email + '. ' : ''}
+              Started {when(selectedRun.startedAt)}, now {selectedRun.state}.
+              {selectedRun.errorKind === 'business' ? ' It ended on a business rule, which is not an error.' : ''}
+            </p>
+            <table class="tbl">
+              <thead><tr><th>Step</th><th>Attempt</th><th>Status</th><th>What happened</th><th>Reference</th><th>When</th></tr></thead>
+              <tbody>
+                {steps.map((s: any) => (
+                  <tr>
+                    <td class="mono small">{s.nodeId}</td>
+                    <td>{s.attempt}</td>
+                    <td>{s.status}</td>
+                    <td class="wrap small">{stepSummary(s)}</td>
+                    <td class="mono small">{s.externalRef || ''}</td>
+                    <td class="small">{when(s.finishedAt || s.claimedAt)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {steps.length === 0 && <p class="muted">This run has not performed a step yet.</p>}
+          </div>
+        )}
+
+        <div class="card">
+          <h2>What you can put in a workflow</h2>
+          <p class="card-sub">Rendered from the engine's own catalogues, so this list cannot fall out of date.</p>
+          <h3>Triggers</h3>
+          <ul class="cols">{TRIGGER_TYPES.map((t: any) => <li><span class="mono small">{t.id}</span> {t.label}</li>)}</ul>
+          <h3>Condition operators</h3>
+          <ul class="cols">{CONDITION_OPERATORS.map((o: any) => <li><span class="mono small">{o.id}</span> {o.label}</li>)}</ul>
+          <h3>Actions</h3>
+          <ul class="cols">{actions.map((a: any) => <li><span class="mono small">{a.type}</span> {a.label}{a.irreversible ? ' (cannot be undone)' : ''}</li>)}</ul>
+          <h3>Delays</h3>
+          <ul class="cols">
+            <li><span class="mono small">minutes / hours / days</span> wait a fixed amount</li>
+            <li><span class="mono small">until</span> wait for an absolute date and time</li>
+            <li><span class="mono small">until_field</span> wait for a date from the event, plus or minus an offset</li>
+          </ul>
+        </div>
+      </div>
+    )}
+  </section>
+</AdminLayout>
+
+<style>
+  .page { max-width: 1100px; margin: 0 auto; padding: 1rem; }
+  .eyebrow { text-transform: uppercase; letter-spacing: .08em; font-size: .7rem; opacity: .7; margin: 0; }
+  h1 { margin: .2rem 0; font-size: 1.5rem; }
+  h3 { margin: .9rem 0 .3rem; font-size: .9rem; text-transform: uppercase; letter-spacing: .05em; opacity: .75; }
+  .sub { opacity: .8; margin: 0; }
+  .card { border: 1px solid rgba(128,128,128,.28); border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+  .card h2 { margin: 0 0 .2rem; font-size: 1.1rem; }
+  .card-sub { margin: 0 0 .8rem; opacity: .8; font-size: .9rem; }
+  .flash { padding: .7rem .9rem; border-radius: 8px; margin: .6rem 0; font-size: .92rem; }
+  .flash.ok { background: rgba(34,197,94,.14); border: 1px solid rgba(34,197,94,.4); }
+  .flash.err { background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.4); }
+  .flash.warn { background: rgba(234,179,8,.12); border: 1px solid rgba(234,179,8,.4); }
+  .flash ul { margin: .4rem 0 0 1rem; padding: 0; }
+  label { display: block; margin: .6rem 0; font-size: .85rem; }
+  input[type=text], textarea { width: 100%; padding: .45rem .55rem; border-radius: 6px; border: 1px solid rgba(128,128,128,.4); background: transparent; color: inherit; font: inherit; }
+  textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; }
+  .row { display: flex; gap: .5rem; margin-top: .6rem; }
+  .tbl { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  .tbl th, .tbl td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid rgba(128,128,128,.18); vertical-align: top; }
+  .tbl th { font-size: .75rem; text-transform: uppercase; letter-spacing: .05em; opacity: .7; }
+  .tbl tr.sel { background: rgba(128,128,128,.12); }
+  .right { text-align: right; }
+  .wrap { max-width: 32rem; white-space: normal; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .small { font-size: .8rem; }
+  .muted { opacity: .7; }
+  .inline { display: inline; }
+  .btn { border: 1px solid rgba(128,128,128,.4); background: transparent; color: inherit; border-radius: 6px; padding: .3rem .6rem; cursor: pointer; font: inherit; }
+  .btn.small { font-size: .82rem; }
+  .btn.primary { border-color: rgba(59,130,246,.6); }
+  .cols { columns: 2; margin: 0; padding-left: 1.1rem; font-size: .85rem; }
+</style>

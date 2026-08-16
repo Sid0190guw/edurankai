@@ -1,0 +1,478 @@
+---
+// /admin/mail/billing — plan, usage, limits, billing status, invoices, renewal and trends.
+//
+// THIS IS THE OPERATOR CONSOLE, NOT THE CUSTOMER'S OWN BILLING PAGE, and the page says so on it.
+// EduRankAI staff open this to answer "what is this tenant on and why did their send fail". They
+// are not members of the tenant, so every decision on the page is taken through
+// `asOperator: true` — the deliberate, separate widening documented in saas/service.ts — and any
+// change made here is recorded as `actorKind: 'operator'` in the billing history.
+//
+// Every read reports its own failure. A billing screen that renders zeroes when the query failed is
+// worse than one that renders nothing: it looks like a tenant who has sent nothing, which is
+// exactly the state somebody opens this page to investigate.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import {
+  billingOverview,
+  changeOrganizationPlan,
+  explainCapabilities,
+  getSaasStore,
+} from '@/lib/mailplatform/saas/service';
+import { dailySeries, daysRemaining, periodProgress, projectedTotal } from '@/lib/mailplatform/saas/usage';
+import {
+  FEATURE_LABELS,
+  METRICS,
+  PLAN_CATALOG,
+  describeLimit,
+  describeMetricValue,
+  limitFor,
+} from '@/lib/mailplatform/saas/plans';
+import { formatMoney, priceFor } from '@/lib/mailplatform/saas/pricing';
+import { billingProviderStatus } from '@/lib/mailplatform/saas/billing';
+import { CAPABILITIES } from '@/lib/mailplatform/saas/entitlements';
+import { TEAM_ROLE_LABELS } from '@/lib/mailplatform/saas/roles';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user, 'mail.manage')) return Astro.redirect('/admin');
+
+// Declared before the POST handler that uses them. `const` is not hoisted, and that has taken this
+// project's admin pages down before.
+const readFailures: string[] = [];
+const dbReason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+const ACCENT = '#FF7040';
+
+let notice: string | null = null;
+let noticeTone: 'ok' | 'bad' = 'ok';
+
+// Which tenant. The query parameter picks it; the operator gate above is what authorises seeing it.
+const url = Astro.url;
+let organizations: { id: string; name: string; slug: string; status: string }[] = [];
+try {
+  organizations = (await getSaasStore().listOrganizations(200)).map((o) => ({
+    id: o.id, name: o.name, slug: o.slug, status: o.status,
+  }));
+} catch (e: any) {
+  readFailures.push('Organization list: ' + dbReason(e));
+}
+const requestedOrgId = url.searchParams.get('org');
+const orgId = requestedOrgId || (organizations[0] ? organizations[0].id : null);
+
+if (Astro.request.method === 'POST' && orgId) {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || '');
+    if (action === 'change-plan') {
+      const planKey = String(form.get('planKey') || '');
+      const result = await changeOrganizationPlan(orgId, user.id, planKey, { asOperator: true });
+      notice = result.message;
+      noticeTone = result.ok ? 'ok' : 'bad';
+    }
+  } catch (e: any) {
+    // Never swallowed: a plan change that failed silently is a customer who was told it worked.
+    notice = 'The change could not be applied: ' + dbReason(e);
+    noticeTone = 'bad';
+  }
+}
+
+let view: Awaited<ReturnType<typeof billingOverview>> = null;
+let capabilities: Awaited<ReturnType<typeof explainCapabilities>> = [];
+let trend: { day: string; value: number }[] = [];
+
+if (orgId) {
+  try {
+    view = await billingOverview(orgId);
+    if (!view) readFailures.push('Organization ' + orgId + ' could not be found.');
+  } catch (e: any) {
+    readFailures.push('Billing summary: ' + dbReason(e));
+  }
+  try {
+    capabilities = await explainCapabilities(orgId, user.id, { asOperator: true });
+  } catch (e: any) {
+    readFailures.push('Entitlement matrix: ' + dbReason(e));
+  }
+  if (view) {
+    try {
+      const events = await getSaasStore().listUsageEvents(orgId, {
+        metric: 'emails_sent', period: view.context.period,
+      });
+      trend = dailySeries('emails_sent', events, view.context.period);
+    } catch (e: any) {
+      readFailures.push('Sending trend: ' + dbReason(e));
+    }
+  }
+}
+
+const ctx = view ? view.context : null;
+const currency = ctx?.profile?.currency || 'INR';
+const progress = ctx ? Math.round(periodProgress(ctx.period) * 100) : 0;
+const daysLeft = ctx ? daysRemaining(ctx.period) : 0;
+const providers = billingProviderStatus();
+
+// The trend is drawn as a bar row rather than a canvas: no client JavaScript, no chart library, and
+// it degrades to a readable list of numbers if the styles never load.
+const trendMax = trend.reduce((m, p) => (p.value > m ? p.value : m), 0);
+
+function toneColor(state: string): string {
+  if (state === 'hard_exceeded') return '#ff5a5a';
+  if (state === 'soft_exceeded') return '#ffa23a';
+  if (state === 'warning') return '#ffd23a';
+  return '#4ade80';
+}
+function standingColor(tone: string): string {
+  if (tone === 'bad') return '#ff5a5a';
+  if (tone === 'warn') return '#ffa23a';
+  return '#4ade80';
+}
+const dt = (v: string | null | undefined): string => {
+  if (!v) return 'never';
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? String(v) : d.toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+};
+---
+
+<AdminLayout title="Mail billing">
+  <div class="admin-page" style="max-width:1040px;">
+    <div class="admin-page-header" style="margin-bottom:18px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">Mail platform</div>
+        <h1 class="admin-page-title">Billing and usage</h1>
+        <p class="admin-page-sub">
+          Plan, limits, consumption and invoices for one tenant.
+          <a href="/admin/mail/tenants" style={`color:${ACCENT};text-decoration:none;`}>Tenants</a>
+          &middot;
+          <a href="/admin/mail/health" style={`color:${ACCENT};text-decoration:none;`}>Health</a>
+        </p>
+      </div>
+    </div>
+
+    <div class="admin-card" style="margin-bottom:16px;border-left:3px solid #6b7280;">
+      <div style="font-size:13px;line-height:1.6;opacity:.85;">
+        You are viewing this as <strong>EduRankAI platform staff</strong>, not as a member of this
+        organization. Anything you change here is recorded against your account as an operator
+        action in the tenant's billing history.
+      </div>
+    </div>
+
+    {readFailures.length > 0 && (
+      <div class="admin-card" style="margin-bottom:16px;border-left:3px solid #ff5a5a;">
+        <div class="admin-card-title" style="margin-bottom:8px;">Some of this page could not be read</div>
+        <ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.7;">
+          {readFailures.map((f) => <li>{f}</li>)}
+        </ul>
+        <div style="margin-top:8px;font-size:12px;opacity:.7;">
+          The numbers below are incomplete. They are not a statement that the missing values are zero.
+        </div>
+      </div>
+    )}
+
+    {notice && (
+      <div class="admin-card" style={`margin-bottom:16px;border-left:3px solid ${noticeTone === 'ok' ? '#4ade80' : '#ff5a5a'};`}>
+        <div style="font-size:13px;line-height:1.6;">{notice}</div>
+      </div>
+    )}
+
+    <form method="get" class="admin-card" style="margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <label for="org" style="font-size:13px;opacity:.8;">Tenant</label>
+      <select id="org" name="org" style="flex:1;min-width:220px;padding:8px 10px;border-radius:8px;background:var(--o-bg1,#111);color:inherit;border:1px solid var(--o-stroke,#26262c);">
+        {organizations.map((o) => (
+          <option value={o.id} selected={o.id === orgId}>{o.name} ({o.slug}){o.status !== 'active' ? ' - ' + o.status : ''}</option>
+        ))}
+      </select>
+      <button type="submit" class="admin-btn" style={`background:${ACCENT};border:none;color:#111;padding:8px 16px;border-radius:8px;font-weight:600;cursor:pointer;`}>View</button>
+    </form>
+
+    {!ctx && organizations.length === 0 && (
+      <div class="admin-card">
+        <div class="admin-card-title" style="margin-bottom:6px;">No tenants yet</div>
+        <p style="font-size:13px;line-height:1.6;margin:0;">
+          Nothing has been created in <code>mp_organizations</code>. Create one from
+          <a href="/admin/mail/tenants" style={`color:${ACCENT};`}> Tenants</a>, or through
+          <code>POST /api/v1/organizations</code>.
+        </p>
+      </div>
+    )}
+
+    {ctx && view && (
+      <>
+        <div class="billing-grid" style="margin-bottom:16px;">
+          <div class="admin-card">
+            <div class="admin-card-title" style="margin-bottom:10px;">Plan</div>
+            <div style="font-size:22px;font-weight:600;">{ctx.plan.name}</div>
+            <div style="font-size:12px;opacity:.7;margin-top:2px;">
+              {ctx.plan.isCustom ? 'Negotiated plan for this tenant' : ctx.plan.description}
+            </div>
+            <div style="margin-top:10px;font-size:13px;">
+              {(() => {
+                const price = priceFor(ctx.plan.key, currency, 'month');
+                return price
+                  ? formatMoney(price.amountMinor, currency) + ' per month'
+                  : 'Quoted, not listed';
+              })()}
+            </div>
+            <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:5px;">
+              {ctx.plan.features.map((f) => (
+                <span style="font-size:11px;padding:2px 8px;border-radius:99px;background:var(--o-bg2,#1a1a20);opacity:.9;">{FEATURE_LABELS[f]}</span>
+              ))}
+              {ctx.plan.features.length === 0 && <span style="font-size:12px;opacity:.6;">No paid features on this plan.</span>}
+            </div>
+          </div>
+
+          <div class="admin-card">
+            <div class="admin-card-title" style="margin-bottom:10px;">Billing status</div>
+            <div style={`font-size:22px;font-weight:600;color:${standingColor(view.standing.tone)};`}>{view.standing.label}</div>
+            <div style="font-size:12px;opacity:.75;margin-top:2px;line-height:1.5;">{view.standing.detail}</div>
+            <div style="margin-top:10px;font-size:13px;line-height:1.7;">
+              <div>Provider: <strong>{ctx.subscription.provider}</strong></div>
+              <div>Renews: <strong>{dt(ctx.period.end)}</strong> ({daysLeft} day{daysLeft === 1 ? '' : 's'})</div>
+              {ctx.subscription.pendingPlanKey && (
+                <div style="color:#ffa23a;">Changing to <strong>{ctx.subscription.pendingPlanKey}</strong> on {dt(ctx.subscription.pendingPlanAt)}</div>
+              )}
+              {ctx.subscription.cancelAt && (
+                <div style="color:#ffa23a;">Cancels on {dt(ctx.subscription.cancelAt)}</div>
+              )}
+            </div>
+            {view.suspension.suspend && (
+              <div style="margin-top:10px;font-size:12px;color:#ff5a5a;line-height:1.5;">{view.suspension.reason}</div>
+            )}
+            {!view.suspension.suspend && view.suspension.graceDaysLeft !== null && (
+              <div style="margin-top:10px;font-size:12px;color:#ffa23a;line-height:1.5;">
+                Payment is outstanding. Service continues for another {view.suspension.graceDaysLeft} day(s) before suspension is advised.
+              </div>
+            )}
+          </div>
+
+          <div class="admin-card">
+            <div class="admin-card-title" style="margin-bottom:10px;">Period</div>
+            <div style="font-size:13px;line-height:1.8;">
+              <div>{dt(ctx.period.start)}</div>
+              <div style="opacity:.6;">to {dt(ctx.period.end)}</div>
+            </div>
+            <div style="margin-top:10px;height:6px;border-radius:99px;background:var(--o-bg2,#1a1a20);overflow:hidden;">
+              <div style={`height:100%;width:${progress}%;background:${ACCENT};`}></div>
+            </div>
+            <div style="margin-top:6px;font-size:12px;opacity:.7;">
+              {progress}% through the period. Boundaries are UTC for every tenant.
+            </div>
+          </div>
+        </div>
+
+        {view.attention.length > 0 && (
+          <div class="admin-card" style="margin-bottom:16px;border-left:3px solid #ffa23a;">
+            <div class="admin-card-title" style="margin-bottom:8px;">Needs attention</div>
+            <ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.8;">
+              {view.attention.map((s) => (
+                <li>
+                  <strong>{METRICS[s.metric].label}</strong> - {Math.round(s.ratio * 100)}% of
+                  {' '}{describeLimit(s.limit, METRICS[s.metric].unit)}
+                  {s.state === 'hard_exceeded' && <span style="color:#ff5a5a;"> (refusing new work)</span>}
+                  {s.state === 'soft_exceeded' && <span style="color:#ffa23a;"> (in overage)</span>}
+                  <div style="opacity:.65;font-size:12px;">{METRICS[s.metric].hint}</div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        <div class="admin-card" style="margin-bottom:16px;">
+          <div class="admin-card-title" style="margin-bottom:12px;">Usage against the plan</div>
+          <div style="overflow-x:auto;">
+            <table style="width:100%;border-collapse:collapse;font-size:13px;">
+              <thead>
+                <tr style="text-align:left;opacity:.65;">
+                  <th style="padding:6px 8px;font-weight:500;">Metric</th>
+                  <th style="padding:6px 8px;font-weight:500;">Kind</th>
+                  <th style="padding:6px 8px;font-weight:500;">Used</th>
+                  <th style="padding:6px 8px;font-weight:500;">Limit</th>
+                  <th style="padding:6px 8px;font-weight:500;width:150px;">Consumed</th>
+                  <th style="padding:6px 8px;font-weight:500;">At this rate</th>
+                </tr>
+              </thead>
+              <tbody>
+                {view.statuses.map((s) => (
+                  <tr style="border-top:1px solid var(--o-stroke,#1f1f25);">
+                    <td style="padding:7px 8px;">{METRICS[s.metric].label}</td>
+                    <td style="padding:7px 8px;opacity:.6;">{s.kind}</td>
+                    <td style="padding:7px 8px;font-family:'Geist Mono',monospace;">{describeMetricValue(s.metric, s.used)}</td>
+                    <td style="padding:7px 8px;font-family:'Geist Mono',monospace;opacity:.8;">{describeLimit(s.limit, METRICS[s.metric].unit)}</td>
+                    <td style="padding:7px 8px;">
+                      {s.limit === null ? (
+                        <span style="font-size:12px;opacity:.5;">no ceiling</span>
+                      ) : (
+                        <div style="height:6px;border-radius:99px;background:var(--o-bg2,#1a1a20);overflow:hidden;">
+                          <div style={`height:100%;width:${Math.min(100, Math.round(s.ratio * 100))}%;background:${toneColor(s.state)};`}></div>
+                        </div>
+                      )}
+                    </td>
+                    <td style="padding:7px 8px;font-family:'Geist Mono',monospace;opacity:.75;">
+                      {(() => {
+                        if (s.kind !== 'counter') return '-';
+                        const p = projectedTotal(s.used, ctx.period);
+                        return p === null ? 'too early' : describeMetricValue(s.metric, p);
+                      })()}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style="margin-top:10px;font-size:12px;opacity:.65;line-height:1.6;">
+            Counters accumulate over the period and reset at the boundary. Gauges are levels held
+            right now and carry forward. Every number here is folded from the durable event log in
+            <code> mp_usage_events</code>, not from a counter anything can write to directly.
+          </div>
+        </div>
+
+        {trend.length > 0 && (
+          <div class="admin-card" style="margin-bottom:16px;">
+            <div class="admin-card-title" style="margin-bottom:12px;">Emails sent, per day this period</div>
+            <div style="display:flex;align-items:flex-end;gap:2px;height:90px;">
+              {trend.map((p) => (
+                <div
+                  title={p.day + ': ' + p.value}
+                  style={`flex:1;min-width:3px;border-radius:2px 2px 0 0;background:${ACCENT};opacity:${p.value > 0 ? 0.85 : 0.18};height:${trendMax > 0 ? Math.max(2, Math.round((p.value / trendMax) * 88)) : 2}px;`}
+                ></div>
+              ))}
+            </div>
+            <div style="margin-top:6px;display:flex;justify-content:space-between;font-size:11px;opacity:.6;">
+              <span>{trend[0].day}</span>
+              <span>peak {trendMax}</span>
+              <span>{trend[trend.length - 1].day}</span>
+            </div>
+          </div>
+        )}
+
+        <div class="admin-card" style="margin-bottom:16px;">
+          <div class="admin-card-title" style="margin-bottom:12px;">Change the plan</div>
+          <form method="post" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <input type="hidden" name="action" value="change-plan" />
+            <select name="planKey" style="flex:1;min-width:200px;padding:8px 10px;border-radius:8px;background:var(--o-bg1,#111);color:inherit;border:1px solid var(--o-stroke,#26262c);">
+              {PLAN_CATALOG.map((p) => (
+                <option value={p.key} selected={p.key === ctx.plan.key}>
+                  {p.name} - {(() => {
+                    const price = priceFor(p.key, currency, 'month');
+                    return price ? formatMoney(price.amountMinor, currency) + '/mo' : 'quoted';
+                  })()}
+                </option>
+              ))}
+            </select>
+            <button type="submit" class="admin-btn" style={`background:${ACCENT};border:none;color:#111;padding:8px 16px;border-radius:8px;font-weight:600;cursor:pointer;`}>Apply</button>
+          </form>
+          <div style="margin-top:10px;font-size:12px;opacity:.65;line-height:1.6;">
+            An upgrade applies immediately. A downgrade is scheduled for
+            {' '}{dt(ctx.period.end)} so that capacity already paid for is not taken away
+            mid-period; it can be cancelled before then by selecting the current plan again.
+          </div>
+        </div>
+
+        <div class="admin-card" style="margin-bottom:16px;">
+          <div class="admin-card-title" style="margin-bottom:12px;">What this tenant can do</div>
+          <div class="cap-grid">
+            {capabilities.map((d) => (
+              <div style="display:flex;gap:8px;align-items:flex-start;font-size:12px;line-height:1.5;padding:6px 0;border-top:1px solid var(--o-stroke,#1f1f25);">
+                <span style={`flex:0 0 8px;height:8px;width:8px;border-radius:99px;margin-top:5px;background:${d.allowed ? '#4ade80' : (d.reason === 'plan' ? '#ffa23a' : '#ff5a5a')};`}></span>
+                <span>
+                  <strong>{CAPABILITIES[d.capability].label}</strong>
+                  <code style="opacity:.5;margin-left:6px;">{d.capability}</code>
+                  {!d.allowed && <div style="opacity:.7;margin-top:2px;">{d.message}</div>}
+                  {!d.allowed && d.upgradeToPlanKey && (
+                    <div style={`color:${ACCENT};margin-top:2px;`}>Included from the {d.upgradeToPlanKey} plan.</div>
+                  )}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div style="margin-top:10px;font-size:12px;opacity:.65;line-height:1.6;">
+            Decided by the same engine the send path and the API use. Green means permission, plan
+            and quota all allow it right now.
+          </div>
+        </div>
+
+        <div class="billing-grid" style="margin-bottom:16px;">
+          <div class="admin-card">
+            <div class="admin-card-title" style="margin-bottom:10px;">Team ({view.members.length})</div>
+            {view.members.length === 0 && <div style="font-size:13px;opacity:.6;">No members recorded.</div>}
+            <div style="font-size:13px;line-height:1.9;">
+              {view.members.slice(0, 10).map((m) => (
+                <div style="display:flex;justify-content:space-between;gap:10px;">
+                  <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{m.userName || m.userEmail || m.userId}</span>
+                  <span style="opacity:.65;flex:0 0 auto;">{TEAM_ROLE_LABELS[m.teamRole]}</span>
+                </div>
+              ))}
+            </div>
+            <a href={`/admin/mail/tenants?org=${ctx.organization.id}`} style={`display:inline-block;margin-top:10px;font-size:12px;color:${ACCENT};text-decoration:none;`}>Manage the team</a>
+          </div>
+
+          <div class="admin-card">
+            <div class="admin-card-title" style="margin-bottom:10px;">Invoices</div>
+            {view.invoices.length === 0 && (
+              <div style="font-size:13px;opacity:.65;line-height:1.6;">
+                No invoices recorded. Under the manual provider an invoice exists once somebody
+                creates it; there is no gateway generating them.
+              </div>
+            )}
+            <div style="font-size:13px;line-height:1.9;">
+              {view.invoices.map((i) => (
+                <div style="display:flex;justify-content:space-between;gap:10px;">
+                  <span>{i.number}</span>
+                  <span style="opacity:.7;">{formatMoney(i.totalMinor, i.currency)}</span>
+                  <span style={`flex:0 0 auto;color:${i.status === 'paid' ? '#4ade80' : '#ffa23a'};`}>{i.status}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div class="admin-card">
+            <div class="admin-card-title" style="margin-bottom:10px;">Payment providers</div>
+            <div style="font-size:13px;line-height:1.6;">
+              {providers.map((p) => (
+                <div style="padding:6px 0;border-top:1px solid var(--o-stroke,#1f1f25);">
+                  <div style="display:flex;gap:8px;align-items:center;">
+                    <span style={`height:8px;width:8px;border-radius:99px;background:${p.enabled ? '#4ade80' : '#6b7280'};`}></span>
+                    <strong>{p.kind}</strong>
+                  </div>
+                  <div style="opacity:.65;font-size:12px;margin-top:2px;">{p.detail}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div class="admin-card">
+          <div class="admin-card-title" style="margin-bottom:10px;">Billing history</div>
+          {view.events.length === 0 && <div style="font-size:13px;opacity:.6;">Nothing recorded yet.</div>}
+          <div style="font-size:13px;line-height:1.9;">
+            {view.events.map((e) => (
+              <div style="display:flex;gap:10px;border-top:1px solid var(--o-stroke,#1f1f25);padding:5px 0;">
+                <span style="flex:0 0 150px;opacity:.6;font-family:'Geist Mono',monospace;font-size:12px;">{dt(e.occurredAt)}</span>
+                <span style="flex:1;">{e.type}</span>
+                <span style="opacity:.55;">{e.provider}</span>
+                {e.error && <span style="color:#ff5a5a;">{e.error}</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      </>
+    )}
+  </div>
+</AdminLayout>
+
+<style>
+  .billing-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 14px;
+  }
+  .cap-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 0 20px;
+  }
+  code {
+    font-family: 'Geist Mono', monospace;
+    font-size: 11px;
+  }
+  @media (max-width: 640px) {
+    .billing-grid, .cap-grid { grid-template-columns: 1fr; }
+  }
+</style>

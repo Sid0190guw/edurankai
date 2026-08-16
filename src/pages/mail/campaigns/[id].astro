@@ -1,0 +1,458 @@
+---
+/**
+ * /mail/campaigns/[id] — the campaign workflow, and afterwards its report.
+ *
+ * ONE PAGE, TWO MODES, DECIDED BY STATE. A draft shows the wizard: details, recipients, content,
+ * preview, test, schedule, confirm. Anything that has been queued shows the report instead, because
+ * the content is frozen at that point and editing it would mean the report described neither the
+ * message people got nor the one on screen.
+ *
+ * THE WIZARD IS STEPS, NOT PAGES. Each step is a section on one screen with its own completion
+ * state, so the "what is still missing" question is answered at a glance rather than by clicking
+ * forward through four screens. The Send button refuses, with the list of what is missing, until
+ * every required step is done — and it refuses on the SERVER too (see the 'queue' action), because
+ * a client-side check is a courtesy, not a guarantee.
+ */
+import MailShell from '@/components/mail/MailShell.astro';
+import MailIcon from '@/components/mail/MailIcon.astro';
+import Chart from '@/components/mail/Chart.astro';
+import { canUseMailbox } from '@/lib/auth/mail-access';
+import { getCampaign, campaignAudienceCount, campaignStats, campaignSeries, STATUS_WORDING } from '@/lib/mail-product/campaigns';
+import { listLists, listSegments } from '@/lib/mail-product/contacts';
+import { listTemplates } from '@/lib/mail-product/templates';
+import { getMailConfig } from '@/lib/mail';
+import { transportStatus } from '@/lib/mail-transport';
+import { rates } from '@/lib/mail-product/analytics';
+import { num, pct, fullTime, timeAgo, reasonOf } from '@/lib/mail-product/common';
+
+const user = Astro.locals.user;
+const access = await canUseMailbox(user as any);
+const id = String(Astro.params.id || '');
+
+let campaign: any = null;
+let audience = 0;
+let lists: any[] = [];
+let segments: any[] = [];
+let templates: any[] = [];
+let stats: Record<string, number> = {};
+let series: any[] = [];
+let transport = { mode: 'none', detail: '' };
+let cfg: any = null;
+let error = '';
+
+if (access.allowed) {
+  try {
+    campaign = await getCampaign(id);
+    if (campaign) {
+      [audience, lists, segments, templates, stats, series, transport, cfg] = await Promise.all([
+        campaignAudienceCount(campaign).catch(() => 0),
+        listLists().catch(() => []),
+        listSegments().catch(() => []),
+        listTemplates({}).catch(() => []),
+        campaignStats(id).catch(() => ({})),
+        campaignSeries(id, 14).catch(() => []),
+        transportStatus().catch(() => ({ mode: 'none' as const, detail: 'Could not be read' })),
+        getMailConfig().catch(() => null),
+      ]) as any;
+    }
+  } catch (e: any) {
+    error = reasonOf(e);
+    console.error('[mail/campaign] read failed:', error);
+  }
+}
+
+const editable = campaign && ['draft', 'scheduled', 'failed'].includes(campaign.status);
+const reporting = campaign && ['queued', 'sending', 'completed', 'paused', 'cancelled'].includes(campaign.status);
+const wording = campaign ? STATUS_WORDING[campaign.status as keyof typeof STATUS_WORDING] : null;
+
+// What is still missing. The SAME list the server checks on 'queue' — kept in step deliberately, and
+// shown here so nobody discovers it by pressing Send.
+const missing: string[] = [];
+if (campaign) {
+  if (!String(campaign.subject || '').trim()) missing.push('a subject line');
+  if (!String(campaign.body_html || '').trim()) missing.push('content');
+  if (!campaign.from_email) missing.push('a From address');
+  if (!(campaign.list_ids || []).length && !campaign.segment_id) missing.push('a list or a segment');
+}
+
+const totals = {
+  sent: stats.sent || 0,
+  delivered: stats.delivered || 0,
+  deferred: stats.deferred || 0,
+  bounced: stats.bounced || 0,
+  opened: stats.opened || 0,
+  clicked: stats.clicked || 0,
+  unsubscribed: stats.unsubscribed || 0,
+  complained: stats.complained || 0,
+  failed: stats.failed || 0,
+};
+const derived = rates(totals);
+const progress = campaign && campaign.recipients_total > 0
+  ? Math.round(((campaign.sent_count + campaign.failed_count) / campaign.recipients_total) * 100)
+  : 0;
+---
+<MailShell
+  title={campaign ? campaign.name : 'Campaign'}
+  active="campaigns"
+  subtitle={wording ? wording.label : ''}
+  crumbs={[{ label: 'Campaigns', href: '/mail/campaigns' }, { label: campaign ? campaign.name : 'Not found' }]}
+>
+  {campaign && editable && (
+    <button slot="actions" type="button" class="em-btn" data-c-save>Save draft</button>
+  )}
+  {campaign && (
+    <span slot="actions" class={'em-badge ' + (wording!.tone === 'muted' ? '' : wording!.tone) + (campaign.status === 'sending' ? ' live' : '')} title={wording!.detail}>
+      {campaign.status === 'sending' && <span class="em-dot"></span>}
+      {wording!.label}
+    </span>
+  )}
+
+  <div class="em-wrap em-stack" id="cRoot" data-id={id} data-status={campaign?.status || ''}>
+    {error && (
+      <div class="em-alert bad"><MailIcon name="warning" size={16} />
+        <p><strong>This campaign could not be read.</strong> {error}</p></div>
+    )}
+
+    {!campaign && !error && (
+      <div class="em-card"><div class="em-empty">
+        <MailIcon name="campaigns" size={36} strokeWidth={1.3} />
+        <h3>No campaign with that id</h3>
+        <p>It may have been deleted.</p>
+        <a class="em-btn" href="/mail/campaigns">Back to campaigns</a>
+      </div></div>
+    )}
+
+    {campaign && (
+      <div class="em-alert info">
+        <MailIcon name="info" size={16} />
+        <p>{wording!.detail}{campaign.last_error ? ' — ' + campaign.last_error : ''}</p>
+      </div>
+    )}
+
+    <!-- ============================ REPORT ============================ -->
+    {campaign && reporting && (
+      <>
+        {(campaign.status === 'sending' || campaign.status === 'queued') && (
+          <div class="em-card">
+            <div class="em-card-head">
+              <h2 class="em-h2">Sending</h2>
+              {/* data-total is the frozen recipient count. The dispatch loop needs a denominator it
+                  can trust, and recomputing one from accumulated batch results drifts the moment a
+                  batch is retried. */}
+              <span class="em-note em-push" data-c-progress-label data-total={campaign.recipients_total}>
+                {num(campaign.sent_count + campaign.failed_count)} of {num(campaign.recipients_total)} attempted
+              </span>
+            </div>
+            <div class="em-card-body">
+              <div class="c-bar" role="progressbar" aria-valuenow={progress} aria-valuemin="0" aria-valuemax="100"
+                   aria-label="Campaign send progress">
+                <span data-c-progress style={`width:${progress}%`}></span>
+              </div>
+              <div class="em-row" style="margin-top:16px">
+                <button type="button" class="em-btn pri" data-c-run>
+                  <MailIcon name="play" size={14} /> {campaign.status === 'queued' ? 'Start sending' : 'Continue sending'}
+                </button>
+                <button type="button" class="em-btn" data-c-act="pause"><MailIcon name="pause" size={14} /> Pause</button>
+                <button type="button" class="em-btn danger" data-c-act="cancel"><MailIcon name="stop" size={14} /> Cancel</button>
+              </div>
+              <p class="em-hint" style="margin-top:12px">
+                Sending runs in batches so a long send cannot be cut off mid-way with no record of where
+                it reached. Each batch claims its recipients before building a message, so nobody is
+                sent to twice — including if you press this again after closing the page.
+              </p>
+            </div>
+          </div>
+        )}
+
+        <div class="em-grid c4">
+          <div class="em-stat"><p class="em-stat-k">Recipients</p><p class="em-stat-v">{num(campaign.recipients_total)}</p>
+            <p class="em-stat-d">frozen when the campaign was queued</p></div>
+          <div class="em-stat"><p class="em-stat-k">Sent</p><p class="em-stat-v" data-c-sent>{num(campaign.sent_count)}</p></div>
+          <div class="em-stat"><p class="em-stat-k">Failed</p>
+            <p class="em-stat-v" data-c-failed style={campaign.failed_count ? 'color:var(--em-bad)' : ''}>{num(campaign.failed_count)}</p>
+            <p class="em-stat-d">counted separately, never folded into &ldquo;sent&rdquo;</p></div>
+          <div class="em-stat"><p class="em-stat-k">Opened</p><p class="em-stat-v">{num(totals.opened)}</p>
+            <p class="em-stat-d">{pct(totals.opened, totals.sent)} of sent</p></div>
+        </div>
+
+        <div class="em-card">
+          <div class="em-card-head"><h2 class="em-h2">Performance</h2></div>
+          <div class="em-card-body">
+            {/* campaignSeries returns one row per (day, type). Pivoted to one row per DAY, which is
+                what a line chart consumes — and sorted, because Object.values() does not promise an
+                order and an unsorted series draws the line backwards through time. */}
+            <Chart
+              rows={series.length ? Object.values(series.reduce((acc: any, r: any) => {
+                acc[r.day] = acc[r.day] || { day: r.day, sent: 0, opened: 0, clicked: 0, bounced: 0 };
+                acc[r.day][r.type] = r.n;
+                return acc;
+              }, {})).sort((a: any, b: any) => String(a.day).localeCompare(String(b.day))) : []}
+              series={[
+                { key: 'sent', label: 'Sent' },
+                { key: 'opened', label: 'Opened' },
+                { key: 'clicked', label: 'Clicked' },
+                { key: 'bounced', label: 'Bounced' },
+              ]}
+              summary={`Sends, opens, clicks and bounces per day for the campaign "${campaign.name}"`}
+            />
+          </div>
+          <div class="em-card-foot" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:16px">
+            {derived.map((r) => (
+              <div>
+                <span style="font-size:17px;font-weight:690;color:var(--em-ink);font-variant-numeric:tabular-nums">
+                  {r.value !== null ? r.value.toFixed(1) + '%' : '—'}
+                </span>
+                <div style="font-size:11.5px;font-weight:620;color:var(--em-ink-3)">{r.label}</div>
+                <div style="font-size:10.5px;color:var(--em-ink-4)">of {r.basis}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div class="em-card">
+          <div class="em-card-head">
+            <h2 class="em-h2">What was sent</h2>
+            <span class="em-note em-push">Frozen — this is the message that actually left.</span>
+          </div>
+          <div class="em-card-body">
+            <p class="em-row" style="margin-bottom:12px">
+              <span class="em-badge">From</span>
+              <span class="em-mono">{campaign.from_name ? `${campaign.from_name} <${campaign.from_email}>` : campaign.from_email}</span>
+            </p>
+            <p class="em-row" style="margin-bottom:16px">
+              <span class="em-badge">Subject</span> <strong>{campaign.subject}</strong>
+            </p>
+            <iframe class="c-preview" sandbox="" title="The message as it was sent" srcdoc={campaign.body_html}></iframe>
+          </div>
+          <div class="em-card-foot">
+            <button type="button" class="em-btn sm" data-c-act="duplicate">
+              <MailIcon name="copy" size={14} /> Duplicate as a new draft
+            </button>
+          </div>
+        </div>
+      </>
+    )}
+
+    <!-- ============================ WIZARD ============================ -->
+    {campaign && editable && (
+      <>
+        {transport.mode === 'none' && (
+          <div class="em-alert bad">
+            <MailIcon name="warning" size={16} />
+            <p>
+              <strong>No SMTP transport is configured</strong>, so this campaign cannot be sent. You can
+              still build and preview it. Set the mail server in <a href="/admin/mail/settings">Mail settings</a> first.
+            </p>
+          </div>
+        )}
+
+        <div class="c-grid">
+          <div class="em-stack">
+            <!-- Step 1: details -->
+            <section class="em-card">
+              <div class="em-card-head">
+                <span class={'c-step' + (campaign.subject && campaign.from_email ? ' done' : '')}>1</span>
+                <div><h2 class="em-h2">Details</h2><p class="em-note">Who it is from and what it says it is about.</p></div>
+              </div>
+              <div class="em-card-body">
+                <label class="em-field"><span class="em-label" for="cName">Internal name</span>
+                  <input class="em-input" id="cName" value={campaign.name} /></label>
+
+                <label class="em-field">
+                  <span class="em-label" for="cSubject">Subject line <span class="req">*</span></span>
+                  <input class="em-input" id="cSubject" value={campaign.subject} maxlength="300" />
+                  <span class="em-hint" data-c-sublen>
+                    Aim for under 60 characters — most clients truncate beyond that on a phone.
+                  </span>
+                </label>
+
+                <label class="em-field">
+                  <span class="em-label" for="cPreheader">Preview text</span>
+                  <input class="em-input" id="cPreheader" value={campaign.preheader || ''} maxlength="200" />
+                  <span class="em-hint">The grey line the inbox shows beside the subject. Left empty, clients use the first words of the message, which is usually a link.</span>
+                </label>
+
+                <div class="em-grid c2">
+                  <label class="em-field"><span class="em-label" for="cFromName">From name</span>
+                    <input class="em-input" id="cFromName" value={campaign.from_name || cfg?.fromName || ''} /></label>
+                  <label class="em-field">
+                    <span class="em-label" for="cFromEmail">From address <span class="req">*</span></span>
+                    <input class="em-input" id="cFromEmail" type="email" value={campaign.from_email || cfg?.fromAddress || ''} />
+                    <span class="em-hint">Must be an address your configured transport is allowed to send as, or providers will reject it.</span>
+                  </label>
+                </div>
+                <label class="em-field"><span class="em-label" for="cReplyTo">Reply-To</span>
+                  <input class="em-input" id="cReplyTo" type="email" value={campaign.reply_to || ''} placeholder="Where replies should go (optional)" /></label>
+              </div>
+            </section>
+
+            <!-- Step 2: recipients -->
+            <section class="em-card">
+              <div class="em-card-head">
+                <span class={'c-step' + ((campaign.list_ids || []).length || campaign.segment_id ? ' done' : '')}>2</span>
+                <div><h2 class="em-h2">Recipients</h2><p class="em-note">Lists and a segment. Both narrow, they do not add.</p></div>
+                <span class="em-badge accent em-push" data-c-audience>{num(audience)} will receive it</span>
+              </div>
+              <div class="em-card-body">
+                {lists.length === 0 && segments.length === 0 ? (
+                  <div class="em-empty" style="padding:28px 16px">
+                    <MailIcon name="list" size={30} strokeWidth={1.3} />
+                    <h3>Nothing to address this to</h3>
+                    <p>Create a list or a segment first — a campaign cannot be sent to &ldquo;everybody&rdquo;.</p>
+                    <a class="em-btn" href="/mail/contacts/lists">Lists &amp; segments</a>
+                  </div>
+                ) : (
+                  <>
+                    <fieldset style="border:none;padding:0;margin:0 0 16px">
+                      <legend class="em-label">Lists</legend>
+                      {lists.length === 0 && <p class="em-note">No lists yet.</p>}
+                      <div class="em-row">
+                        {lists.map((l) => (
+                          <label class="em-check">
+                            <input type="checkbox" data-c-list value={l.id} checked={(campaign.list_ids || []).includes(l.id)} />
+                            {l.name} <span class="em-note">({num(l.member_count)})</span>
+                          </label>
+                        ))}
+                      </div>
+                    </fieldset>
+
+                    <label class="em-field">
+                      <span class="em-label" for="cSegment">Narrow with a segment</span>
+                      <select class="em-select" id="cSegment">
+                        <option value="">No segment</option>
+                        {segments.map((s) => <option value={s.id} selected={campaign.segment_id === s.id}>{s.name}</option>)}
+                      </select>
+                      <span class="em-hint">
+                        A segment ANDs with the lists: somebody must be on a selected list <em>and</em> match
+                        the segment. Everyone who is not currently subscribed is excluded, and that is not
+                        optional.
+                      </span>
+                    </label>
+                  </>
+                )}
+              </div>
+            </section>
+
+            <!-- Step 3: content -->
+            <section class="em-card">
+              <div class="em-card-head">
+                <span class={'c-step' + (campaign.body_html ? ' done' : '')}>3</span>
+                <div><h2 class="em-h2">Content</h2><p class="em-note">Built with blocks, or started from a template.</p></div>
+              </div>
+              <div class="em-card-body">
+                <div class="em-row">
+                  <a class="em-btn pri" href={`/mail/campaigns/${id}/design`}>
+                    <MailIcon name="edit" size={15} /> {campaign.body_html ? 'Edit the design' : 'Design the email'}
+                  </a>
+                  {templates.length > 0 && (
+                    <label class="em-field" style="margin:0;flex:1;min-width:200px">
+                      <span class="em-sr-only">Start from a template</span>
+                      <select class="em-select" data-c-template>
+                        <option value="">Start from a template…</option>
+                        {templates.filter((t) => t.is_active).map((t) => (
+                          <option value={t.id} selected={campaign.template_id === t.id}>{t.template_key} — {t.subject}</option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                </div>
+                {campaign.body_html && (
+                  <iframe class="c-preview" style="margin-top:16px;height:280px" sandbox=""
+                          title="Current content preview" srcdoc={campaign.body_html}></iframe>
+                )}
+              </div>
+            </section>
+
+            <!-- Step 4: test -->
+            <section class="em-card">
+              <div class="em-card-head">
+                <span class="c-step">4</span>
+                <div><h2 class="em-h2">Send yourself a test</h2>
+                  <p class="em-note">Real renderer, real transport, one address, and not counted in the report.</p></div>
+              </div>
+              <div class="em-card-body">
+                <div class="em-row">
+                  <input class="em-input" id="cTestTo" type="email" style="flex:1;min-width:200px"
+                         placeholder="you@edurankai.in" value={user?.email || ''} />
+                  <button type="button" class="em-btn" data-c-test><MailIcon name="send" size={14} /> Send test</button>
+                </div>
+                <p class="em-hint">
+                  Variables are filled with sample values in a test, because there is no real contact
+                  behind it. In the real send an unfillable variable becomes blank — never the literal
+                  <code class="em-mono">{'{{first_name}}'}</code>.
+                </p>
+              </div>
+            </section>
+          </div>
+
+          <!-- Send panel -->
+          <aside class="em-stack c-side">
+            <div class="em-card">
+              <div class="em-card-head"><h2 class="em-h2">Send</h2></div>
+              <div class="em-card-body">
+                {missing.length > 0 ? (
+                  <div class="em-alert warn" style="margin-bottom:0">
+                    <MailIcon name="warning" size={16} />
+                    <div>
+                      <strong>Not ready yet.</strong>
+                      <p style="margin-top:4px">This campaign still needs {missing.join(', ')}.</p>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <p class="em-lede" style="margin-bottom:16px">
+                      Ready to send to <strong>{num(audience)}</strong> subscribed contact{audience === 1 ? '' : 's'}.
+                    </p>
+                    <button type="button" class="em-btn pri wide lg" data-c-act="queue" disabled={transport.mode === 'none'}>
+                      <MailIcon name="send" size={16} /> Send now
+                    </button>
+                    <p class="em-note" style="text-align:center;margin:10px 0">or</p>
+                    <label class="em-field">
+                      <span class="em-label" for="cSchedule">Schedule for</span>
+                      <input class="em-input" id="cSchedule" type="datetime-local"
+                             value={campaign.scheduled_at ? new Date(campaign.scheduled_at).toISOString().slice(0, 16) : ''} />
+                    </label>
+                    <button type="button" class="em-btn wide" data-c-act="schedule">
+                      <MailIcon name="clock" size={15} /> Schedule
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            <div class="em-card">
+              <div class="em-card-head"><h2 class="em-h2">Danger zone</h2></div>
+              <div class="em-card-body">
+                <button type="button" class="em-btn danger wide" data-c-act="delete">
+                  <MailIcon name="trash" size={14} /> Delete this campaign
+                </button>
+                <p class="em-note" style="margin-top:8px">Only possible before it has been queued.</p>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </>
+    )}
+  </div>
+
+  <script src="/mail/campaign.js" is:inline defer></script>
+</MailShell>
+
+<style>
+  .c-grid { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: var(--em-4); align-items: start; }
+  @media (max-width: 980px) { .c-grid { grid-template-columns: 1fr; } .c-side { order: -1; } }
+
+  .c-step { width: 26px; height: 26px; border-radius: 50%; background: var(--em-surface-3);
+    color: var(--em-ink-4); display: grid; place-items: center; font-size: 12px; font-weight: 700;
+    flex-shrink: 0; }
+  .c-step.done { background: var(--em-ok); color: #fff; }
+
+  .c-bar { height: 10px; border-radius: var(--em-r-full); background: var(--em-surface-3); overflow: hidden; }
+  .c-bar span { display: block; height: 100%; background: var(--em-accent); border-radius: inherit;
+    transition: width 300ms ease; }
+
+  .c-preview { width: 100%; height: 460px; border: 1px solid var(--em-line); border-radius: var(--em-r);
+    background: #fff; }
+  .em-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0);
+    clip-path: inset(50%); white-space: nowrap; }
+</style>

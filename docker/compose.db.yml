@@ -1,0 +1,86 @@
+# docker/compose.db.yml — local Postgres and Redis. OPT-IN, and you should usually not opt in.
+#
+# READ THIS BEFORE USING IT.
+#
+# This project has NO MIGRATION RUNNER. The schema is created by ~343 `CREATE TABLE IF NOT EXISTS`
+# statements that self-bootstrap from inside application modules on first use, and no file in this
+# repository reconstructs the live schema — only a dump does (docs/ops/BACKUP.md section 1). A local
+# Postgres therefore does not contain "the schema"; it contains whatever subset of tables the code
+# paths you happened to exercise have created, with none of the data, none of the enum values added
+# by hand over two years, and none of the columns added by a `.dev-scripts` migration that was run
+# once against production.
+#
+# The practical consequence: a feature that works against this container can fail against Supabase,
+# and the difference will look like a code bug. That is why LOCAL_DB_MODE=supabase is the default.
+#
+# USE THIS PROFILE WHEN, and only when:
+#   - you are offline;
+#   - you are running the destructive parts of the disaster-recovery drill (docs/mail/TESTING.md
+#     section 6) and must not point them at a shared database;
+#   - you are load-testing writes and must not put 100k rows into the real one.
+#
+#   docker compose --env-file ../.env.local -f compose.yml -f compose.db.yml --profile localdb up -d
+#
+# Redis is here rather than in the base stack for the same honesty reason: the shipped queue is
+# Postgres (`edu_jobs`). Redis is a future-scale option and a local convenience. Starting it does not
+# make the application use it — nothing in src/ opens a Redis client today.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    profiles: [localdb]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-era}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-era_local_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-era}
+    ports:
+      # Loopback only. A Postgres port on 0.0.0.0 with a dev password is a database anyone on the
+      # network can read.
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      # Anything in here runs ONCE, on an empty data directory. It is the hook for a schema dump:
+      # put `schema.sql` here to get a local database whose shape matches production.
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-era} -d ${POSTGRES_DB:-era}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [mail]
+
+  redis:
+    image: redis:7-alpine
+    profiles: [localdb]
+    restart: unless-stopped
+    # appendonly so a restart does not silently empty a queue you were mid-way through draining.
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    ports:
+      - "127.0.0.1:${PORT_REDIS:-6379}:6379"
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [mail]
+
+  # Point the app at the local database instead of Supabase. This override only applies when this
+  # file is included, so the base stack stays on Supabase by default.
+  #
+  # THIS FILE MUST ALWAYS BE PAIRED WITH `--profile localdb`. The override below makes `app` depend
+  # on services that only exist under that profile; including the file without the profile leaves
+  # app waiting on a container nobody is going to start. ./scripts/start-mail.sh enforces the
+  # pairing (it refuses `--localdb` without adding the profile) so the raw command is the only way
+  # to get this wrong.
+  app:
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-era}:${POSTGRES_PASSWORD:-era_local_dev_only}@postgres:5432/${POSTGRES_DB:-era}
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy

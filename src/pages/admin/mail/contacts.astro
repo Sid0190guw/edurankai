@@ -1,0 +1,570 @@
+---
+/**
+ * /admin/mail/contacts — the contact book.
+ *
+ * Search, filter, edit, tag, list, merge, import and export. Every read on this page reports its own
+ * failure rather than rendering a zero: a screen that cannot tell "no contacts match" from "the
+ * query did not run" is believed, and this project has shipped that exact confusion before on
+ * /admin/mail/analytics.
+ *
+ * Writes go through POST here (so the page works without JavaScript) and through
+ * /api/mail/contacts for the bulk actions the table drives.
+ */
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import {
+  ensureContactSchema, searchContacts, allTags, listsWithCounts, listSegments, listSuppressions,
+  createContact, updateContact, deleteContacts, mergeContacts, addTagToMany, addToList,
+  suppress, unsuppress, isUuid, dbReason, type Actor,
+} from '@/lib/mail-contacts';
+import { getSegment } from '@/lib/mail-contacts';
+import { findDuplicateGroups, SUBSCRIPTION_STATUSES } from '@/lib/mail-csv';
+import type { SegmentNode } from '@/lib/mail-segments';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+const actor: Actor = { userId: user.id, name: user.name || user.email };
+
+// Declared before everything that uses them: `const` is not hoisted, and a handler reaching a later
+// declaration has taken pages down on this project.
+const readFailures: { source: string; reason: string }[] = [];
+function noteFailure<T>(source: string, fallback: T) {
+  return (e: any): T => {
+    readFailures.push({ source, reason: dbReason(e) });
+    console.error('[admin/mail/contacts] ' + source + ' read failed:', dbReason(e));
+    return fallback;
+  };
+}
+
+let okMsg = '';
+let errMsg = '';
+
+try {
+  await ensureContactSchema();
+} catch (e: any) {
+  errMsg = 'The contact tables could not be prepared: ' + dbReason(e);
+}
+
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('_action') || '');
+    const ids = String(fd.get('ids') || '').split(',').map((s) => s.trim()).filter(isUuid);
+
+    if (action === 'create') {
+      const r = await createContact({
+        email: String(fd.get('email') || ''),
+        first_name: String(fd.get('first_name') || '') || null,
+        last_name: String(fd.get('last_name') || '') || null,
+        organization: String(fd.get('organization') || '') || null,
+        phone: String(fd.get('phone') || '') || null,
+        role_title: String(fd.get('role_title') || '') || null,
+        consent_source: String(fd.get('consent_source') || '') || null,
+        consent_at: String(fd.get('consent_source') || '') ? new Date().toISOString() : null,
+        tags: String(fd.get('tags') || '').split(/[;,]/).map((t) => t.trim()).filter(Boolean),
+      }, actor);
+      if (r.ok) okMsg = 'Contact added.';
+      else errMsg = r.error || 'The contact was not added.';
+    } else if (action === 'delete') {
+      const r = await deleteContacts(ids, actor);
+      if (r.error) errMsg = r.error;
+      else okMsg = r.deleted + ' contact' + (r.deleted === 1 ? '' : 's') + ' deleted. Anyone who had unsubscribed stays on the suppression list, so a re-import cannot mail them again.';
+    } else if (action === 'bulk-tag') {
+      const tag = String(fd.get('tag') || '').trim();
+      if (!tag) errMsg = 'Type a tag first.';
+      else okMsg = (await addTagToMany(ids, tag, actor)) + ' contacts tagged "' + tag + '".';
+    } else if (action === 'bulk-list') {
+      const listId = String(fd.get('listId') || '');
+      if (!isUuid(listId)) errMsg = 'Choose a list first.';
+      else okMsg = (await addToList(listId, ids, 'bulk', actor)) + ' contacts added to the list.';
+    } else if (action === 'bulk-unsubscribe') {
+      let n = 0;
+      for (const id of ids) {
+        const r = await updateContact(id, { status: 'unsubscribed' }, actor);
+        if (r.ok) n++;
+      }
+      okMsg = n + ' contacts marked unsubscribed and added to the suppression list.';
+    } else if (action === 'merge') {
+      const r = await mergeContacts(String(fd.get('targetId') || ''), String(fd.get('sourceId') || ''), actor);
+      if (r.ok) okMsg = 'Contacts merged. The record you kept now holds both sets of tags and lists, and the more restrictive subscription status of the two.';
+      else errMsg = r.error || 'Nothing was merged.';
+    } else if (action === 'suppress') {
+      await suppress(String(fd.get('email') || ''), 'manual', 'Added by hand from the contacts screen', null, actor);
+      okMsg = 'That address will not receive any campaign.';
+    } else if (action === 'unsuppress') {
+      const r = await unsuppress(String(fd.get('email') || ''), actor);
+      if (r.ok) okMsg = 'That address can receive campaigns again.';
+      else errMsg = r.error || 'Nothing changed.';
+    }
+  } catch (e: any) {
+    okMsg = '';
+    console.error('[admin/mail/contacts] write failed:', dbReason(e));
+    errMsg = 'Nothing was saved: ' + dbReason(e);
+  }
+}
+
+// ── the query this page is showing ─────────────────────────────────────────────────────────────
+const url = Astro.url;
+const q = url.searchParams.get('q') || '';
+const status = url.searchParams.get('status') || 'any';
+const tagFilter = url.searchParams.get('tag') || '';
+const listFilter = url.searchParams.get('list') || '';
+const segmentFilter = url.searchParams.get('segment') || '';
+const page = Math.max(1, Number(url.searchParams.get('page')) || 1);
+const perPage = 50;
+const tab = url.searchParams.get('tab') || 'contacts';
+
+let segmentNode: SegmentNode | null = null;
+let segmentName = '';
+if (isUuid(segmentFilter)) {
+  const seg = await getSegment(segmentFilter).catch(noteFailure('Segment filter', null));
+  if (seg) { segmentNode = seg.definition; segmentName = seg.name; }
+}
+
+const result = await searchContacts({
+  q, status: status as any, tag: tagFilter || undefined,
+  listId: isUuid(listFilter) ? listFilter : undefined,
+  segment: segmentNode,
+  limit: perPage, offset: (page - 1) * perPage,
+}).catch(noteFailure('Contacts', { contacts: [], total: 0 }));
+
+const tags = await allTags().catch(noteFailure('Tags', []));
+const lists = await listsWithCounts().catch(noteFailure('Lists', []));
+const segments = await listSegments().catch(noteFailure('Segments', []));
+const suppressions = tab === 'suppression' ? await listSuppressions(300).catch(noteFailure('Suppression list', [])) : [];
+const duplicates = tab === 'duplicates' ? findDuplicateGroups(result.contacts as any) : [];
+
+const totalPages = Math.max(1, Math.ceil(result.total / perPage));
+const nothingMatched = result.total === 0 && readFailures.length === 0;
+
+function qs(overrides: Record<string, string>): string {
+  const p = new URLSearchParams(url.searchParams);
+  for (const k of Object.keys(overrides)) {
+    if (overrides[k]) p.set(k, overrides[k]); else p.delete(k);
+  }
+  return '?' + p.toString();
+}
+
+const STATUS_TONES = [
+  ['subscribed', 'background:rgba(16,185,129,.15);color:#6ee7b7;'],
+  ['unsubscribed', 'background:rgba(148,163,184,.15);color:#94a3b8;'],
+  ['bounced', 'background:rgba(245,158,11,.15);color:#fcd34d;'],
+  ['complained', 'background:rgba(239,68,68,.15);color:#fca5a5;'],
+  ['pending', 'background:rgba(99,102,241,.15);color:#a5b4fc;'],
+];
+function toneFor(s: string): string {
+  const hit = STATUS_TONES.find((t) => t[0] === s);
+  return hit ? hit[1] : 'background:rgba(148,163,184,.15);color:#94a3b8;';
+}
+---
+<AdminLayout title="Contacts" activeNav="mail">
+  <style>
+    .cw { padding: 18px; max-width: 1400px; }
+    .card { background: var(--o-panel2,#141418); border: 1px solid var(--o-stroke,#26262e); border-radius: 12px; }
+    .lbl { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: #8a8a94; display: block; margin-bottom: 5px; }
+    .inp { width: 100%; background: #fff; color: #17181d; border: 1.5px solid #cbd0da; border-radius: 8px; padding: 9px 11px; font-size: 13.5px; }
+    .inp:focus { border-color: #FF6A3D; outline: none; box-shadow: 0 0 0 3px rgba(255,106,61,.2); }
+    .prim { background: #FF6A3D; color: #fff; border: none; font-weight: 700; padding: 9px 18px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+    .prim:hover { background: #ff5a28; }
+    .ghost { background: #262832; color: #e6e7ec; border: 1px solid #3a3c48; font-weight: 600; padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 12.5px; }
+    .ghost:hover { background: #30323e; }
+    .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--o-stroke,#26262e); margin-bottom: 16px; flex-wrap: wrap; }
+    .tab { padding: 9px 14px; font-size: 12.5px; font-weight: 600; color: #8a8a94; border-bottom: 2px solid transparent; text-decoration: none; }
+    .tab[data-on="1"] { color: #fff; border-bottom-color: #FF6A3D; }
+    table.ct { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    table.ct th { text-align: left; padding: 9px 10px; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: #8a8a94; border-bottom: 1px solid var(--o-stroke,#26262e); }
+    table.ct td { padding: 9px 10px; border-bottom: 1px solid rgba(255,255,255,.04); color: #d4d4d8; vertical-align: top; }
+    table.ct tr:hover td { background: rgba(255,255,255,.02); }
+    .pill { font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: 100px; text-transform: uppercase; letter-spacing: .05em; }
+    .tagchip { display: inline-block; font-size: 10px; background: rgba(255,106,61,.12); border: 1px solid rgba(255,106,61,.28); color: #FF7040; padding: 1px 6px; border-radius: 100px; margin: 1px 2px 1px 0; }
+    .banner { font-size: 12.5px; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; }
+    .b-ok { background: rgba(16,185,129,.1); border: 1px solid rgba(16,185,129,.3); color: #6ee7b7; }
+    .b-err { background: rgba(239,68,68,.1); border: 1px solid rgba(239,68,68,.3); color: #fca5a5; }
+    .b-warn { background: rgba(245,158,11,.1); border: 1px solid rgba(245,158,11,.3); color: #fcd34d; }
+    .muted { color: #8a8a94; font-size: 11.5px; }
+    .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; margin-bottom: 14px; }
+    .drop { background: #fff; color: #17181d; border: 1.5px solid #cbd0da; border-radius: 8px; padding: 9px 11px; font-size: 13px; }
+    .imp { width: 100%; min-height: 160px; background: #0d0e13; color: #e6e7ec; border: 1px solid #2a2a33; border-radius: 8px; padding: 11px; font-family: ui-monospace, monospace; font-size: 12px; }
+  </style>
+
+  <div class="cw">
+    <div class="admin-page-header" style="margin-bottom:14px;">
+      <div class="admin-page-eyebrow">Mail</div>
+      <h1 class="admin-page-title">Contacts</h1>
+      <p class="admin-page-sub">Everyone this platform may send a campaign to, with their consent record and their history. Deleting a contact does <strong>not</strong> make an unsubscribed address mailable again &mdash; the suppression list is keyed by address and outlives the record.</p>
+    </div>
+
+    {okMsg && <div class="banner b-ok">{okMsg}</div>}
+    {errMsg && <div class="banner b-err">{errMsg}</div>}
+    {readFailures.length > 0 && (
+      <div class="banner b-warn">
+        <strong>Some of this page could not be read, so the figures below are incomplete.</strong>
+        <ul style="margin:6px 0 0 16px;padding:0;">
+          {readFailures.map((f) => <li>{f.source}: {f.reason}</li>)}
+        </ul>
+      </div>
+    )}
+
+    <div class="tabs">
+      <a class="tab" data-on={tab === 'contacts' ? '1' : '0'} href={qs({ tab: '' })}>Contacts</a>
+      <a class="tab" data-on={tab === 'add' ? '1' : '0'} href={qs({ tab: 'add' })}>Add a contact</a>
+      <a class="tab" data-on={tab === 'import' ? '1' : '0'} href={qs({ tab: 'import' })}>Import CSV</a>
+      <a class="tab" data-on={tab === 'duplicates' ? '1' : '0'} href={qs({ tab: 'duplicates' })}>Possible duplicates</a>
+      <a class="tab" data-on={tab === 'suppression' ? '1' : '0'} href={qs({ tab: 'suppression' })}>Suppression list</a>
+      <a class="tab" href="/admin/mail/lists">Lists &amp; segments</a>
+      <a class="tab" href="/admin/mail/campaigns">Campaigns</a>
+    </div>
+
+    {tab === 'contacts' && (
+      <div>
+        <form class="filters" method="GET">
+          <input type="hidden" name="tab" value="contacts" />
+          <div style="flex:1 1 260px;">
+            <label class="lbl">Search</label>
+            <input class="inp" name="q" value={q} placeholder="name, address, organisation or phone" />
+          </div>
+          <div>
+            <label class="lbl">Status</label>
+            <select class="drop" name="status">
+              <option value="any" selected={status === 'any'}>Any</option>
+              {SUBSCRIPTION_STATUSES.map((s) => <option value={s} selected={status === s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label class="lbl">Tag</label>
+            <select class="drop" name="tag">
+              <option value="">Any</option>
+              {tags.map((t: any) => <option value={t.tag} selected={tagFilter === t.tag}>{t.tag} ({t.count})</option>)}
+            </select>
+          </div>
+          <div>
+            <label class="lbl">List</label>
+            <select class="drop" name="list">
+              <option value="">Any</option>
+              {lists.map((l: any) => <option value={l.id} selected={listFilter === l.id}>{l.name} ({l.member_count})</option>)}
+            </select>
+          </div>
+          <div>
+            <label class="lbl">Saved segment</label>
+            <select class="drop" name="segment">
+              <option value="">None</option>
+              {segments.map((s: any) => <option value={s.id} selected={segmentFilter === s.id}>{s.name}</option>)}
+            </select>
+          </div>
+          <button class="prim" type="submit">Apply</button>
+          <a class="ghost" href="/admin/mail/contacts" style="text-decoration:none;display:inline-block;">Clear</a>
+        </form>
+
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+          <div class="muted">
+            {result.total.toLocaleString('en-IN')} contact{result.total === 1 ? '' : 's'} match
+            {segmentName ? ' segment "' + segmentName + '"' : ''}
+            {readFailures.length > 0 ? ' (at least: a read on this page failed)' : ''}
+          </div>
+          <div style="display:flex;gap:8px;">
+            <a class="ghost" style="text-decoration:none;" href={'/api/mail/contacts-export?' + new URLSearchParams({ q, status, tag: tagFilter, list: listFilter }).toString()}>Export this view as CSV</a>
+          </div>
+        </div>
+
+        <form method="POST" id="bulkForm">
+          <input type="hidden" name="ids" id="bulkIds" value="" />
+          <div class="card" style="padding:10px 12px;margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <span class="muted"><span id="selCount">0</span> selected</span>
+            <input class="inp" style="width:150px;" name="tag" placeholder="tag to apply" />
+            <button class="ghost" type="submit" name="_action" value="bulk-tag">Add tag</button>
+            <select class="drop" name="listId">
+              <option value="">choose a list</option>
+              {lists.map((l: any) => <option value={l.id}>{l.name}</option>)}
+            </select>
+            <button class="ghost" type="submit" name="_action" value="bulk-list">Add to list</button>
+            <button class="ghost" type="submit" name="_action" value="bulk-unsubscribe" data-danger="Mark the selected contacts unsubscribed and suppress their addresses?">Mark unsubscribed</button>
+            <button class="ghost" type="submit" name="_action" value="delete" style="color:#fca5a5;border-color:rgba(239,68,68,.3);" data-danger="Delete the selected contacts? Their suppression records stay, so unsubscribed people cannot be re-imported into a campaign.">Delete</button>
+          </div>
+        </form>
+
+        <div class="card" style="overflow:auto;">
+          <table class="ct">
+            <thead>
+              <tr>
+                <th style="width:28px;"><input type="checkbox" id="selAll" /></th>
+                <th>Contact</th><th>Organisation</th><th>Status</th><th>Tags</th><th>Last activity</th><th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {result.contacts.map((c: any) => (
+                <tr>
+                  <td><input type="checkbox" class="rowSel" value={c.id} /></td>
+                  <td>
+                    <a href={'/admin/mail/contacts/' + c.id} style="color:#fff;font-weight:600;text-decoration:none;">
+                      {[c.first_name, c.last_name].filter(Boolean).join(' ') || c.email}
+                    </a>
+                    <div class="muted">{c.email}</div>
+                  </td>
+                  <td>{c.organization || <span class="muted">not recorded</span>}</td>
+                  <td><span class="pill" style={toneFor(c.status)}>{c.status}</span></td>
+                  <td>{(c.tags || []).map((t: string) => <span class="tagchip">{t}</span>)}</td>
+                  <td class="muted">{c.last_activity_at ? new Date(c.last_activity_at).toLocaleDateString('en-GB') : 'none recorded'}</td>
+                  <td><a class="ghost" style="text-decoration:none;padding:4px 9px;" href={'/admin/mail/contacts/' + c.id}>Open</a></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {nothingMatched && <div style="padding:26px;text-align:center;color:#6e6e78;font-size:12.5px;">No contact matches this filter. Every read on this page answered, so this is genuinely empty rather than unreadable.</div>}
+        </div>
+
+        {totalPages > 1 && (
+          <div style="display:flex;gap:8px;justify-content:center;margin-top:14px;align-items:center;">
+            {page > 1 && <a class="ghost" style="text-decoration:none;" href={qs({ page: String(page - 1) })}>Previous</a>}
+            <span class="muted">Page {page} of {totalPages}</span>
+            {page < totalPages && <a class="ghost" style="text-decoration:none;" href={qs({ page: String(page + 1) })}>Next</a>}
+          </div>
+        )}
+      </div>
+    )}
+
+    {tab === 'add' && (
+      <form method="POST" class="card" style="padding:18px;max-width:760px;">
+        <input type="hidden" name="_action" value="create" />
+        <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0 0 4px;">Add a contact</h2>
+        <p class="muted" style="margin:0 0 14px;">Record where the consent came from. A subscribed contact with no consent source is flagged everywhere it appears, because we cannot show what it was later.</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+          <div style="grid-column:1/-1;"><label class="lbl">Email address</label><input class="inp" name="email" type="email" required /></div>
+          <div><label class="lbl">First name</label><input class="inp" name="first_name" /></div>
+          <div><label class="lbl">Last name</label><input class="inp" name="last_name" /></div>
+          <div><label class="lbl">Organisation</label><input class="inp" name="organization" /></div>
+          <div><label class="lbl">Role or title</label><input class="inp" name="role_title" /></div>
+          <div><label class="lbl">Phone</label><input class="inp" name="phone" /></div>
+          <div><label class="lbl">Tags (separated by ; )</label><input class="inp" name="tags" placeholder="intern; iitg" /></div>
+          <div style="grid-column:1/-1;"><label class="lbl">Consent source</label><input class="inp" name="consent_source" placeholder="e.g. signed up at the IITG careers fair, 14 Aug 2026" /></div>
+        </div>
+        <div style="margin-top:16px;"><button class="prim" type="submit">Add contact</button></div>
+      </form>
+    )}
+
+    {tab === 'import' && (
+      <div class="card" style="padding:18px;max-width:1000px;">
+        <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0 0 4px;">Import from CSV</h2>
+        <p class="muted" style="margin:0 0 12px;">
+          Nothing is written until you press Import. Check first shows exactly what would happen: which column becomes which field,
+          which rows are unusable and why, which addresses repeat inside the file, and how many are already suppressed.
+          An existing contact is <strong>updated, never replaced</strong> &mdash; blanks are filled and tags are added, nothing is overwritten.
+        </p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin-bottom:10px;">
+          <div><label class="lbl">CSV file</label><input class="inp" type="file" id="csvFile" accept=".csv,text/csv" /></div>
+          <div>
+            <label class="lbl">Also add everyone to</label>
+            <select class="drop" id="impList">
+              <option value="">no list</option>
+              {lists.map((l: any) => <option value={l.id}>{l.name}</option>)}
+            </select>
+          </div>
+          <div style="flex:1 1 240px;"><label class="lbl">Consent source for rows that have none</label><input class="inp" id="impConsent" placeholder="e.g. IITG careers fair list, 14 Aug 2026" /></div>
+        </div>
+        <label class="lbl">Or paste the CSV</label>
+        <textarea class="imp" id="csvText" placeholder="email,first_name,organization&#10;ananya@example.org,Ananya,IIT Guwahati"></textarea>
+        <div style="display:flex;gap:8px;margin-top:10px;">
+          <button class="ghost" type="button" id="btnPlan">Check the file</button>
+          <button class="prim" type="button" id="btnImport" disabled>Import</button>
+        </div>
+        <div id="impOut" style="margin-top:14px;"></div>
+      </div>
+    )}
+
+    {tab === 'duplicates' && (
+      <div class="card" style="padding:18px;">
+        <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0 0 4px;">Possible duplicates</h2>
+        <p class="muted" style="margin:0 0 14px;">
+          The same address cannot be stored twice, so these are people who look like one person under two addresses: the same name at
+          the same organisation, or the same phone number. This <strong>suggests</strong> &mdash; merging destroys one of the records, so you decide.
+          Computed over the {result.contacts.length} contacts on this page of the current filter.
+        </p>
+        {duplicates.length === 0 && <p class="muted">No likely duplicates in this view.</p>}
+        {duplicates.map((g: any) => (
+          <form method="POST" class="card" style="padding:12px;margin-bottom:10px;">
+            <input type="hidden" name="_action" value="merge" />
+            <div class="muted" style="margin-bottom:8px;">Matched on {g.reason === 'phone' ? 'phone number' : 'name and organisation'}</div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;">
+              <div>
+                <label class="lbl">Keep this record</label>
+                <select class="drop" name="targetId">
+                  {g.members.map((m: any) => <option value={m.id}>{m.email}</option>)}
+                </select>
+              </div>
+              <div>
+                <label class="lbl">Fold in this one (it is deleted)</label>
+                <select class="drop" name="sourceId">
+                  {g.members.slice().reverse().map((m: any) => <option value={m.id}>{m.email}</option>)}
+                </select>
+              </div>
+              <button class="ghost" type="submit" data-danger="Merge these two contacts? The record you fold in is deleted; its tags, lists and history move across.">Merge</button>
+            </div>
+          </form>
+        ))}
+      </div>
+    )}
+
+    {tab === 'suppression' && (
+      <div class="card" style="padding:18px;">
+        <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0 0 4px;">Suppression list</h2>
+        <p class="muted" style="margin:0 0 14px;">
+          Addresses no campaign may reach, whatever any list says. Kept by address rather than by contact, so it survives a delete
+          and a re-import. An address that <strong>reported mail as spam cannot be released</strong> &mdash; re-mailing a complainant damages
+          delivery for everyone else on the domain.
+        </p>
+        <form method="POST" style="display:flex;gap:8px;align-items:end;margin-bottom:14px;flex-wrap:wrap;">
+          <input type="hidden" name="_action" value="suppress" />
+          <div style="flex:1 1 280px;"><label class="lbl">Add an address by hand</label><input class="inp" name="email" type="email" placeholder="someone@example.org" required /></div>
+          <button class="ghost" type="submit">Suppress</button>
+        </form>
+        <div style="overflow:auto;">
+          <table class="ct">
+            <thead><tr><th>Address</th><th>Reason</th><th>Detail</th><th>Added</th><th></th></tr></thead>
+            <tbody>
+              {suppressions.map((s: any) => (
+                <tr>
+                  <td style="color:#fff;">{s.email}</td>
+                  <td><span class="pill" style={toneFor(s.reason === 'complained' ? 'complained' : s.reason === 'bounced' ? 'bounced' : 'unsubscribed')}>{s.reason}</span></td>
+                  <td class="muted">{s.detail || ''}</td>
+                  <td class="muted">{new Date(s.created_at).toLocaleDateString('en-GB')}</td>
+                  <td>
+                    {s.reason !== 'complained' && (
+                      <form method="POST" style="display:inline;">
+                        <input type="hidden" name="_action" value="unsuppress" />
+                        <input type="hidden" name="email" value={s.email} />
+                        <button class="ghost" style="padding:4px 9px;" type="submit" data-danger="Allow campaigns to reach this address again?">Release</button>
+                      </form>
+                    )}
+                    {s.reason === 'complained' && <span class="muted">stays suppressed</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {suppressions.length === 0 && <div style="padding:22px;text-align:center;color:#6e6e78;font-size:12.5px;">Nothing is suppressed.</div>}
+        </div>
+      </div>
+    )}
+  </div>
+
+  <script is:inline>
+    (function () {
+      // ---- bulk selection ----
+      var all = document.getElementById('selAll');
+      var form = document.getElementById('bulkForm');
+      function selected() {
+        return Array.prototype.slice.call(document.querySelectorAll('.rowSel:checked')).map(function (c) { return c.value; });
+      }
+      function sync() {
+        var ids = selected();
+        var box = document.getElementById('bulkIds');
+        var count = document.getElementById('selCount');
+        if (box) box.value = ids.join(',');
+        if (count) count.textContent = String(ids.length);
+      }
+      document.addEventListener('change', function (e) {
+        if (e.target && e.target.classList && e.target.classList.contains('rowSel')) sync();
+        if (e.target === all) {
+          Array.prototype.slice.call(document.querySelectorAll('.rowSel')).forEach(function (c) { c.checked = all.checked; });
+          sync();
+        }
+      });
+      if (form) {
+        form.addEventListener('submit', function (e) {
+          sync();
+          if (!selected().length) { e.preventDefault(); alert('Select at least one contact first.'); return; }
+          var btn = e.submitter;
+          var ask = btn && btn.getAttribute('data-danger');
+          if (ask && !confirm(ask + '\n\n' + selected().length + ' contacts are selected.')) e.preventDefault();
+        });
+      }
+      document.addEventListener('submit', function (e) {
+        if (e.target === form) return;
+        var btn = e.submitter;
+        var ask = btn && btn.getAttribute('data-danger');
+        if (ask && !confirm(ask)) e.preventDefault();
+      });
+
+      // ---- CSV import ----
+      var file = document.getElementById('csvFile');
+      var text = document.getElementById('csvText');
+      var out = document.getElementById('impOut');
+      var btnPlan = document.getElementById('btnPlan');
+      var btnImport = document.getElementById('btnImport');
+      if (file) {
+        file.addEventListener('change', function () {
+          var f = file.files && file.files[0];
+          if (!f) return;
+          var r = new FileReader();
+          r.onload = function () { if (text) text.value = String(r.result || ''); };
+          r.readAsText(f);
+        });
+      }
+      function esc(s) {
+        return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }
+      function post(mode) {
+        if (!text || !text.value.trim()) { alert('Choose or paste a CSV first.'); return; }
+        var listSel = document.getElementById('impList');
+        var consent = document.getElementById('impConsent');
+        if (out) out.innerHTML = '<p class="muted">Working…</p>';
+        fetch('/api/mail/contacts-import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            mode: mode,
+            csv: text.value,
+            listId: listSel ? listSel.value : '',
+            consentSource: consent ? consent.value : '',
+          }),
+        }).then(function (r) { return r.json(); }).then(function (d) {
+          if (!d.ok) { if (out) out.innerHTML = '<div class="banner b-err">' + esc(d.error) + '</div>'; return; }
+          if (d.mode === 'commit') {
+            if (btnImport) btnImport.disabled = true;
+            var note = d.note ? '<p class="muted">' + esc(d.note) + '</p>' : '';
+            var failed = (d.failed && d.failed.length)
+              ? '<p class="muted">' + d.failed.length + ' rows did not write: ' + esc(d.failed.slice(0, 5).map(function (f) { return f.email + ' (' + f.reason + ')'; }).join('; ')) + '</p>'
+              : '';
+            if (out) out.innerHTML = '<div class="banner b-ok">' + d.created + ' created, ' + d.updated + ' updated. '
+              + d.invalidCount + ' unusable rows and ' + d.duplicateCount + ' in-file duplicates were not imported.</div>' + note + failed;
+            return;
+          }
+          var rowsHtml = '';
+          rowsHtml += '<div class="banner ' + (d.invalidCount ? 'b-warn' : 'b-ok') + '">'
+            + d.totalRows + ' rows read. <strong>' + d.validCount + ' would import.</strong> '
+            + d.invalidCount + ' unusable, ' + d.duplicateCount + ' repeated inside the file, '
+            + d.suppressedCount + ' already suppressed (they import, but no campaign will reach them).'
+            + '</div>';
+          rowsHtml += '<p class="lbl">Column mapping</p><p class="muted">'
+            + d.mapping.map(function (m) { return esc(m.header) + ' &rarr; ' + esc(m.field || 'ignored'); }).join(' &middot; ') + '</p>';
+          if (d.ragged && d.ragged.length) {
+            rowsHtml += '<p class="muted">' + d.ragged.length + ' rows have a different number of columns from the header (first: line '
+              + d.ragged[0].line + ', ' + d.ragged[0].got + ' where ' + d.ragged[0].expected + ' were expected). They were still read.</p>';
+          }
+          if (d.invalid && d.invalid.length) {
+            rowsHtml += '<p class="lbl">Rows that will not import</p><ul class="muted" style="margin:0 0 8px 16px;">'
+              + d.invalid.slice(0, 25).map(function (i) { return '<li>Line ' + i.line + ': ' + esc(i.errors.join(' ')) + '</li>'; }).join('')
+              + '</ul>';
+          }
+          if (d.duplicatesInFile && d.duplicatesInFile.length) {
+            rowsHtml += '<p class="lbl">Repeated inside the file (merged into the first occurrence)</p><ul class="muted" style="margin:0 0 8px 16px;">'
+              + d.duplicatesInFile.slice(0, 15).map(function (x) { return '<li>Line ' + x.line + ': ' + esc(x.email) + ' first seen on line ' + x.firstSeenLine + '</li>'; }).join('')
+              + '</ul>';
+          }
+          if (d.warnings && d.warnings.length) {
+            rowsHtml += '<p class="lbl">' + d.warningCount + ' warnings</p><ul class="muted" style="margin:0 0 8px 16px;">'
+              + d.warnings.slice(0, 15).map(function (w) { return '<li>Line ' + w.line + ': ' + esc(w.message) + '</li>'; }).join('')
+              + '</ul>';
+          }
+          if (out) out.innerHTML = rowsHtml;
+          if (btnImport) btnImport.disabled = d.validCount === 0;
+        }).catch(function (e) {
+          if (out) out.innerHTML = '<div class="banner b-err">The check did not run: ' + esc(e && e.message) + '</div>';
+        });
+      }
+      if (btnPlan) btnPlan.addEventListener('click', function () { post('plan'); });
+      if (btnImport) btnImport.addEventListener('click', function () {
+        if (!confirm('Import these contacts now? Existing records are updated, never replaced.')) return;
+        post('commit');
+      });
+    })();
+  </script>
+</AdminLayout>

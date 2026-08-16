@@ -1,0 +1,441 @@
+---
+/**
+ * /mail/box/[folder] — the mailbox: list, thread and every action on both.
+ *
+ * WHY ONE ROUTE FOR EIGHT FOLDERS. Inbox, Sent, Drafts, Starred, Archive, Spam and Trash differ by a
+ * WHERE clause and by which actions make sense. Eight files would be eight copies of one screen, and
+ * the seventh copy is always the one that misses a fix.
+ *
+ * WHAT IS SERVER-RENDERED AND WHY:
+ *   - The THREAD is rendered here, in Astro. It is the part with the security-sensitive body
+ *     handling (see below), it must work from a deep link, and it must print.
+ *   - The LIST is rendered by the client from <template id="mbRow">, because it is virtualised:
+ *     only the ~20 rows in view exist in the DOM at any moment, however many thousands are loaded.
+ *     There is still exactly ONE definition of a row's markup — that template — so the two cannot
+ *     drift. The first page's data is embedded as JSON so the list draws without a round trip.
+ *
+ * THE MESSAGE BODY IS NOT INJECTED AS HTML FROM AN EXTERNAL SENDER.
+ * An inbound message is authored by whoever sent it. Rendering its HTML into this document would run
+ * their markup inside an authenticated application — the classic mail-client hole. So:
+ *   - internal mail (direction 'internal', authored in this system's own composer) renders as HTML
+ *     through the same allow-list sanitiser the email builder uses;
+ *   - anything else renders as TEXT, in a <pre>-like block, with a note saying so and a control to
+ *     view the original markup in a sandboxed frame if somebody genuinely needs to.
+ * That is a deliberate trade: a marketing email from outside looks plainer here than in a consumer
+ * client. It is the right trade for a mailbox that sits inside an admin console.
+ */
+import MailShell from '@/components/mail/MailShell.astro';
+import MailIcon from '@/components/mail/MailIcon.astro';
+import '@/styles/mail-mailbox.css';
+import { canUseMailbox } from '@/lib/auth/mail-access';
+import {
+  listFolder, getFolderCounts, getThreadMessages, markThreadRead, getUserLabels,
+  getMailboxAddress, deliveryWording, FOLDERS, type Folder,
+} from '@/lib/mail';
+// TWO PROFILES, AND WHICH ONE IS NOT A DETAIL.
+//
+// ORIGIN is for markup rendered with set:html INSIDE this document — it additionally refuses styles
+// that lift content out of its box (position:fixed/absolute/sticky, z-index), because a message body
+// that can cover the page can put a fake dialog over the real application.
+// ISOLATED is for the <iframe sandbox=""> below, which already has a unique origin, no script and no
+// navigation; there the message is allowed to look like itself.
+//
+// Both come from src/lib/mailsec/html.ts, which is the single allow-list this whole system shares —
+// the reading pane, the campaign renderer and the outbound composer must not each carry their own
+// idea of what is safe.
+import { sanitizeEmailHtmlString, ORIGIN, ISOLATED } from '@/lib/mailsec/html';
+import { initials, avatarColour, timeAgo, fullTime, reasonOf, htmlToText, esc } from '@/lib/mail-product/common';
+
+const user = Astro.locals.user;
+const access = await canUseMailbox(user as any);
+
+const raw = String(Astro.params.folder || 'inbox');
+const VALID = new Set([...FOLDERS.map((f) => f.key), 'starred']);
+if (!VALID.has(raw)) return Astro.redirect('/mail/box/inbox');
+
+const starred = raw === 'starred';
+const folder = (starred ? 'inbox' : raw) as Folder;
+const url = new URL(Astro.request.url);
+const q = (url.searchParams.get('q') || '').slice(0, 300);
+const label = url.searchParams.get('label');
+const threadId = url.searchParams.get('thread') || '';
+const PAGE = 40;
+
+const TITLE: Record<string, string> = {
+  inbox: 'Inbox', starred: 'Starred', sent: 'Sent', drafts: 'Drafts',
+  archive: 'Archive', spam: 'Spam', trash: 'Trash',
+};
+
+let counts: Record<string, number> = {};
+let rows: any[] = [];
+let labels: string[] = [];
+let address = '';
+let scopeLabel = TITLE[raw] || 'Mail';
+let filtered = false;
+let queryNote = '';
+let nextBefore: string | null = null;
+let listError = '';
+
+let thread: any[] = [];
+let threadSubject = '';
+let threadError = '';
+let otherParty = '';
+
+if (access.allowed) {
+  try {
+    const [c, listing, l, a] = await Promise.all([
+      getFolderCounts(user!.id),
+      listFolder(user!.id, { folder, starred, label, query: q, limit: PAGE + 1 }),
+      getUserLabels(user!.id).catch(() => [] as string[]),
+      getMailboxAddress(user!.id).catch(() => String(user?.email || '')),
+    ]);
+    counts = c;
+    labels = l;
+    address = a;
+    rows = listing.rows.slice(0, PAGE);
+    const last = rows[rows.length - 1];
+    nextBefore = listing.rows.length > PAGE && last ? new Date(last.created_at).toISOString() : null;
+    scopeLabel = listing.scopeLabel;
+    filtered = listing.filtered;
+    queryNote = listing.query?.active ? listing.query.describe : '';
+  } catch (e: any) {
+    // NOT SWALLOWED, AND NOT RENDERED AS "no mail". An unreadable list and an empty folder look the
+    // same and mean opposite things; the banner below says which this is.
+    listError = reasonOf(e);
+    console.error('[mail/box] listing failed:', listError);
+  }
+
+  if (threadId) {
+    try {
+      thread = await getThreadMessages(user!.id, threadId);
+      await markThreadRead(user!.id, threadId).catch((e: any) =>
+        console.error('[mail/box] markThreadRead failed:', reasonOf(e)));
+    } catch (e: any) {
+      threadError = reasonOf(e);
+      console.error('[mail/box] thread failed:', threadError);
+    }
+    threadSubject = thread[0]?.subject || '(no subject)';
+    const lastMsg = thread[thread.length - 1] || {};
+    const me = (address || '').toLowerCase();
+    otherParty = (lastMsg.from_email && String(lastMsg.from_email).toLowerCase() !== me)
+      ? lastMsg.from_email
+      : ((lastMsg.recipients || []).find((r: any) => String(r.email || '').toLowerCase() !== me)?.email || lastMsg.from_email || '');
+  }
+}
+
+/** Which bulk actions apply where. Trash has no "delete to trash"; Drafts cannot be archived. */
+const ACTIONS = {
+  archive: !['sent', 'drafts', 'archive', 'trash'].includes(raw),
+  spam: !['sent', 'drafts', 'spam', 'trash'].includes(raw),
+  trash: raw !== 'trash',
+  restore: raw === 'trash' || raw === 'spam' || raw === 'archive',
+  purge: raw === 'trash',
+};
+
+/** Server-side body rendering. See the header for why external HTML is not injected. */
+function renderBody(m: any): { mode: 'html' | 'text'; content: string } {
+  const isInternal = String(m.direction || '') === 'internal';
+  // ORIGIN, because this goes through set:html into THIS document.
+  if (isInternal && m.body_html) return { mode: 'html', content: sanitizeEmailHtmlString(m.body_html, ORIGIN) };
+  const text = m.body_text || (m.body_html ? htmlToText(m.body_html) : '');
+  return { mode: 'text', content: text };
+}
+---
+<MailShell
+  title={TITLE[raw] || 'Mail'}
+  active={raw}
+  subtitle={address}
+  counts={counts}
+  flush={true}
+>
+  <button slot="actions" type="button" class="em-btn pri" data-compose>
+    <MailIcon name="edit" size={15} /> Compose
+  </button>
+
+  <div class={'mb' + (threadId ? ' reading' : '')} id="mbRoot" data-folder={raw} data-page={PAGE}>
+
+    <!-- ============================ LIST ============================ -->
+    <section class="mb-list" aria-label="Message list">
+      <div class="mb-tools">
+        <form class="em-search" role="search" method="get" action={`/mail/box/${raw}`}>
+          <MailIcon name="search" size={15} />
+          <input
+            type="search" name="q" value={q} id="mbSearch"
+            placeholder="Search mail — try from:anita has:attachment after:7d"
+            aria-label="Search mail"
+          />
+          {label && <input type="hidden" name="label" value={label} />}
+        </form>
+        <button type="button" class="em-btn ghost icon" data-mb-refresh aria-label="Refresh list" title="Refresh">
+          <MailIcon name="refresh" size={15} />
+        </button>
+      </div>
+
+      <div class="mb-bulk" role="toolbar" aria-label="Actions for selected conversations">
+        <span class="mb-bulk-count" data-mb-count aria-live="polite">0 selected</span>
+        <button type="button" class="em-btn sm" data-mb-act="read">Read</button>
+        <button type="button" class="em-btn sm" data-mb-act="unread">Unread</button>
+        <button type="button" class="em-btn sm" data-mb-act="star">Star</button>
+        {ACTIONS.archive && <button type="button" class="em-btn sm" data-mb-act="archive">Archive</button>}
+        {ACTIONS.spam && <button type="button" class="em-btn sm" data-mb-act="spam">Spam</button>}
+        {ACTIONS.restore && <button type="button" class="em-btn sm" data-mb-act="inbox">Move to inbox</button>}
+        {ACTIONS.trash && <button type="button" class="em-btn sm danger" data-mb-act="trash">Delete</button>}
+        {ACTIONS.purge && <button type="button" class="em-btn sm danger" data-mb-act="delete">Delete for ever</button>}
+        <button type="button" class="em-btn ghost sm em-push" data-mb-clear>Clear</button>
+      </div>
+
+      {(filtered || label) && (
+        <div class="mb-scope">
+          <MailIcon name="filter" size={12} />
+          <span>{scopeLabel}{queryNote ? ' · ' + queryNote : ''}</span>
+          <a href={`/mail/box/${raw}`}>Clear</a>
+        </div>
+      )}
+
+      {listError && (
+        <div class="em-alert bad" style="margin:12px 16px 0">
+          <MailIcon name="warning" size={16} />
+          <p>
+            <strong>This list could not be read.</strong> It is empty here for a reason that is not
+            &ldquo;no messages&rdquo;, and nothing in your mailbox has changed. {listError}
+          </p>
+        </div>
+      )}
+
+      <div class="mb-viewport" id="mbViewport" tabindex="0" role="listbox" aria-label={scopeLabel} aria-multiselectable="true">
+        <div class="mb-runway" id="mbRunway"><div class="mb-rows" id="mbRows"></div></div>
+
+        {/* First paint before the list script runs, and the whole list when JS is unavailable. */}
+        <noscript>
+          <ul style="list-style:none;margin:0;padding:0">
+            {rows.map((t: any) => (
+              <li>
+                <a class="mb-row" style="position:static" href={`/mail/box/${raw}?thread=${t.thread_id}`}>
+                  <span class="mb-main">
+                    <span class="mb-top"><span class="mb-from">{t.participants || t.from_name || t.from_email}</span>
+                    <span class="mb-time">{timeAgo(t.created_at)}</span></span>
+                    <span class="mb-subj">{t.subject || '(no subject)'}</span>
+                    <span class="mb-snip">{t.snippet}</span>
+                  </span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        </noscript>
+      </div>
+
+      <div class="mb-foot" id="mbFoot" hidden></div>
+    </section>
+
+    <!-- ============================ READING PANE ============================ -->
+    <section class="mb-read" aria-label="Conversation">
+      {!threadId && (
+        <div class="mb-empty-read">
+          <div>
+            <MailIcon name="mail" size={44} strokeWidth={1.2} />
+            <h3 class="em-h2" style="margin-top:14px">Select a conversation</h3>
+            <p class="em-lede" style="max-width:34ch;margin:6px auto 0">
+              Pick a message on the left, or start a new one.
+            </p>
+            <p style="margin-top:20px"><button type="button" class="em-btn pri" data-compose><MailIcon name="edit" size={15} /> Compose</button></p>
+          </div>
+        </div>
+      )}
+
+      {threadId && (
+        <>
+          <header class="mb-read-head">
+            <div class="mb-acts" style="margin-bottom:10px">
+              <a class="em-btn ghost icon mb-read-back" href={`/mail/box/${raw}`} aria-label="Back to list">
+                <MailIcon name="arrowLeft" size={17} />
+              </a>
+            </div>
+            <h2 class="mb-subject">{threadSubject}</h2>
+            <div class="mb-acts">
+              <button type="button" class="em-btn sm" data-mb-reply><MailIcon name="reply" size={14} /> Reply</button>
+              <button type="button" class="em-btn sm" data-mb-reply-all><MailIcon name="reply-all" size={14} /> Reply all</button>
+              <button type="button" class="em-btn sm" data-mb-forward><MailIcon name="forward" size={14} /> Forward</button>
+              <span class="em-push"></span>
+              {ACTIONS.archive && (
+                <button type="button" class="em-btn sm icon" data-mb-one="archive" aria-label="Archive" title="Archive"><MailIcon name="archive" size={15} /></button>
+              )}
+              {ACTIONS.spam && (
+                <button type="button" class="em-btn sm icon" data-mb-one="spam" aria-label="Report spam" title="Report spam"><MailIcon name="spam" size={15} /></button>
+              )}
+              <button type="button" class="em-btn sm icon" data-mb-one="unread" aria-label="Mark unread" title="Mark unread"><MailIcon name="mail" size={15} /></button>
+              <button type="button" class="em-btn sm icon" onclick="window.print()" aria-label="Print" title="Print"><MailIcon name="print" size={15} /></button>
+              {ACTIONS.trash && (
+                <button type="button" class="em-btn sm icon danger" data-mb-one="trash" aria-label="Delete" title="Delete"><MailIcon name="trash" size={15} /></button>
+              )}
+            </div>
+          </header>
+
+          {threadError && (
+            <div class="em-alert bad" style="margin:16px">
+              <MailIcon name="warning" size={16} />
+              <p>
+                <strong>This conversation could not be read,</strong> so it is empty here for a reason
+                that is not &ldquo;no messages&rdquo;. {threadError}
+              </p>
+            </div>
+          )}
+
+          {!threadError && thread.length === 0 && (
+            <div class="mb-empty-read">
+              <div>
+                <MailIcon name="mail" size={36} strokeWidth={1.3} />
+                <h3 class="em-h2" style="margin-top:12px">Nothing in this conversation</h3>
+                <p class="em-lede">It may have been deleted from your mailbox.</p>
+              </div>
+            </div>
+          )}
+
+          <div class="mb-msgs">
+            {thread.map((m: any) => {
+              const body = renderBody(m);
+              const mine = m.from_user_id === user!.id;
+              const to = (m.recipients || []).filter((r: any) => r.kind !== 'bcc');
+              const cc = (m.recipients || []).filter((r: any) => r.kind === 'cc');
+              return (
+                <article class="mb-msg">
+                  <div class="mb-msg-head">
+                    <span class="em-avatar" aria-hidden="true" style={`background:${avatarColour(String(m.from_email || ''))}`}>
+                      {initials(m.from_name, m.from_email)}
+                    </span>
+                    <div class="mb-msg-who">
+                      <p class="mb-msg-from">
+                        {m.from_name || m.from_email}
+                        <span class="mb-msg-addr"> &lt;{m.from_email}&gt;</span>
+                      </p>
+                      <p class="mb-msg-to">
+                        to {to.filter((r: any) => r.kind === 'to').map((r: any) => r.name || r.email).join(', ') || 'me'}
+                        {cc.length > 0 && <> · cc {cc.map((r: any) => r.name || r.email).join(', ')}</>}
+                      </p>
+                    </div>
+                    <time class="mb-msg-when" datetime={m.created_at} title={fullTime(m.created_at)}>
+                      {fullTime(m.created_at)}
+                    </time>
+                  </div>
+
+                  {body.mode === 'html'
+                    ? <div class="mb-body" set:html={body.content} />
+                    : (
+                      <div class="mb-body">
+                        <div class="mb-plain">{body.content || '(This message has no text.)'}</div>
+                        {m.body_html && (
+                          <details style="margin-top:16px">
+                            <summary style="cursor:pointer;font-size:12px;font-weight:620;color:var(--em-ink-3)">
+                              This message came from outside, so its formatting is shown as text
+                            </summary>
+                            <p class="em-hint" style="margin-top:8px">
+                              The sender&rsquo;s own HTML is not run inside this application. Open the original
+                              in an isolated frame if you need to see the layout — links and images in it
+                              are the sender&rsquo;s, not ours.
+                            </p>
+                            <iframe
+                              class="mb-frame"
+                              sandbox=""
+                              referrerpolicy="no-referrer"
+                              loading="lazy"
+                              title="Original message, isolated"
+                              srcdoc={sanitizeEmailHtmlString(m.body_html, ISOLATED)}
+                            ></iframe>
+                          </details>
+                        )}
+                      </div>
+                    )}
+
+                  {(m.attachments || []).length > 0 && (
+                    <div class="mb-atts">
+                      {m.attachments.map((a: any) => (
+                        <a class="mb-att" href={a.url} target="_blank" rel="noopener noreferrer">
+                          <MailIcon name="paperclip" size={13} />
+                          <span>{a.filename || a.url}</span>
+                          <MailIcon name="external" size={11} />
+                        </a>
+                      ))}
+                    </div>
+                  )}
+
+                  {mine && (
+                    <div class="mb-msg-foot">
+                      {/* THE DELIVERY VERDICT COMES FROM deliveryWording(), the module's own one-
+                          sentence-per-state table — so this badge and the composer's toast cannot
+                          disagree. A message with no delivery record does not claim anything. */}
+                      {m.delivery ? (() => {
+                        const w = deliveryWording(m.delivery);
+                        const tone = w.tone === 'ok' ? 'ok' : w.tone === 'muted' ? '' : w.tone === 'warn' ? 'warn' : 'bad';
+                        return <span class={'em-badge ' + tone} title={w.detail}>{w.label}</span>;
+                      })() : (
+                        <span class="em-badge" title="This message is stored in the mailbox. No external delivery was recorded for it, which is normal for mail that never left this system.">
+                          Stored, no delivery record
+                        </span>
+                      )}
+                      {(m.reads || []).length > 0
+                        ? <span class="em-badge info">Opened{(m.reads as any[]).length > 1 ? ' · ' + m.reads.length + ' times' : ''}</span>
+                        : <span class="em-badge">Not opened yet</span>}
+                    </div>
+                  )}
+
+                  {mine && (m.reads || []).length > 0 && (
+                    <div class="mb-receipts">
+                      <p class="em-h3" style="margin-bottom:4px">Read by</p>
+                      {(m.reads as any[]).slice(0, 6).map((r: any) => (
+                        <p class="mb-receipt">
+                          <span class="em-dot" style={`color:${r.kind === 'external' ? 'var(--em-ok)' : 'var(--em-info)'}`}></span>
+                          <span>{fullTime(r.read_at)}</span>
+                          <span>·</span>
+                          <span>{[r.city, r.region, r.country].filter(Boolean).join(', ') || (r.ip_address ? 'IP ' + r.ip_address : 'location unknown')}</span>
+                          <span class="em-badge" style="height:17px;font-size:10px">{r.kind === 'external' ? 'external open' : 'in app'}</span>
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+
+          {thread.length > 0 && (
+            <div style="padding:0 20px 28px">
+              <button type="button" class="em-btn pri" data-mb-reply><MailIcon name="reply" size={15} /> Reply</button>
+              <button type="button" class="em-btn" data-mb-forward style="margin-inline-start:8px"><MailIcon name="forward" size={15} /> Forward</button>
+            </div>
+          )}
+        </>
+      )}
+    </section>
+  </div>
+
+  {/* ---- The ONE row template. Cloned by mailbox.js; never duplicated in JS. ---- */}
+  <template id="mbRow">
+    <a class="mb-row" role="option" aria-selected="false">
+      <span class="mb-pick"><input type="checkbox" tabindex="-1" aria-label="Select conversation" /></span>
+      <button type="button" class="mb-star" aria-label="Star conversation">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><path d="m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/></svg>
+      </button>
+      <span class="mb-main">
+        <span class="mb-top">
+          <span class="mb-from"></span>
+          <span class="mb-time"></span>
+        </span>
+        <span class="mb-subj"></span>
+        <span class="mb-snip"></span>
+      </span>
+      <span class="mb-flags">
+        <svg class="mb-clip" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" hidden><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+      </span>
+    </a>
+  </template>
+
+  <script type="application/json" id="mbSeed" set:html={JSON.stringify({
+    folder: raw, rows, nextBefore, q, label, threadId, labels, address,
+  })}></script>
+
+  <script src="/mail/mailbox.js" is:inline defer></script>
+</MailShell>
+
+<style>
+  .mb-frame { width: 100%; height: 420px; border: 1px solid var(--em-line-2); border-radius: var(--em-r-sm);
+    margin-top: 10px; background: #fff; }
+</style>

@@ -11,6 +11,9 @@ import { expandGroupTokens } from '@/lib/mail-groups';
 import { getSignature, scheduleMessage, rewriteLinksForTracking } from '@/lib/mail-advanced';
 import { describeLinkList } from '@/lib/mail-links';
 import { denyMailApi } from '@/lib/auth/mail-access';
+// Rate ceilings, recipient caps, suppression and HTML sanitisation, in one call. See the block
+// above guardOutboundSend() below for why it runs where it runs.
+import { guardOutboundSend } from '@/lib/mailsec/sending';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -72,12 +75,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
         + '. Nothing has been sent. Check the slug on /admin/mail/groups.',
     }, 400);
   }
-  const to = parseAddressList(expanded.to);
-  const cc = parseAddressList(expanded.cc);
-  const bcc = parseAddressList(expanded.bcc);
+  let to = parseAddressList(expanded.to);
+  let cc = parseAddressList(expanded.cc);
+  let bcc = parseAddressList(expanded.bcc);
   if (to.length + cc.length + bcc.length === 0) return json({ ok: false, error: 'at least one recipient required' }, 400);
 
-  const subject = (body.subject || '').toString().slice(0, 500);
+  let subject = (body.subject || '').toString().slice(0, 500);
   let bodyText = (body.bodyText ?? body.body ?? '').toString();
   if (bodyText.length > 100000) return json({ ok: false, error: 'message too long' }, 400);
   let bodyHtml = (body.bodyHtml || '').toString();
@@ -112,6 +115,45 @@ export const POST: APIRoute = async ({ request, locals }) => {
       console.error('[api/mail/send] signature', e?.cause?.message || e?.message);
     }
   }
+
+  // ═══ THE SENDING RULES, IN ONE CALL, AFTER THE MESSAGE IS FULLY ASSEMBLED ═══
+  //
+  // Until now this endpoint had NO volume control of any kind: no per-account rate limit, no cap on
+  // recipients per message, no daily ceiling, and — the one that actually cost something — no
+  // suppression check. `mail_suppression` is the table /api/mail/unsubscribe writes to and the
+  // campaign path (src/lib/mail-recipients.ts) has enforced all along; this path never read it. So
+  // an address that hard-bounced, reported us for spam, or clicked unsubscribe was still deliverable
+  // from the composer. Two send paths, one of them following the rules.
+  //
+  // AFTER the signature, deliberately. The signature is HTML this endpoint appends on the sender's
+  // behalf, and a body that is sanitised before something else is glued onto it has been sanitised
+  // for nothing.
+  //
+  // TRANSACTIONAL IS DECIDED BY THE SHAPE OF THE SEND, NOT BY A REQUEST FIELD a caller could set.
+  // A directly-addressed message is a person writing to a person: a bounce or a complaint still
+  // blocks it, an unsubscribe does not, because unsubscribing from a mailing list is not a request
+  // to stop receiving a reply. The moment a `@group:` list is expanded it is a mailing, and every
+  // suppression reason applies.
+  const guard = await guardOutboundSend({
+    userId: user.id,
+    to, cc, bcc,
+    subject,
+    bodyHtml,
+    inReplyTo: body.inReplyTo || null,
+    transactional: expanded.expandedGroups.length === 0,
+  });
+  if (!guard.allowed) {
+    // 429 when it is a ceiling (retry later), 400 when it is the message itself (retrying will not
+    // help). The composer shows `error` verbatim, so it has to be a sentence, not a code.
+    const isCeiling = /limit|faster than|resets in/i.test(guard.error || '');
+    return json({ ok: false, error: guard.error, droppedRecipients: guard.dropped }, isCeiling ? 429 : 400);
+  }
+  to = guard.to; cc = guard.cc; bcc = guard.bcc;
+  subject = guard.subject;
+  // The stored body and the sent body must be the same bytes: /api/mail/click proves a click is
+  // legitimate by looking the destination up in the STORED body, so a body that is sanitised on the
+  // way out but not on the way in would start refusing its own links.
+  bodyHtml = guard.bodyHtml;
 
   // Scheduled send: stash it and return; the scheduled-send cron delivers it.
   const schedRaw = body.scheduledAt ? new Date(body.scheduledAt) : null;
@@ -229,6 +271,11 @@ export const POST: APIRoute = async ({ request, locals }) => {
         // An EXISTING group with no members is not an error - the message still went to everyone
         // else named - but it must be said, because "it went to the list" is what the sender
         // otherwise assumes.
+        // What the sending rules removed or rewrote. Said out loud on a SUCCESSFUL send too: a
+        // composer that quietly drops a suppressed recipient is a composer whose sender believes
+        // the message reached somebody it did not.
+        sendingNotices: guard.warnings.length ? guard.warnings : null,
+        droppedRecipients: guard.dropped.length ? guard.dropped : null,
         groupWarning: expanded.emptyGroups.length
           ? expanded.emptyGroups.map((g) => '@group:' + g).join(' and ') + ' has no members, so nobody received it through that list.'
           : null,
@@ -241,6 +288,8 @@ export const POST: APIRoute = async ({ request, locals }) => {
     const internal: DeliveryStatus = { state: 'internal', externalCount: 0, sent: 0, failed: 0, provider: null, error: null };
     return json({
       ok: true, threadId: result.threadId, messageId: result.messageId,
+      sendingNotices: guard.warnings.length ? guard.warnings : null,
+      droppedRecipients: guard.dropped.length ? guard.dropped : null,
       groupWarning: expanded.emptyGroups.length
         ? expanded.emptyGroups.map((g) => '@group:' + g).join(' and ') + ' has no members, so nobody received it through that list.'
         : null,

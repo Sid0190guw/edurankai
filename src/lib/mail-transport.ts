@@ -2,6 +2,8 @@
 // Config comes from the DB (UI-editable, /admin/mail/settings) and falls back to
 // environment vars. Priority: SMTP (your VPS) -> Resend HTTP API -> log only.
 import nodemailer from 'nodemailer';
+// Refuses a destination that is not a public mail host. See the note in verifySmtp().
+import { assertSafeMailTarget } from '@/lib/mailsec/net';
 import { getMailConfig, logOutbound } from '@/lib/mail';
 
 export interface SendExternalParams {
@@ -15,7 +17,26 @@ export interface SendExternalParams {
   replyTo?: string;
   messageId?: string;
   inReplyTo?: string;
-  attachments?: { filename: string; path?: string; href?: string }[];
+  /**
+   * ATTACHMENTS ARE LINKS IN THE BODY, AND THIS TYPE NO LONGER LETS THEM BE ANYTHING ELSE.
+   *
+   * It used to be `{ filename, path?, href? }`, and both of those fields were passed straight to
+   * nodemailer. `path` makes nodemailer READ A LOCAL FILE; `href` makes it FETCH A URL and embed the
+   * response in the delivered message. Neither `disableFileAccess` nor `disableUrlAccess` was set on
+   * any transport in this repository, so both were live capabilities — a caller that could name a
+   * path could have `/etc/passwd`, or the deployment's own environment file, mailed to an address of
+   * its choosing, and one that could name a URL had a full-response SSRF with the answer delivered
+   * by email.
+   *
+   * No caller passed either today: /api/mail/send and scheduled-send both pass `[]`, deliberately,
+   * with a comment saying why. The danger was the SHAPE — an interface that advertises `path` gets
+   * used, and the mail platform being built alongside this one has an attachment model with byte
+   * content looking for somewhere to go.
+   *
+   * `content` is the only form left: bytes the caller already has and has already validated through
+   * src/lib/mail-attachments.ts. Nothing here reaches the filesystem or the network on its own.
+   */
+  attachments?: { filename: string; content: Buffer | string; contentType?: string }[];
   /**
    * Write an email_logs row for this send. Default true, because most callers here (password
    * resets, offer letters, reminders) have no other record of the attempt.
@@ -27,6 +48,16 @@ export interface SendExternalParams {
    * caught the error.
    */
   logToDb?: boolean;
+  /**
+   * Extra RFC5322 headers.
+   *
+   * ADDED FOR BULK SENDING, AND NOT OPTIONAL FOR IT. A campaign message needs List-Unsubscribe and
+   * List-Unsubscribe-Post (RFC 8058) or the large providers will not offer the one-click opt-out and
+   * will treat the mail as less trustworthy for it, and it needs a `Precedence: bulk` so an
+   * out-of-office does not answer a newsletter. Nothing else in this file changes: callers that
+   * pass no headers produce byte-identical mail to before.
+   */
+  headers?: Record<string, string>;
 }
 
 export interface SendResult { ok: boolean; provider: 'smtp' | 'resend' | 'none'; id?: string; error?: string; }
@@ -52,6 +83,32 @@ export async function verifySmtp(p: VerifySmtpParams): Promise<{ ok: boolean; de
   // Auto-correct: 587 → STARTTLS (secure:false), 465 → implicit TLS (secure:true).
   const port = p.port || 587;
   const secure = port === 465 ? true : port === 587 ? false : !!p.secure;
+
+  // THE DESTINATION IS CHECKED AT THE POINT OF CONNECTION, NOT AT THE ENDPOINT.
+  //
+  // `host` and `port` arrive here from a request body — /api/mail/verify and /api/mail/test both
+  // pass them through untouched — and this function then opens a TCP connection and reports, in
+  // discriminating detail, what happened: ECONNREFUSED, ETIMEDOUT, ENOTFOUND and a TLS version
+  // mismatch all produce different hints. That is a port scanner with an authentication oracle
+  // attached, and `mail.manage` — which every one of the ten non-applicant built-in roles holds,
+  // interns included — is the only thing in front of it.
+  //
+  // Guarding here rather than in each endpoint is deliberate: there are three callers today and the
+  // one that got missed would be the one that mattered. assertSafeMailTarget() resolves the name and
+  // refuses if ANY answer is loopback, link-local (where cloud metadata lives), private, CGNAT or
+  // reserved — and refuses a port that is not a mail port, so this cannot be pointed at a database
+  // or an internal admin interface.
+  const target = await assertSafeMailTarget(p.host, port);
+  if (!target.allowed) {
+    return {
+      ok: false,
+      detail: target.reason,
+      hint: target.code === 'private-address'
+        ? 'A mail server this platform can reach has to be on the public internet. If yours genuinely is on a private network, that needs MAIL_ALLOW_PRIVATE_SMTP set on the deployment.'
+        : undefined,
+    };
+  }
+
   try {
     const transport = nodemailer.createTransport({
       host: p.host,
@@ -59,6 +116,14 @@ export async function verifySmtp(p: VerifySmtpParams): Promise<{ ok: boolean; de
       secure,
       auth: { user: p.user, pass: p.pass },
       tls: { rejectUnauthorized: !p.insecure },
+      // Belt as well as braces: the attachment type no longer expresses a path or a URL, and the
+      // transport is additionally told it may not open either. Two independent things would have to
+      // regress before nodemailer reads a file or makes a request on our behalf. Note that the
+      // installed version carries GHSA-p6gq-j5cr-w38f, in which a message-level `raw` option
+      // bypasses exactly these two flags — which is why the type change above is the primary
+      // control and these are the second line, not the first.
+      disableFileAccess: true,
+      disableUrlAccess: true,
       connectionTimeout: 12000,
       greetingTimeout: 10000,
       socketTimeout: 20000,
@@ -110,6 +175,9 @@ export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
     secure,
     auth: c.smtpUser ? { user: c.smtpUser, pass: c.smtpPass } : undefined,
     tls: { rejectUnauthorized: !(c.smtpInsecure || process.env.SMTP_INSECURE === 'true') },
+    // See verifySmtp() above: the attachment type is the control, these are the second line.
+    disableFileAccess: true,
+    disableUrlAccess: true,
     connectionTimeout: 15000,
     greetingTimeout: 10000,
     socketTimeout: 30000,
@@ -142,7 +210,14 @@ export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
     replyTo,
     messageId: p.messageId,
     inReplyTo: p.inReplyTo,
-    attachments: (p.attachments || []).map((a) => ({ filename: a.filename, path: a.href || a.path })),
+    // Bytes only. `path` and `href` are gone from the type above — see the note there.
+    attachments: (p.attachments || []).map((a) => ({
+      filename: a.filename,
+      content: a.content,
+      contentType: a.contentType,
+    })),
+    // Undefined rather than {} when there are none, so an existing caller's message is unchanged.
+    headers: p.headers && Object.keys(p.headers).length ? p.headers : undefined,
   };
 
   // Retry transient failures (greylisting, timeouts, dropped connections).

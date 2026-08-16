@@ -1,0 +1,225 @@
+---
+/**
+ * /mail/automations/[id] — the visual workflow builder.
+ *
+ * THE CANVAS IS SVG EDGES OVER ABSOLUTELY-POSITIONED NODES. No diagramming library: nodes are DOM
+ * elements the browser can focus, tab to and announce, and the edges are one <svg> layer behind
+ * them. A canvas-element graph would be a picture with no accessibility at all, and this is a screen
+ * that decides who gets mailed.
+ *
+ * VALIDATION RUNS AS YOU DRAW, NOT WHEN YOU PUBLISH. Every edit posts the graph to the 'validate'
+ * action — which is pure, touches no database — and each problem is pinned to the node that causes
+ * it. Publishing asks the same question on the server and refuses with the same list, so a graph
+ * that looks valid here cannot go live broken.
+ */
+import MailShell from '@/components/mail/MailShell.astro';
+import MailIcon from '@/components/mail/MailIcon.astro';
+import { canUseMailbox } from '@/lib/auth/mail-access';
+import {
+  getAutomation, runCounts, recentRuns, validateGraph,
+  NODE_CATALOGUE, TRIGGER_EVENTS, CONDITION_FIELDS,
+} from '@/lib/mail-product/automations';
+import { listTemplates } from '@/lib/mail-product/templates';
+import { listCustomFields } from '@/lib/mail-product/contacts';
+import { num, timeAgo, reasonOf } from '@/lib/mail-product/common';
+
+const user = Astro.locals.user;
+const access = await canUseMailbox(user as any);
+const id = String(Astro.params.id || '');
+
+let automation: any = null;
+let templates: any[] = [];
+let fields: any[] = [];
+let counts: Record<string, number> = {};
+let runs: any[] = [];
+let error = '';
+
+if (access.allowed) {
+  try {
+    automation = await getAutomation(id);
+    if (automation) {
+      [templates, fields, counts, runs] = await Promise.all([
+        listTemplates({}).catch(() => []),
+        listCustomFields().catch(() => []),
+        runCounts(id).catch(() => ({})),
+        recentRuns(id, 20).catch(() => []),
+      ]);
+    }
+  } catch (e: any) {
+    error = reasonOf(e);
+    console.error('[mail/automation] read failed:', error);
+  }
+}
+
+const validation = automation ? validateGraph(automation.graph) : { ok: false, problems: [] };
+const TONE: Record<string, string> = { active: 'ok', paused: 'warn', draft: '' };
+---
+<MailShell
+  title={automation ? automation.name : 'Automation'}
+  active="automations"
+  subtitle={automation ? automation.status : ''}
+  flush={true}
+  crumbs={[]}
+>
+  {automation && (
+    <>
+      <span slot="actions" class="em-note" data-a-status>Saved</span>
+      <span slot="actions" class={'em-badge ' + (TONE[automation.status] || '')}>
+        {automation.status === 'active' && <span class="em-dot"></span>}{automation.status}
+      </span>
+      {automation.status === 'active'
+        ? <button slot="actions" type="button" class="em-btn" data-a-act="pause"><MailIcon name="pause" size={14} /> Pause</button>
+        : <button slot="actions" type="button" class="em-btn pri" data-a-act="activate"><MailIcon name="play" size={14} /> Switch on</button>}
+    </>
+  )}
+
+  {error && (
+    <div class="em-page"><div class="em-alert bad">
+      <MailIcon name="warning" size={16} /><p><strong>This automation could not be read.</strong> {error}</p>
+    </div></div>
+  )}
+
+  {!automation && !error && (
+    <div class="em-page"><div class="em-card"><div class="em-empty">
+      <MailIcon name="automations" size={36} strokeWidth={1.3} />
+      <h3>No automation with that id</h3>
+      <a class="em-btn" href="/mail/automations">Back to automations</a>
+    </div></div></div>
+  )}
+
+  {automation && (
+    <div class="au" id="auRoot" data-id={id} data-status={automation.status}>
+      <aside class="au-palette" aria-label="Steps">
+        <h3>Add a step</h3>
+        {NODE_CATALOGUE.filter((n) => n.kind !== 'trigger').map((n) => (
+          <button type="button" class="au-add" data-au-add={n.kind}>
+            <strong>{n.label}</strong>
+            <span>{n.detail}</span>
+          </button>
+        ))}
+
+        <h3 style="margin-top:22px">Runs</h3>
+        <div class="em-grid c2" style="gap:8px">
+          <div><p class="em-stat-k">Running</p><p class="au-num">{num(counts.running || 0)}</p></div>
+          <div><p class="em-stat-k">Completed</p><p class="au-num">{num(counts.completed || 0)}</p></div>
+        </div>
+        {runs.length > 0 && (
+          <div style="margin-top:14px">
+            {runs.slice(0, 8).map((r: any) => (
+              <p class="au-run">
+                <span class="em-badge" style="height:17px;font-size:10px">{r.status}</span>
+                <span style="min-width:0;overflow:hidden;text-overflow:ellipsis">{r.email || 'contact removed'}</span>
+                <span class="em-note">{timeAgo(r.updated_at)}</span>
+              </p>
+            ))}
+          </div>
+        )}
+      </aside>
+
+      <div class="au-canvas-wrap">
+        <div class="au-toolbar">
+          <input class="em-input" id="auName" value={automation.name} style="max-width:280px" aria-label="Automation name" />
+          <span class="em-push"></span>
+          <span class="em-badge" data-au-valid>checking…</span>
+          <button type="button" class="em-btn sm" data-au-tidy title="Lay the graph out top to bottom">
+            <MailIcon name="refresh" size={13} /> Tidy
+          </button>
+          <button type="button" class="em-btn sm" data-au-save>Save</button>
+        </div>
+
+        <div class="au-canvas" id="auCanvas" tabindex="0" aria-label="Workflow canvas">
+          <svg class="au-edges" id="auEdges" aria-hidden="true"></svg>
+          <div class="au-nodes" id="auNodes"></div>
+        </div>
+
+        <div class="au-problems" id="auProblems" hidden></div>
+      </div>
+
+      <aside class="au-inspect" id="auInspect" aria-label="Step properties">
+        <h3>Nothing selected</h3>
+        <p class="em-note">Press a step on the canvas to set it up. Drag from the dot under a step to connect it to the next one.</p>
+      </aside>
+    </div>
+  )}
+
+  {automation && (
+    <>
+      <script type="application/json" id="auGraph" set:html={JSON.stringify(automation.graph)}></script>
+      <script type="application/json" id="auMeta" set:html={JSON.stringify({
+        catalogue: NODE_CATALOGUE,
+        triggers: TRIGGER_EVENTS,
+        conditionFields: CONDITION_FIELDS,
+        templates: templates.filter((t) => t.is_active).map((t) => ({ id: t.id, name: t.template_key, subject: t.subject })),
+        fields: fields.map((f) => ({ key: f.key, label: f.label })),
+      })}></script>
+      <script src="/mail/automation.js" is:inline defer></script>
+    </>
+  )}
+</MailShell>
+
+<style>
+  .au { display: grid; grid-template-columns: 250px minmax(0, 1fr) 300px; flex: 1; min-height: 0; }
+
+  .au-palette, .au-inspect { background: var(--em-surface); overflow-y: auto; padding: var(--em-4); }
+  .au-palette { border-inline-end: 1px solid var(--em-line); }
+  .au-inspect { border-inline-start: 1px solid var(--em-line); }
+  .au-palette h3, .au-inspect h3 { font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--em-ink-4); margin: 0 0 var(--em-3); }
+  .au-inspect h3:first-child { font-size: 13px; letter-spacing: -0.01em; text-transform: none; color: var(--em-ink); }
+
+  .au-add { display: block; width: 100%; text-align: start; padding: 9px 11px; margin-bottom: 6px;
+    border: 1px solid var(--em-line); border-radius: var(--em-r-sm); background: var(--em-surface-2);
+    cursor: pointer; font: inherit; transition: border-color var(--em-t), background var(--em-t); }
+  .au-add:hover { border-color: var(--em-accent); background: var(--em-accent-soft); }
+  .au-add strong { display: block; font-size: 12.5px; font-weight: 640; color: var(--em-ink); }
+  .au-add span { display: block; font-size: 11px; color: var(--em-ink-4); line-height: 1.4; margin-top: 2px; }
+  .au-num { font-size: 19px; font-weight: 680; color: var(--em-ink); margin: 0; font-variant-numeric: tabular-nums; }
+  .au-run { display: flex; align-items: center; gap: 6px; font-size: 11.5px; padding: 4px 0;
+    border-bottom: 1px solid var(--em-line); }
+
+  .au-canvas-wrap { display: flex; flex-direction: column; min-width: 0; background: var(--em-surface-3); }
+  .au-toolbar { display: flex; align-items: center; gap: var(--em-2); padding: var(--em-3) var(--em-4);
+    background: var(--em-surface); border-bottom: 1px solid var(--em-line); flex-wrap: wrap; }
+  .au-canvas { flex: 1; position: relative; overflow: auto;
+    background-image: radial-gradient(circle, var(--em-line-2) 1px, transparent 1px);
+    background-size: 22px 22px; }
+  .au-edges { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+  .au-nodes { position: relative; width: 2400px; height: 1800px; }
+
+  .au-node { position: absolute; width: 210px; background: var(--em-surface); border: 1px solid var(--em-line-2);
+    border-radius: var(--em-r); box-shadow: var(--em-sh-1); padding: 10px 12px; cursor: grab;
+    transition: border-color var(--em-t), box-shadow var(--em-t); }
+  .au-node:hover { box-shadow: var(--em-sh-2); }
+  .au-node.on { border-color: var(--em-accent); box-shadow: 0 0 0 3px var(--em-accent-soft); }
+  .au-node.bad { border-color: var(--em-bad); }
+  .au-node:focus-visible { outline: 2px solid var(--em-accent); outline-offset: 2px; }
+  .au-node-kind { font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--em-ink-4); display: flex; align-items: center; gap: 5px; }
+  .au-node-kind::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--em-c2); }
+  .au-node[data-kind="trigger"] .au-node-kind::before { background: var(--em-accent); }
+  .au-node[data-kind="condition"] .au-node-kind::before { background: var(--em-c4); }
+  .au-node[data-kind="send_email"] .au-node-kind::before { background: var(--em-c3); }
+  .au-node[data-kind="delay"] .au-node-kind::before { background: var(--em-c5); }
+  .au-node[data-kind="end"] .au-node-kind::before { background: var(--em-ink-4); }
+  .au-node-body { font-size: 12.5px; font-weight: 600; color: var(--em-ink); margin-top: 4px; line-height: 1.35;
+    overflow-wrap: anywhere; }
+  .au-node-warn { font-size: 11px; color: var(--em-bad); margin-top: 5px; line-height: 1.4; }
+
+  .au-port { position: absolute; width: 13px; height: 13px; border-radius: 50%; background: var(--em-surface);
+    border: 2px solid var(--em-ink-4); cursor: crosshair; z-index: 2; }
+  .au-port:hover { border-color: var(--em-accent); background: var(--em-accent-soft); }
+  .au-port[data-branch="yes"] { border-color: var(--em-ok); }
+  .au-port[data-branch="no"] { border-color: var(--em-bad); }
+  .au-port-label { position: absolute; font-size: 9.5px; font-weight: 700; color: var(--em-ink-4); }
+
+  .au-problems { border-top: 1px solid var(--em-line); background: var(--em-warn-bg);
+    padding: var(--em-3) var(--em-4); max-height: 160px; overflow-y: auto; }
+  .au-problems[hidden] { display: none; }
+  .au-problem { display: flex; gap: 8px; font-size: 12px; color: var(--em-warn); padding: 3px 0; cursor: pointer; }
+  .au-problem:hover { text-decoration: underline; }
+
+  @media (max-width: 1080px) {
+    .au { grid-template-columns: 1fr; }
+    .au-palette, .au-inspect { max-height: 220px; }
+  }
+</style>

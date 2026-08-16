@@ -1,0 +1,349 @@
+---
+/**
+ * /admin/mail/contacts/<id> — one person: identity, consent, subscription, and everything that has
+ * happened to them.
+ *
+ * The history is the reason this page exists. "Why did this person get that mail?" and "why did they
+ * NOT get it?" are the two questions a contact record has to answer months later, so campaign
+ * history shows the skip reason as prominently as the send.
+ */
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import {
+  ensureContactSchema, getContact, updateContact, deleteContacts, mergeContacts,
+  contactHistory, contactCampaignHistory, contactMailHistory, listsWithCounts,
+  addToList, removeFromList, isUuid, dbReason, type Actor,
+} from '@/lib/mail-contacts';
+import { SUBSCRIPTION_STATUSES } from '@/lib/mail-csv';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+const actor: Actor = { userId: user.id, name: user.name || user.email };
+
+const id = String(Astro.params.id || '');
+if (!isUuid(id)) return Astro.redirect('/admin/mail/contacts');
+
+const readFailures: { source: string; reason: string }[] = [];
+function noteFailure<T>(source: string, fallback: T) {
+  return (e: any): T => {
+    readFailures.push({ source, reason: dbReason(e) });
+    console.error('[admin/mail/contacts/id] ' + source + ' read failed:', dbReason(e));
+    return fallback;
+  };
+}
+
+let okMsg = '';
+let errMsg = '';
+await ensureContactSchema().catch((e: any) => { errMsg = 'The contact tables could not be prepared: ' + dbReason(e); });
+
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('_action') || '');
+    if (action === 'save') {
+      const r = await updateContact(id, {
+        email: String(fd.get('email') || ''),
+        first_name: String(fd.get('first_name') || '') || null,
+        last_name: String(fd.get('last_name') || '') || null,
+        organization: String(fd.get('organization') || '') || null,
+        phone: String(fd.get('phone') || '') || null,
+        role_title: String(fd.get('role_title') || '') || null,
+        status: String(fd.get('status') || 'subscribed') as any,
+        notes: String(fd.get('notes') || '') || null,
+        consent_source: String(fd.get('consent_source') || '') || null,
+        consent_note: String(fd.get('consent_note') || '') || null,
+        tags: String(fd.get('tags') || '').split(/[;,]/).map((t) => t.trim()).filter(Boolean),
+      }, actor);
+      if (r.ok) okMsg = 'Contact saved.';
+      else errMsg = r.error || 'Nothing was saved.';
+    } else if (action === 'custom') {
+      const key = String(fd.get('key') || '').toLowerCase().replace(/[^a-z0-9_]+/g, '_').slice(0, 40);
+      const value = String(fd.get('value') || '');
+      if (!key) errMsg = 'A custom field needs a name.';
+      else {
+        const current = await getContact(id);
+        const custom = { ...(current?.custom || {}) };
+        if (value) custom[key] = value; else delete custom[key];
+        const r = await updateContact(id, { custom }, actor);
+        if (r.ok) okMsg = value ? 'Custom field saved.' : 'Custom field removed.';
+        else errMsg = r.error || 'Nothing was saved.';
+      }
+    } else if (action === 'add-list') {
+      const listId = String(fd.get('listId') || '');
+      if (!isUuid(listId)) errMsg = 'Choose a list.';
+      else okMsg = (await addToList(listId, [id], 'manual', actor)) ? 'Added to the list.' : 'Already on that list.';
+    } else if (action === 'remove-list') {
+      await removeFromList(String(fd.get('listId') || ''), [id], actor);
+      okMsg = 'Removed from the list.';
+    } else if (action === 'merge-into') {
+      const targetId = String(fd.get('targetId') || '');
+      const r = await mergeContacts(targetId, id, actor);
+      if (r.ok) return Astro.redirect('/admin/mail/contacts/' + targetId);
+      errMsg = r.error || 'Nothing was merged.';
+    } else if (action === 'delete') {
+      const r = await deleteContacts([id], actor);
+      if (r.deleted) return Astro.redirect('/admin/mail/contacts');
+      errMsg = r.error || 'Nothing was deleted.';
+    }
+  } catch (e: any) {
+    okMsg = '';
+    console.error('[admin/mail/contacts/id] write failed:', dbReason(e));
+    errMsg = 'Nothing was saved: ' + dbReason(e);
+  }
+}
+
+const contact = await getContact(id).catch(noteFailure('Contact', null));
+if (!contact && readFailures.length === 0) return Astro.redirect('/admin/mail/contacts');
+
+const history = contact ? await contactHistory(id, 60).catch(noteFailure('Activity history', [])) : [];
+const campaigns = contact ? await contactCampaignHistory(id, 40).catch(noteFailure('Campaign history', [])) : [];
+const mails = contact ? await contactMailHistory(contact.email, 12).catch(noteFailure('Mail history', [])) : [];
+const lists = await listsWithCounts().catch(noteFailure('Lists', []));
+
+const memberOf = contact
+  ? await db.execute(sql`
+      SELECT l.id, l.name FROM mail_list_members m JOIN mail_lists l ON l.id = m.list_id
+      WHERE m.contact_id = ${id} ORDER BY l.name
+    `).then((r: any) => (Array.isArray(r) ? r : (r?.rows || []))).catch(noteFailure('List membership', []))
+  : [];
+
+const suppression = contact
+  ? await db.execute(sql`SELECT reason, detail, created_at FROM mail_suppression WHERE email = ${contact.email} LIMIT 1`)
+      .then((r: any) => (Array.isArray(r) ? r : (r?.rows || []))[0] || null)
+      .catch(noteFailure('Suppression status', null))
+  : null;
+
+const memberIds: string[] = memberOf.map((m: any) => String(m.id));
+const availableLists = lists.filter((l: any) => !memberIds.includes(String(l.id)));
+
+const STATUS_TONES = [
+  ['subscribed', 'background:rgba(16,185,129,.15);color:#6ee7b7;'],
+  ['unsubscribed', 'background:rgba(148,163,184,.15);color:#94a3b8;'],
+  ['bounced', 'background:rgba(245,158,11,.15);color:#fcd34d;'],
+  ['complained', 'background:rgba(239,68,68,.15);color:#fca5a5;'],
+  ['pending', 'background:rgba(99,102,241,.15);color:#a5b4fc;'],
+  ['skipped', 'background:rgba(148,163,184,.15);color:#94a3b8;'],
+  ['sent', 'background:rgba(16,185,129,.15);color:#6ee7b7;'],
+  ['failed', 'background:rgba(239,68,68,.15);color:#fca5a5;'],
+];
+function toneFor(s: string): string {
+  const hit = STATUS_TONES.find((t) => t[0] === s);
+  return hit ? hit[1] : 'background:rgba(148,163,184,.15);color:#94a3b8;';
+}
+function when(v: any): string {
+  return v ? new Date(v).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' }) : '';
+}
+const customEntries = contact ? Object.entries(contact.custom || {}) : [];
+---
+<AdminLayout title="Contact" activeNav="mail">
+  <style>
+    .cw { padding: 18px; max-width: 1300px; }
+    .card { background: var(--o-panel2,#141418); border: 1px solid var(--o-stroke,#26262e); border-radius: 12px; padding: 16px; }
+    .grid { display: grid; grid-template-columns: minmax(0,1.15fr) minmax(0,1fr); gap: 16px; align-items: start; }
+    @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
+    .lbl { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: #8a8a94; display: block; margin-bottom: 5px; }
+    .inp { width: 100%; background: #fff; color: #17181d; border: 1.5px solid #cbd0da; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+    .drop { background: #fff; color: #17181d; border: 1.5px solid #cbd0da; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+    .prim { background: #FF6A3D; color: #fff; border: none; font-weight: 700; padding: 9px 18px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+    .ghost { background: #262832; color: #e6e7ec; border: 1px solid #3a3c48; font-weight: 600; padding: 7px 13px; border-radius: 8px; cursor: pointer; font-size: 12.5px; }
+    .pill { font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: 100px; text-transform: uppercase; letter-spacing: .05em; }
+    .muted { color: #8a8a94; font-size: 11.5px; }
+    .banner { font-size: 12.5px; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; }
+    .b-ok { background: rgba(16,185,129,.1); border: 1px solid rgba(16,185,129,.3); color: #6ee7b7; }
+    .b-err { background: rgba(239,68,68,.1); border: 1px solid rgba(239,68,68,.3); color: #fca5a5; }
+    .b-warn { background: rgba(245,158,11,.1); border: 1px solid rgba(245,158,11,.3); color: #fcd34d; }
+    .row { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,.05); font-size: 12.5px; color: #d4d4d8; }
+    .row:last-child { border-bottom: none; }
+    h2.sec { font-size: 14px; font-weight: 700; color: #fff; margin: 0 0 10px; }
+  </style>
+
+  <div class="cw">
+    <div style="margin-bottom:12px;"><a class="muted" href="/admin/mail/contacts" style="text-decoration:none;">Back to contacts</a></div>
+
+    {okMsg && <div class="banner b-ok">{okMsg}</div>}
+    {errMsg && <div class="banner b-err">{errMsg}</div>}
+    {readFailures.length > 0 && (
+      <div class="banner b-warn">
+        <strong>Part of this record could not be read, so what follows is incomplete.</strong>
+        <ul style="margin:6px 0 0 16px;padding:0;">{readFailures.map((f) => <li>{f.source}: {f.reason}</li>)}</ul>
+      </div>
+    )}
+
+    {contact && (
+      <div>
+        <div class="admin-page-header" style="margin-bottom:14px;">
+          <div class="admin-page-eyebrow">Contact</div>
+          <h1 class="admin-page-title">{[contact.first_name, contact.last_name].filter(Boolean).join(' ') || contact.email}</h1>
+          <p class="admin-page-sub">
+            {contact.email}
+            <span class="pill" style={'margin-left:8px;' + toneFor(contact.status)}>{contact.status}</span>
+          </p>
+        </div>
+
+        {suppression && (
+          <div class="banner b-warn">
+            <strong>This address is suppressed ({suppression.reason}).</strong> No campaign will reach it, whatever list it is on.
+            {suppression.detail ? ' ' + suppression.detail : ''}
+            {suppression.reason === 'complained' ? ' A complaint cannot be released — re-mailing a complainant damages delivery for everyone else.' : ''}
+          </div>
+        )}
+
+        <div class="grid">
+          <div style="display:grid;gap:16px;">
+            <form method="POST" class="card">
+              <input type="hidden" name="_action" value="save" />
+              <h2 class="sec">Identity and consent</h2>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                <div style="grid-column:1/-1;"><label class="lbl">Email address</label><input class="inp" name="email" value={contact.email} required /></div>
+                <div><label class="lbl">First name</label><input class="inp" name="first_name" value={contact.first_name || ''} /></div>
+                <div><label class="lbl">Last name</label><input class="inp" name="last_name" value={contact.last_name || ''} /></div>
+                <div><label class="lbl">Organisation</label><input class="inp" name="organization" value={contact.organization || ''} /></div>
+                <div><label class="lbl">Role or title</label><input class="inp" name="role_title" value={contact.role_title || ''} /></div>
+                <div><label class="lbl">Phone</label><input class="inp" name="phone" value={contact.phone || ''} /></div>
+                <div>
+                  <label class="lbl">Subscription status</label>
+                  <select class="drop" name="status" style="width:100%;">
+                    {SUBSCRIPTION_STATUSES.map((s) => <option value={s} selected={contact.status === s}>{s}</option>)}
+                  </select>
+                </div>
+                <div style="grid-column:1/-1;"><label class="lbl">Tags (separated by ; )</label><input class="inp" name="tags" value={(contact.tags || []).join('; ')} /></div>
+                <div style="grid-column:1/-1;"><label class="lbl">Consent source</label><input class="inp" name="consent_source" value={contact.consent_source || ''} placeholder="where this permission came from" /></div>
+                <div style="grid-column:1/-1;"><label class="lbl">Consent note</label><input class="inp" name="consent_note" value={contact.consent_note || ''} /></div>
+                <div style="grid-column:1/-1;"><label class="lbl">Internal notes</label><textarea class="inp" name="notes" rows="3">{contact.notes || ''}</textarea></div>
+              </div>
+              <p class="muted" style="margin:10px 0 0;">
+                Consent recorded {contact.consent_at ? when(contact.consent_at) : 'at no date we hold'}.
+                Setting the status to unsubscribed adds this address to the suppression list; setting it back to subscribed releases it,
+                unless the address reported a message as spam.
+              </p>
+              <div style="margin-top:14px;display:flex;gap:8px;">
+                <button class="prim" type="submit">Save</button>
+              </div>
+            </form>
+
+            <div class="card">
+              <h2 class="sec">Custom fields</h2>
+              <p class="muted" style="margin:0 0 10px;">Anything imported from a CSV column we did not recognise. Segments can filter on these, and campaigns can merge them as <code>&#123;&#123;custom.name&#125;&#125;</code>.</p>
+              {customEntries.length === 0 && <p class="muted">None recorded.</p>}
+              {customEntries.map((entry) => (
+                <div class="row">
+                  <span style="color:#fff;">{entry[0]}</span>
+                  <span>{typeof entry[1] === 'object' ? JSON.stringify(entry[1]) : String(entry[1])}</span>
+                </div>
+              ))}
+              <form method="POST" style="display:flex;gap:8px;align-items:end;margin-top:12px;flex-wrap:wrap;">
+                <input type="hidden" name="_action" value="custom" />
+                <div><label class="lbl">Field name</label><input class="inp" name="key" placeholder="university" style="width:150px;" /></div>
+                <div style="flex:1 1 180px;"><label class="lbl">Value (blank removes it)</label><input class="inp" name="value" /></div>
+                <button class="ghost" type="submit">Save field</button>
+              </form>
+            </div>
+
+            <div class="card">
+              <h2 class="sec">Campaign history</h2>
+              {campaigns.length === 0 && <p class="muted">This contact has not been in a campaign audience yet.</p>}
+              {campaigns.map((c: any) => (
+                <div class="row">
+                  <span>
+                    <span style="color:#fff;">{c.name || 'a deleted campaign'}</span>
+                    <div class="muted">{c.subject || ''}</div>
+                  </span>
+                  <span style="text-align:right;white-space:nowrap;">
+                    <span class="pill" style={toneFor(c.status)}>{c.status}</span>
+                    <div class="muted">
+                      {c.skip_reason ? 'not sent: ' + c.skip_reason : (c.sent_at ? when(c.sent_at) : '')}
+                      {c.error ? ' — ' + c.error : ''}
+                    </div>
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            <div class="card">
+              <h2 class="sec">Direct mail with this address</h2>
+              <p class="muted" style="margin:0 0 10px;">One-to-one messages through the company mailbox, separate from campaign sending.</p>
+              {mails.length === 0 && <p class="muted">No direct correspondence recorded.</p>}
+              {mails.map((m: any) => (
+                <div class="row">
+                  <span><span style="color:#fff;">{m.subject || '(no subject)'}</span><div class="muted">{m.snippet || ''}</div></span>
+                  <span class="muted" style="white-space:nowrap;">{when(m.created_at)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div style="display:grid;gap:16px;">
+            <div class="card">
+              <h2 class="sec">Lists</h2>
+              {memberOf.length === 0 && <p class="muted">Not on any list.</p>}
+              {memberOf.map((l: any) => (
+                <div class="row">
+                  <a href={'/admin/mail/lists?open=' + l.id} style="color:#fff;text-decoration:none;">{l.name}</a>
+                  <form method="POST" style="display:inline;">
+                    <input type="hidden" name="_action" value="remove-list" />
+                    <input type="hidden" name="listId" value={l.id} />
+                    <button class="ghost" style="padding:3px 8px;" type="submit">Remove</button>
+                  </form>
+                </div>
+              ))}
+              {availableLists.length > 0 && (
+                <form method="POST" style="display:flex;gap:8px;align-items:end;margin-top:12px;">
+                  <input type="hidden" name="_action" value="add-list" />
+                  <div style="flex:1;">
+                    <label class="lbl">Add to a list</label>
+                    <select class="drop" name="listId" style="width:100%;">
+                      {availableLists.map((l: any) => <option value={l.id}>{l.name}</option>)}
+                    </select>
+                  </div>
+                  <button class="ghost" type="submit">Add</button>
+                </form>
+              )}
+            </div>
+
+            <div class="card">
+              <h2 class="sec">Activity</h2>
+              {history.length === 0 && <p class="muted">Nothing recorded yet.</p>}
+              {history.map((h: any) => (
+                <div class="row">
+                  <span>
+                    <span style="color:#fff;">{h.kind}</span>
+                    {h.campaign_name ? <span class="muted"> &middot; {h.campaign_name}</span> : null}
+                    {h.actor_name ? <div class="muted">by {h.actor_name}</div> : null}
+                  </span>
+                  <span class="muted" style="white-space:nowrap;">{when(h.created_at)}</span>
+                </div>
+              ))}
+            </div>
+
+            <div class="card">
+              <h2 class="sec">Merge or delete</h2>
+              <p class="muted" style="margin:0 0 10px;">
+                Merging folds THIS record into another and deletes this one. The record you keep gains anything blank on it,
+                both sets of tags and lists, and the more restrictive subscription status of the two.
+              </p>
+              <form method="POST" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
+                <input type="hidden" name="_action" value="merge-into" />
+                <div style="flex:1 1 220px;"><label class="lbl">Keep this contact id</label><input class="inp" name="targetId" placeholder="paste the other contact's id" /></div>
+                <button class="ghost" type="submit" data-danger="Merge this contact into that one? This record is deleted.">Merge</button>
+              </form>
+              <form method="POST" style="margin-top:12px;">
+                <input type="hidden" name="_action" value="delete" />
+                <button class="ghost" style="color:#fca5a5;border-color:rgba(239,68,68,.3);" type="submit" data-danger="Delete this contact? If they had unsubscribed, the suppression record stays so they cannot be re-imported into a campaign.">Delete this contact</button>
+              </form>
+              <p class="muted" style="margin:10px 0 0;">Contact id: <code>{contact.id}</code></p>
+            </div>
+          </div>
+        </div>
+      </div>
+    )}
+  </div>
+
+  <script is:inline>
+    document.addEventListener('submit', function (e) {
+      var btn = e.submitter;
+      var ask = btn && btn.getAttribute('data-danger');
+      if (ask && !confirm(ask)) e.preventDefault();
+    });
+  </script>
+</AdminLayout>

@@ -1,0 +1,363 @@
+---
+// /admin/mail/tenants — the organizations on the mail platform, and who is on each team.
+//
+// The other half of the commercial layer's dual surface: /admin/mail/billing answers "what is this
+// tenant paying for", this one answers "who are they and who can act for them".
+//
+// Like the billing screen, this is the OPERATOR console. Membership changes made here go through
+// the same `canChangeRole` rules the tenant's own people are held to — an operator cannot promote
+// somebody to a role the hierarchy forbids, because the rule lives in the engine rather than in
+// whichever screen happened to call it.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import {
+  createOrganization,
+  getSaasStore,
+  inviteMember,
+  removeMember,
+  setMemberRole,
+  tenantContext,
+} from '@/lib/mailplatform/saas/service';
+import { ORG_TYPE_DEFAULTS, PLAN_CATALOG, describeLimit, isOrganizationType, METRICS } from '@/lib/mailplatform/saas/plans';
+import {
+  TEAM_ROLE_DESCRIPTIONS,
+  TEAM_ROLE_LABELS,
+  permissionsFor,
+} from '@/lib/mailplatform/saas/roles';
+import { TEAM_ROLES } from '@/lib/mailplatform/saas/types';
+import type { TeamRole } from '@/lib/mailplatform/saas/types';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user, 'mail.manage')) return Astro.redirect('/admin');
+
+// Declared before the POST handler below. `const` is not hoisted.
+const readFailures: string[] = [];
+const dbReason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+const ACCENT = '#FF7040';
+const isTeamRole = (v: unknown): v is TeamRole =>
+  typeof v === 'string' && (TEAM_ROLES as readonly string[]).includes(v);
+
+let notice: string | null = null;
+let noticeTone: 'ok' | 'bad' = 'ok';
+
+const url = Astro.url;
+let selectedOrgId = url.searchParams.get('org');
+
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || '');
+    const formOrgId = String(form.get('orgId') || '') || selectedOrgId;
+
+    if (action === 'create-org') {
+      const name = String(form.get('name') || '').trim();
+      const orgType = String(form.get('orgType') || '');
+      const planKey = String(form.get('planKey') || '') || undefined;
+      if (name.length < 2) {
+        notice = 'An organization needs a name of at least two characters.';
+        noticeTone = 'bad';
+      } else if (!isOrganizationType(orgType)) {
+        notice = 'Pick an organization type.';
+        noticeTone = 'bad';
+      } else {
+        const created = await createOrganization({
+          name, orgType, createdByUserId: user.id, planKey,
+        });
+        selectedOrgId = created.organization.id;
+        notice = 'Created ' + created.organization.name + ' on the ' + created.subscription.planKey + ' plan, with you as its Owner.';
+      }
+    } else if (action === 'add-member' && formOrgId) {
+      const memberId = String(form.get('userId') || '').trim();
+      const role = String(form.get('teamRole') || '');
+      if (!memberId || !isTeamRole(role)) {
+        notice = 'A user id and a valid role are both needed.';
+        noticeTone = 'bad';
+      } else {
+        const result = await inviteMember(formOrgId, user.id, memberId, role);
+        notice = result.message;
+        noticeTone = result.ok ? 'ok' : 'bad';
+      }
+    } else if (action === 'set-role' && formOrgId) {
+      const memberId = String(form.get('userId') || '').trim();
+      const role = String(form.get('teamRole') || '');
+      if (memberId && isTeamRole(role)) {
+        const result = await setMemberRole(formOrgId, user.id, memberId, role);
+        notice = result.message;
+        noticeTone = result.ok ? 'ok' : 'bad';
+      }
+    } else if (action === 'remove-member' && formOrgId) {
+      const memberId = String(form.get('userId') || '').trim();
+      if (memberId) {
+        const result = await removeMember(formOrgId, user.id, memberId);
+        notice = result.message;
+        noticeTone = result.ok ? 'ok' : 'bad';
+      }
+    }
+  } catch (e: any) {
+    // Never swallowed. A membership change that failed silently leaves an operator convinced
+    // somebody has access they do not have, which is the worst way for this screen to be wrong.
+    notice = 'That change could not be applied: ' + dbReason(e);
+    noticeTone = 'bad';
+  }
+}
+
+let organizations: { id: string; name: string; slug: string; status: string; createdAt: string }[] = [];
+try {
+  organizations = (await getSaasStore().listOrganizations(200)).map((o) => ({
+    id: o.id, name: o.name, slug: o.slug, status: o.status, createdAt: o.createdAt,
+  }));
+} catch (e: any) {
+  readFailures.push('Organization list: ' + dbReason(e));
+}
+
+const orgId = selectedOrgId || (organizations[0] ? organizations[0].id : null);
+let ctx: Awaited<ReturnType<typeof tenantContext>> = null;
+let members: Awaited<ReturnType<ReturnType<typeof getSaasStore>['listMembers']>> = [];
+
+if (orgId) {
+  try {
+    ctx = await tenantContext(orgId);
+    if (!ctx) readFailures.push('Organization ' + orgId + ' could not be found.');
+  } catch (e: any) {
+    readFailures.push('Tenant summary: ' + dbReason(e));
+  }
+  try {
+    members = await getSaasStore().listMembers(orgId);
+  } catch (e: any) {
+    readFailures.push('Team list: ' + dbReason(e));
+  }
+}
+
+const ownerCount = members.filter((m) => m.teamRole === 'owner').length;
+const dt = (v: string | null | undefined): string => {
+  if (!v) return '-';
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? String(v) : d.toISOString().slice(0, 10);
+};
+// The limits worth showing next to a team: the ones an operator is asked about.
+const HEADLINE_METRICS = ['users', 'mailboxes', 'domains', 'contacts', 'emails_sent'] as const;
+---
+
+<AdminLayout title="Mail tenants">
+  <div class="admin-page" style="max-width:1040px;">
+    <div class="admin-page-header" style="margin-bottom:18px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">Mail platform</div>
+        <h1 class="admin-page-title">Tenants and teams</h1>
+        <p class="admin-page-sub">
+          Every organization on the mail platform, and who can act for it.
+          <a href="/admin/mail/billing" style={`color:${ACCENT};text-decoration:none;`}>Billing</a>
+          &middot;
+          <a href="/admin/mail/health" style={`color:${ACCENT};text-decoration:none;`}>Health</a>
+        </p>
+      </div>
+    </div>
+
+    {readFailures.length > 0 && (
+      <div class="admin-card" style="margin-bottom:16px;border-left:3px solid #ff5a5a;">
+        <div class="admin-card-title" style="margin-bottom:8px;">Some of this page could not be read</div>
+        <ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.7;">
+          {readFailures.map((f) => <li>{f}</li>)}
+        </ul>
+      </div>
+    )}
+
+    {notice && (
+      <div class="admin-card" style={`margin-bottom:16px;border-left:3px solid ${noticeTone === 'ok' ? '#4ade80' : '#ff5a5a'};`}>
+        <div style="font-size:13px;line-height:1.6;">{notice}</div>
+      </div>
+    )}
+
+    <div class="tenant-grid" style="margin-bottom:16px;">
+      <div class="admin-card">
+        <div class="admin-card-title" style="margin-bottom:10px;">Organizations ({organizations.length})</div>
+        {organizations.length === 0 && (
+          <div style="font-size:13px;opacity:.65;line-height:1.6;">
+            None yet. Create the first one on the right.
+          </div>
+        )}
+        <div style="font-size:13px;">
+          {organizations.map((o) => (
+            <a
+              href={`/admin/mail/tenants?org=${o.id}`}
+              style={`display:flex;justify-content:space-between;gap:10px;padding:7px 8px;border-radius:8px;text-decoration:none;color:inherit;${o.id === orgId ? 'background:var(--o-bg2,#1a1a20);' : ''}`}
+            >
+              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                {o.name}
+                <span style="opacity:.45;"> /{o.slug}</span>
+              </span>
+              <span style={`flex:0 0 auto;font-size:11px;opacity:.7;${o.status !== 'active' ? 'color:#ffa23a;' : ''}`}>
+                {o.status === 'active' ? dt(o.createdAt) : o.status}
+              </span>
+            </a>
+          ))}
+        </div>
+      </div>
+
+      <div class="admin-card">
+        <div class="admin-card-title" style="margin-bottom:10px;">New organization</div>
+        <form method="post" style="display:flex;flex-direction:column;gap:8px;">
+          <input type="hidden" name="action" value="create-org" />
+          <input name="name" placeholder="Organization name" required
+            style="padding:8px 10px;border-radius:8px;background:var(--o-bg1,#111);color:inherit;border:1px solid var(--o-stroke,#26262c);" />
+          <select name="orgType" style="padding:8px 10px;border-radius:8px;background:var(--o-bg1,#111);color:inherit;border:1px solid var(--o-stroke,#26262c);">
+            {Object.entries(ORG_TYPE_DEFAULTS).map(([key, d]) => (
+              <option value={key}>{d.label} - suggests {d.suggestedPlanKey}</option>
+            ))}
+          </select>
+          <select name="planKey" style="padding:8px 10px;border-radius:8px;background:var(--o-bg1,#111);color:inherit;border:1px solid var(--o-stroke,#26262c);">
+            <option value="">Use the suggestion for that type</option>
+            {PLAN_CATALOG.map((p) => <option value={p.key}>{p.name}</option>)}
+          </select>
+          <button type="submit" style={`background:${ACCENT};border:none;color:#111;padding:8px 16px;border-radius:8px;font-weight:600;cursor:pointer;`}>Create</button>
+        </form>
+        <div style="margin-top:10px;font-size:12px;opacity:.65;line-height:1.6;">
+          The type only sets a suggested plan and how the tenant is described. It never changes what
+          a plan includes: two tenants on the same plan get identical limits whatever type they are.
+        </div>
+      </div>
+    </div>
+
+    {ctx && (
+      <>
+        <div class="admin-card" style="margin-bottom:16px;">
+          <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start;">
+            <div>
+              <div class="admin-card-title" style="margin:0 0 4px;">{ctx.organization.name}</div>
+              <div style="font-size:12px;opacity:.65;">
+                /{ctx.organization.slug} &middot; {ctx.profile?.orgType || 'type not set'} &middot;
+                {' '}{ctx.plan.name} plan &middot; {ctx.subscription.status}
+              </div>
+            </div>
+            <a href={`/admin/mail/billing?org=${ctx.organization.id}`}
+              style={`font-size:12px;color:${ACCENT};text-decoration:none;`}>Billing and usage</a>
+          </div>
+          <div style="margin-top:12px;display:flex;gap:18px;flex-wrap:wrap;font-size:12px;">
+            {HEADLINE_METRICS.map((m) => (
+              <div>
+                <div style="opacity:.6;">{METRICS[m].label}</div>
+                <div style="font-family:'Geist Mono',monospace;font-size:14px;">
+                  {ctx.usage.values[m]}
+                  <span style="opacity:.5;"> / {describeLimit(ctx.limits[METRICS[m].limitField as keyof typeof ctx.limits] ?? null, METRICS[m].unit)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div class="admin-card" style="margin-bottom:16px;">
+          <div class="admin-card-title" style="margin-bottom:12px;">
+            Team ({members.length}) &middot; {ownerCount} owner{ownerCount === 1 ? '' : 's'}
+          </div>
+          <div style="overflow-x:auto;">
+            <table style="width:100%;border-collapse:collapse;font-size:13px;">
+              <thead>
+                <tr style="text-align:left;opacity:.65;">
+                  <th style="padding:6px 8px;font-weight:500;">Member</th>
+                  <th style="padding:6px 8px;font-weight:500;">Role</th>
+                  <th style="padding:6px 8px;font-weight:500;">Platform role</th>
+                  <th style="padding:6px 8px;font-weight:500;">Joined</th>
+                  <th style="padding:6px 8px;font-weight:500;"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {members.map((m) => (
+                  <tr style="border-top:1px solid var(--o-stroke,#1f1f25);">
+                    <td style="padding:7px 8px;">
+                      {m.userName || m.userEmail || <code>{m.userId}</code>}
+                      {m.userEmail && m.userName && <div style="opacity:.55;font-size:12px;">{m.userEmail}</div>}
+                    </td>
+                    <td style="padding:7px 8px;">
+                      <form method="post" style="display:flex;gap:6px;align-items:center;">
+                        <input type="hidden" name="action" value="set-role" />
+                        <input type="hidden" name="orgId" value={ctx.organization.id} />
+                        <input type="hidden" name="userId" value={m.userId} />
+                        <select name="teamRole" style="padding:4px 6px;border-radius:6px;background:var(--o-bg1,#111);color:inherit;border:1px solid var(--o-stroke,#26262c);font-size:12px;">
+                          {TEAM_ROLES.map((r) => (
+                            <option value={r} selected={r === m.teamRole}>{TEAM_ROLE_LABELS[r]}</option>
+                          ))}
+                        </select>
+                        <button type="submit" style="background:none;border:1px solid var(--o-stroke,#26262c);color:inherit;padding:3px 8px;border-radius:6px;font-size:11px;cursor:pointer;">Set</button>
+                      </form>
+                    </td>
+                    <td style="padding:7px 8px;opacity:.55;font-size:12px;">{m.role}</td>
+                    <td style="padding:7px 8px;opacity:.6;font-size:12px;">{dt(m.createdAt)}</td>
+                    <td style="padding:7px 8px;">
+                      <form method="post">
+                        <input type="hidden" name="action" value="remove-member" />
+                        <input type="hidden" name="orgId" value={ctx.organization.id} />
+                        <input type="hidden" name="userId" value={m.userId} />
+                        <button type="submit" style="background:none;border:none;color:#ff5a5a;font-size:12px;cursor:pointer;padding:0;">Remove</button>
+                      </form>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {members.length === 0 && (
+            <div style="font-size:13px;opacity:.6;padding:8px 0;">No members recorded for this tenant.</div>
+          )}
+
+          <form method="post" style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <input type="hidden" name="action" value="add-member" />
+            <input type="hidden" name="orgId" value={ctx.organization.id} />
+            <input name="userId" placeholder="User id to add"
+              style="flex:1;min-width:220px;padding:8px 10px;border-radius:8px;background:var(--o-bg1,#111);color:inherit;border:1px solid var(--o-stroke,#26262c);" />
+            <select name="teamRole" style="padding:8px 10px;border-radius:8px;background:var(--o-bg1,#111);color:inherit;border:1px solid var(--o-stroke,#26262c);">
+              {TEAM_ROLES.map((r) => <option value={r} selected={r === 'member'}>{TEAM_ROLE_LABELS[r]}</option>)}
+            </select>
+            <button type="submit" style={`background:${ACCENT};border:none;color:#111;padding:8px 16px;border-radius:8px;font-weight:600;cursor:pointer;`}>Add</button>
+          </form>
+          <div style="margin-top:8px;font-size:12px;opacity:.65;line-height:1.6;">
+            Adding a member consumes a seat against the plan, so this refuses once the tenant is at
+            their limit. The last Owner cannot be removed or demoted: an organization with no owner
+            is one nobody can pay for or change.
+          </div>
+        </div>
+
+        <div class="admin-card">
+          <div class="admin-card-title" style="margin-bottom:12px;">What each role can do</div>
+          <div class="role-grid">
+            {TEAM_ROLES.map((r) => (
+              <div style="padding:8px 0;border-top:1px solid var(--o-stroke,#1f1f25);">
+                <div style="font-weight:600;font-size:13px;">{TEAM_ROLE_LABELS[r]}</div>
+                <div style="font-size:12px;opacity:.7;line-height:1.5;margin:2px 0 6px;">{TEAM_ROLE_DESCRIPTIONS[r]}</div>
+                <div style="display:flex;flex-wrap:wrap;gap:4px;">
+                  {permissionsFor(r).map((p) => (
+                    <code style="font-size:10px;padding:1px 6px;border-radius:99px;background:var(--o-bg2,#1a1a20);opacity:.85;">{p}</code>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style="margin-top:10px;font-size:12px;opacity:.65;line-height:1.6;">
+            Viewer and Analyst deliberately do not hold <code>mail.read</code>. Reading a mailbox is
+            reading somebody's correspondence, and the most restricted-sounding role in the product
+            must not be the one that grants it.
+          </div>
+        </div>
+      </>
+    )}
+  </div>
+</AdminLayout>
+
+<style>
+  .tenant-grid {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: 14px;
+  }
+  .role-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 0 20px;
+  }
+  code {
+    font-family: 'Geist Mono', monospace;
+  }
+  @media (max-width: 760px) {
+    .tenant-grid, .role-grid { grid-template-columns: 1fr; }
+  }
+</style>

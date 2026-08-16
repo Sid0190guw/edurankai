@@ -1,0 +1,619 @@
+---
+/**
+ * /admin/mail/campaigns/<id> — compose, choose an audience, preview, test, schedule, send, watch.
+ *
+ * The order of the panels IS the flow in the brief: audience, template, personalisation, preview,
+ * test, schedule, queue, sending, completed. Each panel refuses politely once the campaign has moved
+ * past the point where changing it would be honest — a queued campaign whose subject can still be
+ * edited produces two different mails under one report.
+ *
+ * NOTHING ON THIS PAGE SENDS WITHOUT PASSING preflight(). The Send panel calls the preview endpoint
+ * first, prints every blocker and warning, and only then offers the button — and above the large-send
+ * threshold the button stays disabled until the exact recipient count is typed back.
+ */
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import {
+  ensureCampaignSchema, getCampaign, updateCampaign, campaignTotals, variantStats, clickBreakdown,
+  campaignRecipients, campaignAudienceSummary, DEFAULT_CAMPAIGN_FROM,
+} from '@/lib/mail-campaigns';
+import { listsWithCounts, listSegments, isUuid, dbReason } from '@/lib/mail-contacts';
+import {
+  stateLabel, stateTone, canEditContent, campaignRates, formatRate, pickWinner,
+  LARGE_CAMPAIGN_THRESHOLD, MIN_VARIANT_SAMPLE,
+} from '@/lib/mail-campaign-state';
+import { COMMON_TIMEZONES, DEFAULT_TIMEZONE, utcToZonedInput, formatInZone } from '@/lib/mail-schedule';
+import { CAMPAIGN_VARIABLES } from '@/lib/mail-personalize';
+import { transportStatus } from '@/lib/mail-transport';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+const id = String(Astro.params.id || '');
+if (!isUuid(id)) return Astro.redirect('/admin/mail/campaigns');
+
+const readFailures: { source: string; reason: string }[] = [];
+function noteFailure<T>(source: string, fallback: T) {
+  return (e: any): T => {
+    readFailures.push({ source, reason: dbReason(e) });
+    console.error('[admin/mail/campaigns/id] ' + source + ' read failed:', dbReason(e));
+    return fallback;
+  };
+}
+
+let okMsg = '';
+let errMsg = '';
+await ensureCampaignSchema().catch((e: any) => { errMsg = 'The campaign tables could not be prepared: ' + dbReason(e); });
+
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    if (String(fd.get('_action')) === 'save') {
+      const r = await updateCampaign(id, {
+        name: String(fd.get('name') || ''),
+        subject: String(fd.get('subject') || ''),
+        preheader: String(fd.get('preheader') || '') || null,
+        fromName: String(fd.get('fromName') || '') || null,
+        fromAddress: String(fd.get('fromAddress') || '') || null,
+        replyTo: String(fd.get('replyTo') || '') || null,
+        bodyHtml: String(fd.get('bodyHtml') || ''),
+        audience: {
+          listIds: (fd.getAll('listIds') as string[]).filter(isUuid),
+          segmentIds: (fd.getAll('segmentIds') as string[]).filter(isUuid),
+          excludeListIds: (fd.getAll('excludeListIds') as string[]).filter(isUuid),
+        },
+      });
+      if (r.ok) okMsg = 'Campaign saved.';
+      else errMsg = r.error || 'Nothing was saved.';
+    }
+  } catch (e: any) {
+    okMsg = '';
+    console.error('[admin/mail/campaigns/id] write failed:', dbReason(e));
+    errMsg = 'Nothing was saved: ' + dbReason(e);
+  }
+}
+
+const campaign = await getCampaign(id).catch(noteFailure('Campaign', null));
+if (!campaign && readFailures.length === 0) return Astro.redirect('/admin/mail/campaigns');
+
+const lists = await listsWithCounts().catch(noteFailure('Lists', []));
+const segments = await listSegments().catch(noteFailure('Segments', []));
+const totals = campaign ? await campaignTotals(id).catch(noteFailure('Campaign totals', null)) : null;
+const variants = campaign ? await variantStats(id).catch(noteFailure('Variant statistics', [])) : [];
+const links = campaign ? await clickBreakdown(id).catch(noteFailure('Click breakdown', [])) : [];
+const audienceLines = campaign ? await campaignAudienceSummary(campaign.audience).catch(noteFailure('Audience summary', [])) : [];
+const recentSkips = campaign ? await campaignRecipients(id, { status: 'skipped', limit: 20 }).catch(noteFailure('Skipped recipients', { rows: [], total: 0 })) : { rows: [], total: 0 };
+const transport = await transportStatus().catch(noteFailure('Mail transport', { mode: 'none' as const, detail: 'could not be read' }));
+
+const editable = campaign ? canEditContent(campaign.status) : false;
+const rates = totals ? campaignRates(totals) : [];
+const winner = campaign?.ab?.enabled ? pickWinner(variants, campaign.ab.winnerMetric) : null;
+
+const selectedLists: string[] = (campaign?.audience?.listIds || []).map(String);
+const selectedSegments: string[] = (campaign?.audience?.segmentIds || []).map(String);
+const excludedLists: string[] = (campaign?.audience?.excludeListIds || []).map(String);
+
+const scheduleTz = campaign?.time_zone || DEFAULT_TIMEZONE;
+const scheduleLocal = campaign?.scheduled_at ? utcToZonedInput(new Date(campaign.scheduled_at), scheduleTz) : '';
+
+function toneStyle(s: string): string {
+  const t = stateTone(s);
+  if (t === 'ok') return 'background:rgba(16,185,129,.15);color:#6ee7b7;';
+  if (t === 'live') return 'background:rgba(255,106,61,.15);color:#FF7040;';
+  if (t === 'warn') return 'background:rgba(245,158,11,.15);color:#fcd34d;';
+  if (t === 'bad') return 'background:rgba(239,68,68,.15);color:#fca5a5;';
+  return 'background:rgba(148,163,184,.15);color:#94a3b8;';
+}
+const abConfig = campaign?.ab || null;
+---
+<AdminLayout title="Campaign" activeNav="mail">
+  <style>
+    .cw { padding: 18px; max-width: 1400px; }
+    .card { background: var(--o-panel2,#141418); border: 1px solid var(--o-stroke,#26262e); border-radius: 12px; padding: 16px; }
+    .grid { display: grid; grid-template-columns: minmax(0,1.35fr) minmax(0,1fr); gap: 16px; align-items: start; }
+    @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+    .lbl { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: #8a8a94; display: block; margin-bottom: 5px; }
+    .inp { width: 100%; background: #fff; color: #17181d; border: 1.5px solid #cbd0da; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+    .drop { background: #fff; color: #17181d; border: 1.5px solid #cbd0da; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+    .code { width: 100%; min-height: 300px; background: #0d0e13; color: #e6e7ec; border: 1px solid #2a2a33; border-radius: 8px; padding: 11px; font-family: ui-monospace, monospace; font-size: 12.5px; line-height: 1.55; resize: vertical; }
+    .prim { background: #FF6A3D; color: #fff; border: none; font-weight: 700; padding: 9px 18px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+    .prim:disabled { background: #4a3a34; color: #9a8a84; cursor: not-allowed; }
+    .ghost { background: #262832; color: #e6e7ec; border: 1px solid #3a3c48; font-weight: 600; padding: 7px 13px; border-radius: 8px; cursor: pointer; font-size: 12.5px; }
+    .muted { color: #8a8a94; font-size: 11.5px; }
+    .pill { font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: 100px; text-transform: uppercase; letter-spacing: .05em; }
+    .banner { font-size: 12.5px; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; }
+    .b-ok { background: rgba(16,185,129,.1); border: 1px solid rgba(16,185,129,.3); color: #6ee7b7; }
+    .b-err { background: rgba(239,68,68,.1); border: 1px solid rgba(239,68,68,.3); color: #fca5a5; }
+    .b-warn { background: rgba(245,158,11,.1); border: 1px solid rgba(245,158,11,.3); color: #fcd34d; }
+    h2.sec { font-size: 14px; font-weight: 700; color: #fff; margin: 0 0 10px; }
+    .var { background: rgba(255,106,61,.12); border: 1px solid rgba(255,106,61,.3); color: #FF7040; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 100px; cursor: pointer; }
+    .stat { display: grid; grid-template-columns: repeat(auto-fit,minmax(120px,1fr)); gap: 10px; }
+    .stat > div { background: rgba(255,255,255,.02); border: 1px solid rgba(255,255,255,.06); border-radius: 10px; padding: 10px 12px; }
+    .stat .n { font-size: 20px; font-weight: 800; color: #fff; }
+    .row { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,.05); font-size: 12.5px; color: #d4d4d8; }
+    .chk { display: block; font-size: 12.5px; color: #d4d4d8; padding: 3px 0; }
+    .prev { background: #fff; border-radius: 8px; min-height: 220px; }
+    .prev iframe { width: 100%; min-height: 220px; border: 0; border-radius: 8px; }
+  </style>
+
+  <div class="cw">
+    <div style="margin-bottom:12px;"><a class="muted" href="/admin/mail/campaigns" style="text-decoration:none;">Back to campaigns</a></div>
+
+    {okMsg && <div class="banner b-ok">{okMsg}</div>}
+    {errMsg && <div class="banner b-err">{errMsg}</div>}
+    {readFailures.length > 0 && (
+      <div class="banner b-warn">
+        <strong>Part of this campaign could not be read, so the figures below are incomplete.</strong>
+        <ul style="margin:6px 0 0 16px;padding:0;">{readFailures.map((f) => <li>{f.source}: {f.reason}</li>)}</ul>
+      </div>
+    )}
+
+    {campaign && (
+      <div>
+        <div class="admin-page-header" style="margin-bottom:14px;">
+          <div class="admin-page-eyebrow">Campaign</div>
+          <h1 class="admin-page-title">{campaign.name}</h1>
+          <p class="admin-page-sub">
+            <span class="pill" style={toneStyle(campaign.status)}>{stateLabel(campaign.status)}</span>
+            <span style="margin-left:8px;">{campaign.stream === 'transactional' ? 'transactional stream' : 'campaign stream'}</span>
+            {campaign.scheduled_at ? <span style="margin-left:8px;">scheduled for {formatInZone(new Date(campaign.scheduled_at), scheduleTz)}</span> : null}
+            {campaign.occurrence_no > 1 ? <span style="margin-left:8px;">occurrence {campaign.occurrence_no}</span> : null}
+          </p>
+        </div>
+
+        {!editable && (
+          <div class="banner b-warn">
+            This campaign is {stateLabel(campaign.status).toLowerCase()}, so its content and audience are frozen.
+            {campaign.status === 'scheduled' ? ' Unschedule it to make changes.' : ' Reopen it as a draft to make changes.'}
+          </div>
+        )}
+        {transport.mode === 'none' && (
+          <div class="banner b-warn"><strong>No outbound mail server is configured.</strong> {transport.detail}.</div>
+        )}
+
+        <div class="grid">
+          <div style="display:grid;gap:16px;">
+            <form method="POST" class="card">
+              <input type="hidden" name="_action" value="save" />
+              <h2 class="sec">Message</h2>
+              <div style="display:grid;gap:10px;">
+                <div><label class="lbl">Internal name</label><input class="inp" name="name" value={campaign.name} disabled={!editable} /></div>
+                <div><label class="lbl">Subject line</label><input class="inp" name="subject" id="f_subject" value={campaign.subject} disabled={!editable} /></div>
+                <div><label class="lbl">Preheader (the grey line after the subject in an inbox)</label><input class="inp" name="preheader" value={campaign.preheader || ''} disabled={!editable} /></div>
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
+                  <div><label class="lbl">From name</label><input class="inp" name="fromName" value={campaign.from_name || ''} disabled={!editable} /></div>
+                  <div><label class="lbl">From address</label><input class="inp" name="fromAddress" value={campaign.from_email || DEFAULT_CAMPAIGN_FROM} disabled={!editable} /></div>
+                  <div><label class="lbl">Reply-to</label><input class="inp" name="replyTo" value={campaign.reply_to || ''} disabled={!editable} /></div>
+                </div>
+              </div>
+
+              <div style="margin-top:14px;">
+                <label class="lbl">Personalisation &mdash; click to insert. Always give a default.</label>
+                <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px;">
+                  {CAMPAIGN_VARIABLES.map((v) => (
+                    <span class="var" data-insert={'{{' + v.name + (v.system ? '' : ' | default:"…"') + '}}'} title={v.label + ' — e.g. ' + v.example}>{v.name}</span>
+                  ))}
+                </div>
+                <p class="muted" style="margin:0 0 8px;">
+                  A variable with no value and no default renders as nothing &mdash; never as the raw token &mdash; so nobody receives
+                  &quot;Hi &#123;&#123;first_name&#125;&#125;&quot;. Writing <code>&#123;&#123;first_name | default:&quot;there&quot;&#125;&#125;</code>
+                  is what turns that blank into a word.
+                </p>
+              </div>
+
+              <label class="lbl">Body (HTML)</label>
+              <textarea class="code" name="bodyHtml" id="f_body" disabled={!editable}>{campaign.body_html}</textarea>
+              <p class="muted" style="margin:8px 0 0;">
+                A campaign body must contain <code>&#123;&#123;unsubscribe_url&#125;&#125;</code> &mdash; the send is refused without it.
+                Links are rewritten for click tracking at send time, except the unsubscribe link, which is never routed through a tracker.
+              </p>
+
+              <h2 class="sec" style="margin-top:18px;">Audience</h2>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+                <div>
+                  <label class="lbl">Send to these lists</label>
+                  {lists.length === 0 && <p class="muted">No lists yet.</p>}
+                  {lists.map((l: any) => (
+                    <label class="chk"><input type="checkbox" name="listIds" value={l.id} checked={selectedLists.includes(String(l.id))} disabled={!editable} /> {l.name} <span class="muted">({l.member_count})</span></label>
+                  ))}
+                </div>
+                <div>
+                  <label class="lbl">And these segments</label>
+                  {segments.length === 0 && <p class="muted">No segments yet.</p>}
+                  {segments.map((s: any) => (
+                    <label class="chk"><input type="checkbox" name="segmentIds" value={s.id} checked={selectedSegments.includes(String(s.id))} disabled={!editable} /> {s.name}</label>
+                  ))}
+                  <label class="lbl" style="margin-top:12px;">But not these lists</label>
+                  {lists.map((l: any) => (
+                    <label class="chk"><input type="checkbox" name="excludeListIds" value={l.id} checked={excludedLists.includes(String(l.id))} disabled={!editable} /> {l.name}</label>
+                  ))}
+                </div>
+              </div>
+              <p class="muted" style="margin:10px 0 0;">
+                Lists and segments are combined, then deduplicated, then filtered: suppression, unsubscribes, bounces, complaints and
+                unusable addresses are all removed before anything is queued. The Send panel shows exactly how many go each way.
+              </p>
+
+              <div style="margin-top:16px;display:flex;gap:8px;">
+                <button class="prim" type="submit" disabled={!editable}>Save campaign</button>
+                <a class="ghost" style="text-decoration:none;" href="/admin/mail/lists">Manage lists and segments</a>
+              </div>
+            </form>
+
+            <div class="card">
+              <h2 class="sec">Preview</h2>
+              <p class="muted" style="margin:0 0 10px;">Rendered against real contacts from the resolved audience, so an empty merge field shows up as the blank it will be.</p>
+              <button class="ghost" type="button" id="btnPreview">Load preview</button>
+              <div id="previewOut" style="margin-top:12px;"></div>
+            </div>
+
+            <div class="card">
+              <h2 class="sec">Report</h2>
+              {!totals && <p class="muted">The totals could not be read.</p>}
+              {totals && (
+                <div class="stat">
+                  {rates.map((r: any) => (
+                    <div>
+                      <div class="n">{r.value}</div>
+                      <div class="muted">{r.label}{r.rate === null ? '' : ' — ' + formatRate(r.rate)}</div>
+                      <div class="muted" style="font-size:10.5px;">{r.over}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <p class="muted" style="margin:12px 0 0;">
+                &quot;Delivered&quot; here means the receiving server accepted the message. Our own SMTP returns an acceptance, not a
+                mailbox confirmation, so this is not proof it reached an inbox. Opens are counted when a mail client loads remote
+                images, which many clients block and a few pre-load &mdash; treat the open rate as an indicator, not a headcount.
+              </p>
+
+              {links.length > 0 && (
+                <div style="margin-top:14px;">
+                  <label class="lbl">Clicks by link</label>
+                  {links.map((l: any) => (
+                    <div class="row"><span style="word-break:break-all;">{l.url}</span><span style="white-space:nowrap;">{l.recipients} people, {l.clicks} clicks</span></div>
+                  ))}
+                </div>
+              )}
+
+              {recentSkips.total > 0 && (
+                <div style="margin-top:14px;">
+                  <label class="lbl">{recentSkips.total} addresses were in the audience but not sent to</label>
+                  {recentSkips.rows.map((r: any) => (
+                    <div class="row"><span>{r.email}</span><span class="muted">{r.skip_reason}</span></div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {abConfig && abConfig.enabled && (
+              <div class="card">
+                <h2 class="sec">A/B test</h2>
+                <p class="muted" style="margin:0 0 10px;">
+                  Varying the {abConfig.dimension}. {abConfig.testPercent}% of the audience is in the test; the rest is held back
+                  until a winner is promoted. Decided on {abConfig.winnerMetric} rate.
+                </p>
+                {variants.map((v: any) => (
+                  <div class="row">
+                    <span style="color:#fff;">Variant {v.key.toUpperCase()}</span>
+                    <span class="muted">{v.sent} sent &middot; {v.opened} opened &middot; {v.clicked} clicked</span>
+                  </div>
+                ))}
+                {winner && (
+                  <div class={'banner ' + (winner.confident ? 'b-ok' : 'b-warn')} style="margin-top:12px;">
+                    {winner.reason}
+                  </div>
+                )}
+                {!winner && <p class="muted">Not enough has been sent to compare variants yet ({MIN_VARIANT_SAMPLE} per variant is the minimum).</p>}
+                <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+                  <button class="ghost" type="button" data-action="promote-winner">Promote the winner to the hold-back</button>
+                  <button class="ghost" type="button" data-action="promote-winner" data-override="1" data-danger="The difference between variants is inside the margin of error. Promote anyway?">Promote anyway</button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div style="display:grid;gap:16px;">
+            <div class="card">
+              <h2 class="sec">Send</h2>
+              <div class="muted" style="margin-bottom:10px;">
+                {audienceLines.length === 0 ? 'No audience chosen yet.' : audienceLines.join(' · ')}
+              </div>
+              <button class="ghost" type="button" id="btnCheck">Check who this reaches</button>
+              <div id="checkOut" style="margin-top:12px;"></div>
+              <div id="confirmWrap" style="display:none;margin-top:10px;">
+                <label class="lbl">Type the recipient count to confirm</label>
+                <input class="inp" id="confirmCount" inputmode="numeric" placeholder="e.g. 1284" />
+                <p class="muted" style="margin:6px 0 0;">Required above {LARGE_CAMPAIGN_THRESHOLD} recipients. This is the one deliberate speed bump between a draft and several thousand inboxes.</p>
+              </div>
+              <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+                <button class="prim" type="button" id="btnSend" disabled>Send now</button>
+                <button class="ghost" type="button" data-action="pause" data-danger="Pause this campaign? Anything already sent stays sent.">Pause</button>
+                <button class="ghost" type="button" data-action="resume">Resume</button>
+                <button class="ghost" type="button" data-action="send-batch">Send the next batch now</button>
+                <button class="ghost" style="color:#fca5a5;border-color:rgba(239,68,68,.3);" type="button" data-action="cancel" data-danger="Cancel this campaign? Everyone not yet sent to is dropped. Messages already sent cannot be recalled.">Cancel</button>
+                <button class="ghost" type="button" data-action="reopen" data-danger="Reopen as a draft? The resolved audience is discarded and will be recomputed when you send again.">Reopen as draft</button>
+              </div>
+              <p class="muted" style="margin:10px 0 0;">
+                Sending runs on the server in batches. &quot;Send the next batch now&quot; drains one batch immediately; otherwise
+                the scheduled worker picks it up.
+              </p>
+            </div>
+
+            <div class="card">
+              <h2 class="sec">Schedule</h2>
+              <div style="display:grid;gap:10px;">
+                <div><label class="lbl">Send at (wall clock in the zone below)</label><input class="inp" type="datetime-local" id="schedLocal" value={scheduleLocal} /></div>
+                <div>
+                  <label class="lbl">Time zone</label>
+                  <select class="drop" id="schedTz" style="width:100%;">
+                    {COMMON_TIMEZONES.map((t) => <option value={t.tz} selected={scheduleTz === t.tz}>{t.label} — {t.tz}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label class="lbl">Repeat</label>
+                  <select class="drop" id="schedRepeat" style="width:100%;">
+                    <option value="">does not repeat</option>
+                    <option value="daily" selected={campaign.recurrence?.freq === 'daily'}>every day</option>
+                    <option value="weekly" selected={campaign.recurrence?.freq === 'weekly'}>every week</option>
+                    <option value="monthly" selected={campaign.recurrence?.freq === 'monthly'}>every month</option>
+                  </select>
+                </div>
+              </div>
+              <div style="display:flex;gap:8px;margin-top:12px;">
+                <button class="prim" type="button" id="btnSchedule">Schedule</button>
+                <button class="ghost" type="button" data-action="unschedule">Unschedule</button>
+              </div>
+              <p class="muted" style="margin:10px 0 0;">
+                The time is resolved to an instant on the server using the zone you pick, so it does not depend on this browser or on
+                where the server happens to be. A repeating campaign creates its next run as a new campaign when this one finishes,
+                so each occurrence keeps its own report.
+              </p>
+            </div>
+
+            <div class="card">
+              <h2 class="sec">Send a test</h2>
+              <p class="muted" style="margin:0 0 10px;">
+                Test sends go to company mailboxes or to your own address only. That is deliberate: a test aimed at a real prospect is
+                how an unfinished draft reaches somebody who never asked for it.
+              </p>
+              <label class="lbl">To</label>
+              <input class="inp" id="testTo" value={user.email} />
+              <label class="lbl" style="margin-top:10px;">Render with this contact (optional)</label>
+              <input class="inp" id="testContact" placeholder="paste a contact id for real merge data" />
+              <div style="margin-top:10px;"><button class="ghost" type="button" id="btnTest">Send test</button></div>
+              <div id="testOut" style="margin-top:10px;"></div>
+            </div>
+
+            <div class="card">
+              <h2 class="sec">A/B test setup</h2>
+              <p class="muted" style="margin:0 0 10px;">
+                Split the audience, hold the rest back, and send the winner to the hold-back once the difference is outside the margin
+                of error. A leader is always shown; promoting one that is not statistically separated needs an explicit override.
+              </p>
+              <div style="display:grid;gap:10px;">
+                <div>
+                  <label class="lbl">Vary</label>
+                  <select class="drop" id="abDim" style="width:100%;" disabled={!editable}>
+                    <option value="">no A/B test</option>
+                    <option value="subject" selected={abConfig?.dimension === 'subject'}>the subject line</option>
+                    <option value="content" selected={abConfig?.dimension === 'content'}>the body</option>
+                    <option value="cta" selected={abConfig?.dimension === 'cta'}>the call to action</option>
+                  </select>
+                </div>
+                <div><label class="lbl">Variant A</label><input class="inp" id="abA" value={abConfig?.variants?.[0]?.subject || abConfig?.variants?.[0]?.ctaText || ''} disabled={!editable} /></div>
+                <div><label class="lbl">Variant B</label><input class="inp" id="abB" value={abConfig?.variants?.[1]?.subject || abConfig?.variants?.[1]?.ctaText || ''} disabled={!editable} /></div>
+                <div><label class="lbl">Share of the audience in the test (%)</label><input class="inp" type="number" min="1" max="100" id="abPct" value={abConfig?.testPercent || 20} disabled={!editable} /></div>
+                <div>
+                  <label class="lbl">Winner decided on</label>
+                  <select class="drop" id="abMetric" style="width:100%;" disabled={!editable}>
+                    <option value="open" selected={abConfig?.winnerMetric === 'open'}>open rate</option>
+                    <option value="click" selected={abConfig?.winnerMetric === 'click'}>click rate</option>
+                    <option value="conversion" selected={abConfig?.winnerMetric === 'conversion'}>conversion</option>
+                  </select>
+                </div>
+              </div>
+              <div style="margin-top:12px;"><button class="ghost" type="button" id="btnAb" disabled={!editable}>Save A/B setup</button></div>
+              <div id="abOut" style="margin-top:10px;"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    )}
+  </div>
+
+  <script define:vars={{ campaignId: id, threshold: LARGE_CAMPAIGN_THRESHOLD }}>
+    (function () {
+      var out = document.getElementById('checkOut');
+      var sendBtn = document.getElementById('btnSend');
+      var confirmWrap = document.getElementById('confirmWrap');
+      var confirmBox = document.getElementById('confirmCount');
+      var lastCount = -1;
+
+      function esc(s) {
+        return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }
+      function api(payload) {
+        return fetch('/api/mail/campaigns', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(Object.assign({ id: campaignId }, payload)),
+        }).then(function (r) { return r.json(); });
+      }
+      function banner(kind, text) {
+        return '<div class="banner b-' + kind + '">' + text + '</div>';
+      }
+
+      document.querySelectorAll('.var').forEach(function (chip) {
+        chip.addEventListener('click', function () {
+          var body = document.getElementById('f_body');
+          if (!body || body.disabled) return;
+          var t = chip.getAttribute('data-insert') || '';
+          var s = body.selectionStart || 0;
+          body.value = body.value.slice(0, s) + t + body.value.slice(body.selectionEnd || s);
+          body.focus();
+          body.selectionStart = body.selectionEnd = s + t.length;
+        });
+      });
+
+      function check() {
+        if (!out) return;
+        out.innerHTML = '<p class="muted">Resolving the audience…</p>';
+        api({ action: 'preview' }).then(function (d) {
+          if (!d.ok) { out.innerHTML = banner('err', esc(d.error)); return; }
+          lastCount = d.recipientCount;
+          var html = '<div style="font-size:26px;font-weight:800;color:#fff;line-height:1;">' + d.recipientCount.toLocaleString('en-IN') + '</div>'
+            + '<p class="muted">people would receive this.</p>';
+          if (d.skipLines && d.skipLines.length) {
+            html += '<p class="lbl" style="margin-top:10px;">Removed before sending</p><ul class="muted" style="margin:0 0 8px 16px;">'
+              + d.skipLines.map(function (l) { return '<li>' + esc(l) + '</li>'; }).join('') + '</ul>';
+          }
+          if (d.truncated) html += banner('warn', 'The audience hit the resolver cap, so this count is a floor, not the total.');
+          if (d.preflight && d.preflight.blockers.length) {
+            html += banner('err', '<strong>This cannot be sent yet.</strong><ul style="margin:6px 0 0 16px;">'
+              + d.preflight.blockers.map(function (b) { return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>');
+          }
+          if (d.preflight && d.preflight.warnings.length) {
+            html += banner('warn', '<ul style="margin:0 0 0 16px;">'
+              + d.preflight.warnings.map(function (b) { return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>');
+          }
+          out.innerHTML = html;
+
+          var needs = d.preflight && d.preflight.needsConfirmation;
+          if (confirmWrap) confirmWrap.style.display = needs ? 'block' : 'none';
+          if (sendBtn) {
+            var blockedOnlyByConfirmation = d.preflight
+              && d.preflight.blockers.length > 0
+              && d.preflight.blockers.every(function (b) { return b.indexOf('confirmation box') >= 0; });
+            sendBtn.disabled = !(d.preflight && (d.preflight.ok || blockedOnlyByConfirmation));
+          }
+        }).catch(function (e) { out.innerHTML = banner('err', 'The check did not run: ' + esc(e && e.message)); });
+      }
+
+      var btnCheck = document.getElementById('btnCheck');
+      if (btnCheck) btnCheck.addEventListener('click', check);
+
+      if (sendBtn) {
+        sendBtn.addEventListener('click', function () {
+          var confirmed = confirmWrap && confirmWrap.style.display !== 'none' ? Number(confirmBox.value) : null;
+          if (!confirm('Queue this campaign for sending' + (lastCount >= 0 ? ' to ' + lastCount + ' people' : '') + '?')) return;
+          sendBtn.disabled = true;
+          api({ action: 'queue', confirmedCount: confirmed }).then(function (d) {
+            if (!d.ok) {
+              out.innerHTML = banner('err', esc(d.error)) + out.innerHTML;
+              sendBtn.disabled = false;
+              return;
+            }
+            out.innerHTML = banner('ok', 'Queued. ' + d.inserted + ' recipients written. Sending happens on the server in batches — reload for progress.');
+          }).catch(function (e) {
+            out.innerHTML = banner('err', 'The send did not start: ' + esc(e && e.message));
+            sendBtn.disabled = false;
+          });
+        });
+      }
+
+      document.querySelectorAll('[data-action]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var action = btn.getAttribute('data-action');
+          var ask = btn.getAttribute('data-danger');
+          if (ask && !confirm(ask)) return;
+          var payload = { action: action };
+          if (btn.getAttribute('data-override')) payload.override = true;
+          btn.disabled = true;
+          api(payload).then(function (d) {
+            alert(d.ok ? 'Done.' : d.error);
+            if (d.ok) location.reload(); else btn.disabled = false;
+          }).catch(function (e) { alert('That did not run: ' + (e && e.message)); btn.disabled = false; });
+        });
+      });
+
+      var btnSchedule = document.getElementById('btnSchedule');
+      if (btnSchedule) {
+        btnSchedule.addEventListener('click', function () {
+          var local = document.getElementById('schedLocal').value;
+          var tz = document.getElementById('schedTz').value;
+          var repeat = document.getElementById('schedRepeat').value;
+          if (!local) { alert('Pick a date and time first.'); return; }
+          var recurrence = null;
+          if (repeat) {
+            var parts = local.split('T');
+            var hm = (parts[1] || '09:00').split(':');
+            recurrence = {
+              freq: repeat, interval: 1, hour: Number(hm[0]), minute: Number(hm[1]),
+              timeZone: tz, anchor: new Date(local).toISOString(),
+            };
+          }
+          api({ action: 'schedule', localTime: local, timeZone: tz, recurrence: recurrence }).then(function (d) {
+            if (!d.ok) { alert(d.error); return; }
+            alert('Scheduled. The server resolved that to ' + new Date(d.at).toUTCString() + '.');
+            location.reload();
+          });
+        });
+      }
+
+      var btnPreview = document.getElementById('btnPreview');
+      if (btnPreview) {
+        btnPreview.addEventListener('click', function () {
+          var box = document.getElementById('previewOut');
+          box.innerHTML = '<p class="muted">Rendering…</p>';
+          api({ action: 'preview', sampleSize: 3 }).then(function (d) {
+            if (!d.ok) { box.innerHTML = banner('err', esc(d.error)); return; }
+            if (!d.samples || !d.samples.length) {
+              box.innerHTML = '<p class="muted">No recipients resolved yet, so there is nobody to render against. Choose an audience first.</p>';
+              return;
+            }
+            box.innerHTML = d.samples.map(function (s) {
+              var missing = s.missing && s.missing.length
+                ? '<p class="muted" style="color:#fcd34d;">Blank for this person: ' + esc(s.missing.join(', ')) + '</p>' : '';
+              return '<div style="margin-bottom:14px;"><p class="lbl">' + esc(s.email) + '</p>'
+                + '<p style="color:#fff;font-size:13px;margin:0 0 6px;">' + esc(s.subject) + '</p>'
+                + missing
+                + '<div class="prev"><iframe sandbox="" srcdoc="' + esc(s.html).replace(/"/g, '&quot;') + '"></iframe></div></div>';
+            }).join('');
+          });
+        });
+      }
+
+      var btnTest = document.getElementById('btnTest');
+      if (btnTest) {
+        btnTest.addEventListener('click', function () {
+          var box = document.getElementById('testOut');
+          box.innerHTML = '<p class="muted">Sending…</p>';
+          api({
+            action: 'test',
+            to: document.getElementById('testTo').value,
+            contactId: document.getElementById('testContact').value.trim(),
+          }).then(function (d) {
+            box.innerHTML = d.ok
+              ? banner('ok', 'Test sent to ' + esc(d.sentTo.join(', ')) + (d.note ? ' — ' + esc(d.note) : ''))
+              : banner('err', esc(d.error));
+          });
+        });
+      }
+
+      var btnAb = document.getElementById('btnAb');
+      if (btnAb) {
+        btnAb.addEventListener('click', function () {
+          var dim = document.getElementById('abDim').value;
+          var box = document.getElementById('abOut');
+          var ab = null;
+          if (dim) {
+            var a = document.getElementById('abA').value;
+            var b = document.getElementById('abB').value;
+            var key = dim === 'subject' ? 'subject' : dim === 'content' ? 'bodyHtml' : 'ctaText';
+            var va = { key: 'a' }; va[key] = a;
+            var vb = { key: 'b' }; vb[key] = b;
+            ab = {
+              enabled: true, dimension: dim, variants: [va, vb],
+              testPercent: Number(document.getElementById('abPct').value) || 20,
+              winnerMetric: document.getElementById('abMetric').value,
+            };
+          }
+          api({ action: 'update', ab: ab }).then(function (d) {
+            box.innerHTML = d.ok ? banner('ok', 'A/B setup saved.') : banner('err', esc(d.error));
+            if (d.ok) setTimeout(function () { location.reload(); }, 700);
+          });
+        });
+      }
+    })();
+  </script>
+</AdminLayout>

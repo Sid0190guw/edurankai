@@ -2,6 +2,8 @@
 // etc.) and inserts them into mail_messages / mail_box. Designed to be called
 // from a cron (Vercel cron) and from a manual "Check now" button.
 import { ImapFlow } from 'imapflow';
+// Refuses a destination that is not a public mail host. See the note in verifyImap().
+import { assertSafeMailTarget } from '@/lib/mailsec/net';
 import { simpleParser } from 'mailparser';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
@@ -38,6 +40,25 @@ export async function verifyImap(p: ImapTestParams): Promise<{ ok: boolean; deta
   if (!p.user || !p.pass) return { ok: false, detail: 'Username or password missing' };
   const port = p.port || 993;
   const secure = p.secure === false ? false : true;
+
+  // THE DESTINATION IS CHECKED BEFORE THE SOCKET OPENS. `host` and `port` reach here straight from
+  // the body of POST /api/mail/imap-test, whose gate is `mail.manage` — held by all ten
+  // non-applicant built-in roles, interns included. Without this, the endpoint connects wherever it
+  // is told and reports back a discriminating error (ECONNREFUSED / ETIMEDOUT / ENOTFOUND /
+  // certificate), which is a port scanner with a credential oracle attached. The same guard is
+  // applied at the SMTP sink in src/lib/mail-transport.ts — at the sinks rather than at the three
+  // endpoints, because the endpoint that got missed would be the one that mattered.
+  const target = await assertSafeMailTarget(p.host, port);
+  if (!target.allowed) {
+    return {
+      ok: false,
+      detail: target.reason,
+      hint: target.code === 'private-address'
+        ? 'A mail server this platform can reach has to be on the public internet.'
+        : undefined,
+    };
+  }
+
   const client = new ImapFlow({
     host: p.host, port, secure,
     auth: { user: p.user, pass: p.pass },
