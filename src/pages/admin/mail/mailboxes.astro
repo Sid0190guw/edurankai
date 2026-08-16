@@ -1,0 +1,304 @@
+---
+// /admin/mail/mailboxes — mailboxes and aliases for this organization.
+//
+// The two live on one page because they are one routing decision seen from two sides, and because
+// the mistakes people make with them are mutual: an alias that shadows a mailbox, a mailbox that
+// forwards into an alias that points back. Both write paths run the same server-side loop check.
+//
+// The alias rows show what each alias DELIVERS TO TODAY, computed from the live graph, rather than
+// what the row says. A destination whose mailbox was disabled last week still reads fine in the row.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { platformAuth } from '@/lib/mailplatform/adapters/auth-platform';
+import { listMailboxes, listAliases, getMailboxSettings, deliveryGraph, verifiedDomainNames } from '@/lib/mailplatform/domains/store';
+import { expand } from '@/lib/mailplatform/domains/aliases';
+import { quotaState, formatBytes, STATUS_EFFECT } from '@/lib/mailplatform/domains/mailbox-rules';
+import { can } from '@/lib/mailplatform/permissions';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const causeOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+const principal = await platformAuth().authenticate({ request: Astro.request, locals: Astro.locals });
+const mayRead = can(principal, 'mail.read');
+const mayManage = can(principal, 'mailbox.manage');
+
+let loadError = '';
+let boxRows: any[] = [];
+let aliasRows: any[] = [];
+let domains: string[] = [];
+
+if (principal && mayRead) {
+  try {
+    const [boxes, aliases, graph, verified] = await Promise.all([
+      listMailboxes(principal.orgId),
+      listAliases(principal.orgId),
+      deliveryGraph(principal.orgId),
+      verifiedDomainNames(principal.orgId),
+    ]);
+    domains = verified;
+    boxRows = await Promise.all(boxes.map(async (m) => {
+      const settings = await getMailboxSettings(principal.orgId, m.id);
+      const q = quotaState(m.usedBytes, m.quotaBytes);
+      return {
+        id: m.id,
+        address: m.primaryAddress,
+        name: m.name,
+        status: m.status,
+        statusColor: m.status === 'active' ? '#6ee7b7' : m.status === 'suspended' ? '#fca5a5' : '#a1a1aa',
+        effect: STATUS_EFFECT[m.status],
+        quotaLabel: q.percent === null ? formatBytes(m.usedBytes) + ' used, no quota' : q.message,
+        quotaPercent: q.percent === null ? 0 : Math.min(100, q.percent),
+        quotaColor: q.level === 'full' || q.level === 'critical' ? '#fca5a5' : q.level === 'warn' ? '#fbbf24' : '#3f9d6d',
+        forwarding: settings.forwardTo,
+        keepCopy: settings.forwardKeepCopy,
+        autoReply: settings.autoReplyEnabled,
+        autoReplyWindow: settings.autoReplyStartsAt || settings.autoReplyEndsAt
+          ? (settings.autoReplyStartsAt || 'now') + ' to ' + (settings.autoReplyEndsAt || 'switched off')
+          : '',
+        signature: settings.signatureText || '',
+      };
+    }));
+    aliasRows = aliases.map((a) => {
+      const result = expand(a.sourceAddress, graph);
+      return {
+        id: a.id,
+        source: a.sourceAddress,
+        targets: a.targets,
+        isActive: a.isActive,
+        delivers: result.mailboxes,
+        external: result.external,
+        undeliverable: result.undeliverable,
+        loops: result.loops,
+      };
+    });
+  } catch (e: any) {
+    loadError = causeOf(e);
+    console.error('[admin/mail/mailboxes] load failed -', loadError);
+  }
+}
+
+const domainHint = domains.length > 0 ? domains[0] : 'your-domain.com';
+---
+<AdminLayout title="Mailboxes" activeNav="mail">
+<div class="admin-page" style="max-width:1000px;">
+  <div class="admin-page-header" style="margin-bottom:18px;">
+    <div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">Mail</div>
+      <h1 class="admin-page-title">Mailboxes and aliases</h1>
+      <p class="admin-page-sub">
+        Addresses that receive mail, and the addresses that route into them.
+        <a href="/admin/mail/domains" style="color:#FF7040;text-decoration:none;">Domains</a> &middot;
+        <a href="/admin/mail/health" style="color:#FF7040;text-decoration:none;">Mail Health</a>
+      </p>
+    </div>
+  </div>
+
+  {!principal && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;">
+      <p style="font-size:12.5px;color:#fca5a5;margin:0;font-weight:700;">This account is not a member of a mail organization.</p>
+    </div>
+  )}
+
+  {principal && loadError && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;margin-bottom:16px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fca5a5;margin:0 0 4px;">This page could not be read, so nothing below is a statement about your mailboxes.</p>
+      <p style="font-size:11.5px;color:#fca5a5;margin:0;font-family:'Geist Mono',monospace;">{loadError}</p>
+    </div>
+  )}
+
+  {principal && mayRead && !loadError && (
+    <>
+      {domains.length === 0 && (
+        <div style="background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.30);border-radius:12px;padding:14px 16px;margin-bottom:16px;">
+          <p style="font-size:12.5px;font-weight:700;color:#fbbf24;margin:0 0 5px;">No verified domain yet.</p>
+          <p style="font-size:12px;color:#d8d8de;margin:0;line-height:1.6;">A mailbox has to live on a domain this organization has verified. <a href="/admin/mail/domains" style="color:#FF7040;">Add one first</a>.</p>
+        </div>
+      )}
+
+      {mayManage && domains.length > 0 && (
+        <div class="admin-card" style="margin-bottom:16px;">
+          <div class="admin-card-title" style="margin-bottom:8px;">Create a mailbox</div>
+          <form id="boxForm" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <input id="boxAddress" type="text" placeholder={'someone@' + domainHint} required style="flex:1;min-width:220px;background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12.5px;font-family:'Geist Mono',monospace;padding:9px 12px;border-radius:8px;" />
+            <input id="boxName" type="text" placeholder="Display name" style="flex:1;min-width:150px;background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12.5px;padding:9px 12px;border-radius:8px;" />
+            <input id="boxQuota" type="text" placeholder="Quota, e.g. 5GB" style="width:150px;background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12.5px;padding:9px 12px;border-radius:8px;" />
+            <button type="submit" style="background:#FF4F00;color:#fff;border:none;font-size:12.5px;font-weight:700;padding:9px 18px;border-radius:8px;cursor:pointer;">Create</button>
+          </form>
+          <p id="boxError" style="display:none;font-size:12px;color:#fca5a5;margin:10px 0 0;line-height:1.6;"></p>
+        </div>
+      )}
+
+      <div class="admin-card" style="margin-bottom:16px;">
+        <div class="admin-card-title" style="margin-bottom:10px;">Mailboxes</div>
+        {boxRows.length === 0 ? (
+          <p style="font-size:12px;color:#8a8a94;margin:0;">No mailboxes yet.</p>
+        ) : (
+          <div style="display:flex;flex-direction:column;gap:8px;">
+            {boxRows.map((m: any) => (
+              <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:11px 13px;">
+                <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;">
+                  <div style="min-width:0;">
+                    <p style="font-size:13px;font-weight:700;color:#fff;margin:0;font-family:'Geist Mono',monospace;word-break:break-all;">{m.address}</p>
+                    <p style="font-size:11px;color:#8a8a94;margin:3px 0 0;">{m.name}</p>
+                  </div>
+                  <div style="display:flex;gap:8px;align-items:center;">
+                    <span style={'font-size:10px;font-weight:700;letter-spacing:0.08em;color:' + m.statusColor + ';'}>{m.status.toUpperCase()}</span>
+                    {mayManage && m.status !== 'deleted' && (
+                      <select class="box-status" data-id={m.id} style="background:#15151a;border:1px solid #2a2a2f;color:#d8d8de;font-size:11px;padding:4px 8px;border-radius:6px;">
+                        <option value="">Change state</option>
+                        <option value="active">Make active</option>
+                        <option value="disabled">Disable (keeps receiving)</option>
+                        <option value="suspended">Suspend (bounces mail)</option>
+                        <option value="deleted">Delete</option>
+                      </select>
+                    )}
+                  </div>
+                </div>
+                <p style="font-size:11px;color:#6e6e78;margin:6px 0 0;line-height:1.5;">{m.effect}</p>
+                <div style="margin-top:8px;">
+                  <div style="height:5px;background:#1a1a1f;border-radius:999px;overflow:hidden;">
+                    <div style={'height:100%;width:' + m.quotaPercent + '%;background:' + m.quotaColor + ';'}></div>
+                  </div>
+                  <p style="font-size:11px;color:#8a8a94;margin:5px 0 0;">{m.quotaLabel}</p>
+                </div>
+                {m.forwarding.length > 0 && (
+                  <p style="font-size:11.5px;color:#9aa6b6;margin:7px 0 0;">Forwards to <span style="font-family:'Geist Mono',monospace;color:#d8d8de;">{m.forwarding.join(', ')}</span>{m.keepCopy ? ' and keeps a copy' : ' without keeping a copy'}.</p>
+                )}
+                {m.autoReply && (
+                  <p style="font-size:11.5px;color:#9aa6b6;margin:5px 0 0;">Auto-reply is on{m.autoReplyWindow ? ' (' + m.autoReplyWindow + ')' : ''}.</p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        <p id="boxActionError" style="display:none;font-size:12px;color:#fca5a5;margin:10px 0 0;line-height:1.6;"></p>
+      </div>
+
+      {mayManage && domains.length > 0 && (
+        <div class="admin-card" style="margin-bottom:16px;">
+          <div class="admin-card-title" style="margin-bottom:8px;">Create an alias</div>
+          <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;line-height:1.6;">
+            An alias is an address that delivers into one or more existing mailboxes. Separate several destinations with commas.
+            Aliases that would form a delivery loop are refused before they are saved, including loops that close through a mailbox's forwarding rule.
+          </p>
+          <form id="aliasForm" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <input id="aliasSource" type="text" placeholder={'support@' + domainHint} required style="flex:1;min-width:200px;background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12.5px;font-family:'Geist Mono',monospace;padding:9px 12px;border-radius:8px;" />
+            <input id="aliasTargets" type="text" placeholder="one@..., two@..." required style="flex:1.4;min-width:220px;background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12.5px;font-family:'Geist Mono',monospace;padding:9px 12px;border-radius:8px;" />
+            <button type="submit" style="background:#FF4F00;color:#fff;border:none;font-size:12.5px;font-weight:700;padding:9px 18px;border-radius:8px;cursor:pointer;">Create</button>
+          </form>
+          <p id="aliasError" style="display:none;font-size:12px;color:#fca5a5;margin:10px 0 0;line-height:1.6;"></p>
+        </div>
+      )}
+
+      <div class="admin-card">
+        <div class="admin-card-title" style="margin-bottom:10px;">Aliases</div>
+        {aliasRows.length === 0 ? (
+          <p style="font-size:12px;color:#8a8a94;margin:0;">No aliases yet.</p>
+        ) : (
+          <div style="display:flex;flex-direction:column;gap:8px;">
+            {aliasRows.map((a: any) => (
+              <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:11px 13px;">
+                <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;">
+                  <p style="font-size:13px;font-weight:700;color:#fff;margin:0;font-family:'Geist Mono',monospace;word-break:break-all;">{a.source}</p>
+                  <div style="display:flex;gap:8px;align-items:center;">
+                    <span style={'font-size:10px;font-weight:700;letter-spacing:0.08em;color:' + (a.isActive ? '#6ee7b7' : '#a1a1aa') + ';'}>{a.isActive ? 'ACTIVE' : 'OFF'}</span>
+                    {mayManage && (
+                      <button type="button" class="alias-delete" data-id={a.id} style="background:#15151a;border:1px solid rgba(239,68,68,0.35);color:#fca5a5;font-size:11px;padding:4px 11px;border-radius:6px;cursor:pointer;">Remove</button>
+                    )}
+                  </div>
+                </div>
+                <p style="font-size:11.5px;color:#9aa6b6;margin:6px 0 0;">
+                  Delivers to <span style="font-family:'Geist Mono',monospace;color:#d8d8de;">{a.delivers.length > 0 ? a.delivers.join(', ') : 'nothing'}</span>
+                </p>
+                {a.external.length > 0 && (
+                  <p style="font-size:11.5px;color:#fbbf24;margin:4px 0 0;">Also leaves this organization to: <span style="font-family:'Geist Mono',monospace;">{a.external.join(', ')}</span></p>
+                )}
+                {a.undeliverable.length > 0 && (
+                  <p style="font-size:11.5px;color:#fca5a5;margin:4px 0 0;">Not delivered: {a.undeliverable.map((u: any) => u.address + ' - ' + u.reason).join('; ')}</p>
+                )}
+                {a.loops.length > 0 && (
+                  <p style="font-size:11.5px;color:#fca5a5;margin:4px 0 0;font-weight:700;">A delivery loop exists on this alias: {a.loops[0].join(' then ')}. Remove one link in that chain.</p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        <p id="aliasActionError" style="display:none;font-size:12px;color:#fca5a5;margin:10px 0 0;line-height:1.6;"></p>
+      </div>
+    </>
+  )}
+</div>
+
+<script>
+  function fail(id: string, message: string) {
+    const el = document.getElementById(id) as HTMLElement | null;
+    if (!el) return;
+    el.textContent = message;
+    el.style.display = 'block';
+  }
+
+  async function send(url: string, method: string, payload?: unknown) {
+    const r = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: payload ? JSON.stringify(payload) : undefined,
+    });
+    return r.json();
+  }
+
+  const boxForm = document.getElementById('boxForm');
+  if (boxForm) {
+    boxForm.addEventListener('submit', async (e: Event) => {
+      e.preventDefault();
+      const address = (document.getElementById('boxAddress') as HTMLInputElement).value.trim();
+      const name = (document.getElementById('boxName') as HTMLInputElement).value.trim();
+      const quota = (document.getElementById('boxQuota') as HTMLInputElement).value.trim();
+      const body = await send('/api/mail/mailboxes', 'POST', { address, name: name || address, quota: quota || null });
+      if (body.ok) window.location.reload();
+      else fail('boxError', body.error || 'The mailbox could not be created.');
+    });
+  }
+
+  document.querySelectorAll('.box-status').forEach((el) => {
+    el.addEventListener('change', async () => {
+      const select = el as HTMLSelectElement;
+      const status = select.value;
+      if (!status) return;
+      if (status === 'deleted' && !window.confirm('Delete this mailbox? Its address stays reserved so it cannot be given to somebody else, and stored messages are kept until an administrator purges them.')) {
+        select.value = '';
+        return;
+      }
+      const body = await send('/api/mail/mailboxes', 'PATCH', { id: select.getAttribute('data-id'), status });
+      if (body.ok) window.location.reload();
+      else {
+        fail('boxActionError', body.error || 'That change was refused.');
+        select.value = '';
+      }
+    });
+  });
+
+  const aliasForm = document.getElementById('aliasForm');
+  if (aliasForm) {
+    aliasForm.addEventListener('submit', async (e: Event) => {
+      e.preventDefault();
+      const source = (document.getElementById('aliasSource') as HTMLInputElement).value.trim();
+      const targets = (document.getElementById('aliasTargets') as HTMLInputElement).value
+        .split(',').map((s) => s.trim()).filter(Boolean);
+      const body = await send('/api/mail/aliases', 'POST', { source, targets });
+      if (body.ok) window.location.reload();
+      else fail('aliasError', body.error || 'The alias could not be created.');
+    });
+  }
+
+  document.querySelectorAll('.alias-delete').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!window.confirm('Remove this alias? Mail sent to it will start bouncing.')) return;
+      const r = await fetch('/api/mail/aliases?id=' + btn.getAttribute('data-id'), { method: 'DELETE' });
+      const body = await r.json();
+      if (body.ok) window.location.reload();
+      else fail('aliasActionError', body.error || 'That did not work.');
+    });
+  });
+</script>
+</AdminLayout>

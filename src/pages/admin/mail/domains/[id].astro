@@ -1,0 +1,601 @@
+---
+// /admin/mail/domains/:id — the setup wizard AND the health dashboard, on one page.
+//
+// They are the same screen on purpose. A separate "wizard" that a domain leaves once and never
+// returns to is a screen that lies six months later, when somebody deletes the SPF record. Here the
+// current step is derived from the last check every time the page loads, so the page a person opens
+// to fix a problem is the page that walked them through setup.
+//
+// Everything shown is decided in this frontmatter. The markup maps over arrays and reads strings —
+// no Record indexed inside JSX, and no arrow characters in JSX text, both of which break parsing.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { platformAuth } from '@/lib/mailplatform/adapters/auth-platform';
+import { domainView, WIZARD_STEPS } from '@/lib/mailplatform/domains/service';
+import { listAudit } from '@/lib/mailplatform/domains/store';
+import { can } from '@/lib/mailplatform/permissions';
+import { quotedTxt } from '@/lib/mailplatform/domains/dkim';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const causeOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+const domainId = String(Astro.params.id || '');
+
+const principal = await platformAuth().authenticate({ request: Astro.request, locals: Astro.locals });
+const mayRead = can(principal, 'domains.read');
+const mayManage = can(principal, 'domains.manage');
+
+let view: Awaited<ReturnType<typeof domainView>> = null;
+let loadError = '';
+let auditRows: any[] = [];
+if (principal && mayRead) {
+  try {
+    view = await domainView({ principal }, domainId);
+    if (view) auditRows = await listAudit(principal.orgId, domainId, 15);
+  } catch (e: any) {
+    loadError = causeOf(e);
+    console.error('[admin/mail/domains/:id] load failed -', loadError);
+  }
+}
+
+function statusColor(status: string): string {
+  if (status === 'pass') return '#6ee7b7';
+  if (status === 'warn') return '#fbbf24';
+  if (status === 'fail') return '#fca5a5';
+  return '#a1a1aa';
+}
+function statusLabel(status: string): string {
+  if (status === 'pass') return 'OK';
+  if (status === 'warn') return 'CHECK';
+  if (status === 'fail') return 'FIX';
+  return 'UNKNOWN';
+}
+const fmt = (d: string | null | undefined): string => {
+  if (!d) return 'never';
+  try {
+    return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+  } catch { return ''; }
+};
+
+// --- everything the markup renders, resolved here -------------------------
+const d = view ? view.domain : null;
+const health = view ? view.health : null;
+
+const steps = WIZARD_STEPS.map((s) => ({
+  ...s,
+  state: !view ? 'todo' : s.step < view.step ? 'done' : s.step === view.step ? 'now' : 'todo',
+  // A receive-only or send-only domain must not be left with a step it can never complete.
+  skipped: !!view && ((s.step === 4 && view.domain.purpose === 'sending') || (s.step === 3 && view.domain.purpose === 'receiving')),
+}));
+
+const recordRows = view
+  ? view.records.map((r) => ({
+      type: r.recordType,
+      host: r.host,
+      fqdn: r.fqdn,
+      value: r.value,
+      // The chunked-and-quoted form matters for a 2048-bit DKIM key, which is over the 255-byte
+      // limit for a single TXT string and which some DNS panels will not split for you.
+      quoted: r.value.length > 255 ? quotedTxt(r.value) : '',
+      ttl: String(r.ttl),
+      priority: r.priority === null ? '' : String(r.priority),
+      purpose: r.purpose,
+      required: r.isRequired,
+      explain: r.explain,
+    }))
+  : [];
+
+const checkCards = health
+  ? health.checks.map((c) => ({
+      title: c.label + (c.ref ? ' (' + c.ref + ')' : ''),
+      status: c.status,
+      color: statusColor(c.status),
+      label: statusLabel(c.status),
+      detail: c.detail,
+      expected: c.expected || '',
+      observed: c.observed || '',
+      advice: c.advice,
+      checked: c.checked,
+    }))
+  : [];
+
+const dkimRows = view
+  ? view.dkimKeys.map((k) => ({
+      id: k.id,
+      selector: k.selector,
+      algorithm: k.algorithm === 'ed25519-sha256' ? 'Ed25519' : 'RSA ' + (k.keySize || 2048),
+      status: k.status,
+      created: fmt(k.createdAt),
+      activated: k.activatedAt ? fmt(k.activatedAt) : '',
+      canActivate: k.status !== 'active' && k.status !== 'retired',
+      canRetire: k.status !== 'retired',
+    }))
+  : [];
+
+const identityRows = view ? view.identities : [];
+const ptrRows = view ? view.ptr : [];
+const spf = view ? view.spf : null;
+const dmarc = view ? view.dmarc : null;
+const canActivate = !!d && d.status === 'verified' && !!health && health.sendingReady && !d.sendingEnabled;
+const pageTitle = d ? d.domain : 'Domain';
+---
+<AdminLayout title={'Domain: ' + pageTitle} activeNav="mail">
+<div class="admin-page" style="max-width:1000px;">
+  <div class="admin-page-header" style="margin-bottom:18px;">
+    <div class="admin-page-title-block">
+      <div class="admin-page-eyebrow"><a href="/admin/mail/domains" style="color:#8a8a94;text-decoration:none;">Mail / Domains</a></div>
+      <h1 class="admin-page-title" style="font-family:'Geist Mono',monospace;">{pageTitle}</h1>
+      {view && <p class="admin-page-sub">{view.stepReason}</p>}
+    </div>
+  </div>
+
+  {!principal && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;">
+      <p style="font-size:12.5px;color:#fca5a5;margin:0;font-weight:700;">This account is not a member of a mail organization.</p>
+    </div>
+  )}
+
+  {principal && loadError && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fca5a5;margin:0 0 4px;">This domain could not be read.</p>
+      <p style="font-size:11.5px;color:#fca5a5;margin:0;font-family:'Geist Mono',monospace;">{loadError}</p>
+    </div>
+  )}
+
+  {principal && mayRead && !view && !loadError && (
+    <div class="admin-card">
+      <p style="font-size:13px;color:#d8d8de;margin:0;">This domain does not exist, or it belongs to another organization.</p>
+    </div>
+  )}
+
+  {view && d && (
+    <>
+      <!-- Wizard rail -->
+      <div class="admin-card" style="margin-bottom:16px;">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;">
+          {steps.map((s) => (
+            <div style={'background:#08080a;border:1px solid ' + (s.state === 'now' ? '#FF4F00' : '#1a1a1f') + ';border-radius:8px;padding:10px 11px;opacity:' + (s.skipped ? '0.45' : '1') + ';'}>
+              <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+                {s.state === 'done' ? (
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6ee7b7" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                ) : (
+                  <span style={'width:10px;height:10px;border-radius:50%;background:' + (s.state === 'now' ? '#FF4F00' : '#2a2a2f') + ';display:inline-block;'}></span>
+                )}
+                <span style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;">Step {s.step}</span>
+              </div>
+              <p style="font-size:12px;font-weight:700;color:#fff;margin:0 0 3px;">{s.title}</p>
+              <p style="font-size:10.5px;color:#8a8a94;margin:0;line-height:1.45;">{s.skipped ? 'Not needed for this domain.' : s.blurb}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <!-- Status strip: the three separate questions -->
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin-bottom:16px;">
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:12px 14px;">
+          <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 4px;">Ownership</p>
+          <p style={'font-size:14px;font-weight:700;margin:0;color:' + (health ? (health.ownershipVerified ? '#6ee7b7' : '#fca5a5') : '#a1a1aa') + ';'}>
+            {health ? (health.ownershipVerified ? 'Verified' : 'Not verified') : 'Not checked yet'}
+          </p>
+        </div>
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:12px 14px;">
+          <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 4px;">Sending</p>
+          <p style={'font-size:14px;font-weight:700;margin:0;color:' + (d.sendingEnabled ? '#6ee7b7' : health && health.sendingReady ? '#7dd3fc' : '#a1a1aa') + ';'}>
+            {d.sendingEnabled ? 'On' : health && health.sendingReady ? 'Ready, not switched on' : 'Not ready'}
+          </p>
+        </div>
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:12px 14px;">
+          <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 4px;">Receiving</p>
+          <p style={'font-size:14px;font-weight:700;margin:0;color:' + (health && health.receivingReady ? '#6ee7b7' : '#a1a1aa') + ';'}>
+            {health ? (health.receivingReady ? 'Mail arrives here' : 'Arrives elsewhere') : 'Not checked yet'}
+          </p>
+        </div>
+      </div>
+
+      <!-- Records to publish -->
+      <div class="admin-card" style="margin-bottom:16px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+          <div class="admin-card-title" style="margin:0;">DNS records to add</div>
+          <div style="display:flex;gap:8px;">
+            <button type="button" id="checkBtn" data-domain={d.id} style="background:#FF4F00;color:#fff;border:none;font-size:12px;font-weight:700;padding:7px 16px;border-radius:7px;cursor:pointer;">Check now</button>
+          </div>
+        </div>
+        <p style="font-size:12px;color:#8a8a94;margin:0 0 12px;line-height:1.6;">
+          Add these at whoever manages DNS for this domain. Publishing them does not move your mail: only the MX record changes where mail arrives, and it is listed separately below.
+          DNS changes usually appear within minutes and can take up to an hour.
+        </p>
+        <div id="checkResult" style="display:none;font-size:12px;margin:0 0 12px;padding:9px 11px;border-radius:8px;"></div>
+
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          {recordRows.map((r) => (
+            <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px;">
+                <span style="font-size:10px;font-weight:700;letter-spacing:0.08em;color:#FF7040;background:rgba(255,79,0,0.12);padding:2px 8px;border-radius:999px;">{r.type}</span>
+                <span style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#6e6e78;">{r.purpose}</span>
+                {!r.required && <span style="font-size:10px;color:#6e6e78;">optional</span>}
+              </div>
+              <div style="display:grid;grid-template-columns:70px 1fr;gap:4px 10px;font-family:'Geist Mono',monospace;font-size:11.5px;">
+                <span style="color:#6e6e78;">Name</span><span style="color:#d8d8de;word-break:break-all;">{r.host}</span>
+                {r.priority && <span style="color:#6e6e78;">Priority</span>}
+                {r.priority && <span style="color:#d8d8de;">{r.priority}</span>}
+                <span style="color:#6e6e78;">Value</span>
+                <span style="color:#FF7040;word-break:break-all;" class="record-value">{r.value}</span>
+                <span style="color:#6e6e78;">TTL</span><span style="color:#d8d8de;">{r.ttl}</span>
+              </div>
+              {r.quoted && (
+                <details style="margin-top:8px;">
+                  <summary style="font-size:11px;color:#8a8a94;cursor:pointer;">This value is longer than 255 characters. Some DNS panels need it split.</summary>
+                  <code style="display:block;margin-top:6px;font-family:'Geist Mono',monospace;font-size:11px;color:#9aa6b6;background:#0f0f14;border:1px solid #1a1a1f;padding:8px 10px;border-radius:6px;word-break:break-all;">{r.quoted}</code>
+                </details>
+              )}
+              <p style="font-size:11.5px;color:#8a8a94;margin:8px 0 0;line-height:1.55;">{r.explain}</p>
+            </div>
+          ))}
+          {recordRows.length === 0 && (
+            <p style="font-size:12px;color:#8a8a94;margin:0;">No records can be generated: this deployment has not been told where its mail leaves from. Nothing is printed rather than printing a hostname for infrastructure that does not exist.</p>
+          )}
+        </div>
+      </div>
+
+      <!-- SPF merge -->
+      {spf && (
+        <div class="admin-card" style="margin-bottom:16px;">
+          <div class="admin-card-title" style="margin-bottom:8px;">SPF</div>
+          {spf.action === 'manual' ? (
+            <div style="background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.30);border-radius:8px;padding:11px 13px;">
+              <p style="font-size:12px;color:#fbbf24;margin:0;line-height:1.6;font-weight:600;">This one needs a person.</p>
+              <p style="font-size:12px;color:#d8d8de;margin:6px 0 0;line-height:1.6;">{spf.manualReason}</p>
+              {spf.preserved.length > 0 && (
+                <div style="margin-top:8px;font-family:'Geist Mono',monospace;font-size:11px;color:#9aa6b6;">
+                  {spf.preserved.map((p: string) => <div style="word-break:break-all;">{p}</div>)}
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
+              <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;line-height:1.6;">
+                {spf.action === 'unchanged'
+                  ? 'Your SPF record already authorises this platform. Nothing to change.'
+                  : spf.action === 'create'
+                    ? 'No SPF record is published yet. Add this one.'
+                    : 'You already have an SPF record. This is that record with our sending servers added to it, and nothing removed. Replace the existing record with this value.'}
+              </p>
+              <code style="display:block;font-family:'Geist Mono',monospace;background:#08080a;border:1px solid #2a2a2f;color:#FF7040;padding:9px 12px;border-radius:6px;font-size:11.5px;word-break:break-all;">{spf.record}</code>
+              {spf.additions.length > 0 && (
+                <p style="font-size:11.5px;color:#8a8a94;margin:8px 0 0;">Added: <span style="font-family:'Geist Mono',monospace;color:#6ee7b7;">{spf.additions.join(' ')}</span></p>
+              )}
+              {spf.warnings.length > 0 && (
+                <ul style="font-size:11.5px;color:#fbbf24;margin:8px 0 0;padding-left:18px;line-height:1.6;">
+                  {spf.warnings.map((w: string) => <li>{w}</li>)}
+                </ul>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      <!-- DKIM -->
+      <div class="admin-card" style="margin-bottom:16px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+          <div class="admin-card-title" style="margin:0;">DKIM signing keys</div>
+          {mayManage && (
+            <button type="button" id="genDkim" data-domain={d.id} style="background:#15151a;border:1px solid #2a2a2f;color:#d8d8de;font-size:11.5px;font-weight:600;padding:6px 14px;border-radius:7px;cursor:pointer;">Generate a key</button>
+          )}
+        </div>
+        <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;line-height:1.6;">
+          A signing key has two halves. The public half goes in your DNS, above. The private half stays here, encrypted, and is never shown or sent anywhere; there is no way to export it, deliberately.
+          To replace a key, generate a new one and retire the old one after a few days rather than overwriting it, or mail already on its way stops verifying.
+        </p>
+        <div id="dkimResult" style="display:none;font-size:12px;margin:0 0 10px;padding:9px 11px;border-radius:8px;"></div>
+        {dkimRows.length === 0 ? (
+          <p style="font-size:12px;color:#8a8a94;margin:0;">No signing key yet. Generate one, then publish the record it produces.</p>
+        ) : (
+          <div style="display:flex;flex-direction:column;gap:8px;">
+            {dkimRows.map((k) => (
+              <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;">
+                <div>
+                  <p style="font-size:12.5px;font-weight:700;color:#fff;margin:0 0 3px;font-family:'Geist Mono',monospace;">{k.selector}</p>
+                  <p style="font-size:11px;color:#8a8a94;margin:0;">{k.algorithm} &middot; created {k.created}{k.activated ? ' - active since ' + k.activated : ''}</p>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;">
+                  <span style={'font-size:10px;font-weight:700;letter-spacing:0.08em;padding:3px 9px;border-radius:999px;color:' + (k.status === 'active' ? '#6ee7b7' : k.status === 'retired' ? '#a1a1aa' : '#fbbf24') + ';background:rgba(255,255,255,0.05);'}>{k.status.toUpperCase()}</span>
+                  {mayManage && k.canActivate && (
+                    <button type="button" class="dkim-action" data-key={k.id} data-domain={d.id} data-action="activate" style="background:#15151a;border:1px solid #2a2a2f;color:#d8d8de;font-size:11px;padding:4px 11px;border-radius:6px;cursor:pointer;">Use for signing</button>
+                  )}
+                  {mayManage && k.canRetire && (
+                    <button type="button" class="dkim-action" data-key={k.id} data-domain={d.id} data-action="retire" style="background:#15151a;border:1px solid #2a2a2f;color:#fca5a5;font-size:11px;padding:4px 11px;border-radius:6px;cursor:pointer;">Retire</button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <!-- DMARC -->
+      {dmarc && (
+        <div class="admin-card" style="margin-bottom:16px;">
+          <div class="admin-card-title" style="margin-bottom:8px;">DMARC</div>
+          <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;line-height:1.6;">
+            DMARC tells other mail systems what to do with a message that claims to be from this domain and fails the checks above.
+            Currently published: <strong style="color:#d8d8de;">{view.publishedDmarcPolicy ? 'p=' + view.publishedDmarcPolicy : 'nothing'}</strong>.
+          </p>
+          <code style="display:block;font-family:'Geist Mono',monospace;background:#08080a;border:1px solid #2a2a2f;color:#FF7040;padding:9px 12px;border-radius:6px;font-size:11.5px;word-break:break-all;">{dmarc.record}</code>
+          {view.dmarcNext && (
+            <div style="margin-top:10px;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">
+              <p style="font-size:11.5px;color:#d8d8de;margin:0 0 8px;line-height:1.6;">{view.dmarcNext.why}</p>
+              {mayManage && (
+                <button type="button" id="dmarcBtn" data-domain={d.id} data-policy={view.dmarcNext.policy} style="background:#15151a;border:1px solid #2a2a2f;color:#d8d8de;font-size:11.5px;font-weight:600;padding:6px 14px;border-radius:7px;cursor:pointer;">Record the intention to move to p={view.dmarcNext.policy}</button>
+              )}
+              <p style="font-size:11px;color:#6e6e78;margin:8px 0 0;line-height:1.55;">Recording an intention here does not change your DNS. We do not hold your registrar credentials and cannot publish anything on your behalf; you publish the record above yourself.</p>
+            </div>
+          )}
+          <div id="dmarcResult" style="display:none;font-size:12px;margin:10px 0 0;padding:9px 11px;border-radius:8px;"></div>
+          {dmarc.warnings.length > 0 && (
+            <ul style="font-size:11.5px;color:#fbbf24;margin:8px 0 0;padding-left:18px;line-height:1.6;">
+              {dmarc.warnings.map((w: string) => <li>{w}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
+
+      <!-- Health dashboard -->
+      <div class="admin-card" style="margin-bottom:16px;">
+        <div class="admin-card-title" style="margin-bottom:8px;">Health</div>
+        {!health ? (
+          <p style="font-size:12px;color:#8a8a94;margin:0;">No check has been run yet. Press "Check now" above.</p>
+        ) : (
+          <>
+            <p style="font-size:11.5px;color:#6e6e78;margin:0 0 10px;">Last checked {fmt(health.checkedAt)}.</p>
+            {health.unchecked.length > 0 && (
+              <div style="background:rgba(161,161,170,0.10);border:1px solid rgba(161,161,170,0.30);border-radius:8px;padding:10px 12px;margin-bottom:10px;">
+                <p style="font-size:12px;font-weight:700;color:#d4d4d8;margin:0 0 5px;">Some lookups did not complete, so those are shown as unknown rather than as faults.</p>
+                <ul style="font-size:11px;color:#a1a1aa;margin:0;padding-left:18px;line-height:1.65;font-family:'Geist Mono',monospace;">
+                  {health.unchecked.map((u: string) => <li>{u}</li>)}
+                </ul>
+              </div>
+            )}
+            <div style="display:flex;flex-direction:column;gap:8px;">
+              {checkCards.map((c) => (
+                <div style={'background:#08080a;border:1px solid ' + (c.status === 'fail' ? 'rgba(239,68,68,0.28)' : '#1a1a1f') + ';border-radius:8px;padding:10px 12px;'}>
+                  <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;">
+                    <p style="font-size:12.5px;font-weight:700;color:#fff;margin:0;">{c.title}</p>
+                    <span style={'font-size:10px;font-weight:700;letter-spacing:0.08em;color:' + c.color + ';'}>{c.label}</span>
+                  </div>
+                  <p style="font-size:12px;color:#d8d8de;margin:5px 0 0;line-height:1.6;">{c.detail}</p>
+                  {c.observed && (
+                    <p style="font-size:11px;color:#9aa6b6;margin:6px 0 0;font-family:'Geist Mono',monospace;word-break:break-all;">Found: {c.observed}</p>
+                  )}
+                  {c.advice.length > 0 && (
+                    <ul style="font-size:11.5px;color:#8a8a94;margin:6px 0 0;padding-left:18px;line-height:1.6;">
+                      {c.advice.map((a: string) => <li>{a}</li>)}
+                    </ul>
+                  )}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      <!-- PTR -->
+      {ptrRows.length > 0 && (
+        <div class="admin-card" style="margin-bottom:16px;">
+          <div class="admin-card-title" style="margin-bottom:8px;">Reverse DNS (PTR)</div>
+          <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;line-height:1.6;">
+            Reverse DNS lives with whoever owns the sending IP address, not with your domain. It cannot be set from this page and nothing here will change it. It is shown because several large receivers refuse mail from an address whose reverse DNS is missing or wrong.
+          </p>
+          {ptrRows.map((p) => (
+            <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;font-family:'Geist Mono',monospace;font-size:11.5px;">
+              <div style="display:grid;grid-template-columns:90px 1fr;gap:4px 10px;">
+                <span style="color:#6e6e78;">Address</span><span style="color:#d8d8de;">{p.ip}</span>
+                <span style="color:#6e6e78;">Should be</span><span style="color:#FF7040;">{p.expected || 'not configured for this deployment'}</span>
+              </div>
+              <p style="font-family:inherit;font-size:11px;color:#8a8a94;margin:8px 0 0;line-height:1.55;font-family:system-ui,sans-serif;">Set by {p.controlledBy}</p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <!-- Identities -->
+      <div class="admin-card" style="margin-bottom:16px;">
+        <div class="admin-card-title" style="margin-bottom:8px;">Sending identities on this domain</div>
+        <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;line-height:1.6;">The From addresses mail may be sent as. An identity can exist before the domain is ready; it cannot send until the domain is.</p>
+        {mayManage && (
+          <form id="identityForm" data-domain={d.domain} style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+            <input id="idLocal" type="text" placeholder="talent" required style="width:130px;background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12.5px;font-family:'Geist Mono',monospace;padding:8px 11px;border-radius:7px;" />
+            <span style="align-self:center;color:#6e6e78;font-family:'Geist Mono',monospace;font-size:12.5px;">@{d.domain}</span>
+            <input id="idName" type="text" placeholder="Display name" style="flex:1;min-width:150px;background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12.5px;padding:8px 11px;border-radius:7px;" />
+            <input id="idPurpose" type="text" placeholder="Purpose (e.g. recruitment)" style="flex:1;min-width:150px;background:#08080a;border:1px solid #2a2a2f;color:#fff;font-size:12.5px;padding:8px 11px;border-radius:7px;" />
+            <button type="submit" style="background:#15151a;border:1px solid #2a2a2f;color:#d8d8de;font-size:12px;font-weight:600;padding:8px 16px;border-radius:7px;cursor:pointer;">Add</button>
+          </form>
+        )}
+        <div id="identityResult" style="display:none;font-size:12px;margin:0 0 10px;padding:9px 11px;border-radius:8px;"></div>
+        {identityRows.length === 0 ? (
+          <p style="font-size:12px;color:#8a8a94;margin:0;">No sending identities on this domain yet.</p>
+        ) : (
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            {identityRows.map((i) => (
+              <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;">
+                <div>
+                  <p style="font-size:12.5px;color:#fff;margin:0;font-family:'Geist Mono',monospace;">{i.fromAddress}</p>
+                  <p style="font-size:11px;color:#8a8a94;margin:3px 0 0;">{i.fromName || 'no display name'}{i.purpose ? ' - ' + i.purpose : ''}</p>
+                </div>
+                <span style={'font-size:10.5px;font-weight:700;color:' + (i.isVerified ? '#6ee7b7' : '#fbbf24') + ';'}>{i.isVerified ? 'READY' : 'WAITING ON DOMAIN'}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <!-- Lifecycle actions -->
+      {mayManage && (
+        <div class="admin-card" style="margin-bottom:16px;">
+          <div class="admin-card-title" style="margin-bottom:8px;">This domain</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            {canActivate && (
+              <button type="button" class="lifecycle" data-domain={d.id} data-action="activate" style="background:#FF4F00;color:#fff;border:none;font-size:12px;font-weight:700;padding:8px 16px;border-radius:7px;cursor:pointer;">Turn sending on</button>
+            )}
+            {d.sendingEnabled && (
+              <button type="button" class="lifecycle" data-domain={d.id} data-action="deactivate" style="background:#15151a;border:1px solid #2a2a2f;color:#d8d8de;font-size:12px;font-weight:600;padding:8px 16px;border-radius:7px;cursor:pointer;">Stop sending</button>
+            )}
+            {d.lifecycle === 'SUSPENDED' ? (
+              <button type="button" class="lifecycle" data-domain={d.id} data-action="resume" style="background:#15151a;border:1px solid #2a2a2f;color:#d8d8de;font-size:12px;font-weight:600;padding:8px 16px;border-radius:7px;cursor:pointer;">Resume</button>
+            ) : (
+              <button type="button" class="lifecycle" data-domain={d.id} data-action="suspend" style="background:#15151a;border:1px solid #2a2a2f;color:#fbbf24;font-size:12px;font-weight:600;padding:8px 16px;border-radius:7px;cursor:pointer;">Suspend</button>
+            )}
+            <button type="button" id="removeBtn" data-domain={d.id} style="background:#15151a;border:1px solid rgba(239,68,68,0.35);color:#fca5a5;font-size:12px;font-weight:600;padding:8px 16px;border-radius:7px;cursor:pointer;margin-left:auto;">Remove domain</button>
+          </div>
+          <div id="lifecycleResult" style="display:none;font-size:12px;margin:10px 0 0;padding:9px 11px;border-radius:8px;"></div>
+          {!canActivate && !d.sendingEnabled && (
+            <p style="font-size:11.5px;color:#8a8a94;margin:10px 0 0;line-height:1.6;">Sending cannot be switched on until the checks confirm that SPF authorises this platform and a DKIM key is published.</p>
+          )}
+        </div>
+      )}
+
+      <!-- Audit -->
+      {auditRows.length > 0 && (
+        <div class="admin-card">
+          <div class="admin-card-title" style="margin-bottom:8px;">Changes to this domain</div>
+          <div style="display:flex;flex-direction:column;gap:5px;font-family:'Geist Mono',monospace;font-size:11px;">
+            {auditRows.map((a: any) => (
+              <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;background:#08080a;border:1px solid #1a1a1f;border-radius:6px;padding:7px 10px;">
+                <span style="color:#d8d8de;">{a.action}</span>
+                <span style="color:#6e6e78;">{a.actor_name || a.actor_email || 'system'} &middot; {fmt(a.created_at)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </>
+  )}
+</div>
+
+<script>
+  // One helper, four buttons. All at the top level: a <script> inside a JSX conditional breaks
+  // .astro parsing, so the handlers guard on the element being present instead.
+  function show(id: string, ok: boolean, message: string) {
+    const el = document.getElementById(id) as HTMLElement | null;
+    if (!el) return;
+    el.style.display = 'block';
+    el.style.background = ok ? 'rgba(16,185,129,0.10)' : 'rgba(239,68,68,0.10)';
+    el.style.border = '1px solid ' + (ok ? 'rgba(16,185,129,0.30)' : 'rgba(239,68,68,0.30)');
+    el.style.color = ok ? '#6ee7b7' : '#fca5a5';
+    el.textContent = message;
+  }
+
+  async function send(url: string, method: string, payload?: unknown) {
+    const r = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: payload ? JSON.stringify(payload) : undefined,
+    });
+    return { status: r.status, body: await r.json() };
+  }
+
+  const checkBtn = document.getElementById('checkBtn');
+  if (checkBtn) {
+    checkBtn.addEventListener('click', async () => {
+      const id = checkBtn.getAttribute('data-domain');
+      checkBtn.textContent = 'Checking...';
+      checkBtn.setAttribute('disabled', 'true');
+      try {
+        const res = await send('/api/mail/domains/' + id + '/verify', 'POST', {});
+        if (res.body.ok) {
+          show('checkResult', true, 'Checked. Reloading with the results.');
+          window.location.reload();
+        } else {
+          show('checkResult', false, res.body.error || 'The checks could not be run.');
+        }
+      } catch (e) {
+        show('checkResult', false, 'The request did not reach the server: ' + String(e));
+      }
+      checkBtn.textContent = 'Check now';
+      checkBtn.removeAttribute('disabled');
+    });
+  }
+
+  const genDkim = document.getElementById('genDkim');
+  if (genDkim) {
+    genDkim.addEventListener('click', async () => {
+      const id = genDkim.getAttribute('data-domain');
+      genDkim.textContent = 'Generating...';
+      genDkim.setAttribute('disabled', 'true');
+      try {
+        const res = await send('/api/mail/domains/' + id + '/dkim', 'POST', { algorithm: 'rsa-sha256', keySize: 2048 });
+        if (res.body.ok) window.location.reload();
+        else show('dkimResult', false, res.body.error || 'The key could not be generated.');
+      } catch (e) {
+        show('dkimResult', false, 'The request did not reach the server: ' + String(e));
+      }
+      genDkim.textContent = 'Generate a key';
+      genDkim.removeAttribute('disabled');
+    });
+  }
+
+  document.querySelectorAll('.dkim-action').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const action = btn.getAttribute('data-action');
+      if (action === 'retire' && !window.confirm('Retire this key? Its private half is destroyed and mail still signed with it will stop verifying once you remove the DNS record.')) return;
+      const res = await send('/api/mail/domains/' + btn.getAttribute('data-domain') + '/dkim', 'PATCH', {
+        keyId: btn.getAttribute('data-key'),
+        action,
+      });
+      if (res.body.ok) window.location.reload();
+      else show('dkimResult', false, res.body.error || 'That did not work.');
+    });
+  });
+
+  const dmarcBtn = document.getElementById('dmarcBtn');
+  if (dmarcBtn) {
+    dmarcBtn.addEventListener('click', async () => {
+      const id = dmarcBtn.getAttribute('data-domain');
+      const policy = dmarcBtn.getAttribute('data-policy');
+      let res = await send('/api/mail/domains/' + id, 'PATCH', { action: 'settings', dmarcPolicy: policy });
+      if (res.status === 409 && res.body.code === 'confirmation_required') {
+        if (!window.confirm(res.body.error + '\n\nRecord this intention anyway?')) return;
+        res = await send('/api/mail/domains/' + id, 'PATCH', { action: 'settings', dmarcPolicy: policy, confirm: true });
+      }
+      if (res.body.ok) window.location.reload();
+      else show('dmarcResult', false, res.body.error || 'That did not work.');
+    });
+  }
+
+  document.querySelectorAll('.lifecycle').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const res = await send('/api/mail/domains/' + btn.getAttribute('data-domain'), 'PATCH', { action: btn.getAttribute('data-action') });
+      if (res.body.ok) window.location.reload();
+      else show('lifecycleResult', false, res.body.error || 'That did not work.');
+    });
+  });
+
+  const removeBtn = document.getElementById('removeBtn');
+  if (removeBtn) {
+    removeBtn.addEventListener('click', async () => {
+      if (!window.confirm('Remove this domain? Mail will no longer be sent or received for it. Its DNS records stay where they are; you can delete them at your DNS host afterwards.')) return;
+      const r = await fetch('/api/mail/domains/' + removeBtn.getAttribute('data-domain'), { method: 'DELETE' });
+      const body = await r.json();
+      if (body.ok) window.location.href = '/admin/mail/domains';
+      else show('lifecycleResult', false, body.error || 'That did not work.');
+    });
+  }
+
+  const identityForm = document.getElementById('identityForm');
+  if (identityForm) {
+    identityForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const domain = identityForm.getAttribute('data-domain');
+      const local = (document.getElementById('idLocal') as HTMLInputElement).value.trim();
+      if (!local) return;
+      const res = await send('/api/mail/identities', 'POST', {
+        fromAddress: local + '@' + domain,
+        fromName: (document.getElementById('idName') as HTMLInputElement).value.trim() || null,
+        purpose: (document.getElementById('idPurpose') as HTMLInputElement).value.trim() || null,
+      });
+      if (res.body.ok) window.location.reload();
+      else show('identityResult', false, res.body.error || 'The identity could not be created.');
+    });
+  }
+</script>
+</AdminLayout>
