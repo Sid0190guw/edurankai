@@ -215,14 +215,36 @@ export interface CourseGrade {
  *    2. drop-lowest drops by PERCENTAGE, not by raw points, because a 9/10 quiz and a 60/100 exam
  *       are not comparable in points.
  *  Pure. */
+export const UNCATEGORISED_ID = '__uncategorised__';
+
 export function courseGrade(categories: CategorySpec[], scores: ScoreRow[], scale: Band[] = DEFAULT_SCALE): CourseGrade {
-  const specs = categories.length
-    ? categories
+  const specs: CategorySpec[] = categories.length
+    ? categories.slice()
     : [{ id: '__all__', name: 'All work', weight: 100, dropLowest: 0 }];
 
+  // WORK THAT BELONGS TO NO CATEGORY GETS ITS OWN BUCKET, NOT SOMEBODY ELSE'S.
+  //
+  // The callers used to map a null category onto `specs[0]`, so an assignment an instructor simply
+  // had not filed landed in whichever category happened to sort first — silently, taking that
+  // category's weight, and producing a course percentage nobody could account for. Excluding it
+  // instead would have been the opposite error: graded work vanishing from a learner's grade with
+  // no trace.
+  //
+  // So it becomes a visible category of its own, carrying whatever weight the named categories left
+  // unclaimed. If they already add to 100 the residual is zero, the work does not move the grade,
+  // and the gradebook shows a row saying exactly that — which is an instructor's setup mistake made
+  // legible rather than absorbed.
+  if (categories.length && scores.some((s) => !s.categoryId)) {
+    const claimed = categories.reduce((sum, c) => sum + (Number(c.weight) || 0), 0);
+    specs.push({ id: UNCATEGORISED_ID, name: 'Uncategorised', weight: round2(Math.max(0, 100 - claimed)), dropLowest: 0 });
+  }
+
   const results: CategoryResult[] = specs.map((spec) => {
-    const mine = scores.filter((s) => (categories.length ? s.categoryId === spec.id : true))
-      .filter((s) => s.counted !== false && s.total > 0);
+    const mine = scores.filter((s) => {
+      if (!categories.length) return true;
+      if (spec.id === UNCATEGORISED_ID) return !s.categoryId;
+      return s.categoryId === spec.id;
+    }).filter((s) => s.counted !== false && s.total > 0);
     let kept = mine;
     let dropped = 0;
     if (spec.dropLowest > 0 && mine.length > spec.dropLowest) {

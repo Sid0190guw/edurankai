@@ -357,7 +357,7 @@ export async function gradeForLearner(courseId: string, userId: string, opts: { 
   }));
   const scores: ScoreRow[] = scoreRows
     .filter((r: any) => r.points != null && !r.excused)
-    .map((r: any) => ({ categoryId: r.category_id || (specs[0]?.id ?? null), points: Number(r.points), total: Number(r.total || 0) }));
+    .map((r: any) => ({ categoryId: r.category_id || null, points: Number(r.points), total: Number(r.total || 0) }));
 
   const scale = await courseScale(courseId);
   const grade = courseGrade(specs, scores, scale);
@@ -412,7 +412,7 @@ export async function gradebookMatrix(courseId: string, sectionId: string | null
       .filter((c) => c.points != null && !c.excused)
       .map((c) => {
         const a = assignments.find((x: any) => x.id === c.assignmentId);
-        return { categoryId: a?.category_id || (specs[0]?.id ?? null), points: c.points as number, total: Number(a?.points || 0) };
+        return { categoryId: a?.category_id || null, points: c.points as number, total: Number(a?.points || 0) };
       });
     const total = courseGrade(specs, scores, scale);
     return { userId: s.user_id, name: s.name || '(no name)', email: s.email, cells, total };

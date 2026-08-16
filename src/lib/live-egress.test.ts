@@ -48,6 +48,14 @@ describe('refusalOf', () => {
     expect(isAlreadyThere(refusalOf(500, {}))).toBe(false);
   });
 
+  // The signal is a FIELD, not the sentence. Reword the copy — which somebody will, it is copy —
+  // and a prose match would silently turn "already ended" back into a failure a teacher sees.
+  it('survives the reason sentence being rewritten', () => {
+    const r = refusalOf(400, { error: { errors: [{ reason: 'redundantTransition' }] } });
+    r.reason = 'Completely different wording chosen by a designer.';
+    expect(isAlreadyThere(r)).toBe(true);
+  });
+
   it('survives a body that is not json at all', () => {
     const r = refusalOf(502, '<html>gateway</html>');
     expect(r.kind).toBe('upstream');

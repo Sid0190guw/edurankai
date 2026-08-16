@@ -48,6 +48,13 @@ export interface LiveEgressRefusal {
   kind: LiveEgressErrorKind;
   /** A complete sentence for a person. Brand-free — it never names the platform. */
   reason: string;
+  /**
+   * True when the request failed only because the outcome had already happened. Callers treat that
+   * as success. It is a FIELD rather than something read out of `reason`, because `reason` is copy
+   * shown to a person: rewording it — which somebody will, it is a sentence — would silently turn
+   * "already ended" back into a failure a teacher sees.
+   */
+  alreadyThere?: boolean;
   /** What the platform actually said, for the log. Never rendered. */
   detail?: string;
 }
@@ -173,8 +180,9 @@ export function refusalOf(status: number, body: any): LiveEgressRefusal {
     return { ok: false, kind: 'stream_inactive', detail: raw, reason: 'The class cannot go live yet because the streaming software has not started sending video. Start the encoder first, then try again.' };
   }
   if (has('redundanttransition')) {
-    // Not a failure: it is already where we asked it to go. Callers treat this as success.
-    return { ok: false, kind: 'upstream', detail: raw, reason: 'The class was already in that state.' };
+    // Not a failure: it is already where we asked it to go. Callers treat this as success, and they
+    // find that out from `alreadyThere`, NOT by reading the sentence — see isAlreadyThere().
+    return { ok: false, kind: 'upstream', alreadyThere: true, detail: raw, reason: 'The class was already in that state.' };
   }
   if (status === 403) {
     return { ok: false, kind: 'not_permitted', detail: raw, reason: 'The streaming service refused this action for the connected channel.' };
@@ -184,7 +192,7 @@ export function refusalOf(status: number, body: any): LiveEgressRefusal {
 
 /** True when a refusal means "already done", which callers should treat as success. Pure. */
 export function isAlreadyThere(r: LiveEgressRefusal): boolean {
-  return r.kind === 'upstream' && /already in that state/i.test(r.reason);
+  return r.alreadyThere === true;
 }
 
 /**

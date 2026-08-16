@@ -159,6 +159,40 @@ describe('courseGrade', () => {
     expect(g.pct).toBe(80);
   });
 
+  // WORK AN INSTRUCTOR NEVER FILED USED TO BE COUNTED IN WHICHEVER CATEGORY SORTED FIRST.
+  // Silently, taking that category's weight, producing a course percentage nobody could account
+  // for. It now gets its own visible bucket carrying the weight the named categories left unclaimed.
+  it('does not smuggle uncategorised work into the first category', () => {
+    const g = courseGrade(cats, [
+      { categoryId: 'hw', points: 100, total: 100 },
+      { categoryId: 'exam', points: 100, total: 100 },
+      { categoryId: null, points: 0, total: 100 },   // a zero that must not drag Homework down
+    ]);
+    expect(g.categories.find((c) => c.id === 'hw')!.pct).toBe(100);
+    expect(g.pct).toBe(100);   // the named categories add to 100, so the stray work has no weight
+  });
+
+  it('shows the uncategorised bucket so the setup mistake is visible rather than absorbed', () => {
+    const g = courseGrade(cats, [{ categoryId: 'hw', points: 90, total: 100 }, { categoryId: null, points: 50, total: 100 }]);
+    const stray = g.categories.find((c) => c.name === 'Uncategorised');
+    expect(stray).toBeTruthy();
+    expect(stray!.pct).toBe(50);
+    expect(stray!.weight).toBe(0);
+  });
+
+  it('gives uncategorised work the unclaimed weight when the categories do not add to 100', () => {
+    const light = [{ id: 'hw', name: 'Homework', weight: 60, dropLowest: 0 }];
+    const g = courseGrade(light, [{ categoryId: 'hw', points: 100, total: 100 }, { categoryId: null, points: 0, total: 100 }]);
+    const stray = g.categories.find((c) => c.name === 'Uncategorised')!;
+    expect(stray.weight).toBe(40);
+    expect(g.pct).toBe(60);   // 100 * 0.6 + 0 * 0.4
+  });
+
+  it('adds no bucket at all when every score is filed', () => {
+    const g = courseGrade(cats, [{ categoryId: 'hw', points: 90, total: 100 }]);
+    expect(g.categories.some((c) => c.name === 'Uncategorised')).toBe(false);
+  });
+
   it('ignores zero-point assignments instead of dividing by them', () => {
     const g = courseGrade([], [{ categoryId: null, points: 0, total: 0 }, { categoryId: null, points: 5, total: 10 }]);
     expect(g.pct).toBe(50);
