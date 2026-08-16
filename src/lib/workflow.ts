@@ -2745,16 +2745,33 @@ export async function resumeWorkflow(
  * WHEN THE GRAPH NAMES NOBODY ABOVE THEM, THE STEP STAYS EXACTLY AS IT IS and the refusal says so.
  * It is never auto-approved, never handed to a capability holder and never handed to a role.
  *
- * NO ENTITLEMENT CHECK HERE, AND THE CALLER MUST PROVIDE ONE. `user` is taken for the audit trail
- * only — unlike cancelWorkflow(), this does not test the requester or the domain capability. What
- * limits it is that it CANNOT DECIDE ANYTHING: it only ADDS an approver the graph already places
- * above the stalled one, leaves the original pending, and refuses to fire twice on one step.
- * /admin/hr/leave/workflow gates it behind the `leave` section at edit level. Any NEW caller must
- * bring its own gate; there is none inside this function.
+ * ENTITLEMENT IS ASKED HERE, through mayAct() — the same Layer 2 entry point decideStep() uses.
+ *
+ * IT DID NOT USE TO BE. This function documented that it had no check and that "any NEW caller must
+ * bring its own gate", and two new callers then arrived without one:
+ * /portal/employee/schedule/approvals and /portal/employee/credits/approvals both pass a
+ * form-supplied step id straight through behind nothing but requireEmployee(). Any signed-in
+ * employee could post any step id, in any of the twenty workflow domains, and pull a stranger into
+ * an approval circle — sending that person a notification naming somebody else's request.
+ *
+ * A contract that lives only in a comment is not a control. The check moved inside, so it holds for
+ * every caller that exists and every caller that has not been written yet. It is deliberately the
+ * SAME three arms as deciding — routed approver, their in-force delegate, or the domain's standing
+ * capability — because escalation changes who may decide, which is the same class of power. The
+ * admin callers (/admin/hr/leave/workflow, /admin/finance/invoices/[id]) pass through arm 3 exactly
+ * as they did before, so their behaviour is unchanged.
+ *
+ * WHAT STILL LIMITS IT beyond entitlement: it CANNOT DECIDE ANYTHING. It only ADDS an approver the
+ * graph already places above the stalled one, leaves the original pending, and refuses to fire twice
+ * on one step.
+ *
+ * NOT ADMITTED, AND THAT IS A POLICY QUESTION RATHER THAN AN OVERSIGHT: the SUBJECT of the request
+ * cannot escalate their own stalled approval. Letting them would widen the circle on their own
+ * request, and this module's own note on double-escalation says why that is not a free action.
  */
 export async function escalateStep(
   stepId: string,
-  user: { id?: string | null } | null | undefined,
+  user: { id?: string | null; role?: string | null; isActive?: boolean | null } | null | undefined,
 ): Promise<WorkflowResult> {
   if (!isUuid(stepId)) return { ok: false, error: NOT_AVAILABLE };
   const actorId = String(user?.id || '').trim() || null;
@@ -2769,6 +2786,17 @@ export async function escalateStep(
 
     const instance = await getInstance(step.instanceId);
     if (!instance) return { ok: false, error: NOT_AVAILABLE };
+
+    // ASKED BEFORE ANY OTHER STATE IS REVEALED. Placed immediately after the instance resolves and
+    // ahead of the state, subject and already-escalated probes, so the refusal a stranger gets does
+    // not differ by the request's condition — an error that changes with state is an oracle for
+    // enumerating step ids, which is the shape of the hole this is closing.
+    const allowed = await mayAct(user, instance.domain, {
+      approverEmployeeId: step.approverEmployeeId,
+      approverUserId: step.approverUserId,
+    });
+    if (!allowed.ok) return { ok: false, error: allowed.reason || NOT_AVAILABLE };
+
     if (instance.state !== 'pending') return { ok: false, error: 'This request is no longer waiting on anybody.' };
     if (!instance.subjectEmployeeId) return { ok: false, error: HALT_NO_EMPLOYEE };
 

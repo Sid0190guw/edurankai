@@ -15,7 +15,49 @@ const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/employee/onboarding'));
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
-const emp: any = rows(await db.execute(sql`SELECT * FROM hr_employees WHERE user_id = ${user.id} OR lower(personal_email) = ${(user.email || '').toLowerCase()} OR lower(email) = ${(user.email || '').toLowerCase()} LIMIT 1`))[0];
+
+// WHO THIS PAGE IS ALLOWED TO BE ABOUT.
+//
+// This resolved the employee with
+//   WHERE user_id = <session id> OR lower(personal_email) = <session email> OR lower(email) = <session email>
+//   LIMIT 1
+// and then let the POST handler below write bank_account_number, bank_ifsc, pan_number and
+// govt_id_number into whichever row came back. Three facts turn that into salary diversion:
+//
+//   1. /portal/signup issues a session immediately on insert (signup.astro:128-133) — there is no
+//      verification step, so the address on a session proves nothing about who controls it.
+//   2. personal_email and email carry no UNIQUE constraint (db/hr-schema.sql:49-50).
+//   3. LIMIT 1 with no ORDER BY silently picks one row out of several matches.
+//
+// Registering with a colleague's personal address therefore returned THEIR employee record, and one
+// POST rewrote the bank account that the next payroll run pays into.
+//
+// The session's user_id is the only identifier a session actually proves, so ownership is resolved
+// from that alone. The email fallback stays — a hand-added joiner has no user_id until the people
+// desk links them, and removing it would leave them unable to submit anything — but it now matches
+// only an UNCLAIMED row, and it refuses rather than guesses when more than one row comes back.
+const uid = String(user.id);
+const sessionEmail = (user.email || '').toLowerCase().trim();
+const claimedByMe = rows(await db.execute(sql`
+  SELECT * FROM hr_employees WHERE user_id = ${uid} LIMIT 2`));
+
+// Two records claiming one account is a data fault, and choosing between them would be a coin toss
+// over somebody's payroll. Say so and stop.
+if (claimedByMe.length > 1) {
+  return Astro.redirect('/portal?e=' + encodeURIComponent(
+    'More than one employee record is linked to your account. The people desk needs to resolve that before joining details can be submitted.'));
+}
+
+let emp: any = claimedByMe[0];
+if (!emp && sessionEmail) {
+  const unclaimed = rows(await db.execute(sql`
+    SELECT * FROM hr_employees
+     WHERE user_id IS NULL
+       AND (lower(personal_email) = ${sessionEmail} OR lower(email) = ${sessionEmail})
+     LIMIT 2`));
+  // Exactly one, or none. An ambiguous email match is the same coin toss as above.
+  if (unclaimed.length === 1) emp = unclaimed[0];
+}
 if (!emp) return Astro.redirect('/portal');
 
 // ADDITIVE. Declared BEFORE the POST handler that reads them — `const` is not hoisted, and a
@@ -108,7 +150,12 @@ if (Astro.request.method === 'POST') {
       -- COALESCE for the same reason: this column means "when they first sent their joining
       -- details", and a later correction should not rewrite that date.
       onboarding_submitted_at = COALESCE(onboarding_submitted_at, NOW()), updated_at = NOW()
-    WHERE id = ${emp.id}
+    -- THE OWNERSHIP TEST IS REPEATED AT THE WRITE, not just at the read above.
+    -- emp is resolved once when the page renders; this clause is what guarantees that a row
+    -- belonging to somebody else cannot be written no matter how it came to be selected. Financial
+    -- and government-identity columns are the payload, so the check belongs on the statement that
+    -- sets them rather than only on the query that found them.
+    WHERE id = ${emp.id} AND (user_id = ${uid} OR user_id IS NULL)
   `);
   if (emp.onboarding_status !== 'verified' && emp.onboarding_status !== 'complete') {
     emp.onboarding_status = 'submitted';

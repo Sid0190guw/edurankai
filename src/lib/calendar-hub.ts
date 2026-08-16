@@ -39,9 +39,20 @@
 //   holiday     organization-wide holidays plus their own department's.
 //   training    sessions they are enrolled on or hosting.
 //
-// WHAT A TEAM OR DEPARTMENT VIEW SHOWS ABOUT ANOTHER PERSON is deliberately thin: a name, that they
-// are away, and the leave type. No reason, no medical detail, no attendance minute-by-minute for
+// WHAT A TEAM OR DEPARTMENT VIEW SHOWS ABOUT ANOTHER PERSON is deliberately thin: a name, and that
+// they are away. No leave type, no reason, no medical detail, no attendance minute-by-minute for
 // somebody else. A manager needs to know who is in on Thursday; nothing here needs to know why.
+//
+// THIS PARAGRAPH USED TO END "...and the leave type", AND THE CODE AGREED WITH IT. leaveSource()
+// rendered "<name> - Sick leave" and "<name> - Maternity leave" onto a colleague's screen. Leave
+// TYPE is health information about an identified person, and maternity is reproductive health
+// information; neither becomes shareable because the viewer is somebody's manager. The rule this
+// project runs under is that no admin, and not the founder, sees one person's health data, and that
+// oversight is aggregate-only. A per-person calendar row has no aggregate to hide behind.
+//
+// It was also inconsistent with the platform's own decision elsewhere: hr-events.ts:73 refuses to
+// carry the leave type into an event payload for precisely this reason. The comment is corrected
+// alongside the code so the next person to read this file is not told the leak is the design.
 //
 // AND THE GRAPH IS EMPTY UNTIL THE FOUNDER RUNS db/org-graph-backfill.sql. The team and department
 // views therefore render an HONEST EMPTY STATE naming exactly that, and never fall back to a role
@@ -384,7 +395,24 @@ async function leaveSource(
           id: 'lv-' + String(row?.id || '') + '-' + dateIso,
           source: 'leave',
           dateIso,
-          title: (withNames && name ? name + ' - ' : '') + leaveWord(type),
+          // WHOSE LEAVE THIS IS DECIDES WHETHER ITS REASON MAY BE NAMED.
+          //
+          // `withNames` is true exactly when this calendar is showing OTHER PEOPLE — a manager or a
+          // team view. It used to render the leave TYPE beside the person's name, producing
+          // "<name> - Sick leave" and "<name> - Maternity leave" on a colleague's screen. That is
+          // health information about an identified individual, and maternity is reproductive health
+          // information, disclosed to somebody with no clinical relationship and no consent record,
+          // with no MIN_GROUP floor because it is a per-person row rather than an aggregate.
+          //
+          // This module is not the first place the question came up, and the answer here is the one
+          // already reached elsewhere: hr-events.ts:73 deliberately refuses to carry the leave type
+          // into an event payload for exactly this reason. A calendar that leaked what the event bus
+          // was careful not to carry made that decision meaningless.
+          //
+          // Somebody planning cover needs to know WHO IS AWAY and WHEN. They do not need to know why,
+          // and the operational value of the row survives without it. The person's own calendar
+          // (withNames false) still names their own leave type — it is their information.
+          title: leaveEventTitle(type, name, withNames),
           detail: status === 'pending' ? 'Requested, not yet decided' : 'Approved',
           timeLabel: null,
           personName: withNames ? name : null,
@@ -403,6 +431,29 @@ function leaveWord(type: string): string {
   const t = String(type || '').replace(/_/g, ' ').trim();
   if (!t) return 'Leave';
   return t.charAt(0).toUpperCase() + t.slice(1) + ' leave';
+}
+
+/**
+ * THE PRIVACY DECISION, EXTRACTED SO IT CAN BE TESTED AND CANNOT DRIFT BACK.
+ *
+ * This was inline in leaveSource() and it is the exact line that leaked. `withNames` is true only
+ * when the calendar is showing OTHER PEOPLE — a manager or a team view — and in that case the title
+ * must carry identity and availability and nothing else. "<name> - Sick leave" and
+ * "<name> - Maternity leave" are health information about an identified individual, maternity being
+ * reproductive health information, shown to a colleague with no clinical relationship, no consent
+ * record, and no MIN_GROUP floor because a per-person row is not an aggregate.
+ *
+ * On a person's OWN calendar (`withNames` false) the type is named, because it is their information.
+ *
+ * The operational need survives the restriction completely: somebody planning cover has to know who
+ * is away and when, not why.
+ *
+ * Kept as a pure function on purpose. A policy expressed as a conditional buried inside a database
+ * loop is a policy nobody can write a test against, and this one is worth a test.
+ */
+export function leaveEventTitle(type: string, name: string | null, withNames: boolean): string {
+  if (withNames) return name ? name + ' - Away' : 'Away';
+  return leaveWord(type);
 }
 
 /**

@@ -505,11 +505,33 @@ export async function listGoals(employeeId: string) {
   `));
 }
 
-export async function closeGoal(goalId: string, status: 'met' | 'partial' | 'missed' | 'dropped', notes?: string) {
+/**
+ * Close an objective with an outcome.
+ *
+ * `ownerEmployeeId` NARROWS THE WRITE TO ONE PERSON'S OBJECTIVES, and an untrusted caller must pass it.
+ *
+ * This took a goal id and nothing else, and /portal/employee/performance handed it a form field
+ * (`close_goal`, performance.astro:193). Any signed-in employee could therefore post any objective's
+ * id and close somebody else's objective as 'missed' or 'dropped' — a write that lands in the record
+ * a performance review is built from, made by a person with no relationship to it and no trace that
+ * it was not the owner.
+ *
+ * The parameter is optional so the HR and manager surfaces, which legitimately close objectives
+ * belonging to other people behind their own capability gate, are unchanged. Every caller reached
+ * from a self-service page must supply it. It is applied as a predicate on the UPDATE rather than as
+ * a separate SELECT-then-write: a check that is not part of the statement can be raced past.
+ */
+export async function closeGoal(
+  goalId: string,
+  status: 'met' | 'partial' | 'missed' | 'dropped',
+  notes?: string,
+  ownerEmployeeId?: string | null,
+) {
   await ensureLifecycleSchema();
   await db.execute(sql`
     UPDATE hr_employee_goals SET status = ${status}, outcome_notes = ${notes || null}, updated_at = NOW()
     WHERE id = ${goalId}
+      AND (${ownerEmployeeId ?? null}::text IS NULL OR employee_id::text = ${ownerEmployeeId ?? null}::text)
   `);
 }
 

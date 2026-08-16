@@ -125,10 +125,23 @@ export const notify = {
       entityId: appId,
     }),
 
-  leaveRequest: (empName: string, leaveType: string, days: number) =>
+  // THE LEAVE TYPE IS NOT PUT IN THE BODY, because this fans out to notifyAllAdmins().
+  //
+  // It read `${days} day(s) ${leaveType}`, which pushed "3 day(s) sick" and "90 day(s) maternity"
+  // — named in the title — to EVERY administrator, not to the people who decide leave. A leave type
+  // is health information about an identified person, and a notification is the worst possible
+  // carrier for it: it is duplicated per recipient, it lands outside any authorization check, and it
+  // survives in a table nobody reviews. Whoever is entitled to act on the request opens it and sees
+  // the type there, behind the gate that surface already applies.
+  //
+  // The parameter stays on the signature so no caller breaks and so this decision is legible at the
+  // call sites that pass it. AUDIENCE IS A SEPARATE, UNRESOLVED QUESTION: notifyAllAdmins() is
+  // broader than "the people who decide leave", and narrowing it to the HR desk is a policy change
+  // recorded for the owner rather than made here.
+  leaveRequest: (empName: string, _leaveType: string, days: number) =>
     notifyAllAdmins({
       title: `Leave request: ${empName}`,
-      body: `${days} day(s) ${leaveType}`,
+      body: `${days} day(s)`,
       type: 'leave',
       actionUrl: `/admin/hr/leave`,
       entityType: 'leave',
