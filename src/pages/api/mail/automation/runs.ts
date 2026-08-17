@@ -23,14 +23,14 @@ export const GET: APIRoute = async ({ locals, url }) => {
       const run = await pgStore.getRun(ORG_ID, runId);
       if (!run) return json({ ok: false, error: 'There is no run with that id here.' }, 404);
       const steps = await pgStore.listSteps(run.runId);
-      const contact = run.contactId ? await pgStore.getContact(ORG_ID, run.contactId) : null;
+      const contact = run.contactId ? await pgStore.getContact(run.contactId) : null;
       return json({ ok: true, run, steps, contact });
     }
     const state = safeId(url.searchParams.get('state'), 16) as RunState | '';
     return json({
       ok: true,
       runs: await pgStore.listRuns(ORG_ID, {
-        workflowId: safeId(url.searchParams.get('workflowId')) || undefined,
+        automationId: safeId(url.searchParams.get('automationId')) || undefined,
         state: state || undefined,
         deadLetterOnly: url.searchParams.get('deadLetter') === '1',
         limit: Math.min(200, Number(url.searchParams.get('limit') || 100) || 100),
