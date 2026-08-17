@@ -223,7 +223,17 @@ export async function runVerification(
             ? `This domain publishes ${spfRecords.length} SPF records. A domain may have only one — merge them into a single v=spf1 line, or SPF fails for every sender.`
             : hit
               ? 'SPF includes our sender.'
-              : `No SPF record on ${name} includes ${include}.`,
+              // A LOOKUP THAT DID NOT RUN IS NOT AN ABSENT RECORD, AND HERE THAT DIFFERENCE IS
+              // DANGEROUS. This branch never consulted `r.ok`, so a UDP loss or a resolver timeout
+              // produced the same sentence as a genuinely missing record — and the documented next
+              // step on that screen is to ADD an SPF record. A second v=spf1 line makes SPF fail for
+              // EVERY sender on the domain (the `multiple` case immediately above says so), so a
+              // transient timeout could talk an operator into breaking mail delivery for the whole
+              // company. The ownership, DKIM and MX branches in this same file already answer this
+              // correctly; SPF and DMARC were the two that were missed.
+              : r.ok
+                ? `No SPF record on ${name} includes ${include}.`
+                : `Could not read TXT for ${name}: ${r.error}`,
         });
         continue;
       }
@@ -262,7 +272,11 @@ export async function runVerification(
               (policy && policy !== 'none'
                 ? ' Note: a policy stricter than p=none while SPF or DKIM is still failing will spam-folder your own mail.'
                 : '')
-            : 'No DMARC record. Not required to send, but recommended once SPF and DKIM pass.',
+            // Same repair as SPF above: the lookup either answered "no DMARC" or did not answer at
+            // all, and only one of those is a fact about the operator's DNS.
+            : r.ok
+              ? 'No DMARC record. Not required to send, but recommended once SPF and DKIM pass.'
+              : `Could not read TXT for _dmarc.${name}: ${r.error}`,
         });
         continue;
       }

@@ -74,7 +74,13 @@ export function conditionFromNode(node: AutomationNode): ConditionNode | null {
 
   switch (String(c.field || '')) {
     case 'stage':
-      return { field: 'contact.application_stage', operator, value };
+      // NOT `contact.application_stage`, and this was wrong once. On an application.stage.changed
+      // run the stage that matters is the one the EVENT carries — the value it just changed to —
+      // and the contact row may not have been updated yet (often this very automation is what
+      // updates it). Reading only the contact answered "" and sent every candidate down the no
+      // branch. The bare `stage` fact is the event's when the event has one and the contact's
+      // otherwise; engine.ts fills in that fallback. See runFacts().
+      return { field: 'stage', operator, value };
     case 'tag':
       // A tag test is membership, whatever the operator says: "has tag shortlisted" is not an
       // equality against the whole list, and answering it as one would make every tagged contact

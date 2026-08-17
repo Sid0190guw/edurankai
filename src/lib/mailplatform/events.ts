@@ -197,7 +197,17 @@ export function toNdjson(events: readonly MailEvent[]): string {
 // ---------------------------------------------------------------------------
 
 /**
- * The Postgres event table.
+ * The Postgres event table for the analytics stream.
+ *
+ * NAMED `mp_event_stream`, NOT `mp_events`, AND THE RENAME IS THE WHOLE POINT. `mp_events` is
+ * already taken: MP_DDL in schema.ts creates it as a PLAIN per-org audit log
+ * (org_id / entity_type / payload), and adapters/event-bus-postgres.ts writes it on every send,
+ * campaign and domain change. Both definitions were `CREATE TABLE IF NOT EXISTS`, so whichever ran
+ * first silently won and the loser's queries failed on columns that had never been created — the
+ * worst shape a schema conflict can take, because nothing errors at deploy time.
+ *
+ * They are two different things that collided on a name: that one is an audit log, this is a
+ * high-volume analytics stream on its way to ClickHouse. Both are wanted; only the name was wrong.
  *
  * DECLARATIVE MONTHLY PARTITIONING, and it is not premature — §4 says not to add complexity without
  * measurement, and this is the one case where the measurement is arithmetic rather than a benchmark:
@@ -207,9 +217,13 @@ export function toNdjson(events: readonly MailEvent[]): string {
  *
  * `mp_` prefix per the convention asserted in types.ts — this repository already owns a table called
  * `events` and an unprefixed name would have collided on the first migration.
+ *
+ * NOT DEPLOYED ANYWHERE YET: postgresSink() below is the only thing that applies this DDL, and it
+ * has no callers. eventStoreStats() therefore reports on the live audit log and probes for this
+ * table's existence rather than assuming it.
  */
 export const EVENT_DDL: readonly string[] = [
-  `CREATE TABLE IF NOT EXISTS mp_events (
+  `CREATE TABLE IF NOT EXISTS mp_event_stream (
     event_id uuid NOT NULL,
     event_type text NOT NULL,
     occurred_at timestamptz NOT NULL,
@@ -226,11 +240,11 @@ export const EVENT_DDL: readonly string[] = [
   // A DEFAULT partition so an insert can never fail because next month has no partition yet. Rows
   // landing here are a signal that partition maintenance has stopped, not a failure — ensurePartition()
   // below creates the real ones, and the ops screen reports default-partition row count.
-  `CREATE TABLE IF NOT EXISTS mp_events_default PARTITION OF mp_events DEFAULT`,
-  `CREATE INDEX IF NOT EXISTS mp_events_tenant_time_idx ON mp_events (tenant_id, occurred_at DESC)`,
-  `CREATE INDEX IF NOT EXISTS mp_events_type_time_idx ON mp_events (event_type, occurred_at DESC)`,
-  `CREATE INDEX IF NOT EXISTS mp_events_message_idx ON mp_events (message_id) WHERE message_id IS NOT NULL`,
-  `CREATE INDEX IF NOT EXISTS mp_events_campaign_idx ON mp_events (campaign_id, occurred_at DESC) WHERE campaign_id IS NOT NULL`,
+  `CREATE TABLE IF NOT EXISTS mp_event_stream_default PARTITION OF mp_event_stream DEFAULT`,
+  `CREATE INDEX IF NOT EXISTS mp_event_stream_tenant_time_idx ON mp_event_stream (tenant_id, occurred_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS mp_event_stream_type_time_idx ON mp_event_stream (event_type, occurred_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS mp_event_stream_message_idx ON mp_event_stream (message_id) WHERE message_id IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS mp_event_stream_campaign_idx ON mp_event_stream (campaign_id, occurred_at DESC) WHERE campaign_id IS NOT NULL`,
 ];
 
 /** SQL creating the partition covering a given month. Idempotent; safe to run on every boot. */
@@ -239,8 +253,8 @@ export function partitionSql(year: number, month1to12: number): string {
   const startY = year, startM = month1to12;
   const endY = month1to12 === 12 ? year + 1 : year;
   const endM = month1to12 === 12 ? 1 : month1to12 + 1;
-  const name = 'mp_events_' + startY + pad(startM);
-  return `CREATE TABLE IF NOT EXISTS ${name} PARTITION OF mp_events FOR VALUES FROM ('${startY}-${pad(startM)}-01') TO ('${endY}-${pad(endM)}-01')`;
+  const name = 'mp_event_stream_' + startY + pad(startM);
+  return `CREATE TABLE IF NOT EXISTS ${name} PARTITION OF mp_event_stream FOR VALUES FROM ('${startY}-${pad(startM)}-01') TO ('${endY}-${pad(endM)}-01')`;
 }
 
 /**
@@ -409,7 +423,7 @@ export function postgresSink(): EventSink {
         ready = true;
       }
       const values = rows.map((r) => sql`(${r.event_id}::uuid, ${r.event_type}, ${r.occurred_at}::timestamptz, ${r.tenant_id}::uuid, ${r.message_id}, ${r.contact_id}::uuid, ${r.campaign_id}::uuid, ${r.workflow_id}::uuid, ${r.source}, ${r.source_id}, ${r.metadata}::jsonb)`);
-      await db.execute(sql`INSERT INTO mp_events (event_id, event_type, occurred_at, tenant_id, message_id, contact_id, campaign_id, workflow_id, source, source_id, metadata) VALUES ${sql.join(values, sql`, `)}`);
+      await db.execute(sql`INSERT INTO mp_event_stream (event_id, event_type, occurred_at, tenant_id, message_id, contact_id, campaign_id, workflow_id, source, source_id, metadata) VALUES ${sql.join(values, sql`, `)}`);
     },
   };
 }
@@ -438,7 +452,7 @@ export async function exportEventsNdjson(opts: { from: string; to: string; after
       : sql``;
     const r = await db.execute(sql`
       SELECT event_id, event_type, occurred_at, tenant_id, message_id, contact_id, campaign_id, workflow_id, source, source_id, metadata
-      FROM mp_events
+      FROM mp_event_stream
       WHERE occurred_at >= ${opts.from}::timestamptz AND occurred_at < ${opts.to}::timestamptz ${cursor}
       ORDER BY occurred_at ASC, event_id ASC
       LIMIT ${limit}`);
@@ -473,21 +487,39 @@ export async function eventStoreStats(): Promise<{ ok: boolean; total: number | 
   try {
     const { db } = await import('@/lib/db');
     const { sql } = await import('drizzle-orm');
+    // READS THE LIVE EVENT TABLE, which is MP_DDL's `mp_events` in schema.ts — the per-org audit log
+    // that event-bus-postgres.ts actually writes. The partitioned analytics stream above is not
+    // deployed anywhere yet, so reporting on it would report on nothing.
     const q = await db.execute(sql`
       SELECT
         (SELECT COUNT(*)::bigint FROM mp_events) AS total,
         (SELECT MIN(occurred_at) FROM mp_events) AS oldest,
         (SELECT MAX(occurred_at) FROM mp_events) AS newest,
-        (SELECT COUNT(*)::bigint FROM mp_events WHERE occurred_at > now() - interval '24 hours') AS last24h,
-        (SELECT COUNT(*)::bigint FROM mp_events_default) AS default_rows`);
+        (SELECT COUNT(*)::bigint FROM mp_events WHERE occurred_at > now() - interval '24 hours') AS last24h`);
     const row = ((Array.isArray(q) ? q : ((q as { rows?: unknown[] })?.rows || [])) as Record<string, unknown>[])[0] || {};
+
+    // The DEFAULT-partition count is a SEPARATE, GUARDED query, and it has to be separate. Postgres
+    // resolves table names when it PARSES a statement, so naming a table that does not exist fails
+    // the whole statement — a `to_regclass` guard in the same SELECT would not have saved it. That
+    // is exactly how this function used to die: one subquery against a never-created partition took
+    // the four useful numbers down with it, and the ops panel showed an error while mp_events had
+    // rows the whole time. Absent table reports null (not deployed), never an error on the panel.
+    let defaultPartitionRows: number | null = null;
+    const probe = await db.execute(sql`SELECT to_regclass('public.mp_event_stream_default') IS NOT NULL AS present`);
+    const present = ((Array.isArray(probe) ? probe : ((probe as { rows?: unknown[] })?.rows || [])) as Record<string, unknown>[])[0]?.present;
+    if (present === true) {
+      const d = await db.execute(sql`SELECT COUNT(*)::bigint AS default_rows FROM mp_event_stream_default`);
+      const dr = ((Array.isArray(d) ? d : ((d as { rows?: unknown[] })?.rows || [])) as Record<string, unknown>[])[0]?.default_rows;
+      defaultPartitionRows = dr === undefined || dr === null ? null : Number(dr);
+    }
+
     return {
       ok: true,
       total: row.total === undefined || row.total === null ? null : Number(row.total),
       oldest: row.oldest ? toIso(row.oldest) : null,
       newest: row.newest ? toIso(row.newest) : null,
       last24h: row.last24h === undefined || row.last24h === null ? null : Number(row.last24h),
-      defaultPartitionRows: row.default_rows === undefined || row.default_rows === null ? null : Number(row.default_rows),
+      defaultPartitionRows,
     };
   } catch (e) {
     return { ok: false, total: null, oldest: null, newest: null, last24h: null, defaultPartitionRows: null, error: reason(e) };

@@ -2,21 +2,27 @@
 // PROCESSES: a delay that outlives its worker, an event delivered twice, a crash between the send
 // and the record of it, a run cancelled while it waits.
 //
+// The graphs here are the CANVAS's own shape (src/lib/mail-product/automations.ts), and every
+// fixture asserts validateGraph() would publish it — so what the engine is tested against is what an
+// operator can actually draw at /mail/automations.
+//
 // All of it runs against MemoryStore, which enforces the same atomicity rules as the Postgres store.
 // "The worker restarted" is modelled by throwing away every engine object and building new ones over
 // the SAME store; "the database restarted" is modelled by serialising the store to JSON and reading
 // it back, which is the honest test of whether anything important was living in a variable.
-import { beforeEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { MemoryStore, newMemoryStore } from './memory-store';
 import { advanceRun, type EngineDeps } from './engine';
 import { emit, ingestEvent, makeEvent, withPublisher } from './router';
 import { controlRun, tick } from './worker';
-import { saveWorkflow, setWorkflowStatus } from './service';
+import { validateGraph } from './graph';
+import type { AutomationGraph } from './graph';
 import type { ChannelAdapter } from './adapters';
-import type { WorkflowDefinition } from './graph';
 import { TemporaryFailure } from './errors';
 
 const ORG = 'testorg';
+const TEMPLATE_ID = '11111111-1111-4111-8111-111111111111';
+const REMINDER_ID = '22222222-2222-4222-8222-222222222222';
 
 /** A channel that records instead of sending, and can be told to fail or to die mid-send. */
 function recordingChannel() {
@@ -31,7 +37,7 @@ function recordingChannel() {
       if (mode === 'crash') {
         // The send REACHED the far end, and then this process died before it could be recorded.
         sent.push({ to: m.to, subject: m.subject || '', key: m.idempotencyKey });
-        throw Object.assign(new Error('process died after the message left'), { __crash: true });
+        throw new Error('process died after the message left');
       }
       if (mode === 'temporary') throw new TemporaryFailure('421 4.7.0 try again later');
       if (mode === 'permanent') return { ok: false, error: '550 5.1.1 no such user' };
@@ -42,75 +48,91 @@ function recordingChannel() {
   return { adapter, sent, setMode: (m: typeof mode) => { mode = m; }, resolve: (id: string) => (id === 'email' ? adapter : null) };
 }
 
-/** A fixed, movable clock. Nothing in these tests depends on real time passing. */
+/** A fixed, movable clock. Nothing here depends on real time passing. */
 function clock(startIso: string) {
   let t = new Date(startIso).getTime();
   return { now: () => new Date(t), advanceMs: (ms: number) => { t += ms; }, advanceHours: (h: number) => { t += h * 3_600_000; } };
 }
 
-const stageThreeDefinition = (): WorkflowDefinition => ({
-  version: 1,
+/** stage changed -> is it 3? -> send -> wait 24h -> still incomplete? -> remind / tag. */
+const stageThreeGraph = (): AutomationGraph => ({
   nodes: [
-    { id: 'trigger_1', kind: 'trigger', trigger: { event: 'application.stage.changed' } },
-    { id: 'condition_1', kind: 'condition', condition: { field: 'event.stage', operator: 'equals', value: '3' } },
-    { id: 'action_1', kind: 'action', label: 'Stage 3 letter', action: { type: 'send_email', params: { subject: 'Stage 3, {{first_name}}', text: 'Hello {{first_name|default:there}}' } } },
-    { id: 'delay_1', kind: 'delay', delay: { kind: 'hours', amount: 24 } },
-    {
-      id: 'condition_2', kind: 'condition',
-      condition: { or: [{ field: 'contact.custom.assessment_completed', operator: 'does_not_exist' }, { field: 'contact.custom.assessment_completed', operator: 'not_equals', value: 'true' }] },
-    },
-    { id: 'action_2', kind: 'action', label: 'Reminder', action: { type: 'send_email', params: { subject: 'Reminder', text: 'Your assessment is open' } } },
-    { id: 'action_3', kind: 'action', label: 'Tag done', action: { type: 'add_tag', params: { tag: 'assessment-complete' } } },
+    { id: 'trigger_1', kind: 'trigger', config: { event: 'application_stage_changed' } },
+    { id: 'condition_1', kind: 'condition', config: { field: 'stage', operator: 'equals', value: '3' } },
+    { id: 'send_1', kind: 'send_email', config: { templateId: TEMPLATE_ID } },
+    { id: 'delay_1', kind: 'delay', config: { minutes: 1440 } },
+    { id: 'condition_2', kind: 'condition', config: { field: 'assessment_completed', operator: 'not_equals', value: 'true' } },
+    { id: 'send_2', kind: 'send_email', config: { templateId: REMINDER_ID } },
+    { id: 'add_tag_1', kind: 'add_tag', config: { tag: 'assessment-complete' } },
+    { id: 'end_1', kind: 'end', config: {} },
+    { id: 'end_2', kind: 'end', config: {} },
+    { id: 'end_3', kind: 'end', config: {} },
   ],
   edges: [
-    { id: 'e1', from: 'trigger_1', to: 'condition_1' },
-    { id: 'e2', from: 'condition_1', to: 'action_1', branch: 'true' },
-    { id: 'e3', from: 'action_1', to: 'delay_1' },
-    { id: 'e4', from: 'delay_1', to: 'condition_2' },
-    { id: 'e5', from: 'condition_2', to: 'action_2', branch: 'true' },
-    { id: 'e6', from: 'condition_2', to: 'action_3', branch: 'false' },
+    { from: 'trigger_1', to: 'condition_1' },
+    { from: 'condition_1', to: 'send_1', branch: 'yes' },
+    { from: 'condition_1', to: 'end_1', branch: 'no' },
+    { from: 'send_1', to: 'delay_1' },
+    { from: 'delay_1', to: 'condition_2' },
+    { from: 'condition_2', to: 'send_2', branch: 'yes' },
+    { from: 'condition_2', to: 'add_tag_1', branch: 'no' },
+    { from: 'send_2', to: 'end_2' },
+    { from: 'add_tag_1', to: 'end_3' },
   ],
 });
 
-async function fixture(definition = stageThreeDefinition(), startIso = '2026-08-16T09:00:00.000Z') {
+async function fixture(graph = stageThreeGraph(), startIso = '2026-08-16T09:00:00.000Z') {
   const store = newMemoryStore();
   const c = clock(startIso);
   store.now = c.now;
   const ch = recordingChannel();
-  const saved = await saveWorkflow(store, ORG, { key: 'wf', name: 'Test workflow', definition }, 'user_1');
-  expect(saved.ok, saved.message).toBe(true);
-  const status = await setWorkflowStatus(store, ORG, saved.workflow!.id, 'active', { channels: ch.resolve });
-  expect(status.ok, status.message).toBe(true);
-  const contact = await store.upsertContact(ORG, { email: 'ananya@example.test', firstName: 'Ananya' });
+  store.templates.set(TEMPLATE_ID, { id: TEMPLATE_ID, name: 'stage-3', subject: 'Stage 3, {{first_name}}', html: '', text: 'Hello {{first_name|default:there}}' });
+  store.templates.set(REMINDER_ID, { id: REMINDER_ID, name: 'reminder', subject: 'Reminder', html: '', text: 'Your assessment is open' });
+
+  // The graph must be one the canvas would actually publish. A test that exercised a shape the
+  // validator refuses would prove the engine works on automations nobody can create.
+  const v = validateGraph(graph);
+  expect(v.ok, v.problems.map((p) => p.nodeId + ': ' + p.message).join('; ')).toBe(true);
+
+  const automation = store.putAutomation({ orgId: ORG, name: 'Test automation', graph, status: 'active', version: 1 });
+  await store.saveGraphVersion(ORG, automation.id, 1, graph);
+  const contact = await store.upsertContact({ email: 'ananya@example.test', firstName: 'Ananya' });
   const deps = (): EngineDeps => ({ store, now: c.now, channels: ch.resolve });
-  return { store, clock: c, ch, workflow: saved.workflow!, contact, deps };
+  return { store, clock: c, ch, automation, contact, deps };
 }
 
 const stageEvent = (contactId: string, stage = '3', eventId = 'evt_stage_1') =>
-  makeEvent({ type: 'application.stage.changed', orgId: ORG, contactId, payload: { stage }, eventId, source: 'internal' });
+  makeEvent({ type: 'application_stage_changed', orgId: ORG, contactId, payload: { stage }, eventId, source: 'internal' });
 
 describe('trigger, condition, branch', () => {
-  it('starts a run, takes the true branch and sends', async () => {
+  it('starts a run, takes the yes branch and sends', async () => {
     const f = await fixture();
     const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
     expect(r.startedRuns.length).toBe(1);
     expect(f.ch.sent.length).toBe(1);
     expect(f.ch.sent[0].subject).toBe('Stage 3, Ananya');
     const run = await f.store.getRun(ORG, r.startedRuns[0]);
-    expect(run!.state).toBe('WAITING');            // parked at the 24-hour delay
+    expect(run!.state).toBe('waiting');            // parked at the 24-hour delay
     expect(run!.currentNode).toBe('condition_2');  // the step the wait is FOR
   });
 
-  it('starts nothing when the trigger filter does not match', async () => {
+  it('the underscored canvas key and the dotted event name are the same trigger', async () => {
+    const f = await fixture();
+    const r = await ingestEvent({ ...f.deps(), advance: true },
+      makeEvent({ type: 'application.stage.changed', orgId: ORG, contactId: f.contact.id, payload: { stage: '3' }, eventId: 'evt_dotted' }));
+    expect(r.startedRuns.length).toBe(1);
+    expect(f.ch.sent.length).toBe(1);
+  });
+
+  it('runs but sends nothing when the condition does not match', async () => {
     const f = await fixture();
     const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id, '2'));
     expect(r.startedRuns.length).toBe(1);          // a run IS started — the narrowing is a condition
-    expect(f.ch.sent.length).toBe(0);              // …and it ends at the condition without sending
-    const run = await f.store.getRun(ORG, r.startedRuns[0]);
-    expect(run!.state).toBe('COMPLETED');
+    expect(f.ch.sent.length).toBe(0);              // …and it ends at the End step without sending
+    expect((await f.store.getRun(ORG, r.startedRuns[0]))!.state).toBe('completed');
   });
 
-  it('does not start a workflow listening for a different event', async () => {
+  it('does not start an automation listening for a different event', async () => {
     const f = await fixture();
     const r = await ingestEvent({ ...f.deps(), advance: true }, makeEvent({ type: 'contact.created', orgId: ORG, contactId: f.contact.id, eventId: 'evt_other' }));
     expect(r.startedRuns.length).toBe(0);
@@ -118,7 +140,8 @@ describe('trigger, condition, branch', () => {
 
   it('will not start a run for another organisation', async () => {
     const f = await fixture();
-    const r = await ingestEvent({ ...f.deps(), advance: true }, makeEvent({ type: 'application.stage.changed', orgId: 'someone-else', contactId: f.contact.id, payload: { stage: '3' }, eventId: 'evt_x' }));
+    const r = await ingestEvent({ ...f.deps(), advance: true },
+      makeEvent({ type: 'application_stage_changed', orgId: 'someone-else', contactId: f.contact.id, payload: { stage: '3' }, eventId: 'evt_x' }));
     expect(r.startedRuns.length).toBe(0);
     expect(f.ch.sent.length).toBe(0);
   });
@@ -130,43 +153,34 @@ describe('delays survive time and processes', () => {
     await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
     expect(f.ch.sent.length).toBe(1);
 
-    // Nothing is due yet: a tick an hour later must do nothing at all.
     f.clock.advanceHours(1);
-    const early = await tick(f.deps(), { orgId: ORG });
-    expect(early.claimed).toBe(0);
+    expect((await tick(f.deps(), { orgId: ORG })).claimed).toBe(0);   // nothing is due yet
     expect(f.ch.sent.length).toBe(1);
 
-    // A day later it wakes, finds the assessment still incomplete, and reminds.
     f.clock.advanceHours(24);
-    const later = await tick(f.deps(), { orgId: ORG });
-    expect(later.claimed).toBe(1);
+    expect((await tick(f.deps(), { orgId: ORG })).claimed).toBe(1);
     expect(f.ch.sent.length).toBe(2);
     expect(f.ch.sent[1].subject).toBe('Reminder');
   });
 
-  it('takes the false branch when the contact CHANGED during the wait — the contact is re-read', async () => {
+  it('takes the no branch when the contact CHANGED during the wait — the contact is re-read', async () => {
     const f = await fixture();
     const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
-    // The candidate finishes the assessment while the run is parked.
-    await f.store.updateContactFields(ORG, f.contact.id, { assessment_completed: 'true' });
+    await f.store.updateContactFields(f.contact.id, { assessment_completed: 'true' });
     f.clock.advanceHours(25);
     await tick(f.deps(), { orgId: ORG });
     expect(f.ch.sent.length).toBe(1);                       // no reminder
-    const contact = await f.store.getContact(ORG, f.contact.id);
-    expect(contact!.tags).toContain('assessment-complete'); // the false branch ran instead
-    const run = await f.store.getRun(ORG, r.startedRuns[0]);
-    expect(run!.state).toBe('COMPLETED');
+    expect((await f.store.getContact(f.contact.id))!.tags).toContain('assessment-complete');
+    expect((await f.store.getRun(ORG, r.startedRuns[0]))!.state).toBe('completed');
   });
 
   it('survives a WORKER restart: new engine objects over the same store', async () => {
     const f = await fixture();
     await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
     f.clock.advanceHours(25);
-    // Everything the first "process" held is discarded — only the store persists.
     const ch2 = recordingChannel();
-    const freshDeps: EngineDeps = { store: f.store, now: f.clock.now, channels: ch2.resolve };
-    const t = await tick(freshDeps, { orgId: ORG });
-    expect(t.claimed).toBe(1);
+    const fresh: EngineDeps = { store: f.store, now: f.clock.now, channels: ch2.resolve };
+    expect((await tick(fresh, { orgId: ORG })).claimed).toBe(1);
     expect(ch2.sent.length).toBe(1);   // the reminder went out from the NEW process
   });
 
@@ -174,30 +188,27 @@ describe('delays survive time and processes', () => {
     const f = await fixture();
     const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
 
-    // Serialise every table and read it back into a new store — nothing may live in a variable.
     const dump = JSON.stringify({
-      workflows: [...f.store.workflows], versions: [...f.store.versions], runs: [...f.store.runs],
+      automations: [...f.store.automations], versions: [...f.store.versions], runs: [...f.store.runs],
       steps: [...f.store.steps], events: [...f.store.events], contacts: [...f.store.contacts],
-      lists: [...f.store.lists], listMembers: [...f.store.listMembers].map(([k, v]) => [k, [...v]]),
+      templates: [...f.store.templates],
     });
     const raw = JSON.parse(dump, (_k, v) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T.*Z$/.test(v) ? new Date(v) : v));
     const revived = new MemoryStore();
     revived.now = f.clock.now;
-    revived.workflows = new Map(raw.workflows);
+    revived.automations = new Map(raw.automations);
     revived.versions = new Map(raw.versions);
     revived.runs = new Map(raw.runs);
     revived.steps = new Map(raw.steps);
     revived.events = new Map(raw.events);
     revived.contacts = new Map(raw.contacts);
-    revived.lists = new Map(raw.lists);
-    revived.listMembers = new Map(raw.listMembers.map(([k, v]: any) => [k, new Set(v)]));
+    revived.templates = new Map(raw.templates);
 
     const ch2 = recordingChannel();
     f.clock.advanceHours(25);
-    const t = await tick({ store: revived, now: f.clock.now, channels: ch2.resolve }, { orgId: ORG });
-    expect(t.claimed).toBe(1);
+    expect((await tick({ store: revived, now: f.clock.now, channels: ch2.resolve }, { orgId: ORG })).claimed).toBe(1);
     expect(ch2.sent.length).toBe(1);
-    expect((await revived.getRun(ORG, r.startedRuns[0]))!.state).toBe('COMPLETED');
+    expect((await revived.getRun(ORG, r.startedRuns[0]))!.state).toBe('completed');
   });
 });
 
@@ -222,10 +233,9 @@ describe('idempotency', () => {
   it('advancing the same run twice does not repeat a completed step', async () => {
     const f = await fixture();
     const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
-    const run = await f.store.getRun(ORG, r.startedRuns[0]);
-    // Force it back to RUNNING at the step it already performed, as a double-claim would.
-    await f.store.updateRun(run!.runId, { state: 'RUNNING', currentNode: 'action_1' });
-    const again = await advanceRun(f.deps(), (await f.store.getRun(ORG, run!.runId))!);
+    const runId = r.startedRuns[0];
+    await f.store.updateRun(runId, { state: 'running', currentNode: 'send_1' });
+    const again = await advanceRun(f.deps(), (await f.store.getRun(ORG, runId))!);
     expect(f.ch.sent.length).toBe(1);                                        // NOT two
     expect(again.steps.some((s) => /Already done/.test(s.summary))).toBe(true);
   });
@@ -237,39 +247,39 @@ describe('idempotency', () => {
     expect(f.ch.sent.length).toBe(1);                       // the message DID leave
     const runId = r.startedRuns[0];
 
-    // The crash left the step claimed-but-unfinished. Simulate the worker dying by putting the step
-    // back to 'running' and moving the clock past the stale window, exactly as an abandoned step looks.
-    await f.store.finishStep(runId, 'action_1', 'running', {});
-    await f.store.updateRun(runId, { state: 'WAITING', waitUntil: new Date(0) });
+    // The crash left the step claimed-but-unfinished. Put it back to 'running' and move the clock
+    // past the stale window — exactly how an abandoned step looks to the next worker.
+    await f.store.finishStep(runId, 'send_1', 'running', {});
+    await f.store.updateRun(runId, { state: 'waiting', waitUntil: new Date(0), completedAt: null });
     f.clock.advanceMs(20 * 60_000);
 
     f.ch.setMode('ok');
     await tick(f.deps(), { orgId: ORG });
     expect(f.ch.sent.length).toBe(1);                        // still one. No second copy.
     const run = await f.store.getRun(ORG, runId);
-    expect(run!.state).toBe('FAILED');
+    expect(run!.state).toBe('failed');
     expect(run!.deadLetter).toBe(true);
     expect(run!.error).toMatch(/could send the same message again/);
   });
 
   it('a REVERSIBLE step abandoned the same way is simply re-run', async () => {
-    const def: WorkflowDefinition = {
-      version: 1,
+    const graph: AutomationGraph = {
       nodes: [
-        { id: 'trigger_1', kind: 'trigger', trigger: { event: 'application.stage.changed' } },
-        { id: 'action_1', kind: 'action', action: { type: 'add_tag', params: { tag: 'seen' } } },
+        { id: 'trigger_1', kind: 'trigger', config: { event: 'application_stage_changed' } },
+        { id: 'add_tag_1', kind: 'add_tag', config: { tag: 'seen' } },
+        { id: 'end_1', kind: 'end', config: {} },
       ],
-      edges: [{ id: 'e1', from: 'trigger_1', to: 'action_1' }],
+      edges: [{ from: 'trigger_1', to: 'add_tag_1' }, { from: 'add_tag_1', to: 'end_1' }],
     };
-    const f = await fixture(def);
+    const f = await fixture(graph);
     const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
     const runId = r.startedRuns[0];
-    await f.store.finishStep(runId, 'action_1', 'running', {});
-    await f.store.updateRun(runId, { state: 'WAITING', waitUntil: new Date(0), completedAt: null });
+    await f.store.finishStep(runId, 'add_tag_1', 'running', {});
+    await f.store.updateRun(runId, { state: 'waiting', waitUntil: new Date(0), completedAt: null });
     f.clock.advanceMs(20 * 60_000);
     await tick(f.deps(), { orgId: ORG });
     const run = await f.store.getRun(ORG, runId);
-    expect(run!.state).toBe('COMPLETED');           // no needs_review; a tag can be re-applied
+    expect(run!.state).toBe('completed');           // no needs_review; a tag can be re-applied
     expect(run!.deadLetter).toBe(false);
   });
 });
@@ -281,7 +291,7 @@ describe('retries and dead letters', () => {
     const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
     const runId = r.startedRuns[0];
     let run = await f.store.getRun(ORG, runId);
-    expect(run!.state).toBe('WAITING');
+    expect(run!.state).toBe('waiting');
     expect(run!.retryCount).toBe(1);
     expect(run!.error).toMatch(/421/);
 
@@ -290,7 +300,7 @@ describe('retries and dead letters', () => {
     await tick(f.deps(), { orgId: ORG });
     expect(f.ch.sent.length).toBe(1);
     run = await f.store.getRun(ORG, runId);
-    expect(run!.state).toBe('WAITING');            // now waiting on the 24-hour delay, not a retry
+    expect(run!.state).toBe('waiting');            // now on the 24-hour delay, not a retry
     expect(run!.retryCount).toBe(0);
   });
 
@@ -299,10 +309,9 @@ describe('retries and dead letters', () => {
     f.ch.setMode('temporary');
     const deps = { ...f.deps(), maxRetries: 2 };
     const r = await ingestEvent({ ...deps, advance: true }, stageEvent(f.contact.id));
-    const runId = r.startedRuns[0];
     for (let i = 0; i < 5; i++) { f.clock.advanceMs(60 * 60_000); await tick(deps, { orgId: ORG }); }
-    const run = await f.store.getRun(ORG, runId);
-    expect(run!.state).toBe('FAILED');
+    const run = await f.store.getRun(ORG, r.startedRuns[0]);
+    expect(run!.state).toBe('failed');
     expect(run!.deadLetter).toBe(true);
     expect(run!.errorKind).toBe('temporary');
   });
@@ -312,21 +321,41 @@ describe('retries and dead letters', () => {
     f.ch.setMode('permanent');
     const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
     const run = await f.store.getRun(ORG, r.startedRuns[0]);
-    expect(run!.state).toBe('FAILED');
+    expect(run!.state).toBe('failed');
     expect(run!.retryCount).toBe(0);
     expect(run!.errorKind).toBe('permanent');
   });
 
-  it('ends the run — without an error — when a business rule says no', async () => {
+  it('ends the run — without an error — when the contact is not subscribed', async () => {
     const f = await fixture();
-    await f.store.setUnsubscribed(ORG, f.contact.id, true);
+    await f.store.setStatus(f.contact.id, 'unsubscribed');
     const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
     const run = await f.store.getRun(ORG, r.startedRuns[0]);
     expect(f.ch.sent.length).toBe(0);
-    expect(run!.state).toBe('COMPLETED');          // not FAILED
+    expect(run!.state).toBe('completed');          // not failed
     expect(run!.deadLetter).toBe(false);
     expect(run!.errorKind).toBe('business');
-    expect(run!.error).toMatch(/unsubscribed/);
+    expect(run!.error).toMatch(/not subscribed/);
+  });
+
+  it('ends the run when the address is suppressed, even though the contact looks subscribed', async () => {
+    const f = await fixture();
+    f.store.suppressed.add(f.contact.email);
+    const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
+    const run = await f.store.getRun(ORG, r.startedRuns[0]);
+    expect(f.ch.sent.length).toBe(0);
+    expect(run!.errorKind).toBe('business');
+    expect(run!.error).toMatch(/suppression list/);
+  });
+
+  it('refuses to send when the template is missing or switched off', async () => {
+    const f = await fixture();
+    f.store.templates.delete(TEMPLATE_ID);
+    const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
+    const run = await f.store.getRun(ORG, r.startedRuns[0]);
+    expect(f.ch.sent.length).toBe(0);
+    expect(run!.state).toBe('failed');
+    expect(run!.errorKind).toBe('permanent');
   });
 
   it('a dead-lettered run can be retried by a person, and the stopped step is released', async () => {
@@ -334,11 +363,10 @@ describe('retries and dead letters', () => {
     f.ch.setMode('permanent');
     const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
     const runId = r.startedRuns[0];
-    expect((await f.store.getRun(ORG, runId))!.state).toBe('FAILED');
+    expect((await f.store.getRun(ORG, runId))!.state).toBe('failed');
 
     f.ch.setMode('ok');
-    const c = await controlRun(f.store, ORG, runId, 'retry');
-    expect(c.changed).toBe(true);
+    expect((await controlRun(f.store, ORG, runId, 'retry')).changed).toBe(true);
     await tick(f.deps(), { orgId: ORG });
     expect(f.ch.sent.length).toBe(1);
   });
@@ -351,10 +379,9 @@ describe('cancellation, pause and resume', () => {
     const runId = r.startedRuns[0];
     expect((await controlRun(f.store, ORG, runId, 'cancel')).changed).toBe(true);
     f.clock.advanceHours(48);
-    const t = await tick(f.deps(), { orgId: ORG });
-    expect(t.claimed).toBe(0);
+    expect((await tick(f.deps(), { orgId: ORG })).claimed).toBe(0);
     expect(f.ch.sent.length).toBe(1);              // only the first send, never the reminder
-    expect((await f.store.getRun(ORG, runId))!.state).toBe('CANCELLED');
+    expect((await f.store.getRun(ORG, runId))!.state).toBe('cancelled');
   });
 
   it('cancelling twice reports honestly that nothing changed', async () => {
@@ -379,64 +406,50 @@ describe('cancellation, pause and resume', () => {
     await controlRun(f.store, ORG, runId, 'resume');
     await tick(f.deps(), { orgId: ORG });
     expect(f.ch.sent.length).toBe(2);
-    expect((await f.store.getRun(ORG, runId))!.state).toBe('COMPLETED');
+    expect((await f.store.getRun(ORG, runId))!.state).toBe('completed');
   });
 
-  it('a paused workflow starts no new runs, and says the in-flight ones continue', async () => {
+  it('a paused automation starts no new runs', async () => {
     const f = await fixture();
     await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id, '3', 'evt_1'));
-    const paused = await setWorkflowStatus(f.store, ORG, f.workflow.id, 'paused');
-    expect(paused.message).toMatch(/Runs already in flight continue/);
+    f.store.putAutomation({ ...f.automation, status: 'paused' });
     const after = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id, '3', 'evt_2'));
     expect(after.startedRuns.length).toBe(0);
   });
 });
 
-describe('chained workflows and follow-on events', () => {
-  it('a tag added by one workflow starts another, and the chain is bounded', async () => {
-    const store = newMemoryStore();
-    const c = clock('2026-08-16T09:00:00.000Z');
-    store.now = c.now;
-    const ch = recordingChannel();
+describe('chained automations and follow-on events', () => {
+  it('a tag added by one automation starts another, and re-adding it emits nothing', async () => {
+    const f = await fixture({
+      nodes: [
+        { id: 'trigger_1', kind: 'trigger', config: { event: 'application_stage_changed' } },
+        { id: 'add_tag_1', kind: 'add_tag', config: { tag: 'shortlisted' } },
+        { id: 'end_1', kind: 'end', config: {} },
+      ],
+      edges: [{ from: 'trigger_1', to: 'add_tag_1' }, { from: 'add_tag_1', to: 'end_1' }],
+    });
 
-    const tagger = await saveWorkflow(store, ORG, {
-      key: 'tagger', name: 'Tag on stage change', definition: {
-        version: 1,
+    const welcomer = f.store.putAutomation({
+      orgId: ORG, name: 'Welcome the shortlisted', status: 'active', version: 1,
+      graph: {
         nodes: [
-          { id: 'trigger_1', kind: 'trigger', trigger: { event: 'application.stage.changed' } },
-          { id: 'action_1', kind: 'action', action: { type: 'add_tag', params: { tag: 'shortlisted' } } },
+          { id: 'trigger_1', kind: 'trigger', config: { event: 'tag_added', filter: { field: 'event.tag', operator: 'equals', value: 'shortlisted' } } },
+          { id: 'send_1', kind: 'send_email', config: { templateId: TEMPLATE_ID } },
+          { id: 'end_1', kind: 'end', config: {} },
         ],
-        edges: [{ id: 'e1', from: 'trigger_1', to: 'action_1' }],
+        edges: [{ from: 'trigger_1', to: 'send_1' }, { from: 'send_1', to: 'end_1' }],
       },
-    }, null);
-    await setWorkflowStatus(store, ORG, tagger.workflow!.id, 'active', { channels: ch.resolve });
+    });
+    await f.store.saveGraphVersion(ORG, welcomer.id, 1, welcomer.graph);
 
-    const welcomer = await saveWorkflow(store, ORG, {
-      key: 'welcomer', name: 'Welcome the shortlisted', definition: {
-        version: 1,
-        nodes: [
-          { id: 'trigger_1', kind: 'trigger', trigger: { event: 'contact.tag.added', filter: { field: 'event.tag', operator: 'equals', value: 'shortlisted' } } },
-          { id: 'action_1', kind: 'action', action: { type: 'send_email', params: { subject: 'You have been shortlisted', text: 'Congratulations' } } },
-        ],
-        edges: [{ id: 'e1', from: 'trigger_1', to: 'action_1' }],
-      },
-    }, null);
-    await setWorkflowStatus(store, ORG, welcomer.workflow!.id, 'active', { channels: ch.resolve });
+    await ingestEvent({ ...withPublisher(f.deps(), 0), advance: true }, stageEvent(f.contact.id));
+    expect((await f.store.getContact(f.contact.id))!.tags).toContain('shortlisted');
+    expect(f.ch.sent.length).toBe(1);
 
-    const contact = await store.upsertContact(ORG, { email: 'b@example.test', firstName: 'Bhavna' });
-    const deps: EngineDeps = { store, now: c.now, channels: ch.resolve };
-    await ingestEvent({ ...withPublisher(deps, 0), advance: true }, stageEvent(contact.id));
-
-    expect((await store.getContact(ORG, contact.id))!.tags).toContain('shortlisted');
-    expect(ch.sent.length).toBe(1);
-    expect(ch.sent[0].subject).toBe('You have been shortlisted');
-  });
-
-  it('re-applying a tag that is already there emits nothing, so a chain cannot loop on a no-op', async () => {
-    const f = await fixture();
-    await f.store.addTag(ORG, f.contact.id, 'seen');
-    const changedAgain = await f.store.addTag(ORG, f.contact.id, 'seen');
-    expect(changedAgain).toBe(false);
+    // The tag is already there, so a second run of the tagger emits nothing and the welcomer does not
+    // fire again — which is what stops two automations looping on a no-op.
+    await ingestEvent({ ...withPublisher(f.deps(), 0), advance: true }, stageEvent(f.contact.id, '3', 'evt_second'));
+    expect(f.ch.sent.length).toBe(1);
   });
 });
 
@@ -448,10 +461,8 @@ describe('emit() from the rest of the platform', () => {
       contactEmail: 'New.Person@Example.TEST', contact: { firstName: 'Nikhil' }, payload: { stage: '3' },
     }, f.deps());
     expect(r.startedRuns.length).toBe(1);
-    const c = await f.store.findContactByEmail(ORG, 'new.person@example.test');
-    expect(c!.firstName).toBe('Nikhil');
-    const events = await f.store.listEvents(ORG, {});
-    expect(events.some((e) => e.type === 'contact.created')).toBe(true);
+    expect((await f.store.findContactByEmail('new.person@example.test'))!.firstName).toBe('Nikhil');
+    expect((await f.store.listEvents(ORG, {})).some((e) => e.type === 'contact.created')).toBe(true);
     expect(f.ch.sent[0].subject).toBe('Stage 3, Nikhil');
   });
 
@@ -463,53 +474,41 @@ describe('emit() from the rest of the platform', () => {
   });
 });
 
-describe('editing a live workflow', () => {
+describe('editing a live automation', () => {
   it('an in-flight run keeps the version it started on', async () => {
     const f = await fixture();
-    const r = await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
-    const runId = r.startedRuns[0];
+    await ingestEvent({ ...f.deps(), advance: true }, stageEvent(f.contact.id));
 
-    // Rewrite the workflow: the reminder becomes a different subject, and version 2 is stored.
-    const next = stageThreeDefinition();
-    (next.nodes.find((n) => n.id === 'action_2') as any).action.params.subject = 'REWRITTEN';
-    const saved = await saveWorkflow(f.store, ORG, { id: f.workflow.id, key: 'wf', name: 'Test workflow', definition: next }, null);
-    expect(saved.versioned).toBe(true);
-    expect(saved.workflow!.version).toBe(2);
-    expect(saved.message).toMatch(/already in flight/);
+    // Version 2: the reminder now uses a different template. The snapshot of version 1 is untouched.
+    const next = stageThreeGraph();
+    (next.nodes.find((n) => n.id === 'send_2') as any).config.templateId = TEMPLATE_ID;
+    f.store.putAutomation({ ...f.automation, graph: next, version: 2 });
+    await f.store.saveGraphVersion(ORG, f.automation.id, 2, next);
 
     f.clock.advanceHours(25);
     await tick(f.deps(), { orgId: ORG });
-    expect(f.ch.sent[1].subject).toBe('Reminder');   // version 1's copy, not the rewrite
-    void runId;
+    expect(f.ch.sent[1].subject).toBe('Reminder');   // version 1's template, not the rewrite
   });
 });
 
 describe('the tick reports what it did not get to', () => {
-  let store: MemoryStore;
-  beforeEach(() => { store = newMemoryStore(); });
-
   it('says moreDue when it hits its limit', async () => {
-    const c = clock('2026-08-16T09:00:00.000Z');
-    store.now = c.now;
-    const ch = recordingChannel();
-    const def: WorkflowDefinition = {
-      version: 1,
+    const graph: AutomationGraph = {
       nodes: [
-        { id: 'trigger_1', kind: 'trigger', trigger: { event: 'application.stage.changed' } },
-        { id: 'delay_1', kind: 'delay', delay: { kind: 'minutes', amount: 1 } },
-        { id: 'action_1', kind: 'action', action: { type: 'add_tag', params: { tag: 'done' } } },
+        { id: 'trigger_1', kind: 'trigger', config: { event: 'application_stage_changed' } },
+        { id: 'delay_1', kind: 'delay', config: { minutes: 1 } },
+        { id: 'add_tag_1', kind: 'add_tag', config: { tag: 'done' } },
+        { id: 'end_1', kind: 'end', config: {} },
       ],
-      edges: [{ id: 'e1', from: 'trigger_1', to: 'delay_1' }, { id: 'e2', from: 'delay_1', to: 'action_1' }],
+      edges: [{ from: 'trigger_1', to: 'delay_1' }, { from: 'delay_1', to: 'add_tag_1' }, { from: 'add_tag_1', to: 'end_1' }],
     };
-    const saved = await saveWorkflow(store, ORG, { key: 'wf', name: 'w', definition: def }, null);
-    await setWorkflowStatus(store, ORG, saved.workflow!.id, 'active', { channels: ch.resolve });
-    const deps: EngineDeps = { store, now: c.now, channels: ch.resolve };
+    const f = await fixture(graph);
     for (let i = 0; i < 5; i++) {
-      const contact = await store.upsertContact(ORG, { email: 'p' + i + '@example.test' });
-      await ingestEvent({ ...deps, advance: true }, stageEvent(contact.id, '3', 'evt_' + i));
+      const c = await f.store.upsertContact({ email: 'p' + i + '@example.test' });
+      await ingestEvent({ ...f.deps(), advance: true }, stageEvent(c.id, '3', 'evt_' + i));
     }
-    c.advanceMs(120_000);
-    const t = await tick(deps, { orgId: ORG, limit: 2 });
+    f.clock.advanceMs(120_000);
+    const t = await tick(f.deps(), { orgId: ORG, limit: 2 });
     expect(t.claimed).toBe(2);
     expect(t.moreDue).toBe(true);
   });

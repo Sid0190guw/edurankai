@@ -11,6 +11,8 @@
 // for one that speaks to it. The MTA agent owns that implementation; this file owns the shape it
 // must satisfy.
 
+// Renders link attachments into the body instead of having the server fetch or read them.
+import { appendLinkAttachments } from '@/lib/mailsec/link-attachments';
 import type {
   MailTransport,
   OperationResult,
@@ -75,22 +77,31 @@ export function smtpTransport(): MailTransport {
         // the legacy path ALSO write email_logs would double every status count on
         // /admin/mail/analytics, which is a bug that has already happened once on this exact path
         // and is written up in the header of src/lib/mail-transport.ts.
+        // ATTACHMENT LINKS GO INTO THE MESSAGE. THEY ARE NOT FETCHED, AND NO PATH IS READ.
+        //
+        // This passed `href: a.url` and `path: a.path` straight to nodemailer. `href` makes
+        // nodemailer FETCH the URL and embed the response; `path` makes it READ THAT FILE off the
+        // local disk. Neither transport set disableUrlAccess or disableFileAccess, so both were
+        // live capabilities on a path whose envelope is assembled from stored campaign data — an
+        // arbitrary file read and a full-response SSRF, with the result delivered by email.
+        //
+        // The links are rendered into the body instead, which is what this product does everywhere
+        // else and what src/lib/mail-links.ts exists to explain. `path` has no replacement on
+        // purpose: there is no upload path in this system and a local file is never a legitimate
+        // attachment source here.
+        const withLinks = appendLinkAttachments(envelope.html || '', envelope.text || '', envelope.attachments as any);
+
         const result = await sendExternal({
           from,
           to,
           cc: envelope.cc,
           bcc: envelope.bcc,
           subject: envelope.subject,
-          html: envelope.html || '',
-          text: envelope.text || undefined,
+          html: withLinks.html,
+          text: withLinks.text || undefined,
           replyTo: envelope.replyTo || undefined,
           messageId: envelope.messageId || undefined,
           inReplyTo: envelope.inReplyTo || undefined,
-          attachments: (envelope.attachments || []).map((a) => ({
-            filename: a.filename,
-            href: a.url,
-            path: a.path,
-          })),
           // `headers` was added to SendExternalParams by the SMTP/MTA work happening alongside this
           // patch, for List-Unsubscribe and Precedence on bulk mail. Passed straight through: the
           // platform decides WHICH headers a message needs (see ../send.ts), the transport decides

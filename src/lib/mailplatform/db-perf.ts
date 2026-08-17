@@ -215,7 +215,7 @@ export function analyzeTables(stats: readonly TableStat[], t: AnalysisThresholds
         table: s.table,
         severity: 'warning',
         detail: s.table + ' is append-only and holds ~' + s.liveRows.toLocaleString() + ' rows. Retention on an unpartitioned table of this size is a bulk DELETE followed by hours of vacuum, against a table that is still being written to.',
-        recommendation: 'Partition by month on the timestamp column. mp_events is ALREADY partitioned (see mailplatform/events.ts EVENT_DDL); this one is not, and converting later requires copying every row.',
+        recommendation: 'Partition by month on the timestamp column. mailplatform/events.ts EVENT_DDL already carries a worked example (mp_event_stream); this table does not, and converting later requires copying every row.',
         evidence: { liveRows: s.liveRows, totalBytes: s.totalBytes },
       });
     }

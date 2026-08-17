@@ -11,6 +11,7 @@
 
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { textIn } from '@/lib/pg-array';
 import { addressKey } from './rfc';
 import { TemporaryFailure } from './errors';
 import type { SuppressionEntry, SuppressionReason, UUID } from './types';
@@ -94,7 +95,7 @@ export async function checkSuppressedResult(
       SELECT lower(address) AS addr, reason, scope, scope_ref, created_at, expires_at
       FROM mp_suppression_entries
       WHERE org_id = ${orgId}
-        AND lower(address) = ANY(${keys})
+        AND lower(address) IN ${textIn(keys)}
         AND (expires_at IS NULL OR expires_at > NOW())
         AND (scope = 'org'
              OR (scope = 'domain' AND scope_ref = split_part(lower(address), '@', 2))

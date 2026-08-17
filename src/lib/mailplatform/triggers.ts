@@ -58,7 +58,33 @@ export const TRIGGER_TYPES: ReadonlyArray<TriggerType> = [
 const BY_ID = new Map(TRIGGER_TYPES.map((t) => [t.id, t]));
 
 export function triggerType(id: string): TriggerType | null {
-  return BY_ID.get(String(id || '')) || null;
+  return BY_ID.get(canonicalEventType(id)) || null;
+}
+
+/**
+ * THE SIX KEYS THE EXISTING CANVAS ALREADY WROTE, MAPPED TO THEIR CANONICAL EVENT NAMES.
+ *
+ * src/lib/mail-product/automations.ts shipped its trigger picker with underscored keys before this
+ * engine existed, and automations drawn against them are already stored in `graph`. Renaming them
+ * would silently stop every one of those automations from ever starting again — a data migration
+ * dressed as a tidy-up. So both spellings resolve to one event type, here, in one table, and
+ * everything downstream (the event log, the webhook door, the API) only ever sees the dotted name.
+ *
+ * New trigger keys are dotted from the start; only these six need translating, for ever.
+ */
+const CANVAS_ALIASES: Record<string, string> = {
+  application_stage_changed: 'application.stage.changed',
+  contact_created: 'contact.created',
+  tag_added: 'contact.tag.added',
+  list_joined: 'contact.list.added',
+  campaign_opened: 'email.opened',
+  campaign_clicked: 'email.clicked',
+};
+
+/** The one event name for a trigger, whichever spelling the graph holds. */
+export function canonicalEventType(keyOrType: string): string {
+  const k = String(keyOrType || '').trim();
+  return CANVAS_ALIASES[k] || k;
 }
 
 /** Dotted, lower case, 3-80 characters. The shape a custom application event must take. */
@@ -74,7 +100,7 @@ export const EVENT_TYPE_RE = /^[a-z][a-z0-9]*(\.[a-z0-9_]+){1,5}$/;
  * "stage changed" would be two silently different triggers that both look right on a screen.
  */
 export function isUsableEventType(type: string): boolean {
-  const t = String(type || '').trim();
+  const t = canonicalEventType(type);
   if (BY_ID.has(t)) return true;
   return t.length >= 3 && t.length <= 80 && EVENT_TYPE_RE.test(t);
 }
@@ -122,8 +148,11 @@ export function eventMatchesTrigger(
   trigger: { event: string; filter?: ConditionNode } | null | undefined,
   facts: Facts,
 ): { matches: boolean; reason: string } {
-  if (!trigger || !trigger.event) return { matches: false, reason: 'the workflow has no trigger event' };
-  if (trigger.event !== event.type) return { matches: false, reason: 'the event is ' + event.type + ', the trigger listens for ' + trigger.event };
+  if (!trigger || !trigger.event) return { matches: false, reason: 'the automation has no trigger event' };
+  const listensFor = canonicalEventType(trigger.event);
+  if (listensFor !== canonicalEventType(event.type)) {
+    return { matches: false, reason: 'the event is ' + event.type + ', the trigger listens for ' + listensFor };
+  }
   if (!trigger.filter) return { matches: true, reason: 'the trigger has no filter' };
   const r = evaluateCondition(trigger.filter, facts);
   return { matches: r.result, reason: r.result ? 'the filter matched' : 'the filter did not match' };

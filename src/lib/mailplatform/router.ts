@@ -1,18 +1,17 @@
 // src/lib/mailplatform/router.ts — EVENTS IN, RUNS OUT. The only way anything starts.
 //
 // Every door — the admin API, platform code announcing a stage change, a signed webhook, the
-// scheduler, and an action inside another workflow — comes through ingestEvent(). One path means one
-// place where idempotency, tenant scoping and the chain-depth limit are enforced, instead of four
-// places where three of them are.
+// scheduler, and an action inside another automation — comes through ingestEvent(). One path means
+// one place where idempotency, tenant scoping and the chain-depth limit are enforced, instead of
+// four places where three of them are.
 //
 // THE ORDER IS DELIBERATE AND IT IS THE IDEMPOTENCY GUARANTEE:
 //
 //   1. Record the event, keyed on its id. A second delivery of the same id returns stored:false and
 //      this function stops. Nothing after this line runs twice for one event.
-//   2. Find the ACTIVE workflows listening for that type, in that organisation.
-//   3. Filter each one's trigger against the facts.
-//   4. Create a run — idempotent on (workflow, event), so even if step 1's guard were somehow
-//      bypassed, one event still cannot start two runs of one workflow.
+//   2. Find the ACTIVE automations and match each one's trigger node.
+//   3. Create a run — idempotent on (automation, event), so even if step 1's guard were somehow
+//      bypassed, one event still cannot start two runs of one automation.
 //
 // The event id is therefore the single most important field an integration sends. A sender that
 // generates a fresh id per RETRY has no idempotency, and the honest place to say so is the
@@ -20,8 +19,8 @@
 import type { AutomationStore, RunRecord } from './store';
 import { normalizeEmail } from './store';
 import type { IncomingEvent } from './triggers';
-import { eventMatchesTrigger, factsFor, isUsableEventType } from './triggers';
-import { findNode } from './graph';
+import { canonicalEventType, eventMatchesTrigger, factsFor, isUsableEventType } from './triggers';
+import { triggerNode } from './graph';
 import { advanceRun, contactFacts, type AdvanceReport, type EngineDeps } from './engine';
 import { newEventId, newRunId } from './security';
 import { reasonOf } from './errors';
@@ -29,16 +28,16 @@ import { reasonOf } from './errors';
 /**
  * How many times an event may cause an event may cause an event.
  *
- * Workflow A tags a contact; the tag starts workflow B; B updates the contact; the update starts A
- * again. Cycles between workflows are not detectable at authoring time the way a cycle inside one
- * definition is, so the chain is bounded at runtime. Five is deep enough for any real design and
- * short enough that a mistake costs five events rather than a mailbox.
+ * Automation A tags a contact; the tag starts automation B; B updates the contact; the update starts
+ * A again. Cycles BETWEEN automations are not detectable at authoring time the way a cycle inside
+ * one graph is (validateGraph refuses those), so the chain is bounded at runtime. Five is deep
+ * enough for any real design and short enough that a mistake costs five events rather than a mailbox.
  */
 export const MAX_CHAIN_DEPTH = 5;
 
 export interface IngestOptions extends EngineDeps {
   /** Advance the runs this event started, in this call. Off for a bulk import, where the worker
-   *  should do the work rather than the request that is holding somebody's browser open. */
+   *  should do the work rather than the request holding somebody's browser open. */
   advance?: boolean;
   depth?: number;
 }
@@ -49,9 +48,9 @@ export interface IngestReport {
   /** True when this exact event had already been recorded. Nothing was done, and that is correct. */
   duplicate: boolean;
   startedRuns: string[];
-  /** One line per candidate workflow saying why it did or did not start. This is what makes "my
+  /** One line per candidate automation saying why it did or did not start. This is what makes "my
    *  automation did not fire" answerable without reading the code. */
-  decisions: Array<{ workflowId: string; workflowName: string; started: boolean; reason: string }>;
+  decisions: Array<{ automationId: string; name: string; started: boolean; reason: string }>;
   advanced: AdvanceReport[];
   error: string | null;
 }
@@ -68,7 +67,9 @@ export function makeEvent(input: {
 }): IncomingEvent {
   return {
     eventId: String(input.eventId || newEventId()).slice(0, 128),
-    type: String(input.type || '').trim(),
+    // Stored canonically, so the six underscored keys the canvas already wrote and the dotted names
+    // everything else uses are ONE type in the log and one thing to query for.
+    type: canonicalEventType(input.type),
     orgId: input.orgId,
     contactId: input.contactId || null,
     payload: input.payload || {},
@@ -98,7 +99,7 @@ export async function ingestEvent(deps: IngestOptions, event: IncomingEvent): Pr
   }
 
   if (depth >= MAX_CHAIN_DEPTH) {
-    const msg = 'This event was ' + depth + ' links deep in a chain of workflows triggering one another, which is the limit. It was recorded but started nothing — check for two workflows that trigger each other.';
+    const msg = 'This event was ' + depth + ' links deep in a chain of automations triggering one another, which is the limit. It was recorded but started nothing — check for two automations that trigger each other.';
     console.error('[mailplatform/router] chain depth limit reached for ' + event.type + ' (' + event.eventId + ')');
     await store.markEventProcessed(event.eventId, 0, msg);
     report.error = msg;
@@ -106,36 +107,35 @@ export async function ingestEvent(deps: IngestOptions, event: IncomingEvent): Pr
   }
 
   try {
-    const contact = event.contactId ? await store.getContact(event.orgId, event.contactId) : null;
+    const contact = event.contactId ? await store.getContact(event.contactId) : null;
     const facts = factsFor(event, contact ? contactFacts(contact) : null);
-    const candidates = await store.workflowsListeningFor(event.orgId, event.type);
 
-    for (const wf of candidates) {
-      const triggerNode = wf.definition?.nodes?.find((n) => n.kind === 'trigger') || null;
-      if (!triggerNode) {
-        report.decisions.push({ workflowId: wf.id, workflowName: wf.name, started: false, reason: 'it has no trigger node' });
+    // EVERY ACTIVE AUTOMATION, MATCHED IN CODE. Not an indexed lookup on a denormalised trigger
+    // column: the canvas writes `graph` through its own saveAutomation() and would not know to keep
+    // such a column in step, so it would go stale and the router would silently stop starting runs.
+    const candidates = await store.activeAutomations(event.orgId);
+
+    for (const a of candidates) {
+      const trigger = triggerNode(a.graph);
+      if (!trigger) {
+        report.decisions.push({ automationId: a.id, name: a.name, started: false, reason: 'it has no trigger step' });
         continue;
       }
-      const match = eventMatchesTrigger(event, triggerNode.trigger, facts);
+      const spec = { event: String((trigger.config || {}).event || ''), filter: (trigger.config || {}).filter as any };
+      const match = eventMatchesTrigger(event, spec, facts);
       if (!match.matches) {
-        report.decisions.push({ workflowId: wf.id, workflowName: wf.name, started: false, reason: match.reason });
-        continue;
-      }
-      // The first node AFTER the trigger, resolved now so a run never starts pointing at a marker.
-      const startNode = triggerNode.id;
-      if (!findNode(wf.definition, startNode)) {
-        report.decisions.push({ workflowId: wf.id, workflowName: wf.name, started: false, reason: 'its trigger node is missing from the definition' });
+        report.decisions.push({ automationId: a.id, name: a.name, started: false, reason: match.reason });
         continue;
       }
 
       const run: RunRecord = {
         runId: newRunId(),
-        workflowId: wf.id,
-        workflowVersion: wf.version,
+        automationId: a.id,
+        graphVersion: a.version,
         orgId: event.orgId,
         contactId: event.contactId,
-        currentNode: startNode,
-        state: 'RUNNING',
+        currentNode: trigger.id,
+        state: 'running',
         waitUntil: null,
         // The event is FROZEN here. Conditions asking about it get the same answer in a week.
         context: { event: { id: event.eventId, type: event.type, source: event.source, occurred_at: event.occurredAt.toISOString(), ...event.payload }, facts },
@@ -150,11 +150,11 @@ export async function ingestEvent(deps: IngestOptions, event: IncomingEvent): Pr
       };
       const created = await store.createRun(run);
       if (!created.created) {
-        report.decisions.push({ workflowId: wf.id, workflowName: wf.name, started: false, reason: 'this event had already started run ' + created.run.runId });
+        report.decisions.push({ automationId: a.id, name: a.name, started: false, reason: 'this event had already started run ' + created.run.runId });
         continue;
       }
       report.startedRuns.push(created.run.runId);
-      report.decisions.push({ workflowId: wf.id, workflowName: wf.name, started: true, reason: 'started run ' + created.run.runId });
+      report.decisions.push({ automationId: a.id, name: a.name, started: true, reason: 'started run ' + created.run.runId });
     }
 
     await store.markEventProcessed(event.eventId, report.startedRuns.length, null);
@@ -176,7 +176,7 @@ export async function ingestEvent(deps: IngestOptions, event: IncomingEvent): Pr
 /**
  * Wire the engine's follow-on events back into this router, one link deeper.
  *
- * This is the whole of "prepare generic event support": an action emitting internship.selected is
+ * This is the whole of "generic event support": an action emitting internship.selected is
  * indistinguishable, from here down, from an outside system posting it. Same idempotency, same
  * tenant scoping, same depth counter.
  */
@@ -195,11 +195,12 @@ export function withPublisher(deps: EngineDeps, depth = 0): EngineDeps {
 /**
  * Announce something that happened, from anywhere in the platform.
  *
- *   await emit(store, { type: 'application.stage.changed', contactEmail: 'x@y.z', payload: { stage: '3' } })
+ *   await emit(pgStore, { type: 'application.stage.changed', orgId: ORG_ID,
+ *                         contactEmail: 'x@y.z', payload: { stage: '3' } })
  *
  * Takes an EMAIL rather than a contact id, because the code that knows an application moved to
- * stage 3 knows the applicant's address and has no reason to know about a marketing contact row.
- * The contact is created on first sight, which is also how "Contact created" gets its trigger.
+ * stage 3 knows the applicant's address and has no reason to know about a mail contact row. The
+ * contact is created on first sight, which is also how "Contact added" gets its trigger.
  */
 export async function emit(
   store: AutomationStore,
@@ -208,7 +209,7 @@ export async function emit(
     orgId: string;
     contactEmail?: string | null;
     contactId?: string | null;
-    contact?: { firstName?: string; lastName?: string; organization?: string; phone?: string; roleTitle?: string; applicationStage?: string; applicationNumber?: string };
+    contact?: { firstName?: string; lastName?: string; organization?: string; phone?: string; roleTitle?: string; fields?: Record<string, unknown> };
     payload?: Record<string, unknown>;
     eventId?: string | null;
     source?: IncomingEvent['source'];
@@ -219,13 +220,13 @@ export async function emit(
   const created: string[] = [];
   if (!contactId && input.contactEmail) {
     const email = normalizeEmail(input.contactEmail);
-    const existing = await store.findContactByEmail(input.orgId, email);
-    const c = await store.upsertContact(input.orgId, { email, ...(input.contact || {}) });
+    const existing = await store.findContactByEmail(email);
+    const c = await store.upsertContact({ email, ...(input.contact || {}) });
     contactId = c.id;
     if (!existing) created.push(c.id);
   }
 
-  // A brand new contact announces itself FIRST, so a "contact created" workflow starts before the
+  // A brand new contact announces itself FIRST, so a "contact added" automation starts before the
   // event that produced them. Both events are recorded either way; only the order is chosen.
   for (const id of created) {
     await ingestEvent({ store, ...deps, advance: deps.advance !== false } as IngestOptions,

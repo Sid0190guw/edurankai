@@ -109,11 +109,22 @@ describe('storage shapes', () => {
   it('partitions are monthly and roll the year correctly', () => {
     expect(partitionSql(2026, 8)).toContain("FROM ('2026-08-01') TO ('2026-09-01')");
     expect(partitionSql(2026, 12)).toContain("FROM ('2026-12-01') TO ('2027-01-01')");
-    expect(partitionSql(2026, 12)).toContain('mp_events_202612');
+    expect(partitionSql(2026, 12)).toContain('mp_event_stream_202612');
   });
 
   it('ships a DEFAULT partition so an insert can never fail for a missing month', () => {
-    expect(EVENT_DDL.join(' ')).toContain('PARTITION OF mp_events DEFAULT');
+    expect(EVENT_DDL.join(' ')).toContain('PARTITION OF mp_event_stream DEFAULT');
+  });
+
+  // REGRESSION GUARD, and it is guarding a bug that shipped. This DDL used to call the table
+  // `mp_events`, which schema.ts MP_DDL already creates with a completely different shape. Both were
+  // CREATE TABLE IF NOT EXISTS, so whichever ran first won silently and the other one's queries
+  // failed on columns that were never created. Nothing errored at deploy time; it surfaced as an ops
+  // panel that had been showing an error for as long as anyone could remember.
+  it('never claims the mp_events name, which the audit log in schema.ts owns', () => {
+    const ddl = [...EVENT_DDL, partitionSql(2026, 1)].join(' ');
+    expect(ddl).not.toMatch(/\bmp_events\b/);
+    expect(ddl).toContain('mp_event_stream');
   });
 });
 

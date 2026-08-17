@@ -1,20 +1,23 @@
 ---
 /**
- * /admin/mail/automation - every workflow, what is running, and what stopped.
+ * /admin/mail/automation - the ENGINE's own screen: what is running, what is waiting, and what
+ * stopped and needs a person.
  *
- * The engine has one screen, not two: an operator who cannot see the runs cannot answer the only
- * question anybody ever asks about an automation, which is "did it actually send that, and to whom".
- * Everything here is read through src/lib/mailplatform/service.ts, so this page can never activate
- * a workflow the JSON API would refuse.
+ * THE BUILDER IS NOT HERE. Automations are drawn and published at /mail/automations
+ * (src/lib/mail-product/automations.ts owns the graph, its validation and its Publish gate). This
+ * page is the half that did not exist until the executor did: runs, the events that started them,
+ * the dead letters, and whether anything is actually running on a timetable.
  *
- * FAILED READS ARE STATED, NOT SWALLOWED. An unreadable workflow list rendered as "no workflows"
- * reads as "nothing is set up", and the natural response is to build a second copy of something
- * that already exists and is already mailing people.
+ * FAILED READS ARE STATED, NOT SWALLOWED. An unreadable list rendered as "nothing here" reads as
+ * "nothing is set up", and the natural response is to build a second copy of something that already
+ * exists and is already mailing people.
  */
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { pgStore } from '@/lib/mailplatform/pg-store';
-import { ORG_ID, installExample, listExamples, setWorkflowStatus } from '@/lib/mailplatform/service';
-import { validateWorkflow } from '@/lib/mailplatform/graph';
+import { ORG_ID, checkReadyToActivate, installExample, listExamples } from '@/lib/mailplatform/service';
+import { controlRun } from '@/lib/mailplatform/worker';
+import { triggerNode } from '@/lib/mailplatform/graph';
+import { canonicalEventType } from '@/lib/mailplatform/triggers';
 import { channelStatus } from '@/lib/mailplatform/adapters';
 import { cronSecretConfigured } from '@/lib/auth/cron-auth';
 
@@ -27,17 +30,17 @@ let errMsg = '';
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = String(fd.get('_action') || '');
-  const id = String(fd.get('id') || '');
   try {
     if (action === 'install') {
       const r = await installExample(pgStore, ORG_ID, String(fd.get('key') || ''), user.id);
-      if (r.ok) okMsg = 'Installed as a draft. Open it, check the copy, then switch it on. ' + r.message;
-      else errMsg = r.message;
-    } else if (action === 'activate' || action === 'pause' || action === 'archive') {
-      const status = action === 'activate' ? 'active' : action === 'pause' ? 'paused' : 'archived';
-      const r = await setWorkflowStatus(pgStore, ORG_ID, id, status as any);
       if (r.ok) okMsg = r.message;
-      else errMsg = r.message + (r.problems.length ? ' ' + r.problems.filter((p) => p.level === 'error').map((p) => p.message).join(' ') : '');
+      else errMsg = r.message;
+    } else if (action === 'run_control') {
+      const r = await controlRun(pgStore, ORG_ID, String(fd.get('runId') || ''), String(fd.get('control') || '') as any);
+      // changed:false is reported as a refusal, not as success. Telling somebody a run was cancelled
+      // when it had already been sent is the failure that matters on this screen.
+      if (r.ok) okMsg = r.message;
+      else errMsg = r.message;
     }
   } catch (e: any) {
     // The real Postgres reason is on e.cause; e.message is only the failed SQL.
@@ -47,13 +50,13 @@ if (Astro.request.method === 'POST') {
 }
 
 let loadError = '';
-let workflows: any[] = [];
-let counts: any = { RUNNING: 0, WAITING: 0, COMPLETED: 0, FAILED: 0, CANCELLED: 0, PAUSED: 0 };
+let automations: any[] = [];
+let counts: any = { running: 0, waiting: 0, completed: 0, failed: 0, cancelled: 0, paused: 0 };
 let deadLetters: any[] = [];
 let recentRuns: any[] = [];
 let recentEvents: any[] = [];
 try {
-  workflows = await pgStore.listWorkflows(ORG_ID, {});
+  automations = await pgStore.listAutomations(ORG_ID, {});
   counts = await pgStore.countRuns(ORG_ID);
   deadLetters = await pgStore.listRuns(ORG_ID, { deadLetterOnly: true, limit: 20 });
   recentRuns = await pgStore.listRuns(ORG_ID, { limit: 15 });
@@ -63,36 +66,43 @@ try {
   console.error('[admin/mail/automation] read failed:', loadError);
 }
 
+// Whether each ACTIVE automation could actually run right now. An automation that is on and cannot
+// send is worse than one that is off: it looks live, enters contacts, and fails every one at the send.
+const readiness = new Map<string, string>();
+for (const a of automations.filter((x: any) => x.status === 'active')) {
+  try {
+    const r = await checkReadyToActivate(pgStore, ORG_ID, a.id);
+    if (!r.ok) readiness.set(a.id, r.channelProblem || r.problems.map((p: any) => p.message).join(' '));
+  } catch (e: any) {
+    readiness.set(a.id, 'It could not be checked: ' + String(e?.cause?.message || e?.message || e));
+  }
+}
+
 const channels = await channelStatus().catch(() => []);
 const examples = listExamples();
-const installedKeys = new Set(workflows.map((w: any) => w.key));
+const installedNames = new Set(automations.map((a: any) => a.name));
 const cronReady = cronSecretConfigured();
+const nameOf = new Map(automations.map((a: any) => [a.id, a.name]));
 
-function statusLabel(s: string) {
-  if (s === 'active') return 'On';
-  if (s === 'paused') return 'Paused';
-  if (s === 'archived') return 'Archived';
-  return 'Draft';
-}
 function when(d: any) {
   if (!d) return '';
   const t = d instanceof Date ? d : new Date(d);
   return Number.isFinite(t.getTime()) ? t.toISOString().replace('T', ' ').slice(0, 16) : '';
 }
-function problemCount(def: any) {
-  const v = validateWorkflow(def);
-  return v.problems.filter((p) => p.level === 'error').length;
+function listensFor(a: any) {
+  try { return canonicalEventType(String((triggerNode(a.graph)?.config || {}).event || '')) || 'nothing'; }
+  catch { return 'nothing'; }
 }
 ---
-<AdminLayout title="Automation" activeNav="mail">
+<AdminLayout title="Automation runs" activeNav="mail">
   <section class="page">
     <div class="page-head">
       <div>
         <p class="eyebrow">Mail</p>
         <h1>Automation</h1>
         <p class="sub">
-          Event, condition, action, delay. A workflow reacts to something that happened and can wait days
-          before the next step. <a href="/admin/mail">Back to inbox</a>
+          Event, condition, action, delay. Automations are drawn at <a href="/mail/automations">the builder</a>;
+          this page is what happened when they ran. <a href="/admin/mail">Back to inbox</a>
         </p>
       </div>
     </div>
@@ -108,7 +118,7 @@ function problemCount(def: any) {
 
     {!cronReady && (
       <div class="flash err">
-        CRON_SECRET is not set on this deployment, so <strong>nothing runs on a timetable</strong>: a workflow
+        CRON_SECRET is not set on this deployment, so <strong>nothing runs on a timetable</strong>: an automation
         can start, but every delay stays parked and no scheduled trigger fires. Nothing is lost — each waiting
         run keeps its appointment and continues once the secret is set and /api/mail/automation/tick is called.
       </div>
@@ -116,14 +126,14 @@ function problemCount(def: any) {
 
     <div class="card">
       <h2>Runs</h2>
-      <p class="card-sub">A run is one contact moving through one workflow.</p>
+      <p class="card-sub">A run is one contact moving through one automation.</p>
       <div class="stat-row">
-        <div class="stat"><span class="n">{counts.RUNNING}</span><span class="l">Running</span></div>
-        <div class="stat"><span class="n">{counts.WAITING}</span><span class="l">Waiting on a delay</span></div>
-        <div class="stat"><span class="n">{counts.PAUSED}</span><span class="l">Paused</span></div>
-        <div class="stat"><span class="n">{counts.COMPLETED}</span><span class="l">Completed</span></div>
-        <div class="stat"><span class="n">{counts.FAILED}</span><span class="l">Failed</span></div>
-        <div class="stat"><span class="n">{counts.CANCELLED}</span><span class="l">Cancelled</span></div>
+        <div class="stat"><span class="n">{counts.running}</span><span class="l">Running</span></div>
+        <div class="stat"><span class="n">{counts.waiting}</span><span class="l">Waiting on a delay</span></div>
+        <div class="stat"><span class="n">{counts.paused}</span><span class="l">Paused</span></div>
+        <div class="stat"><span class="n">{counts.completed}</span><span class="l">Completed</span></div>
+        <div class="stat"><span class="n">{counts.failed}</span><span class="l">Failed</span></div>
+        <div class="stat"><span class="n">{counts.cancelled}</span><span class="l">Cancelled</span></div>
       </div>
     </div>
 
@@ -133,17 +143,25 @@ function problemCount(def: any) {
         <p class="card-sub">
           These runs stopped in a way the engine would not resolve on its own. A step that was interrupted
           part-way through a send is never repeated automatically, because a message cannot be recalled.
-          Check whether it went out, then retry or cancel from the run.
+          Check whether it went out, then retry or cancel.
         </p>
         <table class="tbl">
-          <thead><tr><th>Run</th><th>Stopped at</th><th>Why</th><th>When</th></tr></thead>
+          <thead><tr><th>Run</th><th>Automation</th><th>Stopped at</th><th>Why</th><th></th></tr></thead>
           <tbody>
             {deadLetters.map((r: any) => (
               <tr>
-                <td><a href={'/admin/mail/automation/' + r.workflowId + '?run=' + r.runId}>{r.runId.slice(0, 14)}</a></td>
-                <td>{r.currentNode || ''}</td>
-                <td class="wrap">{r.error || ''}</td>
-                <td>{when(r.updatedAt)}</td>
+                <td class="mono small">{r.runId.slice(0, 8)}</td>
+                <td class="small">{nameOf.get(r.automationId) || r.automationId}</td>
+                <td class="mono small">{r.currentNode || ''}</td>
+                <td class="wrap small">{r.error || ''}</td>
+                <td class="right">
+                  <form method="post" class="inline">
+                    <input type="hidden" name="_action" value="run_control" />
+                    <input type="hidden" name="runId" value={r.runId} />
+                    <button class="btn small" name="control" value="retry">Retry</button>
+                    <button class="btn small" name="control" value="cancel">Cancel</button>
+                  </form>
+                </td>
               </tr>
             ))}
           </tbody>
@@ -152,34 +170,23 @@ function problemCount(def: any) {
     )}
 
     <div class="card">
-      <h2>Workflows</h2>
-      {workflows.length === 0 ? (
-        <p class="muted">No workflows yet. Install one of the examples below to see the shape of one.</p>
+      <h2>Automations</h2>
+      {automations.length === 0 ? (
+        <p class="muted">None yet. Install an example below, or draw one at <a href="/mail/automations">the builder</a>.</p>
       ) : (
         <table class="tbl">
-          <thead><tr><th>Name</th><th>Trigger</th><th>Status</th><th>Version</th><th>Updated</th><th></th></tr></thead>
+          <thead><tr><th>Name</th><th>Starts on</th><th>Status</th><th>Version</th><th>Updated</th></tr></thead>
           <tbody>
-            {workflows.map((w: any) => (
+            {automations.map((a: any) => (
               <tr>
                 <td>
-                  <a href={'/admin/mail/automation/' + w.id}><strong>{w.name}</strong></a>
-                  <div class="muted small">{w.key}</div>
-                  {problemCount(w.definition) > 0 && <div class="small err-text">{problemCount(w.definition)} error(s) to fix before it can be switched on</div>}
+                  <a href={'/mail/automations/' + a.id}><strong>{a.name}</strong></a>
+                  {readiness.get(a.id) && <div class="small err-text">On, but it cannot run: {readiness.get(a.id)}</div>}
                 </td>
-                <td class="mono small">{w.triggerEvent || 'none'}</td>
-                <td><span class={'pill ' + w.status}>{statusLabel(w.status)}</span></td>
-                <td>{w.version}</td>
-                <td class="small">{when(w.updatedAt)}</td>
-                <td class="right">
-                  <form method="post" class="inline">
-                    <input type="hidden" name="id" value={w.id} />
-                    {w.status === 'active' ? (
-                      <button class="btn small" name="_action" value="pause">Pause</button>
-                    ) : (
-                      <button class="btn small primary" name="_action" value="activate">Switch on</button>
-                    )}
-                  </form>
-                </td>
+                <td class="mono small">{listensFor(a)}</td>
+                <td>{a.status}</td>
+                <td>{a.version}</td>
+                <td class="small">{when(a.updatedAt)}</td>
               </tr>
             ))}
           </tbody>
@@ -189,16 +196,20 @@ function problemCount(def: any) {
 
     <div class="card">
       <h2>Start from an example</h2>
-      <p class="card-sub">Installed as a draft, always. An example that switched itself on would begin mailing candidates the moment somebody clicked it to see what it looked like.</p>
+      <p class="card-sub">
+        Installed as a draft, always. An example that switched itself on would begin mailing candidates the
+        moment somebody clicked it to see what it looked like. Its send steps name no template on purpose —
+        choose one in the builder before switching it on.
+      </p>
       <table class="tbl">
         <thead><tr><th>Example</th><th>Steps</th><th></th></tr></thead>
         <tbody>
           {examples.map((ex: any) => (
             <tr>
               <td><strong>{ex.name}</strong><div class="muted small">{ex.description}</div></td>
-              <td>{ex.nodes}</td>
+              <td>{ex.steps}</td>
               <td class="right">
-                {installedKeys.has(ex.key) ? (
+                {installedNames.has(ex.name) ? (
                   <span class="muted small">Installed</span>
                 ) : (
                   <form method="post" class="inline">
@@ -215,9 +226,7 @@ function problemCount(def: any) {
 
     <div class="card">
       <h2>Channels</h2>
-      <p class="card-sub">
-        A step pointing at a channel that is not built refuses to send rather than quietly sending nothing.
-      </p>
+      <p class="card-sub">A step pointing at a channel that is not built refuses to send rather than quietly sending nothing.</p>
       <table class="tbl">
         <thead><tr><th>Channel</th><th>Usable</th><th>Why not</th></tr></thead>
         <tbody>
@@ -238,15 +247,25 @@ function problemCount(def: any) {
         <p class="muted">Nothing has run yet.</p>
       ) : (
         <table class="tbl">
-          <thead><tr><th>Run</th><th>State</th><th>At step</th><th>Waiting until</th><th>Note</th></tr></thead>
+          <thead><tr><th>Run</th><th>Automation</th><th>State</th><th>At step</th><th>Waiting until</th><th>Note</th><th></th></tr></thead>
           <tbody>
             {recentRuns.map((r: any) => (
               <tr>
-                <td><a href={'/admin/mail/automation/' + r.workflowId + '?run=' + r.runId}>{r.runId.slice(0, 14)}</a></td>
+                <td class="mono small">{r.runId.slice(0, 8)}</td>
+                <td class="small">{nameOf.get(r.automationId) || ''}</td>
                 <td>{r.state}</td>
                 <td class="mono small">{r.currentNode || ''}</td>
                 <td class="small">{when(r.waitUntil)}</td>
                 <td class="wrap small">{r.errorKind === 'business' ? 'Ended: ' + (r.error || '') : (r.error || '')}</td>
+                <td class="right">
+                  <form method="post" class="inline">
+                    <input type="hidden" name="_action" value="run_control" />
+                    <input type="hidden" name="runId" value={r.runId} />
+                    {r.state === 'waiting' && <button class="btn small" name="control" value="pause">Pause</button>}
+                    {r.state === 'paused' && <button class="btn small" name="control" value="resume">Resume</button>}
+                    {(r.state === 'waiting' || r.state === 'paused' || r.state === 'running') && <button class="btn small" name="control" value="cancel">Cancel</button>}
+                  </form>
+                </td>
               </tr>
             ))}
           </tbody>
@@ -256,7 +275,10 @@ function problemCount(def: any) {
 
     <div class="card">
       <h2>Recent events</h2>
-      <p class="card-sub">Every event is recorded whether or not it started anything. "Started 0 runs" is a normal answer and usually the one you are looking for.</p>
+      <p class="card-sub">
+        Every event is recorded whether or not it started anything. "Started 0 runs" is a normal answer and
+        usually the one you are looking for.
+      </p>
       {recentEvents.length === 0 ? (
         <p class="muted">No events yet.</p>
       ) : (
@@ -299,7 +321,7 @@ function problemCount(def: any) {
   .tbl th, .tbl td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid rgba(128,128,128,.18); vertical-align: top; }
   .tbl th { font-size: .75rem; text-transform: uppercase; letter-spacing: .05em; opacity: .7; }
   .right { text-align: right; }
-  .wrap { max-width: 34rem; white-space: normal; }
+  .wrap { max-width: 30rem; white-space: normal; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .small { font-size: .8rem; }
   .muted { opacity: .7; }
@@ -307,10 +329,4 @@ function problemCount(def: any) {
   .inline { display: inline; }
   .btn { border: 1px solid rgba(128,128,128,.4); background: transparent; color: inherit; border-radius: 6px; padding: .3rem .6rem; cursor: pointer; font: inherit; }
   .btn.small { font-size: .82rem; }
-  .btn.primary { border-color: rgba(59,130,246,.6); }
-  .pill { border-radius: 999px; padding: .1rem .55rem; font-size: .75rem; border: 1px solid rgba(128,128,128,.4); }
-  .pill.active { border-color: rgba(34,197,94,.6); }
-  .pill.paused { border-color: rgba(234,179,8,.6); }
-  .pill.draft { opacity: .8; }
-  table { overflow-x: auto; display: block; }
 </style>

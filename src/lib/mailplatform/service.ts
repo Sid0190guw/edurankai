@@ -1,205 +1,128 @@
-// src/lib/mailplatform/service.ts — the operations an operator performs, in one place.
+// src/lib/mailplatform/service.ts — the operations the engine adds around the existing builder.
 //
-// The admin page and the JSON API both call these. Two callers doing their own validation is how one
-// of them ends up able to activate a workflow the other would refuse.
-import type { AutomationStore, WorkflowRecord, WorkflowStatus } from './store';
-import type { WorkflowDefinition } from './graph';
-import { validateWorkflow, type ValidationProblem } from './graph';
-import { isUsableEventType } from './triggers';
-import { actionDefinition } from './actions';
+// THIS FILE DELIBERATELY DOES NOT SAVE AUTOMATIONS. src/lib/mail-product/automations.ts already owns
+// createAutomation / saveAutomation / deleteAutomation and the Publish gate, and /mail/automations
+// calls them. A second writer would be a second set of rules about when a graph may go live.
+//
+// What is added here is what only an EXECUTOR needs:
+//   - a version snapshot on every graph change, so in-flight runs keep the shape they started on
+//   - the webhook credentials for the inbound door
+//   - the extra validation that is about what this installation HAS, not about the drawing
+import type { AutomationRecord, AutomationStore } from './store';
+import type { AutomationGraph, GraphProblem } from './graph';
+import { checkAgainstPlatform, coerceGraph, validateGraph } from './graph';
+import { pgStore, setWebhookCredentials } from './pg-store';
+import { DEFAULT_ORG_ID, newWebhookSecret, newWebhookToken } from './security';
 import { channel } from './adapters';
-import { pgStore } from './pg-store';
-import { DEFAULT_ORG_ID, newWebhookSecret, newWebhookToken, newWorkflowId } from './security';
-import { WORKFLOW_EXAMPLES, exampleByKey } from './examples';
-import { setWebhookCredentials } from './pg-store';
+import { reasonOf } from './errors';
+import { exampleByKey, listExamples } from './examples';
 
 export const ORG_ID = DEFAULT_ORG_ID;
 
 /** The production store. Taken as a parameter everywhere below so a test can pass a memory store. */
 export function defaultStore(): AutomationStore { return pgStore; }
 
-export interface SaveInput {
-  id?: string | null;
-  key: string;
-  name: string;
-  description?: string;
-  status?: WorkflowStatus;
-  definition: WorkflowDefinition;
-}
+export { checkAgainstPlatform };
 
-export interface SaveResult {
+export interface ReadinessResult {
   ok: boolean;
-  workflow: WorkflowRecord | null;
-  problems: ValidationProblem[];
-  /** True when the definition changed and the version was bumped. */
-  versioned: boolean;
-  message: string;
+  problems: GraphProblem[];
+  /** Present when the reason is a channel rather than the graph. */
+  channelProblem: string | null;
 }
 
 /**
- * Checks the graph validator cannot make, because they are about what this platform HAS rather than
- * about the shape of the drawing: an action nobody implemented, a channel nobody wired up, an event
- * type that is not a usable name.
+ * Is this automation safe to switch on?
+ *
+ * validateGraph() answers the structural half and mail-product's saveAutomation() already refuses to
+ * activate without it. This adds the two questions only the runtime can answer: can the engine
+ * actually execute every step, and is the channel each send step uses configured on THIS deployment?
+ *
+ * An automation that is on and cannot send is worse than one that is off: it looks live, enters
+ * contacts, and fails every one of them at the send.
  */
-export function checkAgainstPlatform(def: WorkflowDefinition): ValidationProblem[] {
-  const problems: ValidationProblem[] = [];
-  for (const n of def?.nodes || []) {
-    if (n.kind === 'trigger' && n.trigger?.event && !isUsableEventType(n.trigger.event)) {
-      problems.push({ level: 'error', at: n.id, message: '"' + n.trigger.event + '" is not a usable event type. Use a dotted lower-case name, e.g. application.stage.changed.' });
-    }
-    if (n.kind === 'trigger' && (n.trigger?.event === 'schedule.date' || n.trigger?.event === 'schedule.time') && !n.trigger?.schedule?.at) {
-      problems.push({ level: 'error', at: n.id, message: 'A scheduled trigger needs a date and time to fire at, or it never fires.' });
-    }
-    if (n.kind !== 'action') continue;
-    const type = n.action?.type || '';
-    const def_ = actionDefinition(type);
-    if (!def_) { problems.push({ level: 'error', at: n.id, message: 'There is no action called "' + type + '" on this platform.' }); continue; }
-    for (const p of def_.params) {
-      if (p.required && !String((n.action?.params || {})[p.name] ?? '').trim()) {
-        problems.push({ level: 'error', at: n.id, message: '"' + def_.label + '" needs ' + p.label.toLowerCase() + '.' });
-      }
-    }
-    const ch = String((n.action?.params || {}).channel || '');
-    if (ch) {
-      const adapter = channel(ch);
-      if (!adapter) problems.push({ level: 'error', at: n.id, message: 'There is no "' + ch + '" channel.' });
-      // Whether it is CONFIGURED is checked at activation, not here — a draft written on a laptop
-      // with no SMTP is a normal thing to save.
-    }
-  }
-  return problems;
-}
-
-/** Definitions compared by value, so a save that changed nothing does not bump the version and
- *  orphan every in-flight run onto a snapshot identical to the one they already had. */
-function sameDefinition(a: WorkflowDefinition | null | undefined, b: WorkflowDefinition | null | undefined): boolean {
-  try { return JSON.stringify(a || null) === JSON.stringify(b || null); } catch { return false; }
-}
-
-export async function saveWorkflow(store: AutomationStore, orgId: string, input: SaveInput, userId: string | null): Promise<SaveResult> {
-  const key = String(input.key || '').trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-|-$/g, '').slice(0, 80);
-  if (!key) return { ok: false, workflow: null, problems: [{ level: 'error', message: 'The workflow needs a key.' }], versioned: false, message: 'The workflow needs a key.' };
-  if (!String(input.name || '').trim()) return { ok: false, workflow: null, problems: [{ level: 'error', message: 'The workflow needs a name.' }], versioned: false, message: 'The workflow needs a name.' };
-
-  const structural = validateWorkflow(input.definition);
-  const platform = checkAgainstPlatform(input.definition);
-  const problems = [...structural.problems, ...platform];
-  const hasErrors = problems.some((p) => p.level === 'error');
-
-  const existing = input.id ? await store.getWorkflow(orgId, input.id) : await store.getWorkflowByKey(orgId, key);
-  const wantedStatus: WorkflowStatus = input.status || existing?.status || 'draft';
-
-  // A DRAFT MAY BE BROKEN; AN ACTIVE WORKFLOW MAY NOT. Saving work in progress must always be
-  // possible, or an operator loses an afternoon's drawing to a validator.
-  if (hasErrors && wantedStatus === 'active') {
-    return { ok: false, workflow: existing || null, problems, versioned: false, message: 'This workflow cannot be switched on until the errors below are fixed. It has not been changed.' };
-  }
-
-  const changed = !existing || !sameDefinition(existing.definition, input.definition);
-  const version = existing ? (changed ? existing.version + 1 : existing.version) : 1;
-  const triggerEvent = (input.definition?.nodes || []).find((n) => n.kind === 'trigger')?.trigger?.event || '';
-
-  const saved = await store.saveWorkflow({
-    id: existing?.id || input.id || newWorkflowId(),
-    orgId,
-    key,
-    name: String(input.name).trim().slice(0, 200),
-    description: String(input.description || '').trim().slice(0, 2000),
-    status: hasErrors ? (wantedStatus === 'active' ? 'draft' : wantedStatus) : wantedStatus,
-    version,
-    definition: { ...input.definition, version },
-    triggerEvent,
-    webhookToken: existing?.webhookToken || null,
-    createdByUserId: existing?.createdByUserId || userId,
-  });
-
-  // The snapshot is written AFTER the workflow row, and always — including for version 1, so the
-  // very first run has a snapshot to follow rather than the "no snapshot was kept" fallback.
-  if (changed || !(await store.getWorkflowDefinition(orgId, saved.id, version))) {
-    await store.saveWorkflowVersion(orgId, saved.id, version, saved.definition);
-  }
-
-  const inflight = changed && existing
-    ? (await store.listRuns(orgId, { workflowId: saved.id, limit: 500 })).filter((r) => r.state === 'WAITING' || r.state === 'RUNNING' || r.state === 'PAUSED').length
-    : 0;
-
-  return {
-    ok: true,
-    workflow: saved,
-    problems,
-    versioned: changed,
-    message: changed
-      ? 'Saved as version ' + version + '.' + (inflight ? ' ' + inflight + ' run' + (inflight === 1 ? '' : 's') + ' already in flight will finish on version ' + (existing as WorkflowRecord).version + ' — they do not change shape mid-way.' : '')
-      : 'Saved. The steps were unchanged, so the version stayed at ' + version + '.',
-  };
-}
-
-export interface StatusResult { ok: boolean; message: string; problems: ValidationProblem[] }
-
-/** Switch a workflow on or off. Activation re-validates, and it also checks the CHANNELS are
- *  configured — because a workflow that is on and cannot send is worse than one that is off. */
-export async function setWorkflowStatus(
+export async function checkReadyToActivate(
   store: AutomationStore,
   orgId: string,
   id: string,
-  status: WorkflowStatus,
-  // Injected the same way the engine takes it, so a test can activate a workflow without an SMTP
-  // server and production still checks the real adapters. Defaulted, never globally switched.
   opts: { channels?: (id: string) => ReturnType<typeof channel> } = {},
-): Promise<StatusResult> {
+): Promise<ReadinessResult> {
   const resolveChannel = opts.channels || channel;
-  const wf = await store.getWorkflow(orgId, id);
-  if (!wf) return { ok: false, message: 'There is no workflow with that id here.', problems: [] };
+  const a = await store.getAutomation(orgId, id);
+  if (!a) return { ok: false, problems: [{ nodeId: null, message: 'There is no automation with that id here.' }], channelProblem: null };
 
-  if (status === 'active') {
-    const problems = [...validateWorkflow(wf.definition).problems, ...checkAgainstPlatform(wf.definition)];
-    if (problems.some((p) => p.level === 'error')) {
-      return { ok: false, message: 'This workflow cannot be switched on while it has errors.', problems };
+  const graph = coerceGraph(a.graph);
+  const problems = [...validateGraph(graph).problems, ...checkAgainstPlatform(graph)];
+  if (problems.length) return { ok: false, problems, channelProblem: null };
+
+  for (const n of graph.nodes) {
+    if (n.kind !== 'send_email') continue;
+    const ch = resolveChannel(String((n.config || {}).channel || 'email'));
+    if (!ch) return { ok: false, problems, channelProblem: 'Step "' + n.id + '" names a channel this platform does not have.' };
+    if (!(await ch.available())) {
+      return { ok: false, problems, channelProblem: 'Step "' + n.id + '" sends by ' + ch.label + ', and ' + (await ch.unavailableReason()) };
     }
-    const sends = (wf.definition?.nodes || []).filter((n) => n.kind === 'action' && (n.action?.type === 'send_email' || n.action?.type === 'send_template'));
-    for (const n of sends) {
-      const ch = resolveChannel(String((n.action?.params || {}).channel || 'email'));
-      if (!ch) continue;
-      if (!(await ch.available())) {
-        return { ok: false, message: 'Not switched on: "' + (n.label || n.id) + '" sends by ' + ch.label + ', and ' + (await ch.unavailableReason()), problems };
-      }
-    }
-    await store.saveWorkflow({ ...wf, status: 'active' });
-    return { ok: true, message: 'Switched on. New matching events will start runs from now; nothing that happened before is replayed.', problems };
+  }
+  return { ok: true, problems: [], channelProblem: null };
+}
+
+export interface SnapshotResult { ok: boolean; version: number; inFlight: number; message: string }
+
+/**
+ * Record the current graph as a numbered version, and say how many runs are still on the old one.
+ *
+ * Called after mail-product's saveAutomation() has written the graph. Keeping it separate is what
+ * lets the canvas keep its own save path unchanged; the cost is that a graph saved by some future
+ * writer that forgets to call this gets no snapshot, which the engine reports at run time ("no
+ * snapshot of version N was kept") rather than silently guessing.
+ */
+export async function snapshotGraph(store: AutomationStore, orgId: string, id: string, previousGraph?: AutomationGraph | null): Promise<SnapshotResult> {
+  const a = await store.getAutomation(orgId, id);
+  if (!a) return { ok: false, version: 0, inFlight: 0, message: 'There is no automation with that id here.' };
+
+  const changed = !previousGraph || JSON.stringify(coerceGraph(previousGraph)) !== JSON.stringify(coerceGraph(a.graph));
+  const inFlight = (await store.listRuns(orgId, { automationId: id, limit: 500 }))
+    .filter((r) => r.state === 'waiting' || r.state === 'running' || r.state === 'paused').length;
+
+  if (!changed) {
+    // Still make sure a snapshot EXISTS for the current version, including version 1 — otherwise the
+    // very first run has nothing to follow but the live graph.
+    if (!(await store.getGraphVersion(orgId, id, a.version))) await store.saveGraphVersion(orgId, id, a.version, a.graph);
+    return { ok: true, version: a.version, inFlight, message: 'The steps were unchanged, so the version stayed at ' + a.version + '.' };
   }
 
-  await store.saveWorkflow({ ...wf, status });
+  const version = a.version + 1;
+  await store.saveGraphVersion(orgId, id, version, a.graph);
+  await store.setVersion(orgId, id, version);
   return {
     ok: true,
-    problems: [],
-    message: status === 'paused'
-      // Said explicitly because it is the surprising half: pausing stops NEW runs, and the runs
-      // already parked on a 24-hour delay keep their appointment unless they are paused too.
-      ? 'Paused. No new runs will start. Runs already in flight continue — pause or cancel them individually on the runs list.'
-      : 'Saved as ' + status + '.',
+    version,
+    inFlight,
+    message: 'Saved as version ' + version + '.' + (inFlight
+      ? ' ' + inFlight + ' run' + (inFlight === 1 ? '' : 's') + ' already in flight will finish on version ' + a.version + ' — they do not change shape mid-way.'
+      : ''),
   };
 }
 
-export async function installExample(store: AutomationStore, orgId: string, key: string, userId: string | null): Promise<SaveResult> {
-  const ex = exampleByKey(key);
-  if (!ex) return { ok: false, workflow: null, problems: [{ level: 'error', message: 'There is no example called "' + key + '".' }], versioned: false, message: 'Unknown example.' };
-  const existing = await store.getWorkflowByKey(orgId, ex.key);
-  if (existing) return { ok: false, workflow: existing, problems: [], versioned: false, message: 'That example is already installed as "' + existing.name + '". Open it rather than installing a second copy.' };
-  // Installed as a DRAFT, always. An example that switched itself on would start mailing candidates
-  // the moment somebody clicked it to see what it looked like.
-  return saveWorkflow(store, orgId, { key: ex.key, name: ex.name, description: ex.description, status: 'draft', definition: ex.definition }, userId);
+/** Make sure the current version has a snapshot. Cheap, idempotent, and safe to call on every read
+ *  of an automation that is about to start runs. */
+export async function ensureSnapshot(store: AutomationStore, orgId: string, id: string): Promise<void> {
+  try {
+    const a = await store.getAutomation(orgId, id);
+    if (!a) return;
+    if (!(await store.getGraphVersion(orgId, id, a.version))) await store.saveGraphVersion(orgId, id, a.version, a.graph);
+  } catch (e: any) {
+    // Best effort: a missing snapshot degrades to "follow the live graph and say so", which the
+    // engine already handles. It must not stop an automation being used.
+    console.error('[mailplatform/service] snapshot check failed:', reasonOf(e));
+  }
 }
 
-export function listExamples() {
-  return WORKFLOW_EXAMPLES.map((e) => ({ key: e.key, name: e.name, description: e.description, nodes: e.definition.nodes.length }));
-}
-
-/** Turn the webhook door on, returning the credentials ONCE. The secret is not readable afterwards
- *  from any listing endpoint — it is shown here and stored hashed nowhere else in this module's
- *  read paths, which is why regenerating is the recovery for a lost one. */
+/** Turn the webhook door on, returning the credentials ONCE. The secret is never returned by any
+ *  listing endpoint, which is why regenerating is the recovery for a lost one. */
 export async function enableWebhook(store: AutomationStore, orgId: string, id: string): Promise<{ ok: boolean; token?: string; secret?: string; message: string }> {
-  const wf = await store.getWorkflow(orgId, id);
-  if (!wf) return { ok: false, message: 'There is no workflow with that id here.' };
+  const a = await store.getAutomation(orgId, id);
+  if (!a) return { ok: false, message: 'There is no automation with that id here.' };
   const token = newWebhookToken();
   const secret = newWebhookSecret();
   await setWebhookCredentials(orgId, id, token, secret);
@@ -207,8 +130,37 @@ export async function enableWebhook(store: AutomationStore, orgId: string, id: s
 }
 
 export async function disableWebhook(store: AutomationStore, orgId: string, id: string): Promise<{ ok: boolean; message: string }> {
-  const wf = await store.getWorkflow(orgId, id);
-  if (!wf) return { ok: false, message: 'There is no workflow with that id here.' };
+  const a = await store.getAutomation(orgId, id);
+  if (!a) return { ok: false, message: 'There is no automation with that id here.' };
   await setWebhookCredentials(orgId, id, null, null);
   return { ok: true, message: 'The webhook URL no longer accepts anything. Any sender still posting to it now gets a 404.' };
 }
+
+/**
+ * Install one of the shipped examples, THROUGH mail-product's own writers.
+ *
+ * createAutomation() then saveAutomation() — the same two calls /mail/automations makes — so the row
+ * is indistinguishable from one drawn by hand and there is still exactly one place that writes a
+ * graph. Installed as a DRAFT, always: an example that switched itself on would begin mailing
+ * candidates the moment somebody clicked it to see what it looked like.
+ */
+export async function installExample(store: AutomationStore, orgId: string, key: string, userId: string | null): Promise<{ ok: boolean; id: string | null; message: string }> {
+  const ex = exampleByKey(key);
+  if (!ex) return { ok: false, id: null, message: 'There is no example called "' + key + '".' };
+
+  const { createAutomation, saveAutomation, listAutomations } = await import('@/lib/mail-product/automations');
+  const already = (await listAutomations()).find((a: any) => String(a.name) === ex.name);
+  if (already) return { ok: false, id: already.id, message: 'That example is already installed as "' + already.name + '". Open it rather than installing a second copy.' };
+
+  const created = await createAutomation(ex.name, userId);
+  if (!created.id) return { ok: false, id: null, message: 'It could not be created: ' + (created.error || 'unknown error') };
+
+  const saved = await saveAutomation(created.id, { description: ex.description, graph: ex.graph, status: 'draft' });
+  if (!saved.ok) return { ok: false, id: created.id, message: 'It was created but its steps were not saved: ' + (saved.error || 'unknown error') };
+
+  await ensureSnapshot(store, orgId, created.id);
+  return { ok: true, id: created.id, message: 'Installed as a draft. Choose a template on each send step, then switch it on.' };
+}
+
+export { listExamples };
+export type { AutomationRecord };

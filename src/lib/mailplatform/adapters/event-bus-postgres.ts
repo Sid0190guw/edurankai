@@ -11,6 +11,7 @@
 
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { textIn } from '@/lib/pg-array';
 import type {
   AnalyticsProvider,
   EventBus,
@@ -129,7 +130,7 @@ export function postgresEventBus(): EventBus {
       const cursor = decodeCursor(q.cursor);
       try {
         const conditions = [sql`org_id = ${q.orgId}`];
-        if (q.eventTypes?.length) conditions.push(sql`event_type = ANY(${q.eventTypes})`);
+        if (q.eventTypes?.length) conditions.push(sql`event_type IN ${textIn(q.eventTypes)}`);
         if (q.entityType) conditions.push(sql`entity_type = ${q.entityType}`);
         if (q.entityId) conditions.push(sql`entity_id = ${q.entityId}`);
         if (q.since) conditions.push(sql`occurred_at >= ${new Date(q.since)}`);
@@ -203,7 +204,7 @@ export function postgresAnalytics(): AnalyticsProvider {
       try {
         const conditions = [sql`org_id = ${q.orgId}`];
         const types = METRIC_EVENT_TYPES[metric];
-        if (types) conditions.push(sql`event_type = ANY(${types})`);
+        if (types?.length) conditions.push(sql`event_type IN ${textIn(types)}`);
         if (q.since) conditions.push(sql`occurred_at >= ${new Date(q.since)}`);
         if (q.until) conditions.push(sql`occurred_at <= ${new Date(q.until)}`);
 

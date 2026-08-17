@@ -228,7 +228,35 @@ export async function sendMessage(request: SendRequest, ctx: SendContext = {}): 
   }
 
   if (!bypassAllowed) {
-    const checks = await checkSuppressed(orgId, recipients.map((r) => r.email), { campaignId: request.campaignId });
+    // ═══ THE SUPPRESSION READ NOW FAILS CLOSED, AND THAT MUST NOT BECOME A THROW OUT OF HERE ═══
+    //
+    // checkSuppressed() used to answer "nobody is suppressed" when it could not read the table,
+    // which mailed everyone who had bounced, unsubscribed or reported us for spam. It now raises
+    // SuppressionUnavailableError instead, and that is the right direction — but sendMessage()'s
+    // contract, relied on by every caller in this package, is that it RETURNS a SendResult and
+    // never throws. Every other failure in this function goes through fail().
+    //
+    // The caller that makes this load-bearing is sendCampaignBatch() in campaigns.ts. It claims a
+    // batch durably (pending -> 'queued') and then loops calling sendMessage() with no try/catch
+    // around the loop. A throw escaping here would leave the claimed rows stranded in 'queued' —
+    // the claim query only ever selects 'pending', and the remaining-count that marks a campaign
+    // 'sent' only counts 'pending' — so a batch would be lost AND the campaign could be reported as
+    // sent when most of it never left. Failing closed must not cost more than the failure it
+    // prevents.
+    //
+    // Converting the throw to fail() keeps the direction exactly: nothing is stored, nothing is
+    // sent, the reason is carried, and the code is one the caller can retry on.
+    let checks;
+    try {
+      checks = await checkSuppressed(orgId, recipients.map((r) => r.email), { campaignId: request.campaignId });
+    } catch (e: any) {
+      const reason = String(e?.cause?.message || e?.message || 'unknown error');
+      console.error('[mailplatform/send] suppression list unreadable, refusing the send:', reason);
+      return fail(
+        'The suppression list could not be read, so nothing has been sent. This is temporary — retry shortly.',
+        'suppression_unavailable',
+      );
+    }
     deliverable = recipients.filter((r) => {
       const check = checks.get(r.email);
       if (check?.suppressed) {

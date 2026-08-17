@@ -1,101 +1,84 @@
-// src/lib/mailplatform/pure.test.ts — the graph validator, the condition evaluator, the delay
-// arithmetic and the failure classifier. No database, no clock, no network.
+// src/lib/mailplatform/pure.test.ts — the condition evaluator, the delay arithmetic, the failure
+// classifier, the webhook signature, and the adapter that maps the canvas's graph onto them.
+// No database, no clock, no network.
 import { describe, expect, it } from 'vitest';
-import { describeForBuilder, findCycle, nextNodeAfter, nextNodeId, validateWorkflow, type WorkflowDefinition } from './graph';
-import { compareValues, describeCondition, evaluateCondition, resolveField } from './conditions';
+import { validateGraph } from '@/lib/mail-product/automations';
+import { checkAgainstPlatform, conditionFromNode, delayFromNode, describeForBuilder, nextNodeAfter, triggerNode } from './graph';
+import { compareValues, describeCondition, evaluateCondition, isLeaf, resolveField } from './conditions';
+import type { ConditionLeaf, ConditionNode } from './conditions';
 import { describeDelay, resolveDelay, MAX_DELAY_MS } from './delay';
 import { BusinessRuleFailure, PermanentFailure, TemporaryFailure, classifyError, decideRetry, retryDelayMs } from './errors';
-import { eventMatchesTrigger, factsFor, isUsableEventType } from './triggers';
+import { canonicalEventType, eventMatchesTrigger, factsFor, isUsableEventType } from './triggers';
 import { assertSafeOutboundUrl, signWebhookBody, verifyWebhook } from './security';
-import { WORKFLOW_EXAMPLES } from './examples';
-import { checkAgainstPlatform } from './service';
+import { AUTOMATION_EXAMPLES } from './examples';
+import { isIrreversible } from './actions';
 
-const line = (nodes: any[], edges: any[]): WorkflowDefinition => ({ version: 1, nodes, edges });
+/** ConditionNode is a union of a leaf and the and/or/not groups. A test that reads `.field` off it
+ *  is asserting it is a LEAF, so it says so rather than reaching through the union with `!`. */
+function leaf(n: ConditionNode | null): ConditionLeaf {
+  expect(n).toBeTruthy();
+  expect(isLeaf(n as ConditionNode)).toBe(true);
+  return n as ConditionLeaf;
+}
 
-describe('graph validation', () => {
-  it('accepts a straight trigger -> action workflow', () => {
-    const v = validateWorkflow(line(
-      [{ id: 'trigger_1', kind: 'trigger', trigger: { event: 'contact.created' } }, { id: 'action_1', kind: 'action', action: { type: 'add_tag', params: { tag: 'x' } } }],
-      [{ id: 'e1', from: 'trigger_1', to: 'action_1' }],
-    ));
-    expect(v.ok).toBe(true);
-    expect(v.triggerNodeId).toBe('trigger_1');
+describe('the graph adapter', () => {
+  const graph = AUTOMATION_EXAMPLES[0].graph;
+
+  it('finds the single trigger and follows each branch', () => {
+    expect(triggerNode(graph)!.id).toBe('trigger_1');
+    expect(nextNodeAfter(graph, 'condition_1', 'yes')).toBe('send_1');
+    expect(nextNodeAfter(graph, 'condition_1', 'no')).toBe('end_1');
+    expect(nextNodeAfter(graph, 'send_1')).toBe('delay_1');
   });
 
-  it('refuses a workflow with no trigger, and one with two', () => {
-    expect(validateWorkflow(line([{ id: 'action_1', kind: 'action', action: { type: 'add_tag' } }], [])).ok).toBe(false);
-    const two = validateWorkflow(line(
-      [{ id: 'trigger_1', kind: 'trigger', trigger: { event: 'a.b' } }, { id: 'trigger_2', kind: 'trigger', trigger: { event: 'c.d' } }],
-      [],
-    ));
-    expect(two.ok).toBe(false);
-    expect(two.triggerNodeId).toBe(null);
+  it('maps every canvas condition field onto a real path into the run facts', () => {
+    // `stage` is virtual: the event's value when the event carries one, the contact's otherwise.
+    expect(conditionFromNode({ id: 'c', kind: 'condition', config: { field: 'stage', value: '3' } }))
+      .toEqual({ field: 'stage', operator: 'equals', value: '3' });
+    expect(leaf(conditionFromNode({ id: 'c', kind: 'condition', config: { field: 'status', value: 'subscribed' } })).field).toBe('contact.status');
+    expect(leaf(conditionFromNode({ id: 'c', kind: 'condition', config: { field: 'field', key: 'cohort', value: 'a' } })).field).toBe('contact.fields.cohort');
+    // A tag test is MEMBERSHIP whatever operator is chosen — equality against the whole list would
+    // fail every contact the moment they had a second tag.
+    expect(leaf(conditionFromNode({ id: 'c', kind: 'condition', config: { field: 'tag', operator: 'equals', value: 'x' } })).operator).toBe('contains');
+    expect(conditionFromNode({ id: 'c', kind: 'condition', config: {} })).toBe(null);
   });
 
-  it('refuses duplicate node ids — a run resumes by node id', () => {
-    const v = validateWorkflow(line(
-      [{ id: 'trigger_1', kind: 'trigger', trigger: { event: 'a.b' } }, { id: 'n', kind: 'action', action: { type: 'add_tag' } }, { id: 'n', kind: 'end' }],
-      [],
-    ));
-    expect(v.ok).toBe(false);
-    expect(v.problems.some((p) => /share the id/.test(p.message))).toBe(true);
+  it('carries an operator through, and takes a whole and/or/not tree as-is', () => {
+    expect(leaf(conditionFromNode({ id: 'c', kind: 'condition', config: { field: 'stage', operator: 'greater_than', value: '2' } })).operator).toBe('greater_than');
+    const tree = { and: [{ field: 'contact.status', operator: 'equals', value: 'subscribed' }] };
+    expect(conditionFromNode({ id: 'c', kind: 'condition', config: { condition: tree } })).toEqual(tree);
   });
 
-  it('refuses a cycle, and finds it', () => {
-    const def = line(
-      [{ id: 'trigger_1', kind: 'trigger', trigger: { event: 'a.b' } }, { id: 'a', kind: 'action', action: { type: 'add_tag' } }, { id: 'b', kind: 'action', action: { type: 'add_tag' } }],
-      [{ id: 'e1', from: 'trigger_1', to: 'a' }, { id: 'e2', from: 'a', to: 'b' }, { id: 'e3', from: 'b', to: 'a' }],
-    );
-    expect(findCycle(def)).not.toBe(null);
-    expect(validateWorkflow(def).ok).toBe(false);
+  it('maps all three delay forms', () => {
+    expect(delayFromNode({ id: 'd', kind: 'delay', config: { minutes: 1440 } })).toEqual({ kind: 'minutes', amount: 1440 });
+    expect(delayFromNode({ id: 'd', kind: 'delay', config: { until: '2026-08-20T09:00:00Z' } })).toEqual({ kind: 'until', at: '2026-08-20T09:00:00Z' });
+    expect(delayFromNode({ id: 'd', kind: 'delay', config: { untilField: 'event.deadline_at', offsetMinutes: -1440 } }))
+      .toEqual({ kind: 'until_field', field: 'event.deadline_at', offsetMinutes: -1440 });
+    expect(delayFromNode({ id: 'd', kind: 'delay', config: {} })).toBe(null);
   });
 
-  it('refuses two edges for the same branch, and an unlabelled edge out of a condition', () => {
-    const dup = validateWorkflow(line(
-      [{ id: 'trigger_1', kind: 'trigger', trigger: { event: 'a.b' } }, { id: 'c', kind: 'condition', condition: { field: 'x', operator: 'exists' } }, { id: 'x', kind: 'end' }, { id: 'y', kind: 'end' }],
-      [{ id: 'e0', from: 'trigger_1', to: 'c' }, { id: 'e1', from: 'c', to: 'x', branch: 'true' }, { id: 'e2', from: 'c', to: 'y', branch: 'true' }],
-    ));
-    expect(dup.ok).toBe(false);
-    const unlabelled = validateWorkflow(line(
-      [{ id: 'trigger_1', kind: 'trigger', trigger: { event: 'a.b' } }, { id: 'c', kind: 'condition', condition: { field: 'x', operator: 'exists' } }, { id: 'x', kind: 'end' }],
-      [{ id: 'e0', from: 'trigger_1', to: 'c' }, { id: 'e1', from: 'c', to: 'x' }],
-    ));
-    expect(unlabelled.ok).toBe(false);
+  it('reports a step this platform cannot run', () => {
+    const bad = { nodes: [{ id: 'x', kind: 'teleport' as any, config: {} }], edges: [] };
+    expect(checkAgainstPlatform(bad as any).length).toBeGreaterThan(0);
   });
 
-  it('warns about an unreachable node but still allows the save', () => {
-    const v = validateWorkflow(line(
-      [{ id: 'trigger_1', kind: 'trigger', trigger: { event: 'a.b' } }, { id: 'orphan', kind: 'action', action: { type: 'add_tag', params: { tag: 'x' } } }],
-      [],
-    ));
-    expect(v.ok).toBe(true);
-    expect(v.problems.some((p) => p.level === 'warning' && /cannot be reached/.test(p.message))).toBe(true);
-  });
-
-  it('follows the right edge for each branch, and reports the end of a path as null', () => {
-    const def = line(
-      [{ id: 'c', kind: 'condition', condition: { field: 'x', operator: 'exists' } }],
-      [{ id: 'e1', from: 'c', to: 'yes', branch: 'true' }],
-    );
-    expect(nextNodeAfter(def, 'c', 'true')).toBe('yes');
-    expect(nextNodeAfter(def, 'c', 'false')).toBe(null);
-  });
-
-  it('generates node ids that do not collide', () => {
-    expect(nextNodeId('action', ['action_1', 'action_2'])).toBe('action_3');
-  });
-
-  it('describeForBuilder resolves every node with its outgoing edges', () => {
-    const d = describeForBuilder(WORKFLOW_EXAMPLES[0].definition);
-    expect(d.valid).toBe(true);
+  it('describes a graph for a builder, with both validations', () => {
+    const d = describeForBuilder(graph);
     const cond = d.nodes.find((n: any) => n.id === 'condition_2');
     expect(cond).toBeTruthy();
-    expect(cond!.outgoing.map((o: any) => o.branch).sort()).toEqual(['false', 'true']);
+    expect(cond!.outgoing.map((o: any) => o.branch).sort()).toEqual(['no', 'yes']);
+  });
+
+  it('knows which steps cannot be undone', () => {
+    expect(isIrreversible('send_email')).toBe(true);
+    expect(isIrreversible('webhook')).toBe(true);
+    expect(isIrreversible('add_tag')).toBe(false);
+    expect(isIrreversible('update_contact')).toBe(false);
   });
 });
 
 describe('conditions', () => {
-  const facts = { 'contact.email': 'a@b.test', 'contact.first_name': 'Ananya', 'event.stage': '3', 'event.score': 72, 'event.payload': { nested: { deep: 'yes' } } };
+  const facts = { 'contact.email': 'a@b.test', 'contact.first_name': 'Ananya', 'event.stage': '3', 'event.score': 72, 'event.payload': { nested: { deep: 'yes' } }, 'contact.tags': ['shortlisted', 'india'] };
 
   it('handles every operator', () => {
     const t = (c: any) => evaluateCondition(c, facts).result;
@@ -110,6 +93,11 @@ describe('conditions', () => {
     expect(t({ field: 'contact.nothing', operator: 'does_not_exist' })).toBe(true);
   });
 
+  it('finds a tag by membership', () => {
+    expect(evaluateCondition({ field: 'contact.tags', operator: 'contains', value: 'shortlisted' }, facts).result).toBe(true);
+    expect(evaluateCondition({ field: 'contact.tags', operator: 'contains', value: 'rejected' }, facts).result).toBe(false);
+  });
+
   it('compares numbers as numbers, not as text — 9 is not greater than 10', () => {
     expect(compareValues('9', '10')).toBe(-1);
     expect(compareValues('2026-08-20', '2026-08-16')).toBe(1);
@@ -122,6 +110,7 @@ describe('conditions', () => {
   });
 
   it('a missing field is false for equals and TRUE for not_equals', () => {
+    // This is what makes "assessment_completed is not true" match the candidate who never started.
     expect(evaluateCondition({ field: 'nope', operator: 'equals', value: 'x' }, facts).result).toBe(false);
     expect(evaluateCondition({ field: 'nope', operator: 'not_equals', value: 'x' }, facts).result).toBe(true);
   });
@@ -146,7 +135,7 @@ describe('conditions', () => {
     expect(resolveField(facts, 'event.payload.nested.deep')).toBe('yes');
   });
 
-  it('records a trace covering every rule, not only the first failure', () => {
+  it('records a trace covering every rule, not only up to the first failure', () => {
     const r = evaluateCondition({ and: [{ field: 'event.stage', operator: 'equals', value: '9' }, { field: 'event.score', operator: 'greater_than', value: 50 }] }, facts);
     expect(r.result).toBe(false);
     expect(r.trace.length).toBe(3);   // both leaves plus the group
@@ -161,13 +150,12 @@ describe('delays', () => {
   const now = new Date('2026-08-16T09:00:00.000Z');
 
   it('resolves relative delays to an absolute instant', () => {
-    const r = resolveDelay({ kind: 'hours', amount: 24 }, now);
+    const r = resolveDelay({ kind: 'minutes', amount: 1440 }, now);
     expect(r.ok && r.at.toISOString()).toBe('2026-08-17T09:00:00.000Z');
   });
 
   it('resolves an absolute date, and fires immediately when it has already passed', () => {
-    const future = resolveDelay({ kind: 'until', at: '2026-08-20T09:00:00.000Z' }, now);
-    expect(future.ok && future.immediate).toBe(false);
+    expect(resolveDelay({ kind: 'until', at: '2026-08-20T09:00:00.000Z' }, now).ok).toBe(true);
     const past = resolveDelay({ kind: 'until', at: '2026-08-01T09:00:00.000Z' }, now);
     expect(past.ok && past.immediate).toBe(true);
   });
@@ -184,7 +172,7 @@ describe('delays', () => {
   });
 
   it('refuses a negative delay and anything over a year', () => {
-    expect(resolveDelay({ kind: 'hours', amount: -1 }, now).ok).toBe(false);
+    expect(resolveDelay({ kind: 'minutes', amount: -1 }, now).ok).toBe(false);
     expect(resolveDelay({ kind: 'days', amount: 400 }, now).ok).toBe(false);
     expect(MAX_DELAY_MS).toBe(365 * 24 * 60 * 60 * 1000);
   });
@@ -228,9 +216,17 @@ describe('failure classification and retries', () => {
 describe('triggers and event types', () => {
   const event = { eventId: 'e1', type: 'application.stage.changed', orgId: 'edurankai', contactId: 'c1', payload: { stage: '3' }, source: 'internal' as const, occurredAt: new Date('2026-08-16T09:00:00Z') };
 
+  it('resolves the six canvas keys to their canonical dotted names', () => {
+    expect(canonicalEventType('application_stage_changed')).toBe('application.stage.changed');
+    expect(canonicalEventType('tag_added')).toBe('contact.tag.added');
+    expect(canonicalEventType('campaign_clicked')).toBe('email.clicked');
+    expect(canonicalEventType('assessment.completed')).toBe('assessment.completed');
+  });
+
   it('accepts declared and well-formed custom types, refuses free text', () => {
     expect(isUsableEventType('contact.created')).toBe(true);
     expect(isUsableEventType('internship.selected')).toBe(true);
+    expect(isUsableEventType('application_stage_changed')).toBe(true);   // via the alias
     expect(isUsableEventType('Stage Changed!!')).toBe(false);
     expect(isUsableEventType('nodots')).toBe(false);
   });
@@ -242,11 +238,12 @@ describe('triggers and event types', () => {
     expect(f['contact.email']).toBe('a@b.test');
   });
 
-  it('matches only its own event type, then applies the filter', () => {
+  it('matches its own event type in either spelling, then applies the filter', () => {
     const f = factsFor(event, null);
-    expect(eventMatchesTrigger(event, { event: 'contact.created' }, f).matches).toBe(false);
+    expect(eventMatchesTrigger(event, { event: 'contact_created' }, f).matches).toBe(false);
+    expect(eventMatchesTrigger(event, { event: 'application_stage_changed' }, f).matches).toBe(true);
     expect(eventMatchesTrigger(event, { event: 'application.stage.changed' }, f).matches).toBe(true);
-    expect(eventMatchesTrigger(event, { event: 'application.stage.changed', filter: { field: 'event.stage', operator: 'equals', value: '9' } }, f).matches).toBe(false);
+    expect(eventMatchesTrigger(event, { event: 'application_stage_changed', filter: { field: 'event.stage', operator: 'equals', value: '9' } }, f).matches).toBe(false);
   });
 });
 
@@ -275,18 +272,30 @@ describe('security', () => {
 });
 
 describe('the shipped examples', () => {
-  it('both validate, structurally and against this platform', () => {
-    for (const ex of WORKFLOW_EXAMPLES) {
-      const v = validateWorkflow(ex.definition);
-      expect(v.ok, ex.key + ': ' + v.problems.map((p) => p.message).join('; ')).toBe(true);
-      const platform = checkAgainstPlatform(ex.definition);
-      expect(platform.filter((p) => p.level === 'error'), ex.key).toEqual([]);
+  it('both pass the canvas validator, so an operator could publish them', () => {
+    for (const ex of AUTOMATION_EXAMPLES) {
+      // The send steps deliberately name no template, which the canvas flags as "choose a template".
+      // Everything else must be sound, so the graph itself is what the validator is asked about.
+      const withTemplates = {
+        nodes: ex.graph.nodes.map((n) => (n.kind === 'send_email' ? { ...n, config: { ...n.config, templateId: '33333333-3333-4333-8333-333333333333' } } : n)),
+        edges: ex.graph.edges,
+      };
+      const v = validateGraph(withTemplates);
+      expect(v.ok, ex.key + ': ' + v.problems.map((p) => p.nodeId + ': ' + p.message).join('; ')).toBe(true);
+      expect(checkAgainstPlatform(withTemplates), ex.key).toEqual([]);
     }
   });
 
-  it('the stage-3 example branches both ways after the 24-hour wait', () => {
-    const def = WORKFLOW_EXAMPLES[0].definition;
-    expect(nextNodeAfter(def, 'condition_2', 'true')).toBe('action_2');
-    expect(nextNodeAfter(def, 'condition_2', 'false')).toBe('action_3');
+  it('the send steps ship WITHOUT a template, on purpose', () => {
+    for (const ex of AUTOMATION_EXAMPLES) {
+      for (const n of ex.graph.nodes) {
+        if (n.kind === 'send_email') expect(String((n.config || {}).templateId || '')).toBe('');
+      }
+    }
+  });
+
+  it('the deadline example waits on a date carried by the event', () => {
+    const ex = AUTOMATION_EXAMPLES[1];
+    expect(delayFromNode(ex.graph.nodes.find((n) => n.kind === 'delay')!)).toEqual({ kind: 'until_field', field: 'event.deadline_at', offsetMinutes: -1440 });
   });
 });

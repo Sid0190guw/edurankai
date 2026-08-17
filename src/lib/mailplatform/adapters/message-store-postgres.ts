@@ -22,6 +22,7 @@
 
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { uuidIn } from '@/lib/pg-array';
 import { randomUUID } from 'node:crypto';
 import type {
   MailboxStatePatch,
@@ -401,7 +402,7 @@ export function postgresMessageStore(): MessageStore {
         // otherwise costs 40 round trips to render.
         const ids = r.map((x) => x.id);
         const recips = rows(await db.execute(sql`
-          SELECT message_id, kind, user_id, email, name FROM mail_recipients WHERE message_id = ANY(${ids})`));
+          SELECT message_id, kind, user_id, email, name FROM mail_recipients WHERE message_id IN ${uuidIn(ids)}`));
         const byMessage = new Map<string, Recipient[]>();
         for (const x of recips) {
           const list = byMessage.get(x.message_id) || [];

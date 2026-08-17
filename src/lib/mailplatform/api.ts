@@ -19,18 +19,57 @@ import type { MailPermission, Page, Principal } from './types';
 
 export const API_VERSION = 'v1';
 
-/** CORS for the public API. Mirrors src/lib/api-keys.ts so partners see one consistent policy. */
-export const CORS: Record<string, string> = {
+/**
+ * CORS for the public API. Mirrors src/lib/api-keys.ts so partners see one consistent policy.
+ *
+ * THE WILDCARD IS DELIBERATE AND IT IS SAFE TODAY, but the reasoning is worth writing down because
+ * it is one line away from being wrong. This API's primary caller is authenticated by the `x-api-key`
+ * header — no cookies, callable from anywhere, and a wildcard is exactly right for it.
+ * requirePrincipal() below ALSO accepts a session cookie, which is what makes this delicate: a
+ * browser will not attach cookies to a cross-origin request whose response says `*` UNLESS the
+ * response also says `Access-Control-Allow-Credentials: true`. Absent that header the combination is
+ * inert. Present it, and any page on the internet can read a signed-in user's mail through this API.
+ *
+ * So the header is not merely omitted and trusted to stay omitted — sealCors() below REFUSES to emit
+ * it next to a wildcard. The frozen object stops the other half of the same mistake: `CORS` is
+ * exported, and an object literal is mutable, so without this a caller could have edited the policy
+ * for the whole process at runtime.
+ *
+ * For a cookie-authenticated MAIL endpoint the answer is different and already written — an explicit
+ * allowlist echoed one origin at a time, in src/lib/mailops/cors.ts. Use that there, not this.
+ */
+export const CORS: Readonly<Record<string, string>> = Object.freeze({
+  // Suppressed on the next line rather than argued with, because the rule is right to look. Its
+  // heuristic flags any wildcard in a file that mentions cookies, and it finds the word in the 401
+  // message below that tells a caller how to authenticate. The suppression has to sit on the
+  // offending line or the one directly above it, which is why it reads as tersely as it does.
+  // lint-mail-ignore: cors-wildcard-credentials — header-auth API; sealCors() seals the combination
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, x-edurankai-org',
   'Access-Control-Max-Age': '86400',
-};
+});
+
+/**
+ * Drop `Access-Control-Allow-Credentials` whenever the origin is a wildcard.
+ *
+ * Not defensive programming for its own sake. `json()` lets a caller pass extraHeaders that spread
+ * AFTER the CORS block, so adding credentials to one route is a one-word change that no reviewer
+ * would read as a security decision — and browsers reject `*` with credentials outright, so the
+ * route would break loudly for its author and silently widen nothing. Stripping it here means the
+ * only way to get a credentialed response is to choose a real origin, which is a change somebody
+ * has to think about.
+ */
+function sealCors(headers: Record<string, string>): Record<string, string> {
+  if (headers['Access-Control-Allow-Origin'] !== '*') return headers;
+  const { 'Access-Control-Allow-Credentials': _dropped, ...safe } = headers;
+  return safe;
+}
 
 export function json(body: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', ...CORS, ...extraHeaders },
+    headers: sealCors({ 'Content-Type': 'application/json; charset=utf-8', ...CORS, ...extraHeaders }),
   });
 }
 
@@ -55,7 +94,7 @@ function codeForStatus(status: number): string {
   return 'error';
 }
 
-export const preflight = (): Response => new Response(null, { status: 204, headers: CORS });
+export const preflight = (): Response => new Response(null, { status: 204, headers: sealCors({ ...CORS }) });
 
 // ---------------------------------------------------------------------------
 // Authentication and authorization
