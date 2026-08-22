@@ -29,7 +29,22 @@ function connect(): any {
   if (!connectionString) {
     throw new Error('DATABASE_URL is not set');
   }
-  _client = postgres(connectionString, { prepare: false });
+  // Serverless pool sizing. Every warm Vercel instance builds its own client, and postgres-js
+  // defaults to max:10 with idle_timeout:0 — ten connections per instance, held open for the life
+  // of the instance and never returned while it idles. Multiplied across warm instances and the
+  // nineteen daily crons, that exhausts the transaction pooler's client slots; once it is full,
+  // every query on every route waits for a slot that never frees and the function dies at the
+  // gateway timeout. One connection per instance is enough, because an invocation runs its queries
+  // in sequence anyway. idle_timeout hands it back between bursts, max_lifetime recycles it, and
+  // connect_timeout turns a saturated pooler into a fast, loggable error rather than a hang that
+  // reads from outside as the whole site being down.
+  _client = postgres(connectionString, {
+    prepare: false,
+    max: 1,
+    idle_timeout: 20,
+    max_lifetime: 60 * 30,
+    connect_timeout: 10,
+  });
   _real = drizzle(_client, { schema });
   return _real;
 }
@@ -51,6 +66,16 @@ export const db = new Proxy({} as any, {
   },
 }) as Omit<RealDb, 'execute'> & { execute: (query: any) => Promise<any> };
 export { schema };
+
+// The raw postgres-js handle behind `db`, for the few call sites that write tagged-template SQL
+// instead of going through Drizzle. They previously each opened their own postgres() client, which
+// on a page rendered per request meant a new connection per page view; sharing this one keeps them
+// inside the single pooled connection above. Do not call .end() on it — it belongs to the module,
+// and closing it takes down every subsequent query in the same instance.
+export function sqlClient(): ReturnType<typeof postgres> {
+  connect();
+  return _client!;
+}
 
 // Compatibility: getDb is no longer needed but exported as no-op
 // so existing middleware/code that calls it doesn't break
