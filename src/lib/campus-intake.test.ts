@@ -5,7 +5,7 @@
 // shape that would otherwise be stored and later read back as if somebody had meant it.
 
 import { describe, it, expect, report } from './test-shim';
-import { text, email, when, num, tooFast, rowsOf } from './campus-intake';
+import { text, email, when, num, overIntakeLimit, intakeBucket, rowsOf } from './campus-intake';
 
 describe('text()', () => {
   it('treats blank as absent so NOT NULL columns still bite', () => {
@@ -66,20 +66,39 @@ describe('num()', () => {
   });
 });
 
-describe('tooFast()', () => {
+// tooFast() now counts in the database, so the counting itself cannot be exercised here — this
+// suite has no mock layer and this project does not connect to a database from a test. What used to
+// be tested was an in-process Map, which is precisely the part that did not work in production, so
+// asserting on it was worse than not asserting at all. The two halves that ARE pure are tested
+// instead, and the counting is covered by countAttempt() being the single shared implementation.
+describe('overIntakeLimit()', () => {
   it('lets an ordinary submission through', () => {
-    expect(tooFast('test-bucket-a', 'someone')).toBe(false);
+    expect(overIntakeLimit(1)).toBe(false);
+    expect(overIntakeLimit(6)).toBe(false);
   });
 
-  it('trips on a flood from one origin', () => {
-    let tripped = false;
-    for (let i = 0; i < 12; i++) tripped = tooFast('test-bucket-b', 'flooder') || tripped;
-    expect(tripped).toBe(true);
+  it('trips once the window allowance is spent', () => {
+    expect(overIntakeLimit(7)).toBe(true);
+    expect(overIntakeLimit(120)).toBe(true);
   });
+});
 
+describe('intakeBucket()', () => {
   it('does not punish a second person for the first one flooding', () => {
-    for (let i = 0; i < 12; i++) tooFast('test-bucket-c', 'flooder');
-    expect(tooFast('test-bucket-c', 'somebody-else')).toBe(false);
+    // Different origins must land in different buckets, or one flooder locks out everybody.
+    expect(intakeBucket('c', 'flooder') === intakeBucket('c', 'somebody-else')).toBe(false);
+  });
+
+  it('keeps separate forms separate', () => {
+    expect(intakeBucket('commons', 'someone') === intakeBucket('forge', 'someone')).toBe(false);
+  });
+
+  it('is stable for one origin, or the count would never accumulate', () => {
+    expect(intakeBucket('c', 'someone') === intakeBucket('c', 'someone')).toBe(true);
+  });
+
+  it('does not carry the raw origin, so the table is not a visitor log', () => {
+    expect(intakeBucket('c', 'someone@example.com').includes('someone@example.com')).toBe(false);
   });
 });
 

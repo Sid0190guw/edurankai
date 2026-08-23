@@ -27,7 +27,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   // Both are required by every one of the three forms, and a row with neither cannot be acted on.
   if (!fullName) return json({ ok: false, error: 'a name is required' }, 400);
   if (!addr) return json({ ok: false, error: 'that email address does not look right' }, 400);
-  if (tooFast('commons', clientAddress || addr)) return json({ ok: false, error: 'too many submissions just now — try again in a minute' }, 429);
+  if (await tooFast('commons', clientAddress || addr)) return json({ ok: false, error: 'too many submissions just now — try again in a minute' }, 429);
 
   const year = text(b.year_of_study, 40);
 

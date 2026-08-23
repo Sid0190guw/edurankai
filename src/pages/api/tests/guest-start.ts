@@ -12,17 +12,24 @@ import { sql } from 'drizzle-orm';
 import { createOrder, getPublicKeyId, isConfigured } from '@/lib/razorpay';
 import { convertToInrPaise } from '@/lib/fx';
 import { validatePhone } from '@/lib/phone-validate';
+import { clientIp, overPublicFormLimit } from '@/lib/public-form-limit';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request, cookies, clientAddress }) => {
+  // Same shape as /api/forms/submit: unauthenticated, writes a row, and on the premium branch opens
+  // a live payment order. Fails CLOSED — a fabricated pending order costs gateway quota and buries
+  // real payments in the reconciliation run.
+  const spend = await overPublicFormLimit('tests-guest-start', clientIp(request.headers) || String(clientAddress || ''), { whenUnavailable: 'refuse' });
+  if (spend.blocked) return json({ ok: false, error: 'Too many attempts from this connection. Please try again later.' }, 429);
+
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
   const testSlug = (body?.testSlug || '').toString().trim();
-  const name = (body?.name || '').toString().trim();
-  const email = (body?.email || '').toString().trim().toLowerCase();
-  const phoneRaw = (body?.phone || '').toString().trim();
+  const name = (body?.name || '').toString().trim().slice(0, 200);
+  const email = (body?.email || '').toString().trim().toLowerCase().slice(0, 320);
+  const phoneRaw = (body?.phone || '').toString().trim().slice(0, 40);
   const phoneCountry = (body?.phoneCountry || 'IN').toString().trim();
   if (!testSlug) return json({ ok: false, error: 'testSlug required' }, 400);
   if (!name || name.length < 2) return json({ ok: false, error: 'Please enter your full name.' }, 400);

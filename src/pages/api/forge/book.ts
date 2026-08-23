@@ -31,7 +31,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   if (!equipmentId) return json({ ok: false, error: 'pick a machine' }, 400);
   if (!addr) return json({ ok: false, error: 'an email address is required so the operator can reach you' }, 400);
   if (!startAt) return json({ ok: false, error: 'pick a start time' }, 400);
-  if (tooFast('forge', clientAddress || addr)) return json({ ok: false, error: 'too many submissions just now — try again in a minute' }, 429);
+  if (await tooFast('forge', clientAddress || addr)) return json({ ok: false, error: 'too many submissions just now — try again in a minute' }, 429);
 
   const rawFile = text(b.file_url, 500);
   const fileUrl = link(b.file_url);

@@ -25,7 +25,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
 
   const contact = text(b.contact, 200);
   if (!contact) return json({ ok: false, error: 'a way to reach you is needed so the diary can be sent' }, 400);
-  if (tooFast('sleep', clientAddress || contact)) return json({ ok: false, error: 'that went through several times just now — give it a minute' }, 429);
+  if (await tooFast('sleep', clientAddress || contact)) return json({ ok: false, error: 'that went through several times just now — give it a minute' }, 429);
 
   try {
     await db.execute(sql`

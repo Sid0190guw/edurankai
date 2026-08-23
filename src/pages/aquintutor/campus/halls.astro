@@ -1,12 +1,16 @@
----
+﻿---
 import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
+import { clientIp, overPublicFormLimit } from '@/lib/public-form-limit';
 
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
-// Self-bootstrap hall_bookings table
-try {
+// Self-bootstrap hall_bookings. Frontmatter runs on EVERY request, so this DDL used to be a round
+// trip on every single view of a public page, and its `catch { /* ignore */ }` meant a failure was
+// invisible. ensureOnce runs it once per process and logs the real reason if it fails.
+await ensureOnce('hall_bookings_v1', async () => {
   await db.execute(sql`
     CREATE TABLE IF NOT EXISTS hall_bookings (
       id SERIAL PRIMARY KEY,
@@ -19,7 +23,7 @@ try {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
-} catch (e) { /* ignore bootstrap errors */ }
+});
 
 // Handle form POST
 let bookingSuccess = false;
@@ -27,13 +31,17 @@ let bookingError = '';
 if (Astro.request.method === 'POST') {
   try {
     const form = await Astro.request.formData();
-    const hall_id = String(form.get('hall_id') || '').trim();
-    const organiser = String(form.get('organiser') || '').trim();
-    const booking_date = String(form.get('booking_date') || '').trim();
-    const slot = String(form.get('slot') || '').trim();
-    const purpose = String(form.get('purpose') || '').trim();
-    const expected_attendance = parseInt(String(form.get('expected_attendance') || '0'), 10) || 0;
-    if (hall_id && organiser && booking_date && slot && purpose) {
+    // Capped: these are anonymous writes into TEXT columns and nothing bounded them.
+    const hall_id = String(form.get('hall_id') || '').trim().slice(0, 100);
+    const organiser = String(form.get('organiser') || '').trim().slice(0, 200);
+    const booking_date = String(form.get('booking_date') || '').trim().slice(0, 20);
+    const slot = String(form.get('slot') || '').trim().slice(0, 60);
+    const purpose = String(form.get('purpose') || '').trim().slice(0, 500);
+    const expected_attendance = Math.min(100000, Math.max(0, parseInt(String(form.get('expected_attendance') || '0'), 10) || 0));
+    const spend = await overPublicFormLimit('hall-booking', clientIp(Astro.request.headers));
+    if (spend.blocked) {
+      bookingError = 'Several booking requests have come from this connection in the last hour. Please try again later.';
+    } else if (hall_id && organiser && booking_date && slot && purpose) {
       await db.execute(sql`
         INSERT INTO hall_bookings (hall_id, organiser, booking_date, slot, purpose, expected_attendance)
         VALUES (${hall_id}, ${organiser}, ${booking_date}, ${slot}, ${purpose}, ${expected_attendance})

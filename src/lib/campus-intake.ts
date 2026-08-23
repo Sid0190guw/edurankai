@@ -28,9 +28,11 @@
 // below are the whole defence: cap every string, refuse anything that is not an email in the field
 // called email, and never echo back what was stored.
 //
-// tooFast() is a per-process, in-memory limiter. It is honestly labelled: on serverless it bounds
-// one instance, not the fleet, so it stops a stuck retry loop and a casual flood and nothing more.
-// It is not a substitute for a real limiter and is not described as one anywhere.
+// tooFast() counts attempts in the database, not in process memory. It used to be a Map, honestly
+// labelled as bounding one instance rather than the fleet — but on serverless "bounds one instance"
+// means it bounds nothing, because concurrent requests land on instances that each start empty. See
+// the note above the function itself.
+import { createHash } from 'node:crypto';
 
 const rowsOfRaw = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 export const rowsOf = rowsOfRaw;
@@ -68,20 +70,55 @@ export function num(v: unknown, min: number, max: number): number | null {
 }
 
 // -------------------------------------------------------------------------------------------------
-// Best-effort flood guard. Per process, in memory, and described as exactly that.
+// Flood guard, counted in the database because this runs on serverless.
+//
+// This was a Map in module memory. On Vercel that is not a weak rate limit, it is NO rate limit
+// wearing the shape of one: concurrent requests land on different instances that each start with an
+// empty Map, a cold start wipes the count, and `hits.clear()` at 5000 keys let anyone reset every
+// bucket at once by spraying distinct keys. Seven unauthenticated write endpoints treat this
+// function as their only ceiling, and each returns a 429 that made them look protected in review.
+// src/lib/talent/codes.ts:35 states the rule this broke: attempts are recorded in a table, because
+// an in-memory counter on serverless is the same as having no rate limit while looking like it has
+// one.
+//
+// countAttempt() is the project's one attempt counter (src/lib/auth/two-factor.ts) — a single
+// atomic INSERT ... ON CONFLICT DO UPDATE RETURNING, so two concurrent lambdas cannot both see "1".
+// Reused rather than duplicated, for the reason src/lib/auth/recovery.ts gives: one limiter, one
+// table, one place to raise a threshold.
 // -------------------------------------------------------------------------------------------------
-const hits = new Map<string, number[]>();
-const WINDOW_MS = 60_000;
+const WINDOW_SECONDS = 60;
 const MAX_IN_WINDOW = 6;
 
-export function tooFast(bucket: string, who: string): boolean {
-  const key = bucket + '|' + (who || 'unknown');
-  const now = Date.now();
-  const recent = (hits.get(key) || []).filter((t) => now - t < WINDOW_MS);
-  recent.push(now);
-  hits.set(key, recent);
-  if (hits.size > 5000) hits.clear();   // never let the guard become the leak
-  return recent.length > MAX_IN_WINDOW;
+/** Hashed so the attempt table never becomes an incidental log of who submitted what. */
+export function intakeBucket(bucket: string, who: string): string {
+  return 'intake:' + bucket + ':' + createHash('sha256').update(who || 'unknown').digest('hex').slice(0, 32);
+}
+
+/** The decision itself, kept pure so it is testable without a database. */
+export function overIntakeLimit(attempts: number): boolean {
+  return attempts > MAX_IN_WINDOW;
+}
+
+/**
+ * Count this submission and say whether the caller has run out of allowance.
+ *
+ * FAILS OPEN. If the counter cannot be reached, let the submission through: these are the forms by
+ * which somebody first reaches the place, and the write they guard is one cheap validated INSERT.
+ * A counter outage must not become "nobody can sign up". (Compare overRecoveryLimit(), which fails
+ * CLOSED — waving an attacker through there costs an account, which is the opposite trade.)
+ */
+export async function tooFast(bucket: string, who: string): Promise<boolean> {
+  try {
+    // Imported HERE, not at module scope. src/lib/auth/two-factor.ts reads import.meta.env at module
+    // scope, which is undefined outside Vite — so importing it at the top of this file made the pure
+    // validators below unloadable in the shim test runner and took the whole suite down with them.
+    // src/lib/db/index.ts carries the same scar. tooFast is already async, so this costs nothing.
+    const { countAttempt } = await import('@/lib/auth/two-factor');
+    return overIntakeLimit(await countAttempt(intakeBucket(bucket, who), WINDOW_SECONDS));
+  } catch (e: any) {
+    logFail('campus-intake/limiter', e);
+    return false;
+  }
 }
 
 /** The real Postgres reason is on e.cause; e.message is only the failed statement. */

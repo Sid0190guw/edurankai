@@ -6,13 +6,25 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { complete, type ChatMessage } from '@/lib/llm/gateway';
+import { complete, underRateLimit, type ChatMessage } from '@/lib/llm/gateway';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 
 export const POST: APIRoute = async ({ request, locals }) => {
+  // `locals.user` was read further down for the student's NAME only, and nothing ever refused when
+  // it was null — so this route spent metered model budget for anyone who knew the path, with the
+  // prompt entirely under their control. Every sibling that reaches the gateway (aquin-chat.ts:16,
+  // board/compose.ts:16) requires a session and then the per-user limiter; this now matches them.
+  // The second loss if left open is not just the bill: once the upstream key is throttled, the
+  // correctly-gated features fail for the signed-in users who were never the problem.
+  const gateUser = (locals as any)?.user;
+  if (!gateUser) return json({ ok: false, error: 'Sign in to use the tutor.' }, 401);
+  if (!(await underRateLimit(String(gateUser.id), 20, 60))) {
+    return json({ ok: false, error: 'Slow down a moment and try again.' }, 429);
+  }
+
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
   const courseSlug = (body?.courseSlug || '').toString();

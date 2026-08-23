@@ -3,6 +3,7 @@
 // (self-hosted 'own' model → env-Anthropic fallback), never api.anthropic.com directly.
 import type { APIRoute } from 'astro';
 import { complete } from '@/lib/llm/gateway';
+import { clientIp, overPublicFormLimit } from '@/lib/public-form-limit';
 
 const FAQ_SYSTEM = `You are the EduRankAI Help Assistant - a friendly FAQ and support bot for edurankai.in.
 
@@ -75,6 +76,17 @@ YOUR RULES:
 CRITICAL: You have NO access to user accounts, applications, or any database. You only know the general info above.`;
 
 export const POST: APIRoute = async ({ request }) => {
+  // Deliberately public — no sign-in — so the ceiling has to be the caller's address rather than a
+  // user id: underRateLimit() counts rows WHERE user_id = ..., which for an anonymous caller gives
+  // every request its own empty bucket. Fails CLOSED, matching the direction underRateLimit itself
+  // documents (gateway.ts:150): a refused prompt is an inconvenience the caller sees and retries,
+  // an unbounded one is a charge nobody sees until the invoice. 40/hour is a long conversation for
+  // a person and nothing at all for a script.
+  const spend = await overPublicFormLimit('faq-bot', clientIp(request.headers), { whenUnavailable: 'refuse', max: 40 });
+  if (spend.blocked) {
+    return new Response(JSON.stringify({ ok: false, error: 'Too many messages just now. Please try again shortly.' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+  }
+
   try {
     const body = await request.json();
     const { messages } = body;

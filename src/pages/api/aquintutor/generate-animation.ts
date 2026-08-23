@@ -4,7 +4,8 @@
 // animation, not a fixed scene library. If no model is switched on, it returns fallback:true
 // and the client uses the built-in parametric scenes instead (honest, never a dead end).
 import type { APIRoute } from 'astro';
-import { getConfig, isReady, chat } from '@/lib/llm/gateway';
+import { getConfig, isReady, chat, underRateLimit } from '@/lib/llm/gateway';
+import { can } from '@/lib/rbac';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -40,7 +41,17 @@ const BANNED = /\b(fetch|XMLHttpRequest|importScripts|eval|Function|WebSocket|lo
 // account holding a capability", and this sprint changes HOW authorization is asked and never WHO
 // may do what. It is the sharpest item in the accompanying report: matching the four siblings is a
 // one-line change, and it needs a human to accept that anonymous callers lose access.
-export const POST: APIRoute = async ({ request }) => {
+export const POST: APIRoute = async ({ request, locals }) => {
+  // The header above records that this route had NO authorization at all and calls that a finding
+  // rather than a design. This is that finding closed, with the same gate board/compose.ts:17 uses
+  // for the same capability — composing an AnimationObject is a faculty action, and an anonymous
+  // caller could otherwise spend the platform's metered budget on a prompt of their choosing.
+  const user = (locals as any)?.user;
+  if (!user) return json({ ok: false, error: 'sign in required' }, 401);
+  const gate = await can(user, 'write', { type: 'AnimationObject' });
+  if (!gate.allow) return json({ ok: false, error: 'faculty only' }, 403);
+  if (!(await underRateLimit(String(user.id), 20, 60))) return json({ ok: false, error: 'slow down' }, 429);
+
   let b: any = {};
   try { b = await request.json(); } catch { return json({ ok: false, error: 'bad json' }, 400); }
   const prompt = String(b.prompt || '').slice(0, 300).trim();

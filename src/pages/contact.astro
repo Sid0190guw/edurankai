@@ -1,6 +1,7 @@
 ﻿---
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { sqlClient } from '@/lib/db';
+import { clientIp, overPublicFormLimit } from '@/lib/public-form-limit';
 
 // The shared pooled client, not a per-request postgres(). This frontmatter runs on every request,
 // so opening a client here opened a fresh connection — TLS handshake and auth included — for every
@@ -39,28 +40,47 @@ if (Astro.request.method === 'POST') {
     errorMsg = 'Please write a message.';
   } else if (message.length > 5000) {
     errorMsg = 'Message too long. Please keep it under 5000 characters.';
+  } else if (name.length > 200 || subject.length > 300 || category.length > 60 || email.length > 320) {
+    // Only `message` was ever bounded. The other four reached the INSERT at whatever length the
+    // request carried, and the email regex below matches any run of non-space characters, so a
+    // single POST could put megabytes into contact_submissions. Reported rather than silently
+    // truncated: a real person who pasted too much should be told, not have it cut off unseen.
+    // 320 is the RFC 5321 ceiling for an address; the rest are simply longer than any real answer.
+    errorMsg = 'One of those fields is longer than we can accept. Please shorten it and try again.';
   } else if (!email.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
     errorMsg = 'Please enter a valid email address.';
   } else {
-    try {
-      const ipHeader = Astro.request.headers.get('x-forwarded-for') || Astro.request.headers.get('cf-connecting-ip') || '';
-      const ua = Astro.request.headers.get('user-agent') || '';
+    // The allowance is spent HERE — after validation, and only on a submission that would otherwise
+    // write a row. Counting page views, or counting a visitor's typo, would burn an allowance nobody
+    // actually used. A honeypot hit never reaches this line either: it is answered above without
+    // touching the database at all.
+    const ip = clientIp(Astro.request.headers);
+    const limit = await overPublicFormLimit('contact', ip);
+    if (limit.blocked) {
+      // Never name the threshold or the window in the response — that just tells a script how long
+      // to wait. The direct address is the honest way through for a real person who hits this.
+      console.warn('[contact] hourly submission limit reached for one client address; refusing');
+      errorMsg = 'You have sent several messages in the last hour. Please email connect@edurankai.in directly and we will pick it up from there.';
+    } else {
+      try {
+        const ua = Astro.request.headers.get('user-agent') || '';
 
-      await sql`
-        INSERT INTO contact_submissions (name, email, subject, category, message, ip_address, user_agent)
-        VALUES (
-          ${name || null},
-          ${email},
-          ${subject || null},
-          ${category || null},
-          ${message},
-          ${ipHeader.substring(0, 64)},
-          ${ua}
-        );
-      `;
-      successMsg = 'Thanks. We will get back to you within 2 business days.';
-    } catch (err: any) {
-      errorMsg = 'Sorry, something went wrong. Please email connect@edurankai.in directly.';
+        await sql`
+          INSERT INTO contact_submissions (name, email, subject, category, message, ip_address, user_agent)
+          VALUES (
+            ${name || null},
+            ${email},
+            ${subject || null},
+            ${category || null},
+            ${message},
+            ${ip.substring(0, 64)},
+            ${ua}
+          );
+        `;
+        successMsg = 'Thanks. We will get back to you within 2 business days.';
+      } catch (err: any) {
+        errorMsg = 'Sorry, something went wrong. Please email connect@edurankai.in directly.';
+      }
     }
   }
 }

@@ -69,7 +69,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   const addr = email(fd.get('requester_email'));
   if (!title) return back('err', 'The title is needed before a librarian can look for it.');
   if (!addr) return back('err', 'An email address is needed, otherwise nobody can reply to you.');
-  if (tooFast('ill', clientAddress || addr)) return back('err', 'That went through several times just now. Give it a minute.');
+  if (await tooFast('ill', clientAddress || addr)) return back('err', 'That went through several times just now. Give it a minute.');
 
   const fmtRaw = String(fd.get('format') || 'any');
   const format = FORMATS.includes(fmtRaw) ? fmtRaw : 'any';

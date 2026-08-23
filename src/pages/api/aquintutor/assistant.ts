@@ -8,6 +8,7 @@ import type { APIRoute } from 'astro';
 import { getConfig, isReady, chatStream, logUsage, logTrainingExample } from '@/lib/llm/gateway';
 import { sanitizeMessages } from '@/lib/llm/guardrails';
 import { aquinReply } from '@/lib/aquin-brain';
+import { clientIp, overPublicFormLimit } from '@/lib/public-form-limit';
 
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 function sse(o: any): string { return 'data: ' + JSON.stringify(o) + '\n\n'; }
@@ -18,6 +19,15 @@ Your job: help visitors understand how AquinTutor works and find the right tool,
 Rules: never name any external education, cloud or AI company. Do not use emoji. Be warm and concise — two to four sentences unless asked for depth. If a question needs account details you cannot see, say so and point to the relevant page (for example /aquintutor/mastery for progress, or /aquintutor/onboarding to set up a path).`;
 
 export const POST: APIRoute = async ({ request, locals }) => {
+  // Deliberately public — no sign-in — so the ceiling has to be the caller's address rather than a
+  // user id: underRateLimit() counts rows WHERE user_id = ..., which for an anonymous caller gives
+  // every request its own empty bucket. Fails CLOSED, matching the direction underRateLimit itself
+  // documents (gateway.ts:150): a refused prompt is an inconvenience the caller sees and retries,
+  // an unbounded one is a charge nobody sees until the invoice. 40/hour is a long conversation for
+  // a person and nothing at all for a script.
+  const spend = await overPublicFormLimit('aquin-assistant', clientIp(request.headers), { whenUnavailable: 'refuse', max: 40 });
+  if (spend.blocked) return j({ ok: false, error: 'Too many messages just now. Please try again shortly.' }, 429);
+
   const user = (locals as any)?.user || null;
   const cfg = await getConfig();
   let use = cfg;

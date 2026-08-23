@@ -36,7 +36,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   const addr = email(b.email);
   if (!fullName) return json({ ok: false, error: 'a name is required' }, 400);
   if (!addr) return json({ ok: false, error: 'that email address does not look right' }, 400);
-  if (tooFast('literacy', clientAddress || addr)) return json({ ok: false, error: 'that went through several times just now — give it a minute' }, 429);
+  if (await tooFast('literacy', clientAddress || addr)) return json({ ok: false, error: 'that went through several times just now — give it a minute' }, 429);
 
   try {
     await ensureSchema();

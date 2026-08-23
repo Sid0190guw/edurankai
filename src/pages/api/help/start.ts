@@ -28,6 +28,7 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import crypto from 'node:crypto';
+import { clientIp, overPublicFormLimit } from '@/lib/public-form-limit';
 import { logEvent } from '@/lib/logger';
 
 // Declared above the handler that uses them: `const` is not hoisted, and a handler reaching a later
@@ -50,6 +51,23 @@ function newToken() {
 const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 
 export const POST: APIRoute = async ({ request, cookies, locals }) => {
+  // COUNTED FIRST, before any of the work below, because the work is what costs.
+  //
+  // This route is unauthenticated by design and the conversation is keyed on a cookie the caller
+  // controls, so omitting the cookie mints a fresh help_conversations row every time — there is
+  // nothing to reuse and so nothing that bounds it. With initialMessage set, one anonymous request
+  // also fans a web push out to every admin device and sends one mail through the site's OWN SMTP
+  // identity — the same identity that carries campaigns, transactional mail and password recovery.
+  // That is the one cost here that outlives a code fix: rows can be deleted and a bill can be
+  // capped, but a sending domain that gets blocklisted stays blocklisted for days of delisting work.
+  //
+  // Fails CLOSED for that reason. Dropping a help chat during a database hiccup is recoverable —
+  // the page shows the direct address — and running an unmetered mail relay is not.
+  const limit = await overPublicFormLimit('help-start', clientIp(request.headers), { whenUnavailable: 'refuse' });
+  if (limit.blocked) {
+    return json({ ok: false, error: 'Too many messages from this connection just now. Please try again shortly, or email connect@edurankai.in.' }, 429);
+  }
+
   let body: any = {};
   try { body = await request.json(); } catch {}
   const name = (body?.name || '').toString().trim().slice(0, 200);
