@@ -10,6 +10,11 @@ const STATIC_ROUTES: Array<{ path: string; changefreq: string; priority: string 
   { path: '/research', changefreq: 'monthly', priority: '0.9' },
   { path: '/ecosystem', changefreq: 'monthly', priority: '0.8' },
   { path: '/careers', changefreq: 'daily', priority: '0.9' },
+  // The department directory and the research search. Both are category pages in the sense the
+  // structured-data guidance means: stable canonical URLs that group postings and are worth
+  // crawling in their own right, not just as a route to a job.
+  { path: '/careers/departments', changefreq: 'weekly', priority: '0.85' },
+  { path: '/careers/opportunities', changefreq: 'daily', priority: '0.85' },
   { path: '/aquintutor', changefreq: 'weekly', priority: '0.9' },
   { path: '/aquintutor/schools', changefreq: 'weekly', priority: '0.88' },
   { path: '/aquintutor/courses', changefreq: 'daily', priority: '0.9' },
@@ -46,6 +51,30 @@ export const GET: APIRoute = async () => {
   } catch (_) {
     // DB unreachable - degrade to static sitemap
   }
+
+  // Department and division pages. Both degrade to nothing rather than taking the sitemap down:
+  // a sitemap that 500s is worse for indexing than one that is a few URLs short, and `divisions`
+  // does not exist on a database where db/xscale-schema.sql has not been run yet.
+  let departmentIds: string[] = [];
+  let divisionSlugs: string[] = [];
+  try {
+    const { sql: s1 } = await import('drizzle-orm');
+    const dr: any = await db.execute(s1`
+      SELECT DISTINCT d.id
+        FROM departments d
+        JOIN roles r ON r.department_id = d.id
+       WHERE d.is_visible = TRUE
+         AND r.is_open = TRUE
+         AND COALESCE(r.job_status, 'PUBLISHED') = 'PUBLISHED'
+         AND (r.application_deadline IS NULL OR r.application_deadline > NOW())`);
+    departmentIds = (Array.isArray(dr) ? dr : (dr?.rows || [])).map((x: any) => String(x.id));
+  } catch (_) { /* no department pages in the sitemap; the rest of it still ships */ }
+  try {
+    const { sql: s2 } = await import('drizzle-orm');
+    const vr: any = await db.execute(s2`
+      SELECT slug FROM divisions WHERE is_visible = TRUE ORDER BY sort_order ASC`);
+    divisionSlugs = (Array.isArray(vr) ? vr : (vr?.rows || [])).map((x: any) => String(x.slug));
+  } catch (_) { /* the divisions table is absent on a database without the migration */ }
 
   const { sql: rawSql } = await import('drizzle-orm');
 
@@ -104,6 +133,22 @@ export const GET: APIRoute = async () => {
       + '</url>';
   });
 
+  const departmentUrls = departmentIds.map((id) =>
+    '  <url>'
+    + '<loc>' + SITE.url + '/careers/department/' + id + '</loc>'
+    + '<lastmod>' + today + '</lastmod>'
+    + '<changefreq>weekly</changefreq>'
+    + '<priority>0.8</priority>'
+    + '</url>');
+
+  const divisionUrls = divisionSlugs.map((slug) =>
+    '  <url>'
+    + '<loc>' + SITE.url + '/careers/division/' + slug + '</loc>'
+    + '<lastmod>' + today + '</lastmod>'
+    + '<changefreq>weekly</changefreq>'
+    + '<priority>0.8</priority>'
+    + '</url>');
+
   const courseUrls = publicCourses.map((c) => {
     const lastmod = c.updated_at
       ? new Date(c.updated_at).toISOString().split('T')[0]
@@ -148,7 +193,7 @@ export const GET: APIRoute = async () => {
 
   const xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
     + '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
-    + staticUrls.concat(roleUrls).concat(courseUrls).concat(pathUrls).concat(instructorUrls).concat(schoolUrls).join('\n') + '\n'
+    + staticUrls.concat(roleUrls).concat(departmentUrls).concat(divisionUrls).concat(courseUrls).concat(pathUrls).concat(instructorUrls).concat(schoolUrls).join('\n') + '\n'
     + '</urlset>\n';
 
   return new Response(xml, {
