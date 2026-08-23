@@ -283,6 +283,30 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   // The LMS spine — assignments, submissions, grades, sections, discussion, statement store. One
   // module owns every CREATE TABLE for it, so one table answers "has it bootstrapped in production".
   { module: 'LMS coursework', table: 'lms_assignments', owner: 'src/lib/lms/schema.ts' },
+
+  // ============================================================================================
+  // THE THREE THIS LIST WAS MISSING, AND WHY THEIR ABSENCE WAS EXPENSIVE
+  // ============================================================================================
+  //
+  // This list is what "all expected tables present" MEANS. A table read in production but absent
+  // from here is a table this endpoint reports nothing about, and the endpoint's silence reads as
+  // health. All three below are read on paths a real person walks, none of them appears in any
+  // db/*.sql file, and each one's only creator is an ensureOnce() bootstrap — which returns a
+  // resolved promise in production, by design, for the connection-pressure reason written at the
+  // top of src/lib/ensure-once.ts.
+  //
+  // The claim that made this safe was "every caller already tolerates a missing table, so the
+  // failure mode is a feature with no rows". hr_daily_report_revisions is where that stops being
+  // true: submitClockOutReport() INSERTs into it as the FIRST statement inside a db.transaction,
+  // so a missing table does not degrade the daily report — it rolls back the transaction and the
+  // clock-out fails. The person is left unable to end their day, and the parent table
+  // hr_daily_reports IS in db/hr-schema.sql, which is exactly why nobody noticed the trail table
+  // was not.
+  { module: 'Daily report revisions', table: 'hr_daily_report_revisions', owner: 'src/lib/daily-report.ts' },
+  // Read by /portal/profile and five other surfaces; created only by ensureLearningProgressSchema().
+  { module: 'Course certificates', table: 'training_certificates', owner: 'src/lib/learning-progress.ts' },
+  // The clock-out identity trail, same module and same bootstrap as the revisions table above.
+  { module: 'Clock-out checks', table: 'hr_clock_out_checks', owner: 'src/lib/attendance-verify-clockout.ts' },
 ];
 
 // ============================================================================================
