@@ -24,12 +24,38 @@ function sources(dir: string, acc: string[] = []): string[] {
 // Astro build-time flags are not deployment configuration.
 const BUILTIN = new Set(['PROD', 'DEV', 'MODE', 'SSR', 'BASE_URL', 'NODE_ENV']);
 const read = new Set<string>();
+
+// TWO WAYS A VARIABLE IS "READ", AND THE SECOND ONE IS EASY TO MISS.
+//
+// The direct form is a literal lookup on process.env or import.meta.env. (Written in prose rather
+// than spelled out, because this scanner reads its own source file too: a placeholder written in
+// the matchable form registers as a variable named after the placeholder, which is a false positive
+// this very comment produced on its first draft.) The INDIRECT form names the variable as DATA and
+// resolves it at runtime — src/lib/intake-routing.ts carries
+// `envVar: 'WELLNESS_COUNSELLOR_EMAIL'` on each routing destination, and the value is looked up
+// through that string rather than written literally anywhere.
+//
+// Scanning only for the direct form made the checklist look STALE for exactly those variables: the
+// "lists nothing the code does not read" assertion below flagged WELLNESS_COUNSELLOR_EMAIL as a rot
+// entry, when in truth the entry is right and the DETECTOR could not see the read. Deleting the
+// entry would have been the damaging fix — it would send somebody to deploy the wellness routing
+// with no counsellor address configured, and /aquintutor/campus/wellness changes what it promises a
+// user depending on whether that address is set.
+//
+// So both forms count. This makes the gate stricter, never looser: a variable declared indirectly is
+// now also required to be on the checklist by the assertion above.
+const PATTERNS: RegExp[] = [
+  /(?:process\.env|import\.meta\.env)\.([A-Z][A-Z0-9_]{2,})/g,
+  /envVar\s*:\s*['"]([A-Z][A-Z0-9_]{2,})['"]/g,
+];
 for (const f of sources('src')) {
   const body = readFileSync(f, 'utf8');
-  const re = /(?:process\.env|import\.meta\.env)\.([A-Z][A-Z0-9_]{2,})/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(body)) !== null) {
-    if (!BUILTIN.has(m[1])) read.add(m[1]);
+  for (const re of PATTERNS) {
+    re.lastIndex = 0; // the regexes are module-scope and /g carries lastIndex between files
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(body)) !== null) {
+      if (!BUILTIN.has(m[1])) read.add(m[1]);
+    }
   }
 }
 const listed = new Set(REQUIREMENTS.map((r) => r.name));

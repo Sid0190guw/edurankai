@@ -12,6 +12,9 @@ import { logEvent } from '@/lib/logger';
 // array and a type import — it opens no database connection and pulls no page code into the
 // middleware bundle; everything that touches the database in it is behind a dynamic import.
 import { aquinPanelFor } from '@/lib/workforce/landing';
+// The application gate. DB-free by construction — see the note at the call site, and the header of
+// src/lib/talent/gate-pass.ts, for why this is not imported from src/lib/talent/gateway.ts.
+import { applyGateRedirect, GATE_COOKIE } from '@/lib/talent/gate-pass';
 
 // Every /admin path except this one must pass canOpenAdmin. Exactly one exemption, matched exactly:
 // a prefix test here would let /admin/login-anything through, and a second entry is how an unguarded
@@ -52,6 +55,17 @@ function signedOutAdminRedirect(path: string): Response | null {
 // Universal/auth paths (dashboard, mail, notifications, login, logout) are not
 // listed -> never gated. Unmapped admin paths fall through (allowed).
 const PATH_SECTION: [string, string][] = ([
+  // TALENT-TO-ORGANIZATION. The four desks are gated separately from the console itself, so the
+  // hiring desk cannot reach the access engine (spec section 35). Order here is irrelevant — the
+  // `.sort()` at the end of this array makes the longest prefix win — but the SPECIFIC entries are
+  // load-bearing: without them every one of these subtrees resolves to 'talent', which `recruiter`
+  // and `reviewer` hold.
+  ['/admin/talent/access', 'talent_access'],
+  ['/admin/talent/identity', 'talent_identity'],
+  ['/admin/talent/onboarding', 'talent_onboarding'],
+  ['/admin/talent/codes', 'talent_onboarding'],
+  ['/admin/talent/selected', 'talent_onboarding'],
+  ['/admin/talent', 'talent'],
   ['/admin/applications', 'applications'],
   ['/admin/help', 'messages'],
   ['/admin/messages', 'dms'],
@@ -244,6 +258,32 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // value is used only to DECIDE, and for the `next=` parameter on the sign-in redirects, where the
   // collapsed form is the one that should be returned to anyway.
   const path = normalisePath(new URL(context.request.url).pathname);
+
+  // ===============================================================================================
+  // THE APPLICATION GATE — /apply/* AND /onboarding/* ARE UNREACHABLE WITHOUT A GATE PASS
+  // ===============================================================================================
+  //
+  // FIRST, ON PURPOSE, BEFORE THE SESSION IS EVEN RESOLVED. The gate covers external candidates who
+  // have no account at all AND serving employees who do, so it cannot live behind any of the
+  // signed-in branches below — three of which return early. An internal applicant with a private
+  // entrance is exactly how an internal hire ends up with no application record, no evaluation trail
+  // and no selection decision.
+  //
+  // IT ALSO KEEPS THE TWO DOORS APART. A pass earned by declaring "I have no code" must never reach
+  // /onboarding — that would be direct onboarding with no selection behind it — and a pass earned
+  // WITH a code must not wander into the ordinary application flow, which is how one hire acquires
+  // both a selection and a contradictory application. applyGateRedirect() owns both rules.
+  //
+  // IMPORTED FROM './gate-pass', NOT FROM './gateway'. gateway.ts reaches the tal_* tables, which
+  // pulls src/lib/db — postgres-js plus the whole Drizzle schema — into a bundle that runs on EVERY
+  // request. gate-pass.ts imports nothing but node:crypto. This is the same trap this file already
+  // documents for the AquinTutor landing table.
+  //
+  // THE GATE IS NOT THE ONLY LOCK. Middleware sees PAGE requests; `/api/*` is not behind the /admin
+  // gate in this codebase, so the endpoint that actually creates an application calls
+  // requireGatePass() itself and refuses rather than redirects.
+  const applyGate = applyGateRedirect(path, context.cookies.get(GATE_COOKIE)?.value ?? null);
+  if (applyGate) return applyGate;
 
   // ===============================================================================================
   // AQUINTUTOR'S OWN PRINCIPAL, RESOLVED BEFORE ANYTHING ELSE AND KEPT SEPARATE FROM `user`

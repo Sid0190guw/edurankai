@@ -169,6 +169,36 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       { id: 'application-sources', label: 'Application sources', href: '/admin/application-sources', icon: 'chart', section: 'hr' },
     ],
   },
+  // ---------------------------------------------------------------------------------------------
+  // TALENT-TO-ORGANIZATION — docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md.
+  //
+  // A GROUP OF ITS OWN rather than more children under Recruitment, because half of these entries
+  // are not recruitment: the identity registry and the access engine are what happens AFTER somebody
+  // has been hired, and filing them under Recruitment would put the access console in a recruiter's
+  // mental model of their own desk.
+  //
+  // EACH ENTRY NAMES THE SECTION THAT GATES IT, and they are not all the same section. That is the
+  // whole point of this module's header: an entry whose section is wider than the page's own lock
+  // hands somebody a link the door refuses. `talent` is held by hr, recruiter, reviewer and
+  // department_head; `talent_onboarding` and `talent_identity` by hr alone below super_admin;
+  // `talent_access` by super_admin alone, because access administration is a separate desk from the
+  // one that decides who joins.
+  {
+    groupId: 'talent-group',
+    label: 'Talent to organization',
+    icon: 'users',
+    children: [
+      { id: 'talent', label: 'Talent console', href: '/admin/talent', icon: 'grid', section: 'talent' },
+      { id: 'talent-opportunities', label: 'Opportunities', href: '/admin/talent/opportunities', icon: 'inbox', section: 'talent' },
+      { id: 'talent-candidates', label: 'Candidates', href: '/admin/talent/candidates', icon: 'users', section: 'talent' },
+      { id: 'talent-sources', label: 'Recruitment sources', href: '/admin/talent/sources', icon: 'chart', section: 'talent' },
+      { id: 'talent-selected', label: 'Selected candidates', href: '/admin/talent/selected', icon: 'check', section: 'talent_onboarding' },
+      { id: 'talent-codes', label: 'Onboarding codes', href: '/admin/talent/codes', icon: 'shield', section: 'talent_onboarding' },
+      { id: 'talent-onboarding', label: 'Onboarding review', href: '/admin/talent/onboarding', icon: 'inbox', section: 'talent_onboarding' },
+      { id: 'talent-identity', label: 'Identity registry', href: '/admin/talent/identity', icon: 'users', section: 'talent_identity' },
+      { id: 'talent-access', label: 'Access management', href: '/admin/talent/access', icon: 'shield', section: 'talent_access' },
+    ],
+  },
   { id: 'help', label: 'Help Inbox', href: '/admin/help', icon: 'chat', section: 'messages' },
   // WHAT THE PUBLIC CONTACT FORM COLLECTS. /admin/contact was orphaned: the page exists, writes
   // `handled_by_user_id` and `handled_at` back to contact_submissions, and nothing anywhere linked
@@ -221,6 +251,15 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       { id: 'mail-automation', label: 'Automation',       href: '/admin/mail/automation', icon: 'shield',  section: 'settings' },
       { id: 'mail-setup',     label: 'Setup wizard',      href: '/admin/mail/setup',     icon: 'shield',   section: 'settings' },
       { id: 'mail-health',    label: 'Health',            href: '/admin/mail/health',    icon: 'shield',   section: 'settings' },
+      // NEWLY MAPPED, and overdue: these three were reachable only by cross-link from other mail
+      // screens, which is the exact defect this catalogue exists to prevent. Settings is the one that
+      // stings — eleven pages link to it and it holds the SMTP/IMAP credentials the whole subsystem
+      // sends through, so the single most important mail screen was the one you had to already know
+      // the URL of. Same 'settings' gate as their siblings: between them these three hold the sending
+      // credentials and decide which domains may send at all, which is that level of trust exactly.
+      { id: 'mail-settings',  label: 'Mail settings',     href: '/admin/mail/settings',  icon: 'cog',      section: 'settings' },
+      { id: 'mail-domains',   label: 'Sending domains',   href: '/admin/mail/domains',   icon: 'globe',    section: 'settings' },
+      { id: 'mail-mailboxes', label: 'Mailboxes',         href: '/admin/mail/mailboxes', icon: 'inbox',    section: 'settings' },
       // The commercial layer. 'settings' for the same reason as the six above: these are mail
       // PLATFORM screens (tenants, plans, quotas, invoices), super admin only.
       { id: 'mail-tenants',   label: 'Tenants & teams',   href: '/admin/mail/tenants',   icon: 'users',    section: 'settings' },
@@ -571,6 +610,17 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   { id: 'custom-offer', label: 'Custom Offer', href: '/admin/offer/blank', icon: 'file-text', section: 'custom_offer' },
   { id: 'hei-dashboard', label: 'HEI Control Plane', href: '/admin/hei', icon: 'book', section: 'hei_findings' },
   { id: 'roles', label: 'Roles', href: '/admin/roles', icon: 'briefcase', section: 'roles' },
+  // THE EVALUATION PIPELINE. Read-only register of the internal stages an application is worked
+  // through, and the published step each one projects onto.
+  //
+  // FILED ON 'roles' RATHER THAN A NEW SECTION KEY, for the reason this file's header gives about
+  // the Recruitment group: a new key would create a checkbox in /admin/team/roles that nothing
+  // enforces, and — because a section nobody has been granted is a section nobody holds — it would
+  // hide this page from every restricted admin on the day it shipped. The page's own gate is
+  // can(user, 'roles.view') || can(user, 'roles.edit'), so 'roles' is EXACTLY the population the
+  // door admits: nobody is offered a link that bounces them, and nobody who may open it is hidden
+  // from it.
+  { id: 'talent-pipeline', label: 'Evaluation pipeline', href: '/admin/talent/pipeline', icon: 'grid', section: 'roles' },
   { id: 'team-roles', label: 'Custom Roles', href: '/admin/team/roles', icon: 'shield', section: 'team_roles' },
   { id: 'departments', label: 'Departments', href: '/admin/departments', icon: 'grid', section: 'departments' },
   // THE ORGANISATION LAYER'S SECOND SURFACE, and until this entry it was reachable only by typing

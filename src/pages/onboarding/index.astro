@@ -1,0 +1,81 @@
+---
+// /onboarding — THE BRIDGE between a redeemed code and the form.
+//
+// This page renders almost nothing. Its job is to turn the short, stateless gate pass into a real,
+// revocable onboarding session and send the person onward. It exists as a separate step rather than
+// being folded into the gate because the two have different lifetimes and different failure modes:
+// the gate pass is 45 minutes and cannot be revoked, the onboarding session is two hours, lives in
+// tal_onboarding_application, and can be ended server-side the moment a selection is withdrawn.
+//
+// Middleware has ALREADY established that a code-door gate pass is present — /onboarding is in the
+// gated prefixes and applyGateRedirect() bounces an 'open'-door pass to the gate. This page still
+// re-reads the pass rather than assuming it: a page that trusts an upstream check is a page that
+// breaks silently the day somebody changes the upstream check.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { verifyGatePass, GATE_COOKIE } from '@/lib/talent/gate-pass';
+import { startOrResume, ONBOARDING_COOKIE, SESSION_TTL_MINUTES } from '@/lib/talent/onboarding';
+import { findByCode } from '@/lib/talent/codes';
+
+// Declared before anything uses them: `const` is not hoisted, and a handler reaching a later
+// declaration has taken pages down on this project.
+const pass = verifyGatePass(Astro.cookies.get(GATE_COOKIE)?.value ?? null);
+const secure = Astro.url.protocol === 'https:';
+
+let problem = '';
+
+if (!pass || pass.door !== 'code' || !pass.codeId || !pass.selectionId || !pass.personId) {
+  // Not an error state worth a page of its own — send them back to the front door, which explains
+  // itself. This is also the path somebody lands on if their pass expired while reading.
+  return Astro.redirect('/apply/gateway');
+}
+
+// The code reference is read back rather than carried in the pass. The pass holds ids only, so a
+// tampered cookie cannot smuggle a code reference that was never issued.
+const started = await (async () => {
+  try {
+    const { db } = await import('@/lib/db');
+    const { sql } = await import('drizzle-orm');
+    const { rowsOf } = await import('@/lib/talent/types');
+    const r = rowsOf(await db.execute(sql`
+      SELECT code_id FROM tal_onboarding_code WHERE id = ${pass.codeId}::uuid LIMIT 1
+    `));
+    const codeRef = String((r[0] as any)?.code_id || '');
+    if (!codeRef) return { ok: false, error: 'That onboarding code could not be read back.' };
+    return await startOrResume({
+      codeRowId: pass.codeId!, codeRef,
+      selectionId: pass.selectionId!, personId: pass.personId!,
+    });
+  } catch (e: any) {
+    return { ok: false, error: String(e?.cause?.message || e?.message || 'unknown error') };
+  }
+})();
+
+if (started.ok && started.secret) {
+  Astro.cookies.set(ONBOARDING_COOKIE, started.secret, {
+    httpOnly: true, secure, sameSite: 'lax', path: '/', maxAge: SESSION_TTL_MINUTES * 60,
+  });
+  return Astro.redirect('/onboarding/form');
+}
+
+// A finished application comes back ok with no secret. Nothing is editable, so say so plainly
+// instead of handing back a form that would refuse every save.
+if (started.ok && started.app && !started.secret) {
+  return Astro.redirect('/onboarding/submitted?state=' + encodeURIComponent(started.app.status));
+}
+
+problem = started.error || 'Onboarding could not be started.';
+---
+
+<BaseLayout title="Onboarding" description="Start your onboarding with EduRankAI." noindex={true}>
+  <main class="mx-auto w-full max-w-xl px-5 py-16">
+    <h1 class="text-2xl font-semibold tracking-tight text-neutral-900">We could not open your onboarding</h1>
+    <p class="mt-3 text-sm leading-relaxed text-neutral-600">{problem}</p>
+    <p class="mt-4 text-sm leading-relaxed text-neutral-600">
+      Your code has not been used. Reply to the message you received from EduRankAI and the people
+      desk will sort it out.
+    </p>
+    <a href="/apply/gateway" class="mt-6 inline-block rounded-lg border border-neutral-900 px-4 py-2.5 text-sm font-medium text-neutral-900 transition hover:bg-neutral-50">
+      Back to the gate
+    </a>
+  </main>
+</BaseLayout>

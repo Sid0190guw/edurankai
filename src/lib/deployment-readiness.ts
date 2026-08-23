@@ -93,6 +93,43 @@ export const REQUIREMENTS: readonly EnvRequirement[] = Object.freeze([
     mustMatchOld: 'Links already handed out were signed with the old secret and will 404.' },
 
   // ---- optional: absent is a legitimate configuration ----
+  // THE ONE WHERE 'ABSENT' HAS A PERSON ON THE OTHER END OF IT.
+  //
+  // Unset means nobody is monitoring counselling requests, and the Wellness Quarter says so in plain
+  // words rather than claiming a team. That is honest, and it is not good: somebody can still ask for
+  // help and be told, correctly, that it may not be read today.
+  //
+  // It sits under `optional` because the platform runs without it and because inventing a recipient
+  // would be worse than admitting there is none. It is the entry on this page most worth fixing.
+  { name: 'WELLNESS_COUNSELLOR_EMAIL', severity: 'optional',
+    breaks: 'Nobody is notified when a person asks for counselling. The request is still saved, and the Wellness Quarter tells the person outright that no counsellor is monitoring the form, so the page stays truthful — but the request waits. Set this to the address of whoever responds. The notification deliberately carries only the urgency, language, preferred slot and the contact they gave; what they wrote never leaves the database.' },
+
+  // ---- the rest of the campus intake desks (src/lib/intake-routing.ts) ----
+  //
+  // FOUR ENTRIES THAT WERE MISSING, AND WHY NOBODY NOTICED. intake-routing.ts names its recipient
+  // for each desk as DATA — `envVar: 'LIBRARY_EMAIL'` — and resolves it at runtime. The checklist
+  // test scanned only for a literal lookup on process.env, so these four were invisible to it: the code
+  // needed them, the checklist did not list them, and the test that exists to catch exactly that
+  // could not see either side. The scanner in deployment-readiness.test.ts now reads the indirect
+  // form too, which is what surfaced them.
+  //
+  // All four are `optional` on the same reasoning as WELLNESS_COUNSELLOR_EMAIL above: the platform
+  // runs without them and the request is still SAVED, so nothing a person submits is lost. What is
+  // lost is the notification, and therefore the response time.
+  //
+  // Unlike the counselling desk, these four carry mayForwardContent: true — the person's own words
+  // are included in the notification, because an inter-library loan or an access requirement cannot
+  // be acted on by somebody who has not been told what it is. That is stated here so whoever sets
+  // these addresses knows what will arrive at them.
+  { name: 'TEST_CENTRE_EMAIL', severity: 'optional',
+    breaks: 'Nobody is notified when somebody books a test-centre slot or states an access requirement. The booking is still saved and can be worked from the admin screen, but it waits until somebody looks. The notification includes what the person wrote, because an accommodation cannot be arranged by anyone who has not been told what it is.' },
+  { name: 'LIBRARY_EMAIL', severity: 'optional',
+    breaks: 'Nobody is notified when an inter-library loan is requested. The request is still saved and visible in the admin console, but no one is told it arrived, so it waits. Set this to the address of whoever sources loans.' },
+  { name: 'CAMPUS_PROGRAMMES_EMAIL', severity: 'optional',
+    breaks: 'Nobody is notified when somebody applies for a place on the cultural literacy programme. The application is still saved, so nothing is lost, but it is not routed to anyone who can offer a place.' },
+  { name: 'CAMPUS_COMMONS_EMAIL', severity: 'optional',
+    breaks: 'Nobody is notified about dorm circles, club joins, coffee matches or study-buddy requests. All four are still saved and are the ones most likely to go stale unread, because a person who asked to be introduced to somebody and heard nothing does not usually ask twice. Set this to whoever runs student community.' },
+
   // ---- the streaming-channel connector (src/lib/live-egress.ts) ----
   // All four absent is the normal state: no channel is connected and the admin screen says so.
   // The refresh token is the one worth watching — see accountBound, which is the failure mode that
@@ -205,6 +242,52 @@ export const REQUIREMENTS: readonly EnvRequirement[] = Object.freeze([
     breaks: 'New DKIM selectors are minted under the default `era` prefix. Existing selectors are unaffected.' },
   { name: 'MAIL_PROFILE_ID', severity: 'optional', breaks: 'The deployment profile is called `default` on the operator screens.' },
   { name: 'MAIL_PROFILE_LABEL', severity: 'optional', breaks: 'The deployment profile shows a generated label.' },
+
+  // ---- found by the same test, a second time ----
+  // Seventeen more variables had entered the codebase since the list was last reconciled — the mail
+  // engine seam, the integration layer, the metrics endpoint and the host's own injected values.
+  // Two of them fail CLOSED, which is the reason this reconciliation is not cosmetic: a deployment
+  // can be missing them, report itself ready, and drop every webhook and every engine event.
+  { name: 'WEBHOOK_SIGNING_KEY', severity: 'degraded',
+    breaks: 'No outbound webhook is delivered at all. src/lib/mailplatform/webhooks.ts refuses to send rather than send unsigned, so every subscriber stops receiving events and the deliveries sit failed with that reason recorded.',
+    mustMatchOld: 'Signatures are derived from this key and the stored secret hash. A new value makes every signature a receiver has already been told to expect verify differently — their endpoints will start rejecting deliveries.' },
+  { name: 'MAIL_APP_SHARED_SECRET', severity: 'degraded',
+    breaks: 'The mail engine cannot report anything back to the application: /api/mail/engine/events and /api/mail/engine/suppressions refuse EVERY request when it is unset, so deliveries, bounces and complaints never reach the platform and the suppression list stops growing from real bounces.' },
+
+  { name: 'MAIL_SERVICE_URL', severity: 'optional',
+    breaks: 'The application cannot call the standalone mail engine over HTTP — callMailService() returns "MAIL_SERVICE_URL is not set" without attempting a request. Absent is correct while the engine reports IN through /api/mail/engine/* rather than being called OUT to.' },
+  { name: 'MAIL_SERVICE_KEY', severity: 'optional',
+    breaks: 'The same call is refused before it is made, because the request cannot be signed. Set it together with MAIL_SERVICE_URL or not at all.' },
+  { name: 'MAIL_WEBHOOK_SECRET', severity: 'optional',
+    breaks: 'Inbound mail can no longer be authenticated by HMAC signature. It is not open: /api/mail/inbound falls back to the shared-secret header (MAIL_INBOUND_SECRET) and refuses anything that presents neither, but a shared secret in a header is replayable and a signature is not.' },
+  { name: 'MAIL_TRANSPORT', severity: 'optional',
+    breaks: 'Nothing. Outbound uses SMTP, which is the shipped default. Set it to `none` to build a deployment that accepts mail but sends none.' },
+  { name: 'MAIL_INBOUND', severity: 'optional',
+    breaks: 'Nothing. Inbound polls IMAP, which is the shipped default. Set it to `push` when a gateway posts to /api/mail/inbound and no mailbox should be polled.' },
+  { name: 'IMAP_HOST', severity: 'optional',
+    breaks: 'Nothing is polled differently — the mailbox that is actually polled is the one configured at /admin/mail/settings, which is authoritative. This value only names that host on the ops screen, which otherwise describes the poll generically.' },
+  { name: 'MAIL_MAX_INBOUND_BYTES', severity: 'optional',
+    breaks: 'A pushed inbound message larger than 30 MB is rejected. Raise it only if the gateway in front genuinely accepts more, since the whole body is held in memory to verify its signature.' },
+  { name: 'MAIL_ALLOW_PRIVATE_SMTP', severity: 'optional',
+    breaks: 'Nothing, and leaving it unset is the correct configuration. It disables the check that an SMTP host resolves to a public address — the guard against pointing this platform at a private network address to make it probe an internal service. Set it only for a deployment whose mail server genuinely is on a private network.' },
+  { name: 'MAIL_GEOLOCATE_OPENS', severity: 'optional',
+    breaks: 'Nothing, and unset is the intended default. An open is recorded without deriving a location for it. Setting it to true restores geolocation of the address that opened a message, which is data about a reader that nobody asked us to collect.' },
+  { name: 'MAILINT_ENVIRONMENT', severity: 'optional',
+    breaks: 'Nothing. The integration layer decides production versus development from VERCEL_ENV and then NODE_ENV, and fails towards development, so a preview deployment does not mail real people. Set it only to override that judgement deliberately.' },
+  { name: 'METRICS_TOKEN', severity: 'optional',
+    breaks: 'GET /api/metrics answers 404 and the benchmark report cannot be posted by an unattended runner. The endpoint is not left open when the token is unset — the door simply does not exist, and an admin session is the only other way in.' },
+  { name: 'SITE_URL', severity: 'optional',
+    breaks: 'Nothing on its own. It is the second fallback for the campaign link base, behind PUBLIC_SITE_URL and ahead of the built-in site constant.' },
+
+  // Injected by the host rather than set by an operator. They are listed because this checklist is
+  // also read when moving OFF the current host, where all three are simply absent — and each one
+  // then changes a behaviour quietly rather than failing.
+  { name: 'VERCEL_ENV', severity: 'optional',
+    breaks: 'Nothing to set — the host injects it. Where it is absent the integration layer falls back to NODE_ENV to decide whether this deployment may mail real people, so a self-hosted production deployment must set NODE_ENV=production or it will behave as development and hold mail back.' },
+  { name: 'VERCEL_REGION', severity: 'optional',
+    breaks: 'Nothing to set — the host injects it. The metrics payload reports no region.' },
+  { name: 'VERCEL_GIT_COMMIT_SHA', severity: 'optional',
+    breaks: 'Nothing to set — the host injects it. The health endpoint and the metrics payload cannot say which commit is serving, which is the first question asked when two deployments behave differently.' },
 ]);
 
 export interface EnvStatus extends EnvRequirement {
