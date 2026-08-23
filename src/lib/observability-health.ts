@@ -219,6 +219,7 @@ export const CONFIGURED_CRONS: { path: string; schedule: string }[] = [
   { path: '/api/aquintutor/streak-nudge', schedule: '30 14 * * *' },
   { path: '/api/aquintutor/league-settle', schedule: '0 1 * * 1' },
   { path: '/api/hiring/draft-reminders', schedule: '45 4 * * *' },
+  { path: '/api/cron/hr-sweep', schedule: '10 4 * * *' },
   { path: '/api/cron/hei-refresh', schedule: '0 3 * * *' },
   { path: '/api/cron/activity-digest', schedule: '0 13 * * *' },
   // Deletes facial data whose purpose has ended. The test that pairs this list against
@@ -231,12 +232,35 @@ export const CONFIGURED_CRONS: { path: string; schedule: string }[] = [
   // which is exactly the drift the paired test exists to catch.
   { path: '/api/mail/automation/tick', schedule: '15 6 * * *' },
   { path: '/api/mail/campaign-cron', schedule: '30 7 * * *' },
+  // Added to vercel.json by the integrations, governance and webmail workstreams. Registered here
+  // because THIS list is what /admin/diagnostics reports as "the scheduled jobs" — a cron missing
+  // from it is a job nobody is watching, which is the exact drift the paired test exists to catch.
+  { path: '/api/cron/mailint-dispatch', schedule: '45 7 * * *' },
+  { path: '/api/mail/gov/worker', schedule: '20 2 * * *' },
+  { path: '/api/mail/snooze?action=wake', schedule: '10 2 * * *' },
   // The transactional worker: scheduled sends that have come due, deferred retries, and webhook
   // redelivery. A daily run is all a Hobby plan allows and is enough for the housekeeping only —
   // an ordinary send reaches SMTP inside its own request and never waits for this. Point an
   // external scheduler at it every minute or two for retries to be timely; see
   // docs/mail-transactional-api.md.
   { path: '/api/v1/email/dispatch', schedule: '15 7 * * *' },
+  // TWO ENDPOINTS THAT EXISTED, WERE SECRET-GATED, AND WERE SCHEDULED NOWHERE.
+  //
+  // Both were built, both refuse an unauthenticated caller, and neither appeared in vercel.json or
+  // in any GitHub Actions workflow — so neither had ever run. docs/ops/MONITORING.md had recorded
+  // both as open findings. Presence of a file under src/pages/api/cron/ is not evidence that
+  // anything calls it, which is exactly what this list and its paired test exist to make visible.
+  //
+  //   /api/jobs/run          drains edu_jobs. It is the ONLY consumer of the queue, so every job
+  //                          anything enqueued was sitting there unprocessed. The daily entry is a
+  //                          backstop; .github/workflows/jobs-drain.yml runs it every 15 minutes,
+  //                          the same arrangement imap-poll already uses to get past the Hobby
+  //                          plan's daily-only limit.
+  //   /api/cron/security-scan  its own header calls itself "the serverless replacement for a
+  //                          resident continuous monitoring daemon — detection latency is bounded
+  //                          by the cron interval". With no interval, that latency was infinite.
+  { path: '/api/jobs/run', schedule: '10 4 * * *' },
+  { path: '/api/cron/security-scan', schedule: '50 3 * * *' },
 ];
 
 /**
@@ -277,6 +301,43 @@ const ctx = async () => {
 const OBS_DDL = [
   'CREATE TABLE IF NOT EXISTS edu_cron_runs (path text PRIMARY KEY, last_run_at timestamptz NOT NULL DEFAULT now(), last_status text, last_detail text, runs bigint NOT NULL DEFAULT 0)',
   'CREATE TABLE IF NOT EXISTS edu_releases (sha text PRIMARY KEY, ref text, environment text, message text, first_seen_at timestamptz NOT NULL DEFAULT now(), last_seen_at timestamptz NOT NULL DEFAULT now())',
+  // THE ROLLUP GREW COLUMNS RATHER THAN BEING REPLACED. edu_cron_runs already had a consumer
+  // (cronStatus) and a shape other code reads; widening it additively keeps every existing reader
+  // working while giving the ops view something it can actually diagnose from. ADD COLUMN IF NOT
+  // EXISTS is forward-only, which is the established pattern in this repository and the reason
+  // rolling back code does not roll back schema.
+  'ALTER TABLE edu_cron_runs ADD COLUMN IF NOT EXISTS last_execution_id text',
+  'ALTER TABLE edu_cron_runs ADD COLUMN IF NOT EXISTS last_started_at timestamptz',
+  'ALTER TABLE edu_cron_runs ADD COLUMN IF NOT EXISTS last_finished_at timestamptz',
+  'ALTER TABLE edu_cron_runs ADD COLUMN IF NOT EXISTS last_duration_ms integer',
+  'ALTER TABLE edu_cron_runs ADD COLUMN IF NOT EXISTS last_processed integer',
+  'ALTER TABLE edu_cron_runs ADD COLUMN IF NOT EXISTS last_succeeded integer',
+  'ALTER TABLE edu_cron_runs ADD COLUMN IF NOT EXISTS last_failed integer',
+  'ALTER TABLE edu_cron_runs ADD COLUMN IF NOT EXISTS last_error_code text',
+  'ALTER TABLE edu_cron_runs ADD COLUMN IF NOT EXISTS last_error_message text',
+  'ALTER TABLE edu_cron_runs ADD COLUMN IF NOT EXISTS last_release text',
+  // Consecutive failures is the number an operator actually acts on: one failed nightly run is a
+  // Tuesday, four in a row is an outage nobody noticed.
+  'ALTER TABLE edu_cron_runs ADD COLUMN IF NOT EXISTS consecutive_failures integer NOT NULL DEFAULT 0',
+  'ALTER TABLE edu_cron_runs ADD COLUMN IF NOT EXISTS last_success_at timestamptz',
+  // One row per execution. The rollup answers "is it healthy now"; this answers "when did it stop
+  // working", which is the question during an incident and cannot be reconstructed from a rollup.
+  `CREATE TABLE IF NOT EXISTS edu_cron_executions (
+     execution_id text PRIMARY KEY,
+     cron_id text NOT NULL,
+     started_at timestamptz NOT NULL DEFAULT now(),
+     finished_at timestamptz,
+     duration_ms integer,
+     status text NOT NULL DEFAULT 'running',
+     records_processed integer,
+     records_succeeded integer,
+     records_failed integer,
+     error_code text,
+     error_message text,
+     release text,
+     detail text
+   )`,
+  'CREATE INDEX IF NOT EXISTS edu_cron_executions_cron_idx ON edu_cron_executions (cron_id, started_at DESC)',
 ];
 let _obsReady = false;
 
@@ -305,6 +366,212 @@ export async function recordCronRun(path: string, status: 'ok' | 'error' = 'ok',
     // Instrumentation must never break the job it is instrumenting — but it must not vanish either.
     const { logEvent } = await import('@/lib/logger');
     logEvent('warn', 'ops.cron_run_record_failed', { path, message: e?.cause?.message || e?.message });
+  }
+}
+
+// -------------------------------------------------------------------------------------------------
+// CANONICAL CRON TELEMETRY
+//
+// WHY THIS EXISTS. recordCronRun() has been available for some time and NOT ONE ROUTE CALLED IT.
+// Sixteen scheduled jobs, zero producers: /admin/ops correctly reported "not instrumented" for all
+// of them, which is honest and useless. An opt-in one-liner at the bottom of a handler is a thing
+// people mean to add.
+//
+// So the shape changed. withCronRun() WRAPS the job instead of asking to be called at the end, and
+// therefore records a terminal state even when the handler throws, returns early, or forgets. The
+// only way to run a wrapped job without telemetry is to not wrap it — which is visible in review,
+// unlike a missing call at the bottom of a function.
+//
+// ONE SCHEMA FOR EVERY CRON. Before this, a route wanting to say "processed 12, failed 2" had to
+// invent somewhere to put it. Two routes inventing two shapes is how an ops dashboard becomes a pile
+// of free text nobody can aggregate.
+//
+// TELEMETRY MUST NEVER BREAK THE JOB. Every function here swallows its own persistence failure and
+// logs it — but the job's outcome is untouched and its exception is re-thrown. An instrumented job
+// that failed because instrumentation failed would be strictly worse than no instrumentation.
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * The states a scheduled job can be in. Deliberately more than ok/error:
+ *   running       - started and has not reported an end. Stuck here past two intervals = timeout.
+ *   success       - did its work, nothing failed.
+ *   partial       - did SOME of its work. The state most often lost, because a job that processed
+ *                   98 of 100 exits zero and reports "ok".
+ *   failed        - threw, or every record failed.
+ *   timeout       - started, never finished, and the window has passed.
+ *   skipped       - ran, decided there was nothing to do. Healthy, and NOT the same as success.
+ *   misconfigured - could not run for want of a secret or a setting. Not a failure of the code, and
+ *                   it needs a person rather than a retry.
+ */
+export type CronStatus = 'running' | 'success' | 'partial' | 'failed' | 'timeout' | 'skipped' | 'misconfigured';
+
+export interface CronOutcome {
+  status?: CronStatus;
+  /** Records this run looked at. */
+  processed?: number;
+  succeeded?: number;
+  failed?: number;
+  /** One human-readable line for the ops table. */
+  detail?: string;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+/**
+ * Work out the status from the counts when the job did not state one. Pure.
+ *
+ * The interesting case is `partial`: any failure at all alongside any success is partial, never
+ * success. A job that quietly drops 2% and reports success is the reason this function exists.
+ */
+export function deriveCronStatus(o: CronOutcome | null | undefined): CronStatus {
+  if (o?.status) return o.status;
+  const processed = Number(o?.processed ?? 0);
+  const failed = Number(o?.failed ?? 0);
+  const succeeded = Number(o?.succeeded ?? Math.max(0, processed - failed));
+  if (processed === 0 && failed === 0) return 'skipped';
+  if (failed > 0 && succeeded === 0) return 'failed';
+  if (failed > 0) return 'partial';
+  return 'success';
+}
+
+/**
+ * What the ops view should say about a cron right now. Pure, so it is testable without a database.
+ *
+ * Freshness and outcome are BOTH consulted, and freshness wins when the job is simply not running:
+ * a job whose last run succeeded three weeks ago is overdue, not healthy. Showing the green from
+ * that last success is precisely the "never run appears as healthy" failure this replaces.
+ */
+export function cronHealth(
+  schedule: string,
+  row: { lastRunAt?: string | Date | null; lastStartedAt?: string | Date | null; status?: string | null } | null | undefined,
+  now: number | Date = Date.now(),
+): 'never_run' | 'running' | 'success' | 'partial' | 'failed' | 'timeout' | 'skipped' | 'misconfigured' | 'overdue' {
+  const nowMs = Number(now);
+  if (!row || (!row.lastRunAt && !row.lastStartedAt)) return 'never_run';
+
+  const intervalMs = cronIntervalHours(schedule) * 3600 * 1000;
+  const status = String(row.status || '') as CronStatus;
+
+  if (status === 'running') {
+    const startedAt = new Date((row.lastStartedAt || row.lastRunAt) as any).getTime();
+    // Still marked running long after it should have finished: the process died mid-run and nothing
+    // wrote a terminal state. Reporting that as "running" forever is how a dead job looks busy.
+    if (Number.isFinite(startedAt) && nowMs - startedAt > intervalMs * 2) return 'timeout';
+    return 'running';
+  }
+
+  const lastRun = new Date((row.lastRunAt || row.lastStartedAt) as any).getTime();
+  if (!Number.isFinite(lastRun)) return 'never_run';
+  if (nowMs - lastRun > intervalMs * 1.5) return 'overdue';
+
+  if (status === 'success' || status === 'partial' || status === 'failed' || status === 'timeout'
+      || status === 'skipped' || status === 'misconfigured') return status;
+  // A run recorded by a module that keeps its own timestamp and states no status. It ran recently;
+  // that is all that is known, and success is the least misleading label for "fresh, no complaint".
+  return 'success';
+}
+
+/** Does this state need somebody to do something. Pure — drives the ops banner. */
+export function cronNeedsAttention(state: ReturnType<typeof cronHealth>): boolean {
+  return state === 'failed' || state === 'timeout' || state === 'overdue' || state === 'misconfigured';
+}
+
+function newExecutionId(): string {
+  try { return (globalThis as any).crypto.randomUUID(); } catch { return Date.now() + '-' + Math.random().toString(16).slice(2); }
+}
+
+/** Mark a job as started. Returns the execution id to hand to finishCronRun(). Never throws. */
+export async function startCronRun(path: string): Promise<{ executionId: string; startedAtMs: number }> {
+  const executionId = newExecutionId();
+  const startedAtMs = Date.now();
+  try {
+    await ensureObservabilitySchema();
+    const { db, sql } = await ctx();
+    const release = deployMarker().shortCommit || null;
+    await db.execute(sql`INSERT INTO edu_cron_executions (execution_id, cron_id, started_at, status, release)
+      VALUES (${executionId}, ${path}, now(), 'running', ${release})`);
+    await db.execute(sql`INSERT INTO edu_cron_runs (path, last_run_at, last_status, last_execution_id, last_started_at, last_release, runs)
+      VALUES (${path}, now(), 'running', ${executionId}, now(), ${release}, 1)
+      ON CONFLICT (path) DO UPDATE SET last_status = 'running', last_execution_id = ${executionId},
+        last_started_at = now(), last_release = ${release}, runs = edu_cron_runs.runs + 1`);
+  } catch (e: any) {
+    const { logEvent } = await import('@/lib/logger');
+    logEvent('warn', 'ops.cron_start_record_failed', { path, message: e?.cause?.message || e?.message });
+  }
+  return { executionId, startedAtMs };
+}
+
+/** Record how a job ended. Never throws — the job's own result is what matters. */
+export async function finishCronRun(
+  path: string,
+  executionId: string,
+  startedAtMs: number,
+  outcome: CronOutcome = {},
+): Promise<CronStatus> {
+  const status = deriveCronStatus(outcome);
+  const durationMs = Math.max(0, Date.now() - startedAtMs);
+  try {
+    await ensureObservabilitySchema();
+    const { db, sql } = await ctx();
+    const detail = String(outcome.detail || '').slice(0, 300) || null;
+    const errorMessage = String(outcome.errorMessage || '').slice(0, 500) || null;
+    await db.execute(sql`UPDATE edu_cron_executions SET
+        finished_at = now(), duration_ms = ${durationMs}, status = ${status},
+        records_processed = ${outcome.processed ?? null}, records_succeeded = ${outcome.succeeded ?? null},
+        records_failed = ${outcome.failed ?? null}, error_code = ${outcome.errorCode || null},
+        error_message = ${errorMessage}, detail = ${detail}
+      WHERE execution_id = ${executionId}`);
+    const failedRun = status === 'failed' || status === 'timeout';
+    // consecutive_failures is the number an operator acts on: one failed nightly run is a Tuesday,
+    // four in a row is an outage nobody noticed.
+    await db.execute(sql`UPDATE edu_cron_runs SET
+        last_run_at = now(), last_finished_at = now(), last_status = ${status},
+        last_duration_ms = ${durationMs}, last_detail = ${detail},
+        last_processed = ${outcome.processed ?? null}, last_succeeded = ${outcome.succeeded ?? null},
+        last_failed = ${outcome.failed ?? null}, last_error_code = ${outcome.errorCode || null},
+        last_error_message = ${errorMessage},
+        consecutive_failures = CASE WHEN ${failedRun} THEN edu_cron_runs.consecutive_failures + 1 ELSE 0 END,
+        last_success_at = CASE WHEN ${status === 'success' || status === 'skipped'} THEN now() ELSE edu_cron_runs.last_success_at END
+      WHERE path = ${path}`);
+  } catch (e: any) {
+    const { logEvent } = await import('@/lib/logger');
+    logEvent('warn', 'ops.cron_finish_record_failed', { path, executionId, message: e?.cause?.message || e?.message });
+  }
+  return status;
+}
+
+/**
+ * Run a scheduled job with telemetry that cannot be forgotten.
+ *
+ *     export const GET: APIRoute = async ({ request }) => {
+ *       if (!authorized(request)) return json({ error: 'unauthorised' }, 401);
+ *       return withCronRun('/api/cron/thing', async () => {
+ *         const r = await doTheWork();
+ *         return { outcome: { processed: r.total, failed: r.failed }, value: json(r) };
+ *       });
+ *     };
+ *
+ * The handler returns its HTTP response AND the counts. A throw is recorded as `failed` with the
+ * real reason and then RE-THROWN, so the route's own error handling is unchanged and a failure is
+ * not hidden by the act of having observed it.
+ */
+export async function withCronRun<T>(
+  path: string,
+  fn: () => Promise<{ outcome?: CronOutcome; value: T }>,
+): Promise<T> {
+  const { executionId, startedAtMs } = await startCronRun(path);
+  try {
+    const { outcome, value } = await fn();
+    await finishCronRun(path, executionId, startedAtMs, outcome || {});
+    return value;
+  } catch (e: any) {
+    await finishCronRun(path, executionId, startedAtMs, {
+      status: 'failed',
+      errorCode: e?.cause?.code || e?.code || undefined,
+      errorMessage: e?.cause?.message || e?.message || 'threw with no message',
+      detail: 'Handler threw.',
+    });
+    throw e;
   }
 }
 
@@ -510,14 +777,51 @@ export async function errorRate(): Promise<{ lastHour: number; last24h: number; 
   }
 }
 
+export interface CronStatusRow {
+  path: string;
+  schedule: string;
+  lastRunAt: string | null;
+  /** Kept for existing consumers. `health` is the one to render. */
+  state: 'never' | 'ok' | 'overdue';
+  /** The full state: never_run / running / success / partial / failed / timeout / skipped / misconfigured / overdue. */
+  health: ReturnType<typeof cronHealth>;
+  needsAttention: boolean;
+  status: string | null;
+  detail: string | null;
+  source: string;
+  lastStartedAt: string | null;
+  lastSuccessAt: string | null;
+  durationMs: number | null;
+  processed: number | null;
+  succeeded: number | null;
+  failed: number | null;
+  consecutiveFailures: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+  /** When the next run is expected, from the last run plus one interval. */
+  nextExpectedAt: string | null;
+}
+
 /** Configured crons joined to observed runs, plus the two last-run timestamps other modules already keep. */
-export async function cronStatus(): Promise<{ path: string; schedule: string; lastRunAt: string | null; state: 'never' | 'ok' | 'overdue'; status: string | null; detail: string | null; source: string }[]> {
-  const observed = new Map<string, { at: string; status: string | null; detail: string | null; source: string }>();
+export async function cronStatus(): Promise<CronStatusRow[]> {
+  const observed = new Map<string, any>();
   try {
     const { db, sql } = await ctx();
-    const r = rows(await db.execute(sql`SELECT path, last_run_at, last_status, last_detail FROM edu_cron_runs`));
-    for (const x of r) observed.set(String(x.path), { at: x.last_run_at, status: x.last_status || null, detail: x.last_detail || null, source: 'recordCronRun' });
-  } catch { /* table not bootstrapped yet — reported as "no run recorded" below */ }
+    const r = rows(await db.execute(sql`SELECT path, last_run_at, last_status, last_detail, last_started_at,
+        last_success_at, last_duration_ms, last_processed, last_succeeded, last_failed,
+        consecutive_failures, last_error_code, last_error_message
+      FROM edu_cron_runs`));
+    for (const x of r) observed.set(String(x.path), { at: x.last_run_at, status: x.last_status || null, detail: x.last_detail || null, source: 'recordCronRun', row: x });
+  } catch {
+    // Older deployments have the narrow table and no widened columns yet. Fall back rather than
+    // blanking the whole panel — an ops view that disappears during a schema lag is worse than one
+    // missing a column.
+    try {
+      const { db, sql } = await ctx();
+      const r = rows(await db.execute(sql`SELECT path, last_run_at, last_status, last_detail FROM edu_cron_runs`));
+      for (const x of r) observed.set(String(x.path), { at: x.last_run_at, status: x.last_status || null, detail: x.last_detail || null, source: 'recordCronRun', row: x });
+    } catch { /* table not bootstrapped yet — reported as "no run recorded" below */ }
+  }
   // Evidence two modules already write for themselves, so those two crons are observable today
   // without editing routes this workflow does not own.
   try {
@@ -533,12 +837,34 @@ export async function cronStatus(): Promise<{ path: string; schedule: string; la
   const now = Date.now();
   return CONFIGURED_CRONS.map((c) => {
     const o = observed.get(c.path);
+    const row = o?.row || {};
+    const lastRunAt = o?.at ? new Date(o.at).toISOString() : null;
+    const lastStartedAt = row.last_started_at ? new Date(row.last_started_at).toISOString() : null;
+    const health = cronHealth(c.schedule, { lastRunAt, lastStartedAt, status: o?.status || null }, now);
+    const num = (v: any): number | null => (v == null ? null : Number(v));
     return {
       path: c.path, schedule: c.schedule,
-      lastRunAt: o?.at ? new Date(o.at).toISOString() : null,
+      lastRunAt,
       state: cronRunState(c.schedule, o?.at || null, now),
+      health,
+      needsAttention: cronNeedsAttention(health),
       status: o?.status || null, detail: o?.detail || null,
       source: o?.source || 'not instrumented',
+      lastStartedAt,
+      lastSuccessAt: row.last_success_at ? new Date(row.last_success_at).toISOString() : null,
+      durationMs: num(row.last_duration_ms),
+      processed: num(row.last_processed),
+      succeeded: num(row.last_succeeded),
+      failed: num(row.last_failed),
+      consecutiveFailures: Number(row.consecutive_failures || 0),
+      errorCode: row.last_error_code ? String(row.last_error_code) : null,
+      errorMessage: row.last_error_message ? String(row.last_error_message) : null,
+      // Next expected run, derived from the last one plus one interval. Null when nothing has run:
+      // a job that has never run has no basis for an expectation, and inventing one from `now`
+      // would make a never-instrumented job look scheduled.
+      nextExpectedAt: lastRunAt
+        ? new Date(new Date(lastRunAt).getTime() + cronIntervalHours(c.schedule) * 3600 * 1000).toISOString()
+        : null,
     };
   });
 }

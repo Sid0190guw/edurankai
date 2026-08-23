@@ -64,8 +64,23 @@ const queue = await queueHealth()
 const release = health ? health.release : null;
 const dbOk = !!health && health.database.ok;
 const dbLatency = health ? health.database.latencyMs : -1;
-const overdueCrons = crons.filter((c) => c.state === 'overdue');
-const neverCrons = crons.filter((c) => c.state === 'never');
+// THE FULL STATE SET, NOT TWO. `state` collapsed everything into never/ok/overdue, so a job that
+// ran and FAILED, a job that processed 98 of 100, and a job that could not start for want of a
+// secret all rendered identically to one that worked. `health` distinguishes them and
+// needsAttention is the subset somebody has to act on tonight.
+const overdueCrons = crons.filter((c) => c.health === 'overdue');
+const neverCrons = crons.filter((c) => c.health === 'never_run');
+const failingCrons = crons.filter((c) => c.health === 'failed' || c.health === 'timeout');
+const partialCrons = crons.filter((c) => c.health === 'partial');
+const misconfiguredCrons = crons.filter((c) => c.health === 'misconfigured');
+const attentionCrons = crons.filter((c) => c.needsAttention);
+const cronStateColor = (h: string): string =>
+  h === 'success' || h === 'skipped' ? '#5ecb8a'
+    : h === 'running' ? '#9bd1ff'
+      : h === 'partial' ? '#e8b84b'
+        : h === 'never_run' ? '#8a8a94'
+          : '#ff6b6b';
+const cronStateWord = (h: string): string => h.replace('_', ' ');
 const missingSchemas = boot.filter((b) => !b.present);
 
 // THE BANNER. Every broken thing, named, in one place. Order matters: the database first, because
@@ -80,6 +95,10 @@ if (queue.readable && queue.failed > 0) broken.push({ what: queue.failed + ' fai
 if (!rate.readable) broken.push({ what: 'Error log unreadable', detail: (rate.unreadableReason || 'edu_error_log did not answer') + ' — the error counts below are NOT zero, they are unknown' });
 if (rate.readable && rate.lastHour > 0) broken.push({ what: rate.lastHour + ' error(s) in the last hour', detail: rate.distinct24h + ' distinct fault(s) in 24h' });
 if (overdueCrons.length) broken.push({ what: overdueCrons.length + ' overdue scheduled job(s)', detail: overdueCrons.map((c) => c.path).join(', ') });
+// A FAILING JOB IS NOT AN OVERDUE ONE. It ran, on time, and did not work — which the banner never
+// said, because the old state model had nowhere to put it.
+if (failingCrons.length) broken.push({ what: failingCrons.length + ' scheduled job(s) failing', detail: failingCrons.map((c) => c.path + (c.consecutiveFailures > 1 ? ' (' + c.consecutiveFailures + ' in a row)' : '')).join(', ') });
+if (misconfiguredCrons.length) broken.push({ what: misconfiguredCrons.length + ' scheduled job(s) misconfigured', detail: misconfiguredCrons.map((c) => c.path).join(', ') });
 if (mail.configured && mail.reachable === false) broken.push({ what: 'Mail transport not answering', detail: mail.host + ':' + mail.port + ' did not accept a TCP connection' });
 if (!mail.configured) broken.push({ what: 'No mail transport configured', detail: 'Outbound mail would not leave the building' });
 if (pool.available && pool.idleInTransaction > 0) broken.push({ what: pool.idleInTransaction + ' connection(s) idle in transaction', detail: 'This is what exhausted the pooler the day the whole site went down' });
@@ -213,25 +232,34 @@ function tileValueColor(bad: boolean): string {
     </div>
 
     <div style={CARD}>
-      <p style={HD}>Scheduled jobs ({overdueCrons.length} overdue, {neverCrons.length} not instrumented)</p>
+      <p style={HD}>Scheduled jobs ({attentionCrons.length} need attention, {partialCrons.length} partial, {neverCrons.length} never run)</p>
       <div style={SCROLL}>
         <table style={TAB}>
-          <thead><tr><th style={TH}>State</th><th style={TH}>Path</th><th style={TH}>Schedule</th><th style={TH}>Last run</th><th style={TH}>Evidence</th></tr></thead>
+          <thead><tr>
+            <th style={TH}>State</th><th style={TH}>Path</th><th style={TH}>Schedule</th>
+            <th style={TH}>Last attempt</th><th style={TH}>Last success</th><th style={TH}>Next due</th>
+            <th style={TH}>Records</th><th style={TH}>Took</th><th style={TH}>Fails</th><th style={TH}>Evidence</th>
+          </tr></thead>
           <tbody>
             {crons.map((c) => (
               <tr style="border-top:1px solid #1a1a1f;">
-                <td style={TD}><span style={PILL + 'color:' + stateColor(c.state) + ';border:1px solid ' + stateColor(c.state) + '55;'}>{c.state}</span></td>
+                <td style={TD}><span style={PILL + 'color:' + cronStateColor(c.health) + ';border:1px solid ' + cronStateColor(c.health) + '55;'}>{cronStateWord(c.health)}</span></td>
                 <td style={TD + MONO + 'font-size:11.5px;white-space:nowrap;'}>{c.path}</td>
                 <td style={TD + MONO + 'font-size:11.5px;color:#8a8a94;white-space:nowrap;'}>{c.schedule}</td>
                 <td style={TD + MONO + 'font-size:11.5px;color:#8a8a94;white-space:nowrap;'}>{relativeAge(c.lastRunAt)}</td>
-                <td style={TD + 'font-size:11.5px;color:#8a8a94;'}>{c.source}</td>
+                <td style={TD + MONO + 'font-size:11.5px;color:#8a8a94;white-space:nowrap;'}>{c.lastSuccessAt ? relativeAge(c.lastSuccessAt) : 'never'}</td>
+                <td style={TD + MONO + 'font-size:11.5px;color:#8a8a94;white-space:nowrap;'}>{c.nextExpectedAt ? new Date(c.nextExpectedAt).toISOString().slice(5, 16).replace('T', ' ') : 'unknown'}</td>
+                <td style={TD + MONO + 'font-size:11.5px;color:#8a8a94;white-space:nowrap;'}>{c.processed == null ? '-' : (c.succeeded ?? 0) + '/' + c.processed + (c.failed ? ' (' + c.failed + ' failed)' : '')}</td>
+                <td style={TD + MONO + 'font-size:11.5px;color:#8a8a94;white-space:nowrap;'}>{c.durationMs == null ? '-' : c.durationMs < 1000 ? c.durationMs + 'ms' : Math.round(c.durationMs / 100) / 10 + 's'}</td>
+                <td style={TD + MONO + 'font-size:11.5px;white-space:nowrap;' + (c.consecutiveFailures > 0 ? 'color:#ff6b6b;' : 'color:#8a8a94;')}>{c.consecutiveFailures || '-'}</td>
+                <td style={TD + 'font-size:11.5px;color:#8a8a94;'}>{c.errorMessage || c.detail || c.source}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
       <p style="font-size:11.5px;color:#8a8a94;margin:10px 0 0;line-height:1.6;">
-        Schedules mirror the deployment config, and a test fails if the two drift apart, so a new scheduled job cannot be added without appearing here. "not instrumented" means no run has ever been recorded for that path — which is NOT the same as failed, and is shown as its own state rather than dressed up as a red alert. A route opts in with one line: <span style={MONO + 'color:#9bd1ff;'}>await recordCronRun('/api/cron/thing', 'ok', 'processed 12')</span>. Two paths are already observable because the modules behind them keep their own last-run timestamp. Note the tier here allows DAILY schedules only.
+        Schedules mirror the deployment config, and a test fails if the two drift apart, so a new scheduled job cannot be added without appearing here. <strong>Every state here is distinct on purpose.</strong> <span style={MONO}>never run</span> means no execution has ever been recorded — not the same as failed, and not healthy either. <span style={MONO}>skipped</span> means it ran and had nothing to do, which is healthy and is NOT the same as having done work. <span style={MONO}>partial</span> means some records failed and is the state that used to be reported as success. <span style={MONO}>timeout</span> means it started and never reported an end. <span style={MONO}>overdue</span> beats a stale success: a job whose last run worked three weeks ago is not green. A route is instrumented by wrapping its handler — <span style={MONO + 'color:#9bd1ff;'}>{"return withCronRun('/api/cron/thing', async () => ({ outcome, value }))"}</span> — which records a terminal state even when the handler throws, unlike the opt-in call at the end of a function that no route ever added. Two paths are also observable because the modules behind them keep their own last-run timestamp. Note the tier here allows DAILY schedules only.
       </p>
     </div>
 

@@ -18,6 +18,7 @@
 // Nothing else reaches it. `/api/` is exempt from the middleware's admin gate, so this endpoint's own
 // check IS the gate.
 import type { APIRoute } from 'astro';
+import { withCronRun, type CronOutcome } from '@/lib/observability-health';
 import { isCronAuthorized } from '@/lib/auth/cron-auth';
 import { denyAdminApi } from '@/lib/auth/api-guard';
 import { dispatchWebhooks } from '@/lib/mailapi/webhooks';
@@ -38,7 +39,7 @@ function json(d: any, s = 200) {
 const WEBHOOK_LIMIT = 25;
 const STEP_LIMIT = 25;
 
-async function run(): Promise<Response> {
+async function run(): Promise<{ response: Response; outcome: CronOutcome }> {
   const started = Date.now();
   // Each half is independently guarded: a fault in the webhook dispatcher must not stop the delayed
   // steps, because those are messages a candidate is waiting for.
@@ -64,7 +65,7 @@ async function run(): Promise<Response> {
   // over a broken queue is the exact failure this project keeps writing down: a script reporting
   // success proves the script ran, not that it did the work.
   const ok = !webhookError && !stepError;
-  return json({
+  const response = json({
     ok,
     webhooks,
     steps: { claimed: steps.claimed, sent: steps.sent, failed: steps.failed },
@@ -72,17 +73,51 @@ async function run(): Promise<Response> {
     errors: [webhookError, stepError].filter(Boolean),
     took_ms: Date.now() - started,
   }, ok ? 200 : 500);
+
+  // THE OUTCOME IS RETURNED ALONGSIDE THE RESPONSE, not parsed back out of it. Both halves are
+  // counted together because both are this job's work; a run that delivered every webhook and sent
+  // no scheduled step is PARTIAL, and that distinction is the whole point of reporting counts
+  // rather than a boolean.
+  const processed = webhooks.attempted + steps.claimed;
+  const failedCount = webhooks.dead + steps.failed + (webhookError ? 1 : 0) + (stepError ? 1 : 0);
+  const outcome: CronOutcome = {
+    status: (!ok && processed === 0) ? 'failed' : undefined,
+    processed,
+    succeeded: webhooks.delivered + steps.sent,
+    failed: failedCount,
+    detail: `webhooks ${webhooks.delivered}/${webhooks.attempted}, steps ${steps.sent}/${steps.claimed}`,
+    errorMessage: [webhookError, stepError].filter(Boolean).join('; ') || undefined,
+  };
+  return { response, outcome };
 }
+
+// Auth is checked BEFORE the telemetry wrapper in every arm: an unauthorised probe must not be
+// able to write an execution row and fabricate a healthy run history.
+const CRON_ID = '/api/cron/mailint-dispatch';
 
 export const GET: APIRoute = async ({ request, url }) => {
   if (!isCronAuthorized(request, url)) return json({ ok: false, error: 'unauthorized' }, 401);
-  return run();
+  return withCronRun(CRON_ID, async () => {
+    const { response, outcome } = await run();
+    return { outcome, value: response };
+  });
 };
 
 export const POST: APIRoute = async ({ request, url, locals }) => {
-  if (isCronAuthorized(request, url)) return run();
-  // The console's button. Same work, same response, an administrator instead of a scheduler.
+  if (isCronAuthorized(request, url)) {
+    return withCronRun(CRON_ID, async () => {
+      const { response, outcome } = await run();
+      return { outcome, value: response };
+    });
+  }
+  // The console's button. Same work, same response, an administrator instead of a scheduler — and
+  // it is recorded as a run of the same job, because it is one. An operator pressing dispatch and
+  // the scheduler firing it do identical work, and an ops view that only saw one of them would
+  // report the queue as idle while somebody was draining it by hand.
   const denied = await denyAdminApi(locals, { permission: 'mail.manage', label: 'mail.dispatch' });
   if (denied) return denied;
-  return run();
+  return withCronRun(CRON_ID, async () => {
+    const { response, outcome } = await run();
+    return { outcome, value: response };
+  });
 };

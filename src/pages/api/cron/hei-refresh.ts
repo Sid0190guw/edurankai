@@ -15,6 +15,7 @@
 //
 // Protected by CRON_SECRET. Vercel sends it as a Bearer token.
 import type { APIRoute } from 'astro';
+import { withCronRun } from '@/lib/observability-health';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { mineUniversities, countUniversities, slugify } from '@/lib/hei-miner';
@@ -56,8 +57,10 @@ async function ensureState() {
 //
 // One shared, fail-closed helper now: src/lib/auth/cron-auth.ts.
 export const GET: APIRoute = async ({ request }) => {
+  // Auth before telemetry: an unauthorised probe must not record a run.
   if (!isCronAuthorized(request, new URL(request.url))) return j({ ok: false, error: 'unauthorized' }, 401);
   const started = Date.now();
+  return withCronRun('/api/cron/hei-refresh', async () => {
   try {
     await ensureState();
     const st = rows(await db.execute(sql`SELECT country, next_offset FROM hei_miner_state WHERE id = 'default'`))[0] || { country: COUNTRY, next_offset: 0 };
@@ -101,8 +104,24 @@ export const GET: APIRoute = async ({ request }) => {
     const nextOffset = offset;
     const report = { country, total, startOffset, batches, mined, inserted, updated, skipped, ms: Date.now() - started };
     await db.execute(sql`UPDATE hei_miner_state SET next_offset = ${nextOffset}, last_run_at = NOW(), last_report = ${JSON.stringify(report)}::jsonb WHERE id = 'default'`);
-    return j({ ok: true, ...report, nextOffset, sweepProgress: total ? Math.min(100, Math.round((nextOffset / total) * 100)) + '%' : 'n/a', wrapped: nextOffset === 0 });
+    // `skipped` counts institutions the sweep could not write. A sweep that mined 200 and skipped 40
+    // is PARTIAL, not success, and reporting it as success is how a steadily degrading miner stays
+    // invisible for months.
+    return {
+      outcome: { processed: mined, succeeded: inserted + updated, failed: skipped,
+                 detail: `${inserted} new, ${updated} updated, ${skipped} skipped of ${mined} mined` },
+      value: j({ ok: true, ...report, nextOffset, sweepProgress: total ? Math.min(100, Math.round((nextOffset / total) * 100)) + '%' : 'n/a', wrapped: nextOffset === 0 }),
+    };
   } catch (e: any) {
-    return j({ ok: false, error: e?.cause?.message || e?.message || 'refresh failed', ms: Date.now() - started }, 200);
+    const reason = e?.cause?.message || e?.message || 'refresh failed';
+    // NOTE THE 200. This route deliberately answers 200 on failure so the scheduler does not treat
+    // it as a delivery failure and retry a long sweep — which means the HTTP status has never been
+    // a signal of whether the job worked. The telemetry is now the only place that difference is
+    // recorded, and it records it as failed.
+    return {
+      outcome: { status: 'failed' as const, errorCode: e?.cause?.code, errorMessage: reason },
+      value: j({ ok: false, error: reason, ms: Date.now() - started }, 200),
+    };
   }
+  });
 };

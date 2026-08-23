@@ -10,6 +10,7 @@
 //
 // Protected by CRON_SECRET, same as every other job here.
 import type { APIRoute } from 'astro';
+import { withCronRun } from '@/lib/observability-health';
 import { flushDigest } from '@/lib/activity-feed';
 import { isCronAuthorized } from '@/lib/auth/cron-auth';
 
@@ -28,14 +29,26 @@ function json(d: any, s = 200) {
 // configured means no caller is authorised, including the cron. A digest that stops arriving is
 // visible and costs a redeploy; an endpoint anybody can call is not.
 export const GET: APIRoute = async ({ request, url }) => {
+  // Auth outside the telemetry: an unauthorised probe must not record a run.
   if (!isCronAuthorized(request, url)) return json({ ok: false, error: 'unauthorized' }, 401);
-  try {
-    const r = await flushDigest();
-    return json({ ok: true, ...r });
-  } catch (e: any) {
-    console.error('[cron/activity-digest]', e?.cause?.message || e?.message);
-    return json({ ok: false, error: String(e?.message || e) }, 500);
-  }
+  return withCronRun('/api/cron/activity-digest', async () => {
+    try {
+      const r = await flushDigest();
+      const processed = Number((r as any)?.sent ?? (r as any)?.digests ?? 0);
+      const failed = Number((r as any)?.failed ?? 0);
+      return {
+        outcome: { processed, failed, succeeded: Math.max(0, processed - failed) },
+        value: json({ ok: true, ...r }),
+      };
+    } catch (e: any) {
+      const reason = e?.cause?.message || e?.message;
+      console.error('[cron/activity-digest]', reason);
+      return {
+        outcome: { status: 'failed' as const, errorCode: e?.cause?.code, errorMessage: reason },
+        value: json({ ok: false, error: String(e?.message || e) }, 500),
+      };
+    }
+  });
 };
 
 export const POST = GET;

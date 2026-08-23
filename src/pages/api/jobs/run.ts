@@ -3,20 +3,29 @@
 // admin (administer). Idempotent + retrying, so a repeat run never double-sends. Reports a summary.
 import type { APIRoute } from 'astro';
 import { can } from '@/lib/rbac';
+import { isCronAuthorized } from '@/lib/auth/cron-auth';
 import { processJobs, queueHealth, retryFailed } from '@/lib/job-queue';
 import { HANDLERS } from '@/lib/job-handlers';
 
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
-async function authorized(url: URL, locals: any): Promise<boolean> {
-  const secret = process.env.CRON_SECRET;
-  if (secret && (url.searchParams.get('key') === secret)) return true;   // cron
+// THE CRON HALF ONLY ACCEPTED `?key=`, AND NOTHING SENDS THAT.
+//
+// Vercel Cron authenticates with `Authorization: Bearer <CRON_SECRET>`; the GitHub Actions runners
+// in .github/workflows do the same. A scheduler pointed at this URL would therefore have been
+// refused 403 on every run, and the fix would have looked like "the queue is broken" rather than
+// "the door only opens for a query parameter". This is also the second-to-last of the divergent
+// cron checks: the shared helper compares in constant time, trims a pasted newline, accepts the
+// Bearer header, the x-cron-secret header AND the ?key= / ?secret= parameter this route already
+// took, and — unlike four earlier local copies — refuses everybody when CRON_SECRET is unset.
+async function authorized(request: Request, url: URL, locals: any): Promise<boolean> {
+  if (isCronAuthorized(request, url)) return true;                      // the scheduler
   const user = locals?.user; if (!user) return false;
-  return (await can(user, 'administer', { type: 'platform' })).allow;    // or an admin
+  return (await can(user, 'administer', { type: 'platform' })).allow;   // or an admin, by hand
 }
 
-const handle = async (url: URL, locals: any) => {
-  if (!(await authorized(url, locals))) return j({ ok: false, error: 'unauthorized' }, 403);
+const handle = async (request: Request, url: URL, locals: any) => {
+  if (!(await authorized(request, url, locals))) return j({ ok: false, error: 'unauthorized' }, 403);
   if (url.searchParams.get('action') === 'retry') { const n = await retryFailed(); return j({ ok: true, requeued: n, health: await queueHealth() }); }
   const limit = Math.min(100, Number(url.searchParams.get('limit')) || 25);
   try {
@@ -30,5 +39,5 @@ const handle = async (url: URL, locals: any) => {
   } catch (e: any) { return j({ ok: false, error: e?.cause?.message || e?.message || 'error' }, 200); }
 };
 
-export const GET: APIRoute = ({ url, locals }) => handle(url, locals);
-export const POST: APIRoute = ({ url, locals }) => handle(url, locals);
+export const GET: APIRoute = ({ request, url, locals }) => handle(request, url, locals);
+export const POST: APIRoute = ({ request, url, locals }) => handle(request, url, locals);

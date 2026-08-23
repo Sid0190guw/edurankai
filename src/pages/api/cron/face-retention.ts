@@ -10,6 +10,7 @@
 //
 // `?dry=1` counts without deleting, so the rule can be read against real data before it fires.
 import type { APIRoute } from 'astro';
+import { withCronRun } from '@/lib/observability-health';
 import { isCronAuthorized } from '@/lib/auth/cron-auth';
 import { runFaceRetention, previewFaceRetention } from '@/lib/auth/face-erasure';
 
@@ -37,8 +38,25 @@ export const GET: APIRoute = async ({ request }) => {
     });
   }
 
-  const r = await runFaceRetention();
-  if (!r.ok) return json({ ok: false, error: r.error }, 500);
-  console.log('[cron/face-retention] considered', r.considered, 'deleted', r.deleted, 'failed', r.failed);
-  return json({ ok: true, considered: r.considered, deleted: r.deleted, failed: r.failed });
+  // The dry-run branch above deliberately records nothing: a preview is not a run, and counting it
+  // as one would make the retention job look like it had executed when no data was deleted.
+  return withCronRun('/api/cron/face-retention', async () => {
+    const r = await runFaceRetention();
+    if (!r.ok) {
+      return {
+        outcome: { status: 'failed' as const, errorMessage: String(r.error || 'face retention failed') },
+        value: json({ ok: false, error: r.error }, 500),
+      };
+    }
+    console.log('[cron/face-retention] considered', r.considered, 'deleted', r.deleted, 'failed', r.failed);
+    return {
+      outcome: {
+        processed: Number(r.considered || 0),
+        succeeded: Number(r.deleted || 0),
+        failed: Number(r.failed || 0),
+        detail: `deleted ${r.deleted} of ${r.considered} considered`,
+      },
+      value: json({ ok: true, considered: r.considered, deleted: r.deleted, failed: r.failed }),
+    };
+  });
 };
