@@ -726,6 +726,42 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     gate: 'Page: signed in, then resolveEmployeeIdentity, which renders its denial in place. Every read is narrowed to the reader\'s own employee_id; consent, reflections and correction requests are all keyed by it.',
   },
   {
+    // OVER TIME — the person's own record read across horizons.
+    //
+    // ADDED BECAUSE IT HAD NO DOOR AT ALL. /portal/employee/horizon shipped fully built and gated on
+    // requireEmployee, and a repository-wide search for its path found zero inbound links: not one
+    // nav entry, not one href on any page. A screen that composes statements about somebody and that
+    // the somebody cannot open is the failure the whole record group exists to prevent — it is the
+    // manager-only reading this product refuses to build.
+    //
+    // `worksHere`, matching Your record: it is the reader's own file, and gating a person's own
+    // record on holding a capability hides it from the one person entitled to it. The entry is never
+    // wider than the page's own requireEmployee gate.
+    key: 'horizon',
+    label: 'Over time',
+    href: '/portal/employee/horizon',
+    icon: 'calendar',
+    group: 'record',
+    bar: null,
+    audience: worksHere,
+    gate: 'Page: requireEmployee. Every horizon is composed for the reader\'s own employee record and nothing on it is a score or a decision; the long horizons cap their own confidence by the length of the question.',
+  },
+  {
+    // YOUR INTELLIGENCE PROFILE (Patch 06).
+    //
+    // Also doorless until now, and worse than the one above: its only two links in the repository
+    // were on ADMIN console pages, so the record could be opened by people who are not its subject
+    // and by nobody who is. That is precisely inverted.
+    key: 'fusion',
+    label: 'Your profile',
+    href: '/portal/employee/fusion',
+    icon: 'grid',
+    group: 'record',
+    bar: null,
+    audience: worksHere,
+    gate: 'Page: requireEmployee, then the fusion access check, which grants on the "it is you" arm and renders its refusal in place.',
+  },
+  {
     key: 'team',
     label: 'Team',
     href: '/portal/team',
