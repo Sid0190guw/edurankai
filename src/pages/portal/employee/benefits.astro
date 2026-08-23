@@ -21,12 +21,21 @@
 // than leaving somebody to wonder why nothing changed.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+// The single employee-record resolver: the canonical gate plus the couple of extra columns this
+// page renders. Never a hand-written SELECT against hr_employees — see the block below.
+import { resolveEmployeeIdentity } from '@/lib/workforce/identity';
+// THE DOCUMENT, ONCE. This page used to write its own doctype, head, favicon, title and top
+// bar; seventeen pages under /portal/employee each wrote a slightly different copy of the same
+// five things. EmployeeShell owns them now. The page keeps its own <style>, marked is:global so
+// it still reaches <body>, the reset and the chrome the shell renders.
+import EmployeeShell from '@/components/workforce/EmployeeShell.astro';
 import {
   catalogueFor, requestEnrolment, cancelEnrolment, describeRules, benefitCategoryLabel,
   enrolmentStateLabel, type CatalogueEntry,
 } from '@/lib/benefits';
 
 const user = Astro.locals.user;
+
 if (!user) return Astro.redirect('/portal/login?next=/portal/employee/benefits');
 
 // EVERY const BEFORE the POST handler that reads it. `const` is not hoisted.
@@ -47,30 +56,30 @@ const fmtDate = (d: any) => {
 
 const stateColour: Record<string, string> = {
   active: '#047857', pending: '#d97706', halted: '#b45309',
-  rejected: '#b91c1c', cancelled: '#6b6255', ended: '#6b6255',
+  rejected: '#b91c1c', cancelled: 'var(--emp-muted)', ended: 'var(--emp-muted)',
 };
 
-// The same resolution /portal/employee/loans and /portal/employee/payslips use: the linked account
-// first, then the three email columns, because the users-to-employees link is not guaranteed to have
-// been filled in.
-async function resolveEmployee(): Promise<{ employee: any | null; failed: boolean }> {
-  try {
-    const employee = rowsOf(await db.execute(sql`
-      SELECT id, full_name, employee_code
-        FROM hr_employees WHERE user_id = ${account.id} AND is_active = true LIMIT 1`))[0]
-      || rowsOf(await db.execute(sql`
-      SELECT id, full_name, employee_code
-        FROM hr_employees
-       WHERE (work_email = ${account.email} OR personal_email = ${account.email} OR email = ${account.email})
-         AND is_active = true LIMIT 1`))[0]
-      || null;
-    return { employee, failed: false };
-  } catch (e: any) {
-    // A FAILED READ AND AN EMPTY RESULT ARE DIFFERENT SENTENCES, and this page must not print the
-    // second when the first happened.
-    console.error('[portal/benefits] employee lookup', e?.cause?.message || e?.message);
-    return { employee: null, failed: true };
-  }
+// THE LOOKUP IS NOT WRITTEN HERE ANY MORE.
+//
+// It was two raw SELECTs against hr_employees — user_id first, then the three email columns — and
+// src/lib/workforce/identity.ts records the three ways every hand-written copy of that block was
+// wrong: a CASE-SENSITIVE email comparison where the canonical gate compares lower() to lower(), a
+// `LIMIT 1` that PICKED a row where the gate REFUSES two records sharing one address, and two
+// unindexed reads of hr_employees on every single page load. resolveEmployeeIdentity() is that gate
+// plus the couple of extra columns this page renders.
+//
+// The shape of the return value is unchanged, so every caller below is untouched: `employee` is null
+// on any denial, and `failed` still distinguishes "the read did not happen" from "there is no
+// record" — which is the distinction this page's own comment insisted on and the only one that
+// decides which sentence a person is shown.
+async function resolveEmployee(): Promise<{ employee: any | null; failed: boolean; denial: { title: string; reason: string } | null }> {
+  const res = await resolveEmployeeIdentity(account as any, '/portal/employee/benefits');
+  if (!res.ok) return { employee: null, failed: res.failed, denial: res.denial };
+  return {
+    employee: { id: res.identity.employeeId, full_name: res.identity.fullName, employee_code: res.identity.employeeCode },
+    failed: false,
+    denial: null,
+  };
 }
 
 if (Astro.request.method === 'POST') {
@@ -78,7 +87,12 @@ if (Astro.request.method === 'POST') {
   try {
     const resolved = await resolveEmployee();
     if (!resolved.employee) {
-      flash = 'This account is not linked to an employee record, so nothing could be requested.';
+      // The same sentence the GET path shows, for the same reason: a person who was refused
+      // because TWO records share their address must not be told to ask for a link that
+      // already exists twice over.
+      flash = resolved.denial
+        ? resolved.denial.reason
+        : 'This account is not linked to an employee record, so nothing could be requested.';
     } else {
       const fd = await Astro.request.formData();
       const action = String(fd.get('action') || '');
@@ -126,7 +140,10 @@ if (Astro.request.method === 'POST') {
 }
 
 const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
-const { employee, failed: lookupFailed } = await resolveEmployee();
+// `denial` carries the gate's own sentence. Three different facts reach this branch — no record
+// linked, two records sharing this address, a closed record — and one hard-coded line for all
+// three sends two people out of three to ask HR about something that is not the problem.
+const { employee, failed: lookupFailed, denial } = await resolveEmployee();
 const { entries, subject } = await catalogueFor(employee ? String(employee.id) : null);
 
 const yours = entries.filter((e) => e.eligibility.eligible);
@@ -134,59 +151,7 @@ const notYet = entries.filter((e) => !e.eligibility.eligible);
 const enrolled = entries.filter((e) => e.enrolment && e.enrolment.state === 'active');
 const waiting = entries.filter((e) => e.enrolment && (e.enrolment.state === 'pending' || e.enrolment.state === 'halted'));
 ---
-<!doctype html>
-<html lang="en" style="background:#f6f4ef;">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-  <title>My benefits</title>
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0;}
-    body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:48px;color:#1a1510;overflow-x:hidden;}
-    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 14px;position:sticky;top:0;z-index:40;}
-    .top a{color:#9a8f7d;text-decoration:none;display:flex;align-items:center;gap:6px;font-size:14px;min-height:44px;}
-    .wrap{max-width:600px;margin:0 auto;padding:16px 14px;}
-    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
-    .card.dim{background:#fbf9f5;box-shadow:none;}
-    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#6b6255;font-weight:700;margin:0 0 12px;}
-    .btitle{font-size:16px;font-weight:700;line-height:1.35;overflow-wrap:anywhere;}
-    .bmeta{font-size:11.5px;color:#8b8172;margin-top:4px;line-height:1.5;}
-    .bsum{font-size:14px;line-height:1.65;color:#3a332a;margin-top:10px;}
-    .bdet{font-size:13px;line-height:1.65;color:#4a4238;margin-top:8px;white-space:pre-wrap;}
-    .head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;}
-    .pill{font-family:'JetBrains Mono',monospace;font-size:9.5px;font-weight:700;padding:3px 8px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;}
-    .block{background:#faf7f1;border:1px solid #f0e9dc;border-radius:10px;padding:11px 13px;margin-top:12px;}
-    .bl{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:#6b6255;font-weight:700;margin-bottom:5px;}
-    .bt{font-size:13px;color:#4a4238;line-height:1.6;white-space:pre-wrap;}
-    .good{background:rgba(4,120,87,.06);border-color:rgba(4,120,87,.2);}
-    .good .bl{color:#047857;}
-    .bad{background:rgba(180,83,9,.06);border-color:rgba(180,83,9,.2);}
-    .bad .bl{color:#b45309;}
-    .bad .bt{color:#7c4a12;}
-    .empty{text-align:center;padding:34px 12px;color:#6b6255;font-size:13.5px;line-height:1.7;}
-    .empty strong{display:block;font-size:15px;color:#1a1510;margin-bottom:8px;}
-    .note{background:#faf7f1;border:1px solid #f0e9dc;border-radius:10px;padding:11px 13px;font-size:12px;color:#6b6255;line-height:1.6;margin-top:12px;}
-    .warn{background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.28);color:#92400e;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.6;margin-bottom:14px;}
-    .flash{background:rgba(4,120,87,.08);border:1px solid rgba(4,120,87,.25);color:#065f46;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.6;margin-bottom:14px;}
-    form.ask{display:grid;gap:12px;margin-top:12px;}
-    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#6b6255;font-weight:700;display:grid;gap:5px;}
-    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcc;color:#1a1510;padding:11px 12px;border-radius:10px;font-size:15px;font-family:inherit;min-height:44px;letter-spacing:normal;text-transform:none;}
-    textarea{min-height:64px;resize:vertical;}
-    .hint{font-family:'Inter Tight',system-ui,sans-serif;font-size:11.5px;color:#8b8172;text-transform:none;letter-spacing:normal;font-weight:400;line-height:1.55;}
-    button.go{min-height:44px;padding:0 18px;border:none;border-radius:10px;background:#12100c;color:#fff;font-size:14px;font-weight:700;cursor:pointer;justify-self:start;}
-    button.ghost{min-height:44px;padding:0 14px;border:1px solid #e6ddcc;border-radius:10px;background:transparent;color:#6b6255;font-size:13px;font-weight:600;cursor:pointer;margin-top:10px;}
-    a.inline{color:#c2410c;}
-    details > summary{cursor:pointer;font-size:12.5px;color:#8b8172;min-height:44px;display:flex;align-items:center;}
-  </style>
-</head>
-<body>
-<nav class="top">
-  <a href="/portal/employee">
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>My HR</a>
-  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">Benefits</span>
-  <span style="font-size:11px;color:#9a8f7d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:34vw;">{employee?.full_name || user.name}</span>
-</nav>
+<EmployeeShell title="Benefits" documentTitle="My benefits" person={employee?.full_name || user.name} width={600} bottomPad={48} bare>
 
 <div class="wrap">
   {msg && <div class="flash">{msg}</div>}
@@ -201,9 +166,10 @@ const waiting = entries.filter((e) => e.enrolment && (e.enrolment.state === 'pen
   {!lookupFailed && !employee && (
     <div class="card">
       <div class="empty">
-        <strong>This account is not linked to an employee record</strong>
-        Benefits are worked out from your employee record, and this sign-in is not connected to one
-        yet. Ask HR to link it; nothing about your entitlement changes in the meantime.
+        <strong>{denial ? denial.title : 'This account is not linked to an employee record'}</strong>
+        {denial
+          ? denial.reason
+          : 'Benefits are worked out from your employee record, and this sign-in is not connected to one yet. Ask HR to link it; nothing about your entitlement changes in the meantime.'}
       </div>
     </div>
   )}
@@ -228,7 +194,7 @@ const waiting = entries.filter((e) => e.enrolment && (e.enrolment.state === 'pen
             <div class="block">
               <div class="head">
                 <span class="btitle" style="font-size:14px;">{e.benefit.name}</span>
-                <span class="pill" style={`color:${stateColour[e.enrolment?.state || 'pending'] || '#6b6255'};background:${(stateColour[e.enrolment?.state || 'pending'] || '#6b6255')}18;`}>
+                <span class="pill" style={`color:${stateColour[e.enrolment?.state || 'pending'] || 'var(--emp-muted)'};background:${(stateColour[e.enrolment?.state || 'pending'] || 'var(--emp-muted)')}18;`}>
                   {enrolmentStateLabel(e.enrolment?.state || 'pending')}
                 </span>
               </div>
@@ -293,7 +259,7 @@ const waiting = entries.filter((e) => e.enrolment && (e.enrolment.state === 'pen
           <div class="head">
             <span class="btitle">{e.benefit.name}</span>
             {e.benefit.enrolmentRequired && !e.enrolment && (
-              <span class="pill" style="color:#c2410c;background:rgba(194,65,12,.1);">Choose to join</span>
+              <span class="pill" style="color:var(--emp-accent);background:rgba(194,65,12,.1);">Choose to join</span>
             )}
           </div>
           <p class="bmeta">
@@ -403,5 +369,38 @@ const waiting = entries.filter((e) => e.enrolment && (e.enrolment.state === 'pen
     </div>
   )}
 </div>
-</body>
-</html>
+</EmployeeShell>
+
+<style is:global>
+    .card{background:var(--emp-surface);border:1px solid var(--emp-line);border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card.dim{background:#fbf9f5;box-shadow:none;}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--emp-muted);font-weight:700;margin:0 0 12px;}
+    .btitle{font-size:16px;font-weight:700;line-height:1.35;overflow-wrap:anywhere;}
+    .bmeta{font-size:11.5px;color:#8b8172;margin-top:4px;line-height:1.5;}
+    .bsum{font-size:14px;line-height:1.65;color:#3a332a;margin-top:10px;}
+    .bdet{font-size:13px;line-height:1.65;color:#4a4238;margin-top:8px;white-space:pre-wrap;}
+    .head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;}
+    .pill{font-family:'JetBrains Mono',monospace;font-size:9.5px;font-weight:700;padding:3px 8px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;}
+    .block{background:var(--emp-surface-2);border:1px solid #f0e9dc;border-radius:10px;padding:11px 13px;margin-top:12px;}
+    .bl{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--emp-muted);font-weight:700;margin-bottom:5px;}
+    .bt{font-size:13px;color:#4a4238;line-height:1.6;white-space:pre-wrap;}
+    .good{background:rgba(4,120,87,.06);border-color:rgba(4,120,87,.2);}
+    .good .bl{color:#047857;}
+    .bad{background:rgba(180,83,9,.06);border-color:rgba(180,83,9,.2);}
+    .bad .bl{color:#b45309;}
+    .bad .bt{color:#7c4a12;}
+    .empty{text-align:center;padding:34px 12px;color:var(--emp-muted);font-size:13.5px;line-height:1.7;}
+    .empty strong{display:block;font-size:15px;color:var(--emp-ink);margin-bottom:8px;}
+    .note{background:var(--emp-surface-2);border:1px solid #f0e9dc;border-radius:10px;padding:11px 13px;font-size:12px;color:var(--emp-muted);line-height:1.6;margin-top:12px;}
+    .warn{background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.28);color:#92400e;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.6;margin-bottom:14px;}
+    .flash{background:rgba(4,120,87,.08);border:1px solid rgba(4,120,87,.25);color:#065f46;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.6;margin-bottom:14px;}
+    form.ask{display:grid;gap:12px;margin-top:12px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--emp-muted);font-weight:700;display:grid;gap:5px;}
+    input,select,textarea{width:100%;background:var(--emp-surface-2);border:1px solid #e6ddcc;color:var(--emp-ink);padding:11px 12px;border-radius:10px;font-size:15px;font-family:inherit;min-height:44px;letter-spacing:normal;text-transform:none;}
+    textarea{min-height:64px;resize:vertical;}
+    .hint{font-family:'Inter Tight',system-ui,sans-serif;font-size:11.5px;color:#8b8172;text-transform:none;letter-spacing:normal;font-weight:400;line-height:1.55;}
+    button.go{min-height:44px;padding:0 18px;border:none;border-radius:10px;background:var(--emp-bar);color:#fff;font-size:14px;font-weight:700;cursor:pointer;justify-self:start;}
+    button.ghost{min-height:44px;padding:0 14px;border:1px solid #e6ddcc;border-radius:10px;background:transparent;color:var(--emp-muted);font-size:13px;font-weight:600;cursor:pointer;margin-top:10px;}
+    a.inline{color:var(--emp-accent);}
+    details > summary{cursor:pointer;font-size:12.5px;color:#8b8172;min-height:44px;display:flex;align-items:center;}
+</style>

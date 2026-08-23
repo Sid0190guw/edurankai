@@ -677,6 +677,55 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     gate: 'Page: signed in, then its own hr_employees lookup. Every other-person read is scoped by src/lib/performance-scope.ts, which defers to org-graph.ts isResponsibleFor / getDirectReports — a relationship per row, never a role name.',
   },
   {
+    // FEEDBACK — the STRUCTURED item, which is a different thing from the note on the Performance
+    // page above and deliberately has its own door.
+    //
+    // WHY NOT A FIFTH TAB ON PERFORMANCE. That page is already four tabs deep and its feedback tab
+    // owns the lightweight any-to-any note. A structured item is a form with twelve dimensions, an
+    // applicable period, a circumstance and REQUIRED evidence; burying it as a tab inside a tab is
+    // how a thing nobody can find gets built. Both write to the same table, and neither reads the
+    // other as a rating: a note with no dimension rows contributes to no dimension score.
+    //
+    // `worksHere` rather than a capability, for the same reason Performance uses it. Giving feedback
+    // and reading your own record are things every employee does, and gating the door on managing
+    // people would hide somebody's own record from them. WHOSE record may be opened is resolved per
+    // ROW inside the page by src/lib/horizon/feedback/visibility.ts, which defers to the
+    // Organization Graph and fails closed.
+    key: 'feedback',
+    label: 'Feedback',
+    href: '/portal/employee/feedback',
+    icon: 'message',
+    group: 'record',
+    bar: null,
+    audience: worksHere,
+    gate: 'Page: signed in, then its own employee lookup. Every other-person read goes through src/lib/horizon/feedback/contract.ts, which resolves a view from the Organization Graph per row, redacts by that view, and logs the access against the reader.',
+  },
+  {
+    // YOUR RECORD — the personal intelligence view (Patch 15).
+    //
+    // ONE READER, AND IT IS THE SUBJECT. The page takes no id: every query behind it is narrowed to
+    // the reader's own employee record, and the digital twin is built with this person as both
+    // viewer and subject, so it grants on twinAccess's "it is you" arm and never on an HR
+    // capability. There is deliberately no manager-facing variant of this route.
+    //
+    // `worksHere` rather than a capability, for the same reason Performance uses it: this is a
+    // person's own record, and gating it on holding something would hide somebody's record from
+    // themselves. It is narrower than the page's own gate ("signed in", then resolveEmployeeIdentity
+    // renders its own denial in place), which is the direction that is safe — the entry never offers
+    // a door the page refuses.
+    //
+    // DRAWER ONLY. The four ranked bar slots are already spoken for by Home, Tasks, Approvals and
+    // Team; this is a surface people open to read and reflect, not a thumb destination.
+    key: 'intelligence',
+    label: 'Your record',
+    href: '/portal/employee/intelligence',
+    icon: 'user',
+    group: 'record',
+    bar: null,
+    audience: worksHere,
+    gate: 'Page: signed in, then resolveEmployeeIdentity, which renders its denial in place. Every read is narrowed to the reader\'s own employee_id; consent, reflections and correction requests are all keyed by it.',
+  },
+  {
     key: 'team',
     label: 'Team',
     href: '/portal/team',
@@ -711,6 +760,31 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     // whether the door is worth showing.
     audience: worksHere,
     gate: 'Page: signed in. Contents: resolveOrgViewerScope() — employee.manage for the whole graph, a department_head EDGE in the graph for a department subtree, an employee record for your own line. Never a role name.',
+  },
+  {
+    key: 'directory',
+    label: 'Directory',
+    href: '/portal/employee/directory',
+    icon: 'user',
+    group: 'record',
+    // DRAWER ONLY, for the same reason Organization is: a reference surface people open when they
+    // need it, not a thumb destination worth taking a bar slot from Tasks.
+    bar: null,
+    //
+    // WHY A SECOND PEOPLE SURFACE IS NOT A SECOND ANSWER.
+    //
+    // Organization draws the reporting TREE and /portal/search matches a NAME across seven sources
+    // eight hits at a time. Neither of them is a list somebody can page through, which is the shape
+    // the question "who is in my department" actually has once the department is larger than a
+    // screen. This is that list — and it asks resolveOrgViewerScope(), the same function BOTH of
+    // those use, so all three agree to the row about who this viewer may see. If they ever disagree,
+    // the bug is in one of the three pages and never in this entry.
+    //
+    // `worksHere`, strictly narrower than the page's own gate of "signed in", exactly as
+    // Organization is: an applicant does not belong in a staff directory even though the page would
+    // give them an honest empty-scope screen if they arrived.
+    audience: worksHere,
+    gate: 'Page: signed in. Contents: resolveOrgViewerScope(), identical to /portal/organization and the people source of /portal/search. Name, designation, employee code and department only — no contact details, no pay, no identity documents.',
   },
   {
     key: 'hr',

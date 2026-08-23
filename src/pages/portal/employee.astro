@@ -100,57 +100,96 @@ const dayLabel = (v: any) => {
 // failed ALTER leaves no trace at all. Log the real reason, then re-throw: the re-throw is what makes
 // ensureOnce drop its cache entry and try again on the next request rather than remembering the
 // failure forever.
+//
+// =================================================================================================
+// WHY THIS IS NOW A READ FIRST, AND ONLY THEN A WRITE — THE SCALE FIX
+// =================================================================================================
+//
+// `ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS ...` is a no-op when the column is already
+// there. It is NOT free: Postgres still takes an ACCESS EXCLUSIVE lock on the table to evaluate it,
+// which for the duration blocks every reader and every writer of hr_employees — the single hottest
+// table in this product.
+//
+// ensureOnce() memoizes PER PROCESS, and on a serverless platform "per process" means "per cold
+// instance". At a handful of employees there are a handful of instances and this is invisible. At a
+// large roll there are hundreds of instances cycling continuously, so hundreds of exclusive-lock
+// requests per minute queue up against the table that every single authenticated page load reads
+// first. The symptom is not an error; it is a portal that intermittently takes seconds to load for
+// no reason anybody can find in the query logs, because the queries were fine and the LOCK was not.
+//
+// So: ask the catalog first. `information_schema.columns` and `to_regclass` are ordinary reads,
+// take no lock on hr_employees at all, and cost one round trip that is then cached for the life of
+// the instance. The DDL runs only when something is genuinely missing — which is exactly the
+// situation it was written for, and which on a provisioned database is never.
+//
+// The self-heal is NOT removed, and that is deliberate: db/hr-schema.sql is applied by hand here,
+// this page is the thing that created work_email and hr_task_log on the live database, and a fresh
+// environment that has never had the schema file run must still come up. What changes is that a
+// correctly provisioned database stops paying for the check.
 // =================================================================================================
 try {
   const { ensureOnce } = await import('@/lib/ensure-once');
-  // hr_task_log is declared in db/hr-schema.sql but was only ever CREATEd inside the clock-out
-  // handler, so on a database where nobody had clocked out yet the table did not exist — and the
-  // read further down threw on every page load. Same shape as the work_email fault: a table that
-  // exists in the schema file and not in the database. Created here, before anything reads it.
-  await ensureOnce('hr_task_log_v1', async () => {
-    await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_task_log (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      employee_id UUID NOT NULL,
-      log_date DATE NOT NULL,
-      task TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'done',
-      percent INT NOT NULL DEFAULT 100,
-      details TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_task_log_emp_date_idx ON hr_task_log (employee_id, log_date)`);
-  });
+  await ensureOnce('portal_employee_schema_v2', async () => {
+    // ONE read, no locks, three answers.
+    const probe = rowsOf(await db.execute(sql`
+      SELECT to_regclass('public.hr_task_log') IS NOT NULL AS has_task_log,
+             EXISTS (SELECT 1 FROM information_schema.columns
+                      WHERE table_name = 'hr_employees' AND column_name = 'work_email') AS has_work_email,
+             EXISTS (SELECT 1 FROM information_schema.columns
+                      WHERE table_name = 'hr_employees' AND column_name = 'reporting_manager_id') AS has_manager`))[0] || {};
 
-  await ensureOnce('hr_employees_work_email_v1', async () => {
-    try {
-      await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS work_email TEXT`);
-    } catch (e: any) {
-      logFail('work_email ALTER', e);
-      throw e;
+    // hr_task_log is declared in db/hr-schema.sql but was only ever CREATEd inside the clock-out
+    // handler, so on a database where nobody had clocked out yet the table did not exist — and the
+    // read further down threw on every page load. Same shape as the work_email fault: a table that
+    // exists in the schema file and not in the database.
+    if (probe.has_task_log !== true) {
+      try {
+        await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_task_log (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          employee_id UUID NOT NULL,
+          log_date DATE NOT NULL,
+          task TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'done',
+          percent INT NOT NULL DEFAULT 100,
+          details TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+        await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_task_log_emp_date_idx ON hr_task_log (employee_id, log_date)`);
+      } catch (e: any) {
+        logFail('hr_task_log create', e);
+        throw e;
+      }
+    }
+
+    // work_email is declared in db/hr-schema.sql but did NOT exist on the production table. The
+    // email-fallback lookup inside workspace-access.ts names it, so without this the composer's own
+    // employee lookup throws and every person whose HR record is not linked by user_id is told they
+    // have no employee profile — with nothing in the logs to say why.
+    if (probe.has_work_email !== true) {
+      try {
+        await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS work_email TEXT`);
+      } catch (e: any) {
+        logFail('work_email ALTER', e);
+        throw e;
+      }
+    }
+
+    // reporting_manager_id has the same shape of problem. It is declared in db/hr-schema.sql, but
+    // the only things that ALTER it in are the two admin HR screens, at page load — so on a database
+    // where neither has ever been opened the column is simply not there. It has to exist BEFORE the
+    // composer runs, not inside a widget loader: the direct-report count reads it to decide who
+    // manages people and who may decide an approval, and a missing column there degrades the whole
+    // context rather than one card.
+    if (probe.has_manager !== true) {
+      try {
+        await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id UUID`);
+      } catch (e: any) {
+        logFail('reporting_manager_id ALTER', e);
+        throw e;
+      }
     }
   });
 } catch (e: any) {
-  logFail('work_email ensure', e);
-}
-
-// reporting_manager_id has the same shape of problem. It is declared in db/hr-schema.sql, but the
-// only things that ALTER it in are the two admin HR screens, at page load — so on a database where
-// neither has ever been opened the column is simply not there. It has to exist BEFORE the composer
-// runs, not inside a widget loader: countDirectReports() reads it to decide who manages people and
-// who may decide an approval, and a missing column there degrades the whole context rather than one
-// card. Its own ensureOnce key rather than folded into the block above, so one failing cannot mask
-// the other in the logs.
-try {
-  const { ensureOnce } = await import('@/lib/ensure-once');
-  await ensureOnce('hr_employees_reporting_manager_v1', async () => {
-    try {
-      await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id UUID`);
-    } catch (e: any) {
-      logFail('reporting_manager_id ALTER', e);
-      throw e;
-    }
-  });
-} catch (e: any) {
-  logFail('reporting_manager_id ensure', e);
+  logFail('schema ensure', e);
 }
 
 // =================================================================================================
@@ -597,6 +636,60 @@ const wantRoutedQueue = wantAttention && has('approvals.routed');
 const wantMyDocs = wantAttention && has('onboarding.docs');
 const wantDocReview = wantAttention && has('onboarding.review');
 
+// TODAY, AS THE DATABASE COUNTS IT — AND IT IS NO LONGER READ HERE.
+//
+// `todayIso` above is `new Date()` in the SERVER's timezone; `due_on` is compared against
+// CURRENT_DATE inside Postgres, in the DATABASE's timezone. The two disagree by a day whenever the
+// process and the session are set differently, and "Due today" is exactly the claim that must not be
+// off by one.
+//
+// This page used to run its own `SELECT CURRENT_DATE` right here. It does not any more: the
+// composer resolves the day ONCE, onto ctx.today, and every day-partitioned widget on every surface
+// now partitions on the same value. Two surfaces asking two clocks is how the workspace and the task
+// board come to disagree about what is due today — and it is one query fewer per request, not one
+// more, because the composer folded it into a read it was already making.
+//
+// Empty string when the composer could not resolve it. The due-today bucket is then not rendered AT
+// ALL rather than guessed at from the clock in this process.
+const dbToday = composed.context.today || '';
+
+// =================================================================================================
+// ONE BATCH, NOT TWENTY-ONE ROUND TRIPS.
+//
+// WHAT THIS SECTION USED TO BE. Every widget below was written as `let x = <empty>; if (gate) { try {
+// x = await read(); } catch {} }`, one after another, top to bottom. Each of those `await`s is a
+// separate round trip to Postgres, and they were STRICTLY SEQUENTIAL: the notifications read could
+// not begin until the department roster had come back, which could not begin until the credit ledger
+// had, and so on for twenty-one independent questions that have nothing whatsoever to do with each
+// other. src/lib/db/index.ts sizes the pool at max:1 per instance and its own comment measures the
+// warm round trip at ~177ms across regions — so this page was spending multiple SECONDS doing
+// nothing but waiting, on the most-rendered authenticated screen in the product, on a phone.
+//
+// WHAT IT IS NOW. Each block is pushed into `batch` as an async thunk and the whole set is awaited
+// once. postgres-js pipelines on a single connection — it writes the queued statements out without
+// waiting for each reply — so twenty-one serial waits collapse into roughly one, and the connection
+// is held for a fraction of the time it was. Nothing about WHAT is read changed, nothing about the
+// gates changed, and every block keeps its own try/catch so one failure still degrades exactly one
+// card rather than the page.
+//
+// THE RULES FOR ADDING TO THIS BATCH, and they are not style preferences:
+//
+//   1. NOTHING IN THE BATCH MAY READ ANOTHER BATCH MEMBER'S RESULT. The whole point is that they run
+//      at once, so ordering between them does not exist. A read that needs an answer from this batch
+//      belongs in `batch2` below, which runs after the barrier — that is what it is for.
+//   2. NOTHING IN THE BATCH MAY WRITE. The POST handler above finished long before this line. A
+//      write racing twenty concurrent reads on one connection is a deadlock waiting to be reported
+//      as "the workspace is slow".
+//   3. EVERY BLOCK KEEPS ITS OWN try/catch. An unhandled rejection inside Promise.all rejects the
+//      whole array and takes out twenty cards that were fine. Each block already swallows to its own
+//      failure flag; that is load-bearing here, not defensive habit.
+//   4. THE PURE DERIVATIONS BELONG AFTER THE BARRIER. Everything computed FROM these results — the
+//      task buckets, the manager sentences, the credit percentage, the group split — now lives in
+//      one block under `await Promise.all(batch)`. A const left up here would be computed from an
+//      empty array before its read had finished, which is silently wrong rather than loudly broken.
+// =================================================================================================
+const batch: Promise<void>[] = [];
+
 // MY TASKS. src/lib/employee-tasks.ts owns the table, the scoping and the schema ensure; this page
 // only asks it for one person's rows and is handed the hr_employees id, which is what every hr_*
 // table is keyed by. (The WRITE above takes user.id instead; the two are different ids for different
@@ -626,6 +719,7 @@ let tasksFailed = false;
 // board at /portal/tasks, which resolves viewerRoles per row in SQL. A narrower role here can only
 // offer fewer moves, never more, and the write re-derives the right inside its own UPDATE anyway.
 let taskMoves: Record<string, { value: string; label: string }[]> = {};
+batch.push((async () => {
 if (wantTaskView) {
   try {
     const {
@@ -648,56 +742,7 @@ if (wantTaskView) {
     logFail('tasks', e);
   }
 }
-// listMyTasks returns everything, finished work sorted last. This page is the phone screen someone
-// checks between jobs, so it shows what is still outstanding; the finished count goes in the
-// subtitle rather than as rows nobody needs to scroll past.
-//
-// `isOverdue` is computed by Postgres against CURRENT_DATE inside the query. Preferring it to a
-// string comparison here keeps one definition of "late" instead of two that drift apart by a day
-// whenever the server clock and UTC disagree.
-const openTasks = myTasks
-  .filter((t: any) => t.id && t.status !== 'done')
-  .map((t: any) => ({
-    id: t.id,
-    title: t.title || 'Untitled task',
-    priority: String(t.priority || 'normal').toLowerCase(),
-    status: String(t.status || 'open').toLowerCase(),
-    due: isoDay(t.dueOn),
-    overdue: !!t.isOverdue,
-    detail: t.description || '',
-    blockedReason: t.blockedReason || '',
-    from: t.selfAssigned ? '' : (t.assignedByName || ''),
-    /** The canonical status, which is what the transition graph speaks. `status` above is the
-     *  four-value legacy window this page's older markup reads. */
-    state: String(t.state || t.status || 'assigned').toLowerCase(),
-    /** Only the moves this person may make from where the task actually is. Never a fixed list. */
-    moves: taskMoves[String(t.id)] || [],
-  }));
-const overdueCount = Number(taskTally?.overdue ?? NaN);
-const doneCount = Number(taskTally?.done ?? NaN);
-const overdueShown = Number.isFinite(overdueCount) ? overdueCount : openTasks.filter((t: any) => t.overdue).length;
-const taskMeta = [
-  overdueShown > 0 ? overdueShown + (overdueShown === 1 ? ' past its date' : ' past their date') : '',
-  Number.isFinite(doneCount) && doneCount > 0 ? doneCount + ' finished' : '',
-].filter(Boolean).join(' · ');
-
-// TODAY, AS THE DATABASE COUNTS IT — AND IT IS NO LONGER READ HERE.
-//
-// `todayIso` above is `new Date()` in the SERVER's timezone; `due_on` is compared against
-// CURRENT_DATE inside Postgres, in the DATABASE's timezone. The two disagree by a day whenever the
-// process and the session are set differently, and "Due today" is exactly the claim that must not be
-// off by one.
-//
-// This page used to run its own `SELECT CURRENT_DATE` right here. It does not any more: the
-// composer resolves the day ONCE, onto ctx.today, and every day-partitioned widget on every surface
-// now partitions on the same value. Two surfaces asking two clocks is how the workspace and the task
-// board come to disagree about what is due today — and it is one query fewer per request, not one
-// more, because the composer folded it into a read it was already making.
-//
-// Empty string when the composer could not resolve it. The due-today bucket is then not rendered AT
-// ALL rather than guessed at from the clock in this process.
-const dbToday = composed.context.today || '';
-
+})());
 // TODAY'S CLOCK — READ BY THE SAME ENGINE THAT WRITES IT.
 //
 // hr_clock_events for this person only: it stores GPS, IP, device and a selfie per punch, and no
@@ -715,7 +760,15 @@ const dbToday = composed.context.today || '';
 // buttons from the same totals the write path re-checks. Same day boundary (attendance today()),
 // same fold, same answer.
 let todayEvents: any[] = [];
-let currentStatus: 'clocked_out' | 'clocked_in' | 'on_break' = 'clocked_out';
+/** The three positions the punch fold can leave somebody in. Named so the assertion below has
+ *  something to point at rather than repeating the union twice. */
+type ClockPosition = 'clocked_out' | 'clocked_in' | 'on_break';
+// `as ClockPosition` IS LOad-BEARING, not decoration. The read that sets this now happens inside a
+// batched thunk, and TypeScript's flow analysis does not follow an assignment made inside a closure
+// — so with a bare literal initializer it narrows this to exactly `'clocked_out'` and then reports
+// every later `currentStatus === 'clocked_in'` as a comparison with no overlap. The assertion gives
+// the declaration the full union as its flow type, which is what it has always been at runtime.
+let currentStatus = 'clocked_out' as ClockPosition;
 let todayHours = 0;
 let todayBreakMinutes = 0;
 /** Which punches the day allows next. The buttons are drawn from THIS and from nothing else. */
@@ -724,6 +777,7 @@ let punchOptions: string[] = [];
 // hours", which is indistinguishable from a failed read — and the strip at the top of the page
 // states today's clock position as a fact.
 let clockReadFailed = false;
+batch.push((async () => {
 if (employeeId && has('clock.today')) {
   try {
     const {
@@ -763,40 +817,7 @@ if (employeeId && has('clock.today')) {
     logFail('clock events', e);
   }
 }
-
-// HOW THIS PERSON LAST CLOCKED IN, so the form does not ask them the same question about themselves
-// twice a day forever.
-//
-// The work_mode select defaulted to 'remote' on every single render. For an office-based employee
-// that is the wrong answer, every morning, and the fastest path through the form is to leave the
-// default alone — so 'remote' silently over-reports in hr_attendance.work_mode and the attendance
-// data is quietly wrong for exactly the people who never touch the control. Adjacent in spirit to
-// WCAG 2.2 SC 3.3.7 Redundant Entry: information the system already holds about you should not be
-// asked for again.
-//
-// ONE ROW, AND ONLY WHEN THE CLOCK-IN FORM IS ABOUT TO RENDER. Somebody already clocked in is not
-// shown this control, so there is nothing to prefill and no reason to pay for the read. Scoped to
-// the caller's own employee id like every other read on this page, and a failure leaves the old
-// 'remote' default in place rather than breaking the form.
-let lastWorkMode = '';
-if (employeeId && has('clock.today') && currentStatus === 'clocked_out') {
-  try {
-    const r = await db.execute(sql`
-      SELECT work_mode FROM hr_clock_events
-       WHERE employee_id = ${employeeId} AND event_type = 'clock_in' AND work_mode IS NOT NULL
-       ORDER BY event_time DESC
-       LIMIT 1
-    `);
-    lastWorkMode = String(rowsOf(r)[0]?.work_mode || '');
-  } catch (e: any) {
-    logFail('last work mode', e);
-  }
-}
-// Only a value the select actually offers. Anything else — an old code, a null, a value written by a
-// surface that has since changed — falls back to the original default rather than rendering a
-// <select> with nothing selected.
-const WORK_MODES = ['remote', 'office', 'hybrid', 'field'];
-const workModeDefault = WORK_MODES.includes(lastWorkMode) ? lastWorkMode : 'remote';
+})());
 
 // Today's time logs (period tracking)
 let timeLogs: any[] = [];
@@ -806,6 +827,7 @@ let loggedHours = 0;
 // on this page with no read-failure state at all. A person who logged four hours this morning and
 // is shown 0h logged re-enters them.
 let timeLogsUnread = false;
+batch.push((async () => {
 if (employeeId && has('timelog.today')) {
   try {
     // The same day the write above used. These two must never be resolved from different clocks:
@@ -818,10 +840,12 @@ if (employeeId && has('timelog.today')) {
     logFail('time logs', e);
   }
 }
+})());
 
 // Today's clock-out task summaries. Sparse by construction: the only writer is the clock_out branch
 // above, and only when the text field is non-empty.
 let taskLogs: any[] = [];
+batch.push((async () => {
 if (employeeId && has('worklog.today')) {
   try {
     const r = await db.execute(sql`SELECT task, status, percent, details, created_at FROM hr_task_log WHERE employee_id = ${employeeId} AND log_date = CURRENT_DATE ORDER BY created_at DESC`);
@@ -830,6 +854,7 @@ if (employeeId && has('worklog.today')) {
     logFail('session summaries', e);
   }
 }
+})());
 
 // TODAY'S REPORT — READ HERE, WRITTEN NOWHERE ON THIS PAGE ANY MORE. See the long note beside the
 // card for what the write used to do and why it had to stop.
@@ -841,6 +866,7 @@ if (employeeId && has('worklog.today')) {
 // column onto a page that shows none of them.
 let todayReport: any = null;
 let reportReadFailed = false;
+batch.push((async () => {
 if (employeeId && has('dailyreport.today')) {
   try {
     const r = await db.execute(sql`
@@ -854,10 +880,12 @@ if (employeeId && has('dailyreport.today')) {
     logFail('daily report', e);
   }
 }
+})());
 
 // Payslips. Listed straight from hr_payslips and NEVER through hr-payslip.ts's reader, which SELECTs
 // e.work_email — a column with no writer at all.
 let payslips: any[] = [];
+batch.push((async () => {
 if (employeeId && has('payslips.mine')) {
   try {
     const r = await db.execute(sql`
@@ -873,6 +901,7 @@ if (employeeId && has('payslips.mine')) {
     logFail('payslips', e);
   }
 }
+})());
 
 // MY TEAM LEADER. reporting_manager_id holds a USERS id, not an hr_employees id — hr-wallet.ts
 // compares it straight to the signed-in user.id — so the lookup is on user_id. Joining it to
@@ -903,6 +932,7 @@ if (employeeId && has('payslips.mine')) {
 let manager: any = null;
 let managerReadFailed = false;
 let managerSource: string = 'none';
+batch.push((async () => {
 if (employeeId && has('manager.card')) {
   try {
     const { reportingManagerCard } = await import('@/lib/workforce/loaders');
@@ -916,6 +946,423 @@ if (employeeId && has('manager.card')) {
     logFail('manager', e);
   }
 }
+})());
+
+// WAITING ON MY SIGN-OFF, AND WAITING ON MY REVIEW.
+//
+// listBoard() resolves the viewer's roles per row IN SQL (VIEWER_ROLE_COLUMNS), so nothing here can
+// claim a role the database did not grant. Its argument is the USERS id — collaborators are keyed
+// by users.id, not by the hr_employees id, and handing it the wrong one returns an empty board
+// forever rather than an error.
+//
+// A task where the viewer is approver OR lead is counted as sign-off and NOT again as a review, so
+// somebody holding both roles on one task sees it once. Reviewers are only ever added by hand
+// (seedCollaborators creates 'assignee' and 'approver' and nothing else), so an empty review bucket
+// is the ordinary, correct state and is simply absent rather than rendered as a zero.
+let boardOk = false;
+let signOffTasks: any[] = [];
+let reviewTasks: any[] = [];
+batch.push((async () => {
+if (wantBoard && user?.id) {
+  try {
+    const { listBoard } = await import('@/lib/employee-tasks');
+    const board = await listBoard(user.id, { limit: 400 });
+    boardOk = board?.ok === true;
+    if (boardOk) {
+      const waiting = (board.tasks as any[]).filter((t: any) => t.status === 'under_review');
+      signOffTasks = has('tasks.signoff')
+        ? waiting.filter((t: any) => t.viewerRoles.indexOf('approver') >= 0 || t.viewerRoles.indexOf('lead') >= 0)
+        : [];
+      const signOffIds = new Set(signOffTasks.map((t: any) => t.id));
+      reviewTasks = has('tasks.review')
+        ? waiting.filter((t: any) => !signOffIds.has(t.id) && t.viewerRoles.indexOf('reviewer') >= 0)
+        : [];
+    }
+  } catch (e: any) {
+    logFail('board', e);
+  }
+}
+})());
+
+// LEAVE AND WITHDRAWAL REQUESTS WAITING ON A DECISION.
+//
+// THE ROLE TEST THAT USED TO LIVE HERE IS GONE. This page previously read user.role and compared it
+// to three names, which meant a reporting manager — the person a request is actually assigned to —
+// was told nothing, and it meant a role rename silently changed who was told. approvals.leave and
+// approvals.withdrawal carry `approvesRequests`, which the composer derives from the SAME authority
+// pendingLeaveForApprover() and pendingWithdrawalsForApprover() enforce at the read, so a row shown
+// here always has a queue behind it.
+//
+// Counts only — no names, no amounts, no reasons. Own rows are excluded: your own pending request is
+// not an approval waiting on YOU, it is on /portal/employee/leave.
+let pendingLeave = 0;
+let pendingWithdrawals = 0;
+let hrQueueFailed = false;
+batch.push((async () => {
+if (wantLeaveQueue || wantWithdrawalQueue) {
+  try {
+    const [{ pendingLeaveForApprover }, { pendingWithdrawalsForApprover }] = await Promise.all([
+      import('@/lib/hr-leave'),
+      import('@/lib/hr-wallet'),
+    ]);
+    const [lv, wd] = await Promise.all([
+      wantLeaveQueue ? pendingLeaveForApprover(user) : Promise.resolve([] as any[]),
+      wantWithdrawalQueue ? pendingWithdrawalsForApprover(user) : Promise.resolve([] as any[]),
+    ]);
+    const mine = (r: any) => !!employeeId && String(r.employee_id) === String(employeeId);
+    pendingLeave = (lv as any[]).filter((r: any) => !mine(r)).length;
+    pendingWithdrawals = (wd as any[]).filter((r: any) => !mine(r)).length;
+  } catch (e: any) {
+    hrQueueFailed = true;
+    logFail('approver queue', e);
+  }
+}
+})());
+
+// EVERYTHING ELSE ROUTED TO THIS PERSON — the queue this page could not see.
+//
+// THE HOLE THIS CLOSES. The two counts above are leave and wallet withdrawals: two of the nineteen
+// domains in src/lib/workflow.ts. Everything else the org graph routes to somebody — a submitted
+// weekly timesheet, an overtime claim, an attendance correction, an expense claim, a procurement
+// request, a loan, a document, a helpdesk ticket, an appraisal, a benefits election, a separation —
+// reaches them through pendingForApprover(), which seven pages call one domain at a time and no
+// aggregate surface called at all. So the headline on this card was a count of two domains presented
+// as the count of everything waiting, the bar badge was the same two, and a manager who cleared this
+// screen to zero had decided nothing about any of the rest. Nobody was told, because
+// notifyApprover() sends them to /admin/hr/leave/workflow — a page most managers cannot open and
+// which lists only leave.
+//
+// COUNTS AND DOMAIN NAMES ONLY on this card. The full rows, with the decision buttons, are on
+// /portal/approvals; a triage row is a pointer to work, never the work itself.
+let routedCount = 0;
+let routedRows: any[] = [];
+let routedFailed = false;
+batch.push((async () => {
+if (wantRoutedQueue && user?.id) {
+  try {
+    const { routedApprovals } = await import('@/lib/workforce/loaders');
+    const routed = await routedApprovals(String(user.id));
+    routedFailed = !routed.ok;
+    routedCount = routed.count;
+    routedRows = routed.rows;
+  } catch (e: any) {
+    routedFailed = true;
+    logFail('routed approvals', e);
+  }
+}
+})());
+// MEETINGS TODAY — and this page used to deny they could be shown at all.
+//
+// WHAT WAS WRONG. The "Today" section carried the flat sentence "Scheduled meetings are not shown:
+// this workspace has no meeting calendar to read from yet." That stopped being true. meetingSource()
+// in src/lib/calendar-hub.ts:515 reads meet_rooms for anything this person HOSTS or is named on the
+// invitee list of, and /portal/employee/calendar has been rendering exactly that one route away. So
+// the workspace was telling people a capability did not exist while the product had it — the same
+// class of fault as a screen promising something it cannot show, pointed the other way, and it sends
+// somebody to a colleague to ask what time a meeting is that their own workspace could have told
+// them.
+//
+// THE LIMIT IS CARRIED, NOT HIDDEN. `invitees` is a jsonb list of email strings with no membership
+// row and no accepted/declined state, so an invitation appears as an invitation and never as an
+// acceptance, and somebody invited at an address they do not sign in with is not matched. The card
+// says so rather than implying a complete calendar.
+let meetingsToday: any[] = [];
+let meetingsOk = false;
+batch.push((async () => {
+if (has('meetings.today') && user?.id && dbToday) {
+  try {
+    const { buildCalendar } = await import('@/lib/calendar-hub');
+    const model = await buildCalendar(
+      'meeting',
+      {
+        userId: String(user.id),
+        employeeId,
+        departmentId: composed.context.departmentId,
+        holds: composed.context.holds,
+      },
+      { from: dbToday, to: dbToday },
+    );
+    meetingsOk = !model.degraded;
+    meetingsToday = (model.days as any[]).flatMap((d: any) => d.events || []);
+  } catch (e: any) {
+    logFail('meetings today', e);
+  }
+}
+})());
+
+// JOINING DOCUMENTS, MINE — the ones a reviewer sent back.
+//
+// listDocs() rather than a COUNT, for two reasons. It is the function that OWNS the table's DDL — its
+// ctx() runs the CREATE TABLE IF NOT EXISTS — so this cannot be the query that discovers the table is
+// missing. And the cap is MAX_DOCS = 5 rows per person, so reading them costs less than the round
+// trip a count would save. It is scoped to user_id inside its own WHERE clause and it THROWS rather
+// than returning [] on failure, which is exactly what this needs.
+let rejectedDocs = 0;
+let docsFailed = false;
+batch.push((async () => {
+if (wantMyDocs && user?.id) {
+  try {
+    const { listDocs } = await import('@/lib/hr-onboarding');
+    const docs = await listDocs(String(user.id));
+    rejectedDocs = docs.filter((d: any) => d.status === 'rejected').length;
+  } catch (e: any) {
+    docsFailed = true;
+    logFail('joining documents', e);
+  }
+}
+})());
+
+// JOINING DOCUMENTS WAITING FOR A REVIEW. onboarding.review requires admin.access AND the employees
+// section at 'edit' — the same test /api/portal/onboarding/documents uses to authorise the review,
+// plus the admin.access that middleware.ts demands at the door, so this count is never put in front
+// of somebody whose only route to act on it is a redirect. A COUNT, not pendingForReview(), which
+// returns names and email addresses for up to 150 people. Own rows are excluded.
+let docsToReview = 0;
+let docReviewFailed = false;
+batch.push((async () => {
+if (wantDocReview && user?.id) {
+  try {
+    const r = await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM hr_onboarding_documents
+       WHERE status = 'submitted' AND user_id <> ${String(user.id)}`);
+    docsToReview = Number(rowsOf(r)[0]?.n) || 0;
+  } catch (e: any) {
+    docReviewFailed = true;
+    logFail('joining document reviews', e);
+  }
+}
+})());
+
+// THE CREDIT POSITION, AND THE GUARD THAT IS NO LONGER HERE.
+//
+// This block used to test `classification === 'intern' || employment_type === 'internship'` on this
+// page. That test is DELETED. It was an interim guard around one card, and two places deciding the
+// same thing is how they drift: the composer answers it now, for every intern widget at once, from
+// the engagement it resolved. So a founder, an executive, a professor or a consultant is never
+// measured against a target they never agreed to.
+//
+// The card itself withholds what it cannot stand behind rather than being withheld entirely:
+// creditPct stays null when no requirement is recorded, so the progress bar does not render and the
+// figure reads "credit-hours" instead of "of N credit-hours". required_credit_hours has one writer
+// (/admin/hr/completion/[id].astro) and is unset for most interns, so gating the whole card on it
+// would take the credit position away from exactly the people this surface exists for.
+//
+// One ledgerFor() call serves both credit widgets. Two reads of the same arithmetic can disagree.
+let credit: any = null;
+let creditTerms: any = null;
+let weeksLeft: number | null = null;
+batch.push((async () => {
+if (employeeId && (has('credit.position') || has('credit.weeksLeft'))) {
+  try {
+    const { ledgerFor, termsFor } = await import('@/lib/credit-ledger');
+    creditTerms = await termsFor(employeeId);
+    const led = await ledgerFor(employeeId, creditTerms);
+    credit = led.summary;
+    weeksLeft = has('credit.weeksLeft') ? led.weeksRemaining : null;
+  } catch (e: any) {
+    // Never blocks the page over a summary — but never silently either. A credit figure that quietly
+    // stops appearing is exactly the kind of absence nobody reports and nobody notices.
+    logFail('credit', e);
+  }
+}
+})());
+// CHAT. Two numbers, and nothing else is possible. chat_messages stores `ciphertext` and `iv`;
+// there is no plaintext column, and the private key is generated in the browser and never leaves
+// localStorage, so no server-rendered page can show what was said. chat_threads.last_message_preview
+// is not a preview either — the send handler writes the literal string '[encrypted]' into it.
+//
+// Messages is part of the Universal Workspace, which AUTHORIZATION_FIRST.md grants to EVERY
+// authenticated member, so it needs no widget eligibility — but the counts are still read only when
+// the composition is trustworthy. On a degraded screen the same card renders as a door with no
+// numbers on it, which is the safe direction.
+//
+// No schema ensure here on purpose: /portal/messages owns these tables, and it also creates a
+// starter thread on first visit. This card must never write.
+let chatThreads = 0;
+let chatUnread = 0;
+let chatReady = false;
+batch.push((async () => {
+if (composed.ok && user?.id) {
+  try {
+    const r = await db.execute(sql`
+      SELECT COUNT(*)::int AS threads,
+             COUNT(*) FILTER (WHERE EXISTS (
+               SELECT 1 FROM chat_messages c
+                WHERE c.thread_id = m.thread_id
+                  AND c.sender_user_id <> ${user.id}
+                  AND c.deleted_at IS NULL
+                  AND (m.last_read_at IS NULL OR c.created_at > m.last_read_at)
+             ))::int AS unread
+        FROM chat_thread_members m
+       WHERE m.user_id = ${user.id}`);
+    const crows = rowsOf(r);
+    chatThreads = Number(crows[0]?.threads) || 0;
+    chatUnread = Number(crows[0]?.unread) || 0;
+    chatReady = true;
+  } catch (e: any) {
+    logFail('chat counts', e);
+  }
+}
+})());
+
+// COMMUNITY. visibleGroupsFor() is the only permitted way to list groups, and this page does not go
+// near the work_groups table itself. It returns the groups this person belongs to plus the
+// sub-groups of those — a group they are not entitled to is ABSENT from the result, not greyed out
+// and not "request access", because a list of team names is a map of the organisation.
+//
+// It deliberately selects `has_link`, never `join_url`: a chat invite link is a bearer credential, so
+// the URL is only ever revealed by a POST on /portal/team-groups after membership is re-derived at
+// the moment of access. Nothing below renders a link, and there is no total count of anything unseen
+// — that would be the same map by another route.
+let myGroups: any[] = [];
+batch.push((async () => {
+if (has('groups.mine') && user?.id) {
+  try {
+    const { visibleGroupsFor } = await import('@/lib/work-groups');
+    myGroups = await visibleGroupsFor(user.id);
+  } catch (e: any) {
+    logFail('groups', e);
+  }
+}
+})());
+// =================================================================================================
+// THE HOME WIDGETS. Same two rules as everything above: gated on has(...) BEFORE the read, and every
+// one of them reports whether the read HAPPENED.
+//
+// Every loader below lives in src/lib/workforce/loaders.ts rather than in this frontmatter, and that
+// is the change that matters. Fifteen loaders were written inline on this page, which was fine while
+// there was one workspace surface and fatal the moment there were two: the second surface copies the
+// query, the copies drift, and the one that drifts toward showing MORE is the one nobody reports.
+// =================================================================================================
+
+// NOTIFICATIONS. Rows are already written for staff accounts — src/lib/push.ts persists first and
+// pushes second, so the feed fills even with VAPID unset. What an employee has never had is a
+// surface: /portal/notifications.astro:7 redirects every non-applicant to /admin and middleware
+// bounces them back, which is the ping-pong that took /portal down before. So the widget carries
+// href:null and each ROW is rendered against its own notifications.action_url. This card is that
+// missing surface, and it is why the registry's note exists.
+let notifs: any = { ok: false, items: [], unread: 0 };
+batch.push((async () => {
+if (has('notifications.unread') && user?.id) {
+  try {
+    const { myNotifications } = await import('@/lib/workforce/loaders');
+    notifs = await myNotifications(String(user.id), 5);
+  } catch (e: any) {
+    logFail('notifications', e);
+  }
+}
+})());
+
+// DIRECT REPORTS. ctx.managesPeople has been true for reporting managers all along and
+// reports.direct has been registered all along, but NOTHING ANYWHERE LOADED IT — a manager with
+// direct reports had no way to see who they were. Names and designations only.
+//
+// ASKED OF THE ORGANIZATION GRAPH FIRST, exactly as the manager card above is, and for the mirror
+// image of the same reason. The graph ships EMPTY until db/org-graph-backfill.sql is run, so an
+// empty answer from it says nothing whatsoever about whether people report to this person — and
+// "nobody is recorded as reporting to you" is a claim about a real team. directReportsView() keeps
+// the four answers apart and this page renders a different sentence for each; only ONE of them is
+// allowed to say that nobody reports to them.
+let reports: any = { ok: true, people: [], more: 0, source: 'none' };
+batch.push((async () => {
+if (has('reports.direct') && user?.id) {
+  try {
+    const { directReportsView } = await import('@/lib/workforce/loaders');
+    reports = await directReportsView(String(user.id), employeeId, 6);
+  } catch (e: any) {
+    logFail('direct reports', e);
+    reports = { ok: false, people: [], more: 0, source: 'failed' };
+  }
+}
+})());
+// THE DEPARTMENT A LEAD MAY QUERY. Narrowed by departmentFilter() inside the loader, from
+// ctx.scopeDepartmentId — which comes from the session (users.assigned_department_id) and never from
+// a query string. ctx.departmentId is NOT passed and must never be: that is the person's OWN
+// department, display-only, and handing it to the filter would manufacture a peer list for an
+// ordinary employee — a new authorisation decision smuggled in as a rendering one.
+let roster: any = { ok: true, people: [], more: 0 };
+batch.push((async () => {
+if (has('team.roster') && composed.context.scopeDepartmentId) {
+  try {
+    const { departmentRoster } = await import('@/lib/workforce/loaders');
+    roster = await departmentRoster({ scopeDepartmentId: composed.context.scopeDepartmentId }, 6);
+  } catch (e: any) {
+    logFail('department roster', e);
+    roster = { ok: false, people: [], more: 0 };
+  }
+}
+})());
+// THIS MONTH'S ATTENDANCE. Days RECORDED, never a percentage against a target — the target framing
+// belongs to credit.position, which is internship-only, and putting a completion bar here is exactly
+// the defect the widget registry exists to fix.
+let attMonth: any = { ok: false, present: 0, leave: 0, other: 0, daysRecorded: 0, hours: null };
+batch.push((async () => {
+if (employeeId && has('attendance.month')) {
+  try {
+    const { attendanceMonth } = await import('@/lib/workforce/loaders');
+    attMonth = await attendanceMonth(employeeId);
+  } catch (e: any) {
+    logFail('attendance month', e);
+  }
+}
+})());
+
+// APPROVED LEAVE COVERING TODAY — one of the three things "Today" can honestly say.
+let leaveToday: any = { ok: false, days: [] };
+batch.push((async () => {
+if (employeeId && has('schedule.today')) {
+  try {
+    const { leaveCovering } = await import('@/lib/workforce/loaders');
+    leaveToday = await leaveCovering(employeeId, composed.context.today);
+  } catch (e: any) {
+    logFail('leave today', e);
+  }
+}
+})());
+// THE BARRIER. Everything above ran at once; nothing below may assume any of it until this line.
+await Promise.all(batch);
+
+// =================================================================================================
+// DERIVED FROM THE BATCH — pure arithmetic and sentence-building, no I/O of any kind.
+//
+// Each of these used to sit directly beneath the read it derives from. They are gathered here for
+// one reason: a `const` that reads a batched result MUST be evaluated after the barrier, and a
+// reader adding a new one is far more likely to get that right when every existing one is in the
+// same place with this note on top of it.
+// =================================================================================================
+
+// listMyTasks returns everything, finished work sorted last. This page is the phone screen someone
+// checks between jobs, so it shows what is still outstanding; the finished count goes in the
+// subtitle rather than as rows nobody needs to scroll past.
+//
+// `isOverdue` is computed by Postgres against CURRENT_DATE inside the query. Preferring it to a
+// string comparison here keeps one definition of "late" instead of two that drift apart by a day
+// whenever the server clock and UTC disagree.
+const openTasks = myTasks
+  .filter((t: any) => t.id && t.status !== 'done')
+  .map((t: any) => ({
+    id: t.id,
+    title: t.title || 'Untitled task',
+    priority: String(t.priority || 'normal').toLowerCase(),
+    status: String(t.status || 'open').toLowerCase(),
+    due: isoDay(t.dueOn),
+    overdue: !!t.isOverdue,
+    detail: t.description || '',
+    blockedReason: t.blockedReason || '',
+    from: t.selfAssigned ? '' : (t.assignedByName || ''),
+    /** The canonical status, which is what the transition graph speaks. `status` above is the
+     *  four-value legacy window this page's older markup reads. */
+    state: String(t.state || t.status || 'assigned').toLowerCase(),
+    /** Only the moves this person may make from where the task actually is. Never a fixed list. */
+    moves: taskMoves[String(t.id)] || [],
+  }));
+const overdueCount = Number(taskTally?.overdue ?? NaN);
+const doneCount = Number(taskTally?.done ?? NaN);
+const overdueShown = Number.isFinite(overdueCount) ? overdueCount : openTasks.filter((t: any) => t.overdue).length;
+const taskMeta = [
+  overdueShown > 0 ? overdueShown + (overdueShown === 1 ? ' past its date' : ' past their date') : '',
+  Number.isFinite(doneCount) && doneCount > 0 ? doneCount + ' finished' : '',
+].filter(Boolean).join(' · ');
 
 // THE SENTENCES, BUILT HERE RATHER THAN AS NESTED TERNARIES INSIDE JSX.
 //
@@ -944,273 +1391,14 @@ const managerProvenance =
       ? 'Taken from your employee record. The Organization Graph does not hold a reporting line for you, so the two do not agree — worth mentioning to HR.'
       : '';
 
-// WAITING ON MY SIGN-OFF, AND WAITING ON MY REVIEW.
-//
-// listBoard() resolves the viewer's roles per row IN SQL (VIEWER_ROLE_COLUMNS), so nothing here can
-// claim a role the database did not grant. Its argument is the USERS id — collaborators are keyed
-// by users.id, not by the hr_employees id, and handing it the wrong one returns an empty board
-// forever rather than an error.
-//
-// A task where the viewer is approver OR lead is counted as sign-off and NOT again as a review, so
-// somebody holding both roles on one task sees it once. Reviewers are only ever added by hand
-// (seedCollaborators creates 'assignee' and 'approver' and nothing else), so an empty review bucket
-// is the ordinary, correct state and is simply absent rather than rendered as a zero.
-let boardOk = false;
-let signOffTasks: any[] = [];
-let reviewTasks: any[] = [];
-if (wantBoard && user?.id) {
-  try {
-    const { listBoard } = await import('@/lib/employee-tasks');
-    const board = await listBoard(user.id, { limit: 400 });
-    boardOk = board?.ok === true;
-    if (boardOk) {
-      const waiting = (board.tasks as any[]).filter((t: any) => t.status === 'under_review');
-      signOffTasks = has('tasks.signoff')
-        ? waiting.filter((t: any) => t.viewerRoles.indexOf('approver') >= 0 || t.viewerRoles.indexOf('lead') >= 0)
-        : [];
-      const signOffIds = new Set(signOffTasks.map((t: any) => t.id));
-      reviewTasks = has('tasks.review')
-        ? waiting.filter((t: any) => !signOffIds.has(t.id) && t.viewerRoles.indexOf('reviewer') >= 0)
-        : [];
-    }
-  } catch (e: any) {
-    logFail('board', e);
-  }
-}
-
-// LEAVE AND WITHDRAWAL REQUESTS WAITING ON A DECISION.
-//
-// THE ROLE TEST THAT USED TO LIVE HERE IS GONE. This page previously read user.role and compared it
-// to three names, which meant a reporting manager — the person a request is actually assigned to —
-// was told nothing, and it meant a role rename silently changed who was told. approvals.leave and
-// approvals.withdrawal carry `approvesRequests`, which the composer derives from the SAME authority
-// pendingLeaveForApprover() and pendingWithdrawalsForApprover() enforce at the read, so a row shown
-// here always has a queue behind it.
-//
-// Counts only — no names, no amounts, no reasons. Own rows are excluded: your own pending request is
-// not an approval waiting on YOU, it is on /portal/employee/leave.
-let pendingLeave = 0;
-let pendingWithdrawals = 0;
-let hrQueueFailed = false;
-if (wantLeaveQueue || wantWithdrawalQueue) {
-  try {
-    const [{ pendingLeaveForApprover }, { pendingWithdrawalsForApprover }] = await Promise.all([
-      import('@/lib/hr-leave'),
-      import('@/lib/hr-wallet'),
-    ]);
-    const [lv, wd] = await Promise.all([
-      wantLeaveQueue ? pendingLeaveForApprover(user) : Promise.resolve([] as any[]),
-      wantWithdrawalQueue ? pendingWithdrawalsForApprover(user) : Promise.resolve([] as any[]),
-    ]);
-    const mine = (r: any) => !!employeeId && String(r.employee_id) === String(employeeId);
-    pendingLeave = (lv as any[]).filter((r: any) => !mine(r)).length;
-    pendingWithdrawals = (wd as any[]).filter((r: any) => !mine(r)).length;
-  } catch (e: any) {
-    hrQueueFailed = true;
-    logFail('approver queue', e);
-  }
-}
-
-// EVERYTHING ELSE ROUTED TO THIS PERSON — the queue this page could not see.
-//
-// THE HOLE THIS CLOSES. The two counts above are leave and wallet withdrawals: two of the nineteen
-// domains in src/lib/workflow.ts. Everything else the org graph routes to somebody — a submitted
-// weekly timesheet, an overtime claim, an attendance correction, an expense claim, a procurement
-// request, a loan, a document, a helpdesk ticket, an appraisal, a benefits election, a separation —
-// reaches them through pendingForApprover(), which seven pages call one domain at a time and no
-// aggregate surface called at all. So the headline on this card was a count of two domains presented
-// as the count of everything waiting, the bar badge was the same two, and a manager who cleared this
-// screen to zero had decided nothing about any of the rest. Nobody was told, because
-// notifyApprover() sends them to /admin/hr/leave/workflow — a page most managers cannot open and
-// which lists only leave.
-//
-// COUNTS AND DOMAIN NAMES ONLY on this card. The full rows, with the decision buttons, are on
-// /portal/approvals; a triage row is a pointer to work, never the work itself.
-let routedCount = 0;
-let routedRows: any[] = [];
-let routedFailed = false;
-if (wantRoutedQueue && user?.id) {
-  try {
-    const { routedApprovals } = await import('@/lib/workforce/loaders');
-    const routed = await routedApprovals(String(user.id));
-    routedFailed = !routed.ok;
-    routedCount = routed.count;
-    routedRows = routed.rows;
-  } catch (e: any) {
-    routedFailed = true;
-    logFail('routed approvals', e);
-  }
-}
 // How many DISTINCT kinds of thing are waiting, so one row can say "3 requests — expense claim,
 // timesheet" instead of listing three rows that all lead to the same queue.
 const routedKinds = Array.from(new Set((routedRows as any[]).map((r: any) => r.domainLabel).filter(Boolean)));
 
-// MEETINGS TODAY — and this page used to deny they could be shown at all.
-//
-// WHAT WAS WRONG. The "Today" section carried the flat sentence "Scheduled meetings are not shown:
-// this workspace has no meeting calendar to read from yet." That stopped being true. meetingSource()
-// in src/lib/calendar-hub.ts:515 reads meet_rooms for anything this person HOSTS or is named on the
-// invitee list of, and /portal/employee/calendar has been rendering exactly that one route away. So
-// the workspace was telling people a capability did not exist while the product had it — the same
-// class of fault as a screen promising something it cannot show, pointed the other way, and it sends
-// somebody to a colleague to ask what time a meeting is that their own workspace could have told
-// them.
-//
-// THE LIMIT IS CARRIED, NOT HIDDEN. `invitees` is a jsonb list of email strings with no membership
-// row and no accepted/declined state, so an invitation appears as an invitation and never as an
-// acceptance, and somebody invited at an address they do not sign in with is not matched. The card
-// says so rather than implying a complete calendar.
-let meetingsToday: any[] = [];
-let meetingsOk = false;
-if (has('meetings.today') && user?.id && dbToday) {
-  try {
-    const { buildCalendar } = await import('@/lib/calendar-hub');
-    const model = await buildCalendar(
-      'meeting',
-      {
-        userId: String(user.id),
-        employeeId,
-        departmentId: composed.context.departmentId,
-        holds: composed.context.holds,
-      },
-      { from: dbToday, to: dbToday },
-    );
-    meetingsOk = !model.degraded;
-    meetingsToday = (model.days as any[]).flatMap((d: any) => d.events || []);
-  } catch (e: any) {
-    logFail('meetings today', e);
-  }
-}
-
-// JOINING DOCUMENTS, MINE — the ones a reviewer sent back.
-//
-// listDocs() rather than a COUNT, for two reasons. It is the function that OWNS the table's DDL — its
-// ctx() runs the CREATE TABLE IF NOT EXISTS — so this cannot be the query that discovers the table is
-// missing. And the cap is MAX_DOCS = 5 rows per person, so reading them costs less than the round
-// trip a count would save. It is scoped to user_id inside its own WHERE clause and it THROWS rather
-// than returning [] on failure, which is exactly what this needs.
-let rejectedDocs = 0;
-let docsFailed = false;
-if (wantMyDocs && user?.id) {
-  try {
-    const { listDocs } = await import('@/lib/hr-onboarding');
-    const docs = await listDocs(String(user.id));
-    rejectedDocs = docs.filter((d: any) => d.status === 'rejected').length;
-  } catch (e: any) {
-    docsFailed = true;
-    logFail('joining documents', e);
-  }
-}
-
-// JOINING DOCUMENTS WAITING FOR A REVIEW. onboarding.review requires admin.access AND the employees
-// section at 'edit' — the same test /api/portal/onboarding/documents uses to authorise the review,
-// plus the admin.access that middleware.ts demands at the door, so this count is never put in front
-// of somebody whose only route to act on it is a redirect. A COUNT, not pendingForReview(), which
-// returns names and email addresses for up to 150 people. Own rows are excluded.
-let docsToReview = 0;
-let docReviewFailed = false;
-if (wantDocReview && user?.id) {
-  try {
-    const r = await db.execute(sql`
-      SELECT COUNT(*)::int AS n FROM hr_onboarding_documents
-       WHERE status = 'submitted' AND user_id <> ${String(user.id)}`);
-    docsToReview = Number(rowsOf(r)[0]?.n) || 0;
-  } catch (e: any) {
-    docReviewFailed = true;
-    logFail('joining document reviews', e);
-  }
-}
-
-// THE CREDIT POSITION, AND THE GUARD THAT IS NO LONGER HERE.
-//
-// This block used to test `classification === 'intern' || employment_type === 'internship'` on this
-// page. That test is DELETED. It was an interim guard around one card, and two places deciding the
-// same thing is how they drift: the composer answers it now, for every intern widget at once, from
-// the engagement it resolved. So a founder, an executive, a professor or a consultant is never
-// measured against a target they never agreed to.
-//
-// The card itself withholds what it cannot stand behind rather than being withheld entirely:
-// creditPct stays null when no requirement is recorded, so the progress bar does not render and the
-// figure reads "credit-hours" instead of "of N credit-hours". required_credit_hours has one writer
-// (/admin/hr/completion/[id].astro) and is unset for most interns, so gating the whole card on it
-// would take the credit position away from exactly the people this surface exists for.
-//
-// One ledgerFor() call serves both credit widgets. Two reads of the same arithmetic can disagree.
-let credit: any = null;
-let creditTerms: any = null;
-let weeksLeft: number | null = null;
-if (employeeId && (has('credit.position') || has('credit.weeksLeft'))) {
-  try {
-    const { ledgerFor, termsFor } = await import('@/lib/credit-ledger');
-    creditTerms = await termsFor(employeeId);
-    const led = await ledgerFor(employeeId, creditTerms);
-    credit = led.summary;
-    weeksLeft = has('credit.weeksLeft') ? led.weeksRemaining : null;
-  } catch (e: any) {
-    // Never blocks the page over a summary — but never silently either. A credit figure that quietly
-    // stops appearing is exactly the kind of absence nobody reports and nobody notices.
-    logFail('credit', e);
-  }
-}
 const creditPct = credit?.requiredCreditHours
   ? Math.min(100, Math.round((credit.creditHours / credit.requiredCreditHours) * 100))
   : null;
 
-// CHAT. Two numbers, and nothing else is possible. chat_messages stores `ciphertext` and `iv`;
-// there is no plaintext column, and the private key is generated in the browser and never leaves
-// localStorage, so no server-rendered page can show what was said. chat_threads.last_message_preview
-// is not a preview either — the send handler writes the literal string '[encrypted]' into it.
-//
-// Messages is part of the Universal Workspace, which AUTHORIZATION_FIRST.md grants to EVERY
-// authenticated member, so it needs no widget eligibility — but the counts are still read only when
-// the composition is trustworthy. On a degraded screen the same card renders as a door with no
-// numbers on it, which is the safe direction.
-//
-// No schema ensure here on purpose: /portal/messages owns these tables, and it also creates a
-// starter thread on first visit. This card must never write.
-let chatThreads = 0;
-let chatUnread = 0;
-let chatReady = false;
-if (composed.ok && user?.id) {
-  try {
-    const r = await db.execute(sql`
-      SELECT COUNT(*)::int AS threads,
-             COUNT(*) FILTER (WHERE EXISTS (
-               SELECT 1 FROM chat_messages c
-                WHERE c.thread_id = m.thread_id
-                  AND c.sender_user_id <> ${user.id}
-                  AND c.deleted_at IS NULL
-                  AND (m.last_read_at IS NULL OR c.created_at > m.last_read_at)
-             ))::int AS unread
-        FROM chat_thread_members m
-       WHERE m.user_id = ${user.id}`);
-    const crows = rowsOf(r);
-    chatThreads = Number(crows[0]?.threads) || 0;
-    chatUnread = Number(crows[0]?.unread) || 0;
-    chatReady = true;
-  } catch (e: any) {
-    logFail('chat counts', e);
-  }
-}
-
-// COMMUNITY. visibleGroupsFor() is the only permitted way to list groups, and this page does not go
-// near the work_groups table itself. It returns the groups this person belongs to plus the
-// sub-groups of those — a group they are not entitled to is ABSENT from the result, not greyed out
-// and not "request access", because a list of team names is a map of the organisation.
-//
-// It deliberately selects `has_link`, never `join_url`: a chat invite link is a bearer credential, so
-// the URL is only ever revealed by a POST on /portal/team-groups after membership is re-derived at
-// the moment of access. Nothing below renders a link, and there is no total count of anything unseen
-// — that would be the same map by another route.
-let myGroups: any[] = [];
-if (has('groups.mine') && user?.id) {
-  try {
-    const { visibleGroupsFor } = await import('@/lib/work-groups');
-    myGroups = await visibleGroupsFor(user.id);
-  } catch (e: any) {
-    logFail('groups', e);
-  }
-}
 const memberGroups = myGroups.filter((g: any) => g.isMember);
 // Sub-groups of a group they are already in: visible and joinable by definition, so counting them
 // discloses nothing they could not already see on /portal/team-groups.
@@ -1221,52 +1409,6 @@ const memberGroups = myGroups.filter((g: any) => g.isMember);
 // refused when they tried. Counting only what the join actually accepts keeps the sentence true.
 const joinableGroups = myGroups.filter((g: any) => !g.isMember && g.kind === 'sub' && g.parentId);
 
-// =================================================================================================
-// THE HOME WIDGETS. Same two rules as everything above: gated on has(...) BEFORE the read, and every
-// one of them reports whether the read HAPPENED.
-//
-// Every loader below lives in src/lib/workforce/loaders.ts rather than in this frontmatter, and that
-// is the change that matters. Fifteen loaders were written inline on this page, which was fine while
-// there was one workspace surface and fatal the moment there were two: the second surface copies the
-// query, the copies drift, and the one that drifts toward showing MORE is the one nobody reports.
-// =================================================================================================
-
-// NOTIFICATIONS. Rows are already written for staff accounts — src/lib/push.ts persists first and
-// pushes second, so the feed fills even with VAPID unset. What an employee has never had is a
-// surface: /portal/notifications.astro:7 redirects every non-applicant to /admin and middleware
-// bounces them back, which is the ping-pong that took /portal down before. So the widget carries
-// href:null and each ROW is rendered against its own notifications.action_url. This card is that
-// missing surface, and it is why the registry's note exists.
-let notifs: any = { ok: false, items: [], unread: 0 };
-if (has('notifications.unread') && user?.id) {
-  try {
-    const { myNotifications } = await import('@/lib/workforce/loaders');
-    notifs = await myNotifications(String(user.id), 5);
-  } catch (e: any) {
-    logFail('notifications', e);
-  }
-}
-
-// DIRECT REPORTS. ctx.managesPeople has been true for reporting managers all along and
-// reports.direct has been registered all along, but NOTHING ANYWHERE LOADED IT — a manager with
-// direct reports had no way to see who they were. Names and designations only.
-//
-// ASKED OF THE ORGANIZATION GRAPH FIRST, exactly as the manager card above is, and for the mirror
-// image of the same reason. The graph ships EMPTY until db/org-graph-backfill.sql is run, so an
-// empty answer from it says nothing whatsoever about whether people report to this person — and
-// "nobody is recorded as reporting to you" is a claim about a real team. directReportsView() keeps
-// the four answers apart and this page renders a different sentence for each; only ONE of them is
-// allowed to say that nobody reports to them.
-let reports: any = { ok: true, people: [], more: 0, source: 'none' };
-if (has('reports.direct') && user?.id) {
-  try {
-    const { directReportsView } = await import('@/lib/workforce/loaders');
-    reports = await directReportsView(String(user.id), employeeId, 6);
-  } catch (e: any) {
-    logFail('direct reports', e);
-    reports = { ok: false, people: [], more: 0, source: 'failed' };
-  }
-}
 // Exactly one of these says that nobody reports to this person, and it is reachable only when the
 // Organization Graph is initialized, holds no edge for them, and no colleague's employee record
 // points at them either.
@@ -1283,44 +1425,50 @@ const reportsProvenance =
       ? 'Taken from employee records. The Organization Graph holds no reporting line for you, so the two do not agree — worth mentioning to HR.'
       : '';
 
-// THE DEPARTMENT A LEAD MAY QUERY. Narrowed by departmentFilter() inside the loader, from
-// ctx.scopeDepartmentId — which comes from the session (users.assigned_department_id) and never from
-// a query string. ctx.departmentId is NOT passed and must never be: that is the person's OWN
-// department, display-only, and handing it to the filter would manufacture a peer list for an
-// ordinary employee — a new authorisation decision smuggled in as a rendering one.
-let roster: any = { ok: true, people: [], more: 0 };
-if (has('team.roster') && composed.context.scopeDepartmentId) {
-  try {
-    const { departmentRoster } = await import('@/lib/workforce/loaders');
-    roster = await departmentRoster({ scopeDepartmentId: composed.context.scopeDepartmentId }, 6);
-  } catch (e: any) {
-    logFail('department roster', e);
-    roster = { ok: false, people: [], more: 0 };
-  }
-}
-// THIS MONTH'S ATTENDANCE. Days RECORDED, never a percentage against a target — the target framing
-// belongs to credit.position, which is internship-only, and putting a completion bar here is exactly
-// the defect the widget registry exists to fix.
-let attMonth: any = { ok: false, present: 0, leave: 0, other: 0, daysRecorded: 0, hours: null };
-if (employeeId && has('attendance.month')) {
-  try {
-    const { attendanceMonth } = await import('@/lib/workforce/loaders');
-    attMonth = await attendanceMonth(employeeId);
-  } catch (e: any) {
-    logFail('attendance month', e);
-  }
-}
+// =================================================================================================
+// THE SECOND WAVE — the two reads that genuinely cannot start until the first wave has answered.
+//
+// `lastWorkMode` is only asked when the clock read says this person is currently clocked OUT, so it
+// depends on the clock block. `recentTaskActivity` is asked about the tasks this person has open, so
+// it depends on the task block. Both are conditional on a first-wave RESULT, not merely on a gate,
+// which is exactly the case rule 1 above sends here.
+//
+// They are two independent reads, so they are batched with each other rather than chained: this wave
+// costs one round trip, not two, and for most people it costs none at all because neither condition
+// holds.
+// =================================================================================================
+const batch2: Promise<void>[] = [];
 
-// APPROVED LEAVE COVERING TODAY — one of the three things "Today" can honestly say.
-let leaveToday: any = { ok: false, days: [] };
-if (employeeId && has('schedule.today')) {
+// HOW THIS PERSON LAST CLOCKED IN, so the form does not ask them the same question about themselves
+// twice a day forever.
+//
+// The work_mode select defaulted to 'remote' on every single render. For an office-based employee
+// that is the wrong answer, every morning, and the fastest path through the form is to leave the
+// default alone — so 'remote' silently over-reports in hr_attendance.work_mode and the attendance
+// data is quietly wrong for exactly the people who never touch the control. Adjacent in spirit to
+// WCAG 2.2 SC 3.3.7 Redundant Entry: information the system already holds about you should not be
+// asked for again.
+//
+// ONE ROW, AND ONLY WHEN THE CLOCK-IN FORM IS ABOUT TO RENDER. Somebody already clocked in is not
+// shown this control, so there is nothing to prefill and no reason to pay for the read. Scoped to
+// the caller's own employee id like every other read on this page, and a failure leaves the old
+// 'remote' default in place rather than breaking the form.
+let lastWorkMode = '';
+batch2.push((async () => {
+if (employeeId && has('clock.today') && currentStatus === 'clocked_out') {
   try {
-    const { leaveCovering } = await import('@/lib/workforce/loaders');
-    leaveToday = await leaveCovering(employeeId, composed.context.today);
+    const r = await db.execute(sql`
+      SELECT work_mode FROM hr_clock_events
+       WHERE employee_id = ${employeeId} AND event_type = 'clock_in' AND work_mode IS NOT NULL
+       ORDER BY event_time DESC
+       LIMIT 1
+    `);
+    lastWorkMode = String(rowsOf(r)[0]?.work_mode || '');
   } catch (e: any) {
-    logFail('leave today', e);
+    logFail('last work mode', e);
   }
 }
+})());
 
 // RECENT ACTIVITY, CAPPED HARD AND ON PURPOSE. listTaskActivity() is PER TASK and there is no
 // cross-task personal activity reader in this codebase; building one means exporting visibleToSql()
@@ -1328,6 +1476,7 @@ if (employeeId && has('schedule.today')) {
 // dashboard card gets to force. So it runs for a handful of tasks this page has ALREADY read and
 // this person has ALREADY been authorised for, and says so when there were more.
 let activity: any = { ok: true, entries: [], partial: false };
+batch2.push((async () => {
 if (has('tasks.activity') && user?.id && openTasks.length > 0) {
   try {
     const { recentTaskActivity } = await import('@/lib/workforce/loaders');
@@ -1341,6 +1490,14 @@ if (has('tasks.activity') && user?.id && openTasks.length > 0) {
     activity = { ok: false, entries: [], partial: false };
   }
 }
+})());
+await Promise.all(batch2);
+
+// Only a value the select actually offers. Anything else — an old code, a null, a value written by a
+// surface that has since changed — falls back to the original default rather than rendering a
+// <select> with nothing selected.
+const WORK_MODES = ['remote', 'office', 'hybrid', 'field'];
+const workModeDefault = WORK_MODES.includes(lastWorkMode) ? lastWorkMode : 'remote';
 
 // =================================================================================================
 // THE COMMAND CENTRE ROWS. Everything below feeds the "Needs you today" section.

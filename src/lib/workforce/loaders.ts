@@ -32,6 +32,12 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { departmentFilter, type HasDepartmentScope } from '@/lib/auth/workspace-access';
+// THE SCALE PRIMITIVES. Every loader in this file is read on the workspace home page, which is the
+// most-rendered authenticated screen in the product — so each one of them is a query that runs on
+// every phone, every morning. idEq() replaces the `::text =` casts that made three of them
+// unindexable; countUpTo() replaces the `COUNT(*) OVER ()` windows that made two of them count an
+// entire department to print eight names. See src/lib/workforce/scale.ts for the reasoning.
+import { idEq, countUpTo, probeMore, type BoundedCount } from '@/lib/workforce/scale';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 const logFail = (tag: string, e: any) =>
@@ -138,6 +144,17 @@ export interface PeopleView {
   people: PersonRow[];
   /** Rows beyond the cap, so a list can say "and N more" instead of quietly truncating. */
   more: number;
+  /**
+   * True when `more` is a FLOOR rather than a total — the count stopped at its ceiling.
+   *
+   * This exists because the honest answer changed shape when the counting did. `COUNT(*) OVER ()`
+   * gave an exact total and read the whole matching set to get it; countUpTo() reads at most a few
+   * hundred rows and therefore cannot promise an exact total past that. A screen rendering `more`
+   * should print "and 12 more" when this is false and "and 500+ more" when it is true. Optional so
+   * that no existing reader has to change, and every existing reader stays correct: a small team
+   * never reaches the ceiling, which is the only case where the two answers could differ.
+   */
+  moreAtLeast?: boolean;
 }
 
 /**
@@ -148,8 +165,10 @@ export interface PeopleView {
  * anywhere loaded it — so a manager with direct reports had no way to see who they were.
  *
  * THE ID-SPACE TRAP: reporting_manager_id holds a USERS id. The comparison is against users.id and
- * is made as ::text, exactly as pendingLeaveForApprover() and approverRole() make it. Joining it to
- * hr_employees.id matches zero rows and reads as "nobody reports to you" rather than failing.
+ * is made against users.id, exactly as pendingLeaveForApprover() and approverRole() make it.
+ * Joining it to hr_employees.id matches zero rows and reads as "nobody reports to you" rather than
+ * failing. (It used to be written `reporting_manager_id::text = $1`; idEq() makes the same
+ * comparison in a form the index can answer — see src/lib/workforce/scale.ts.)
  *
  * The column is ALTERed in by only two admin pages at page load, so on a database where neither has
  * run it is absent entirely and this returns ok:false rather than an authoritative empty team.
@@ -158,21 +177,37 @@ export async function directReportsFor(userId: string, limit = 8): Promise<Peopl
   const uid = String(userId || '').trim();
   if (!uid) return { ok: false, people: [], more: 0 };
   const cap = Math.min(Math.max(limit, 1), 50);
+  // Written ONCE and used by both statements below, so the page and the count can never disagree
+  // about who is being counted — which is exactly what happens when a "and N more" is computed from
+  // a filter that has drifted from the one that produced the rows.
+  const where = sql`${idEq(sql`reporting_manager_id`, uid)} AND is_active = true`;
   try {
+    // cap + 1 rows, not cap: the extra row is the cheapest possible answer to "is there more", and
+    // it is asked FIRST so that the bounded count below is skipped entirely for the overwhelming
+    // majority of managers, who have fewer than eight reports and need no count at all.
     const r = await db.execute(sql`
-      SELECT id, full_name, designation,
-             COUNT(*) OVER ()::int AS total
+      SELECT id, full_name, designation
         FROM hr_employees
-       WHERE reporting_manager_id::text = ${uid}
-         AND is_active = true
+       WHERE ${where}
        ORDER BY full_name ASC
-       LIMIT ${cap}`);
-    const list = rows(r);
-    const total = Number(list[0]?.total) || list.length;
+       LIMIT ${cap + 1}`);
+    const { items, hasMore } = probeMore(rows(r), cap);
+
+    // ONLY when there IS more. A second round trip on a manager with 400 reports is worth it; on the
+    // 99% case it never happens.
+    let more = 0;
+    let moreAtLeast = false;
+    if (hasMore) {
+      const counted: BoundedCount = await countUpTo(sql`FROM hr_employees WHERE ${where}`);
+      more = counted.ok ? Math.max(0, counted.count - items.length) : 0;
+      moreAtLeast = counted.atLeast;
+    }
+
     return {
       ok: true,
-      more: Math.max(0, total - list.length),
-      people: list.map((p: any) => ({
+      more,
+      moreAtLeast,
+      people: items.map((p: any) => ({
         id: String(p.id),
         name: String(p.full_name || 'Unnamed record'),
         designation: text(p.designation),
@@ -294,21 +329,34 @@ export async function departmentRoster(
 ): Promise<PeopleView> {
   if (!String(scope?.scopeDepartmentId || '').trim()) return { ok: true, people: [], more: 0 };
   const cap = Math.min(Math.max(limit, 1), 60);
+  // THE ONE THAT MATTERED MOST. This card draws eight colleagues; it used to carry
+  // `COUNT(*) OVER ()`, and a window function is evaluated above the scan and below the LIMIT — so
+  // Postgres found and counted every active person in the department before throwing all but eight
+  // away. A department of eighty thousand people paid eighty thousand rows for eight names, on
+  // every render of the workspace home page.
+  const where = sql`${departmentFilter(scope)} AND e.is_active = true`;
   try {
     const r = await db.execute(sql`
-      SELECT e.id, e.full_name, e.designation,
-             COUNT(*) OVER ()::int AS total
+      SELECT e.id, e.full_name, e.designation
         FROM hr_employees e
-       WHERE ${departmentFilter(scope)}
-         AND e.is_active = true
+       WHERE ${where}
        ORDER BY e.full_name ASC
-       LIMIT ${cap}`);
-    const list = rows(r);
-    const total = Number(list[0]?.total) || list.length;
+       LIMIT ${cap + 1}`);
+    const { items, hasMore } = probeMore(rows(r), cap);
+
+    let more = 0;
+    let moreAtLeast = false;
+    if (hasMore) {
+      const counted: BoundedCount = await countUpTo(sql`FROM hr_employees e WHERE ${where}`);
+      more = counted.ok ? Math.max(0, counted.count - items.length) : 0;
+      moreAtLeast = counted.atLeast;
+    }
+
     return {
       ok: true,
-      more: Math.max(0, total - list.length),
-      people: list.map((p: any) => ({
+      more,
+      moreAtLeast,
+      people: items.map((p: any) => ({
         id: String(p.id),
         name: String(p.full_name || 'Unnamed record'),
         designation: text(p.designation),
@@ -580,6 +628,14 @@ export interface AttendanceMonthView {
  *
  * The month boundary comes from Postgres (date_trunc on CURRENT_DATE), not from the render process,
  * so it agrees with ctx.today.
+ *
+ * THE SINGLE WORST READ IN THE PORTAL BEFORE THIS CHANGE, and it did not look like it. The
+ * predicate was `employee_id::text = $1`, which hr_attendance_emp_idx (employee_id, date DESC)
+ * cannot answer — so this card, on the most-rendered authenticated page in the product, took a
+ * sequential scan of a table that grows by one row per person per working day. At the roll size
+ * this portal is now written for, that is billions of rows read to show one person how many days
+ * they have recorded this month. idEq() emits the plain comparison and the index answers it in a
+ * seek. Nothing about the result changed.
  */
 export async function attendanceMonth(employeeId: string): Promise<AttendanceMonthView> {
   const empty: AttendanceMonthView = { ok: false, present: 0, leave: 0, other: 0, daysRecorded: 0, hours: null };
@@ -592,7 +648,7 @@ export async function attendanceMonth(employeeId: string): Promise<AttendanceMon
              COUNT(*) FILTER (WHERE lower(COALESCE(status,'')) IN ('leave','on_leave'))::int AS leave,
              COALESCE(SUM(work_hours), 0)::float AS hours
         FROM hr_attendance
-       WHERE employee_id::text = ${id}
+       WHERE ${idEq(sql`employee_id`, id)}
          AND date >= date_trunc('month', CURRENT_DATE)
          AND date <= CURRENT_DATE`);
     const row = rows(r)[0] || {};

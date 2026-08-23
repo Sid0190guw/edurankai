@@ -107,7 +107,7 @@ export async function createRequisition(opts: any) {
       budget_currency, target_join_by, kras, skills_required
     ) VALUES (
       ${opts.requesterUserId || null}, ${opts.requesterName}, ${opts.roleTitle}, ${opts.department || null},
-      ${opts.level || null}, ${opts.engagementType || 'permanent'}, ${opts.country || null}, ${opts.workMode || 'remote'},
+      ${opts.level || null}, ${opts.engagementType || 'permanent'}, ${opts.country || null}, ${opts.workMode || 'onsite'},
       ${opts.headcount || 1}, ${opts.justification},
       ${opts.budgetMin ?? null}, ${opts.budgetMax ?? null}, ${opts.budgetCurrency || 'CHF'},
       ${opts.targetJoinBy || null}, ${opts.kras || null}, ${opts.skillsRequired || null}

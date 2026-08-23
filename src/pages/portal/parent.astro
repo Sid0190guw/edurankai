@@ -58,6 +58,36 @@ await ensureOnce('parent_child_links_uuid_v2', async () => {
       END
       $do$
     `);
+    // A LINK ONE PERSON ASSERTS ABOUT ANOTHER IS A REQUEST, NOT A RELATIONSHIP.
+    //
+    // Until this column existed, submitting somebody's email address was the entire process: the row
+    // went in, and the page below immediately rendered that account's name, email, last login,
+    // enrolled courses and progress, recent test scores, class schedule and OUTSTANDING FEES. Any
+    // signed-in account could read a complete academic and financial profile of any other account by
+    // typing their address. Nothing asked the child.
+    //
+    // It was not exploitable before, and only because the page was broken: the header above records
+    // that every insert had always failed on a uuid/bigint mismatch, so this table has never held a
+    // row. Repairing the types is what armed it. That is also why this column can be added with a
+    // clean default and no backfill question — there is no existing access to preserve or revoke.
+    //
+    // 'accepted' is never written from this page. It is reached through the guardian relationship an
+    // administrator establishes at /admin/rbac (rbac_guardian_links), which is the platform's
+    // existing, verified answer to "is this adult responsible for this learner" — the same table
+    // src/lib/student-settings.ts and src/lib/edu-notify.ts already trust. This page consults it
+    // rather than minting a second, self-asserted version of the same fact.
+    await db.execute(sql`ALTER TABLE parent_child_links ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending'`);
+    // The read below consults rbac_guardian_links, so it has to exist. Same self-bootstrapping
+    // pattern the RBAC module uses everywhere else (src/lib/enrolment.ts does exactly this), and it
+    // is idempotent — without it, a deployment where nothing has exercised RBAC yet would throw on
+    // the children query and report a database error instead of an empty list.
+    try {
+      const { ensureRbacSchema } = await import('@/lib/rbac');
+      await ensureRbacSchema();
+    } catch (e: any) {
+      // Not fatal to the bootstrap: the children query fails closed (no child rendered) and says so.
+      console.error('[portal/parent] rbac schema bootstrap failed -', e?.cause?.message || e?.message);
+    }
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_parent_child_links_parent ON parent_child_links(parent_user_id)`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_parent_child_links_child ON parent_child_links(child_user_id)`);
   } catch (e: any) {
@@ -86,7 +116,15 @@ if (Astro.request.method === 'POST') {
     } else {
       const found = rows(await db.execute(sql`SELECT id FROM users WHERE email = ${childEmail} LIMIT 1`));
       if (found.length === 0) {
-        formError = 'No EduRankAI account found for that email. The child must register first, then come back here to link.';
+        // THE SAME SENTENCE WHETHER OR NOT THE ACCOUNT EXISTS.
+        //
+        // "No EduRankAI account found for that email" answered, for any signed-in visitor, one
+        // address at a time, whether a given person has an account here. That is an enumeration
+        // oracle over the whole user table, and it is worth nothing to a real parent, who knows
+        // whether their own child registered. The request is recorded either way and the wording
+        // below is identical, so the reply carries no information about anybody else.
+        formOk = 'Request recorded. Access to a learner\'s progress begins once the link is verified — '
+          + 'nothing about that account is shown here until then.';
       } else {
         // users.id is a UUID. This was Number() on BOTH sides, so the self-link guard compared
         // NaN === NaN - which is false - and the NaN was then bound into the insert.
@@ -99,15 +137,21 @@ if (Astro.request.method === 'POST') {
           try {
             // RETURNING, so "linked" is something the database said rather than something this page
             // assumed. A statement that changed nothing comes back empty and is reported as such.
+            // status is NOT in the update list on purpose: re-submitting the form must never be a
+            // way to move a link from pending to accepted.
             const wrote = rows(await db.execute(sql`
-              INSERT INTO parent_child_links (parent_user_id, child_user_id, relationship, is_primary)
-              VALUES (${String(user.id)}::uuid, ${childId}::uuid, ${relationship}, ${isPrimary})
+              INSERT INTO parent_child_links (parent_user_id, child_user_id, relationship, is_primary, status)
+              VALUES (${String(user.id)}::uuid, ${childId}::uuid, ${relationship}, ${isPrimary}, 'pending')
               ON CONFLICT (parent_user_id, child_user_id) DO UPDATE
                 SET relationship = EXCLUDED.relationship, is_primary = EXCLUDED.is_primary
               RETURNING id
             `));
-            if (wrote.length) formOk = 'Child linked. Their dashboard is now visible to you below.';
-            else formError = 'That link was not saved. Nothing else changed - try again in a moment.';
+            if (wrote.length) {
+              formOk = 'Request recorded. Access to a learner\'s progress begins once the link is verified — '
+                + 'nothing about that account is shown here until then.';
+            } else {
+              formError = 'That link was not saved. Nothing else changed - try again in a moment.';
+            }
           } catch (e: any) {
             // The real reason is on e.cause; e.message is only the failed SQL, and printing that at
             // a parent taught them nothing while hiding a schema fault for the life of the page.
@@ -142,6 +186,17 @@ try {
   // users has no `organization` column - it is declared nowhere in src/lib/db/schema.ts and read
   // nowhere else in the repository - so the first of the two statements that used to sit here threw
   // on every load and its "fallback" ran every time. One statement, with the columns that exist.
+  // ONLY A VERIFIED LINK RENDERS A CHILD. Everything below this query — name, email, last login,
+  // course progress, test scores, outstanding fees — is another person's record, so the row that
+  // selects them is where the relationship has to be proved. Two ways to be here, and neither of
+  // them is "somebody typed this address into the form above":
+  //
+  //   status = 'accepted'        the link has been confirmed
+  //   rbac_guardian_links        the guardian relationship an administrator established at
+  //                              /admin/rbac — the platform's existing verified answer, already
+  //                              trusted by src/lib/student-settings.ts and src/lib/edu-notify.ts
+  //
+  // A pending request renders nothing at all, which is the whole point of it being pending.
   children = rows(await db.execute(sql`
     SELECT l.id, l.child_user_id, l.relationship, l.is_primary,
       COALESCE(u.name, u.email, 'Learner') AS name,
@@ -151,6 +206,14 @@ try {
     FROM parent_child_links l
     JOIN users u ON u.id = l.child_user_id
     WHERE l.parent_user_id = ${String(user.id)}::uuid
+      AND (
+        COALESCE(l.status, 'pending') = 'accepted'
+        OR EXISTS (
+          SELECT 1 FROM rbac_guardian_links g
+           WHERE g.guardian_user_id = l.parent_user_id
+             AND g.minor_user_id = l.child_user_id
+        )
+      )
     ORDER BY l.is_primary DESC, l.created_at ASC
   `)) as ChildRow[];
 } catch (e: any) {

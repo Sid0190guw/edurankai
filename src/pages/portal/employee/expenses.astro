@@ -20,6 +20,14 @@
 import { db } from '@/lib/db';
 import { civilToday } from '@/lib/page-safety';
 import { sql } from 'drizzle-orm';
+// The single employee-record resolver: the canonical gate plus the couple of extra columns this
+// page renders. Never a hand-written SELECT against hr_employees — see the block below.
+import { resolveEmployeeIdentity } from '@/lib/workforce/identity';
+// THE DOCUMENT, ONCE. This page used to write its own doctype, head, favicon, title and top
+// bar; seventeen pages under /portal/employee each wrote a slightly different copy of the same
+// five things. EmployeeShell owns them now. The page keeps its own <style>, marked is:global so
+// it still reaches <body>, the reset and the chrome the shell renders.
+import EmployeeShell from '@/components/workforce/EmployeeShell.astro';
 import {
   claimsForEmployee, routeWithdrawals, claimApprovalTrail, decisionsAwaiting, openAdvances,
   CLAIM_KINDS, CLAIM_KIND_LABELS, CLAIM_KIND_HINTS, CLAIM_CATEGORIES,
@@ -31,21 +39,27 @@ if (!user) return Astro.redirect('/portal/login?next=/portal/employee/expenses')
 
 const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
-let employee: any = null;
-let lookupFailed = false;
-try {
-  employee = rowsOf(await db.execute(sql`
-    SELECT id, full_name, employee_code, currency FROM hr_employees
-     WHERE user_id = ${user.id} AND is_active = true LIMIT 1`))[0]
-    || rowsOf(await db.execute(sql`
-    SELECT id, full_name, employee_code, currency FROM hr_employees
-     WHERE (work_email = ${user.email} OR personal_email = ${user.email} OR email = ${user.email})
-       AND is_active = true LIMIT 1`))[0]
-    || null;
-} catch (e: any) {
-  console.error('[portal/expenses] employee lookup', e?.cause?.message || e?.message);
-  lookupFailed = true;
-}
+// THE LOOKUP IS NOT WRITTEN HERE ANY MORE.
+//
+// It was two raw SELECTs against hr_employees — user_id first, then the three email columns — and
+// src/lib/workforce/identity.ts records the three ways every hand-written copy of that block was
+// wrong: a CASE-SENSITIVE email comparison where the canonical gate compares lower() to lower(), a
+// `LIMIT 1` that PICKED a row where the gate REFUSES two records sharing one address, and two
+// unindexed reads of hr_employees on every single page load. resolveEmployeeIdentity() is that gate
+// plus the couple of extra columns this page renders.
+const identity = await resolveEmployeeIdentity(user, '/portal/employee/expenses');
+const employee: { id: string; full_name: string; employee_code: string | null; currency: string | null } | null =
+  identity.ok
+    ? {
+        id: identity.identity.employeeId,
+        full_name: identity.identity.fullName,
+        employee_code: identity.identity.employeeCode,
+        currency: identity.identity.currency,
+      }
+    : null;
+const lookupFailed = !identity.ok && identity.failed;
+const denial = identity.ok ? null : identity.denial;
+if (denial?.redirect) return Astro.redirect(denial.redirect);
 
 const url = new URL(Astro.request.url);
 const requestedKind = String(url.searchParams.get('kind') || 'reimbursement');
@@ -107,13 +121,13 @@ const money = (n: any, cur: string) =>
 // Plain object rather than a typed map: a Record<string,string> annotation inside .astro JSX breaks
 // the parser on this project.
 const stateColour = {
-  draft: '#6b6255',
+  draft: 'var(--emp-muted)',
   submitted: '#d97706',
   halted: '#b45309',
   approved: '#2563eb',
   reimbursed: '#059669',
   rejected: '#dc2626',
-  cancelled: '#6b6255',
+  cancelled: 'var(--emp-muted)',
 };
 
 const live = claims.filter((c) => c.status === 'submitted' || c.status === 'halted');
@@ -130,56 +144,7 @@ const settled = claims.filter((c) => c.status !== 'submitted' && c.status !== 'h
 // stop looking at the page.
 const inbox = await decisionsAwaiting(String(user.id));
 ---
-<!doctype html>
-<html lang="en" style="background:#f6f4ef;">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-  <title>Expenses and claims</title>
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0;}
-    body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:48px;color:#1a1510;overflow-x:hidden;}
-    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 14px;position:sticky;top:0;z-index:40;}
-    .top a{color:#9a8f7d;text-decoration:none;display:flex;align-items:center;gap:6px;font-size:14px;min-height:44px;}
-    .wrap{max-width:620px;margin:0 auto;padding:16px 14px;}
-    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
-    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#6b6255;font-weight:700;margin:0 0 12px;}
-    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#6b6255;font-weight:700;display:block;margin:12px 0 4px;}
-    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;color:#1a1510;outline:none;min-height:44px;}
-    textarea{min-height:84px;resize:vertical;}
-    input:focus,select:focus,textarea:focus{border-color:#c2410c;}
-    /* `outline:none` was set with nothing put in its place, so a keyboard or switch user could not tell which control they were on. */
-    input:focus-visible,select:focus-visible,textarea:focus-visible,button:focus-visible,summary:focus-visible,a:focus-visible{outline:3px solid #7c2d12;outline-offset:2px;}
-    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:13px 18px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;min-height:44px;width:100%;}
-    .btn-quiet{background:#faf7f1;color:#7a2f08;border:1px solid #e6ddcd;font-size:13px;padding:10px 14px;width:auto;}
-    .tabs{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:2px;margin-bottom:14px;}
-    .tabs a{flex:0 0 auto;white-space:nowrap;text-decoration:none;font-size:13px;font-weight:600;padding:0 14px;border-radius:99px;background:#fff;border:1px solid #ece4d6;color:#6b6255;display:inline-flex;align-items:center;min-height:44px;}
-    .tabs a.on{background:#12100c;border-color:#12100c;color:#fff;}
-    .row2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;}
-    .claim{border:1px solid #f0e9dc;border-radius:12px;padding:13px;margin-bottom:10px;background:#fffdf9;}
-    .claim:last-child{margin-bottom:0;}
-    .claim .hd{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;}
-    .claim .ttl{font-size:15px;font-weight:700;overflow-wrap:anywhere;}
-    .claim .sub{font-size:11.5px;color:#8b8172;margin-top:3px;}
-    .amt{font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;white-space:nowrap;}
-    .pill{font-family:'JetBrains Mono',monospace;font-size:9.5px;font-weight:700;padding:3px 8px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;display:inline-block;}
-    .trail{margin-top:10px;border-top:1px dashed #ece4d6;padding-top:9px;font-size:12px;color:#6b6255;line-height:1.6;}
-    .flash-ok{background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;border-radius:10px;padding:12px 14px;font-size:13.5px;line-height:1.6;margin-bottom:14px;}
-    .flash-err{background:rgba(217,119,6,.09);border:1px solid rgba(217,119,6,.3);color:#8a4b06;border-radius:10px;padding:12px 14px;font-size:13.5px;line-height:1.6;margin-bottom:14px;}
-    .note{background:#faf7f1;border:1px solid #f0e9dc;border-radius:10px;padding:11px 13px;font-size:12px;color:#6b6255;line-height:1.6;margin-top:12px;}
-    .empty{text-align:center;padding:26px 12px;color:#6b6255;font-size:13.5px;line-height:1.6;}
-    .scroll-x{overflow-x:auto;-webkit-overflow-scrolling:touch;}
-    a.inline{color:#c2410c;}
-  </style>
-</head>
-<body>
-<nav class="top">
-  <a href="/portal/employee">
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>My HR</a>
-  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">Claims</span>
-  <span style="font-size:11px;color:#9a8f7d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:34vw;">{employee?.full_name || user.name}</span>
-</nav>
+<EmployeeShell title="Claims" documentTitle="Expenses and claims" person={employee?.full_name || user.name} width={620} bottomPad={48} bare>
 
 <div class="wrap">
   {msg && <div class="flash-ok">{msg}</div>}
@@ -195,9 +160,13 @@ const inbox = await decisionsAwaiting(String(user.id));
   {!lookupFailed && !employee && (
     <div class="card">
       <div class="empty">
-        <p style="font-weight:700;color:#1a1510;font-size:15px;">No employee record is linked to this account</p>
-        <p style="margin-top:8px;">A claim is routed for approval from your place in the organization, so
-        it needs an employee record to start from. Ask HR to link your account.</p>
+        {/* The gate's own sentence. Three facts reach here — no record, two records under one
+            address, a closed record — and one line for all three sends two people out of three to
+            ask HR about something that is not the problem. */}
+        <p style="font-weight:700;color:var(--emp-ink);font-size:15px;">{denial ? denial.title : 'No employee record is linked to this account'}</p>
+        <p style="margin-top:8px;">{denial
+          ? denial.reason
+          : 'A claim is routed for approval from your place in the organization, so it needs an employee record to start from. Ask HR to link your account.'}</p>
       </div>
     </div>
   )}
@@ -207,7 +176,7 @@ const inbox = await decisionsAwaiting(String(user.id));
       {inbox.length > 0 && (
         <div class="card" style="border-color:#d9c9a8;background:#fffdf7;">
           <h3>Waiting on you to decide</h3>
-          <p style="font-size:12.5px;color:#6b6255;line-height:1.65;margin-bottom:12px;">
+          <p style="font-size:12.5px;color:var(--emp-muted);line-height:1.65;margin-bottom:12px;">
             These reached you through the reporting line and department structure your organization has
             recorded — not through a job title. Approving is a decision on the record.
           </p>
@@ -249,15 +218,21 @@ const inbox = await decisionsAwaiting(String(user.id));
         </div>
       )}
 
-      <div class="tabs">
+      {/* A <nav> WITH aria-current, NOT A <div> WITH A COLOUR. The selected claim kind was marked
+          only by `class="on"` — a colour change and nothing else — so assistive technology had no
+          way to say which of the five was current, and a person who cannot distinguish the two
+          shades had no way to see it either. `aria-current="page"` is what the shell's tab styling
+          keys off, so the marker and the appearance can no longer disagree. */}
+      <nav class="tabs" aria-label="Kind of claim">
         {CLAIM_KINDS.map((k) => (
-          <a href={`/portal/employee/expenses?kind=${k}`} class={k === kind ? 'on' : ''}>{CLAIM_KIND_LABELS[k]}</a>
+          <a class="tab" href={`/portal/employee/expenses?kind=${k}`}
+             aria-current={k === kind ? 'page' : null}>{CLAIM_KIND_LABELS[k]}</a>
         ))}
-      </div>
+      </nav>
 
       <div class="card">
         <h3>New {CLAIM_KIND_LABELS[kind].toLowerCase()}</h3>
-        <p style="font-size:13px;color:#6b6255;line-height:1.6;">{CLAIM_KIND_HINTS[kind]}</p>
+        <p style="font-size:13px;color:var(--emp-muted);line-height:1.6;">{CLAIM_KIND_HINTS[kind]}</p>
 
         <form method="POST" action="/api/portal/expenses/submit">
           <input type="hidden" name="kind" value={kind}/>
@@ -350,7 +325,7 @@ const inbox = await decisionsAwaiting(String(user.id));
           )}
 
           <button class="btn" style="margin-top:16px;" type="submit">Raise and send for approval</button>
-          <p style="font-size:11.5px;color:#6b6255;margin-top:9px;line-height:1.6;">
+          <p style="font-size:11.5px;color:var(--emp-muted);margin-top:9px;line-height:1.6;">
             The claim is sent the moment you submit it. Who it goes to is worked out from your reporting
             line and the department structure your organization has recorded, not from job titles. Larger
             amounts pick up an additional approval on the way.
@@ -498,7 +473,7 @@ const inbox = await decisionsAwaiting(String(user.id));
 
       <div class="card">
         <h3>Wallet withdrawals</h3>
-        <p style="font-size:13px;color:#6b6255;line-height:1.65;">
+        <p style="font-size:13px;color:var(--emp-muted);line-height:1.65;">
           Requests to move your wallet balance to your bank. Raise one from
           <a class="inline" href="/portal/employee/wallet"> your wallet</a>; it is approved through the
           same chain as a claim.
@@ -521,7 +496,7 @@ const inbox = await decisionsAwaiting(String(user.id));
                 <div class="ttl">{money(w.amount, w.currency)}</div>
                 <div class="sub">{w.requestedAt ? new Date(w.requestedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : ''}{w.note ? ' — ' + w.note : ''}</div>
               </div>
-              <span class="pill" style="color:#6b6255;background:#6b625518;flex:0 0 auto;">{w.status}</span>
+              <span class="pill" style="color:var(--emp-muted);background:var(--emp-muted)18;flex:0 0 auto;">{w.status}</span>
             </div>
             {w.workflowState === 'halted' && w.haltReason && (
               <div class="trail" style="color:#8a4b06;">Not sent to anybody yet: {w.haltReason}</div>
@@ -532,5 +507,32 @@ const inbox = await decisionsAwaiting(String(user.id));
     </div>
   )}
 </div>
-</body>
-</html>
+</EmployeeShell>
+
+<style is:global>
+    .card{background:var(--emp-surface);border:1px solid var(--emp-line);border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--emp-muted);font-weight:700;margin:0 0 12px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--emp-muted);font-weight:700;display:block;margin:12px 0 4px;}
+    input,select,textarea{width:100%;background:var(--emp-surface-2);border:1px solid var(--emp-line-2);border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;color:var(--emp-ink);outline:none;min-height:44px;}
+    textarea{min-height:84px;resize:vertical;}
+    input:focus,select:focus,textarea:focus{border-color:var(--emp-accent);}
+    /* `outline:none` was set with nothing put in its place, so a keyboard or switch user could not tell which control they were on. */
+    input:focus-visible,select:focus-visible,textarea:focus-visible,button:focus-visible,summary:focus-visible,a:focus-visible{outline:3px solid var(--emp-accent-deep);outline-offset:2px;}
+    .btn{background:var(--emp-accent);color:#fff;border:none;border-radius:10px;padding:13px 18px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;min-height:44px;width:100%;}
+    .btn-quiet{background:var(--emp-surface-2);color:#7a2f08;border:1px solid var(--emp-line-2);font-size:13px;padding:10px 14px;width:auto;}
+    .row2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;}
+    .claim{border:1px solid #f0e9dc;border-radius:12px;padding:13px;margin-bottom:10px;background:#fffdf9;}
+    .claim:last-child{margin-bottom:0;}
+    .claim .hd{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;}
+    .claim .ttl{font-size:15px;font-weight:700;overflow-wrap:anywhere;}
+    .claim .sub{font-size:11.5px;color:#8b8172;margin-top:3px;}
+    .amt{font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;white-space:nowrap;}
+    .pill{font-family:'JetBrains Mono',monospace;font-size:9.5px;font-weight:700;padding:3px 8px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;display:inline-block;}
+    .trail{margin-top:10px;border-top:1px dashed var(--emp-line);padding-top:9px;font-size:12px;color:var(--emp-muted);line-height:1.6;}
+    .flash-ok{background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;border-radius:10px;padding:12px 14px;font-size:13.5px;line-height:1.6;margin-bottom:14px;}
+    .flash-err{background:rgba(217,119,6,.09);border:1px solid rgba(217,119,6,.3);color:#8a4b06;border-radius:10px;padding:12px 14px;font-size:13.5px;line-height:1.6;margin-bottom:14px;}
+    .note{background:var(--emp-surface-2);border:1px solid #f0e9dc;border-radius:10px;padding:11px 13px;font-size:12px;color:var(--emp-muted);line-height:1.6;margin-top:12px;}
+    .empty{text-align:center;padding:26px 12px;color:var(--emp-muted);font-size:13.5px;line-height:1.6;}
+    .scroll-x{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+    a.inline{color:var(--emp-accent);}
+</style>

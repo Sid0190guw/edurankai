@@ -39,6 +39,20 @@
 //      ago" quietly becomes false. It must be true the moment it is said.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+// idEq(): `column = $1` in the form an index can answer, instead of the `column::text = $1` casts
+// this file used to write by hand. See src/lib/workforce/scale.ts.
+import { idEq } from '@/lib/workforce/scale';
+
+/**
+ * How far the direct-report count is worth counting.
+ *
+ * `managesPeople` is a boolean and `directReports` is rendered as a small number next to it. Nothing
+ * in this product asks "exactly how many people are under this person" — the org chart answers that,
+ * bounded, on its own screen. So counting past this ceiling is work nobody reads, and on a large
+ * roll it is the difference between a seek and a scan of a whole reporting subtree. Past it, the
+ * number is a floor; every branch below tests it for `> 0`, which the floor answers correctly.
+ */
+const MANAGES_CEILING = 200;
 import { requireEmployee, type Workspace, type WorkspaceUser } from '@/lib/auth/workspace-access';
 import { leadsDepartment as holdsDepartmentLead, decidesEveryRequest } from '@/lib/auth/capability';
 import { resolvePermissions, holdsPermission, WILDCARD } from '@/lib/auth/registry';
@@ -246,12 +260,26 @@ async function readDayAndManager(
 ): Promise<{ today: string | null; reports: number | null; managerUserId: string | null }> {
   const empId = String(employeeId || '').trim();
   try {
+    // THREE FACTS, ONE ROUND TRIP — and all three now index-usable.
+    //
+    // WHAT THIS COST BEFORE. Both id comparisons were written `column::text = $1`, a cast on the
+    // COLUMN, which no btree index can answer. This statement runs on EVERY render of every
+    // workspace surface for every signed-in person, so the report count was a sequential scan of
+    // hr_employees on every page load in the product. At a hundred employees that is free; at ten
+    // million it is the whole table, per request, and it is the first thing that falls over.
+    //
+    // The count is also CEILINGED now. `managesPeople` is a boolean and `directReports` is only ever
+    // rendered as a small number beside it, so counting past MANAGES_CEILING buys nothing and costs
+    // a full index range scan for a department head with fifty thousand people beneath them. Past
+    // the ceiling the value is a floor, which is why reportsAtLeast travels with it.
     const r = await db.execute(sql`
       SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS today,
-             (SELECT COUNT(*)::int FROM hr_employees
-               WHERE reporting_manager_id::text = ${userId} AND is_active = true) AS reports,
+             (SELECT COUNT(*)::int FROM (
+                SELECT 1 FROM hr_employees
+                 WHERE ${idEq(sql`reporting_manager_id`, userId)} AND is_active = true
+                 LIMIT ${MANAGES_CEILING}) probe) AS reports,
              ${empId
-               ? sql`(SELECT m.reporting_manager_id::text FROM hr_employees m WHERE m.id::text = ${empId} LIMIT 1)`
+               ? sql`(SELECT m.reporting_manager_id::text FROM hr_employees m WHERE ${idEq(sql`m.id`, empId)} LIMIT 1)`
                : sql`NULL::text`} AS manager_user_id`);
     const row = rows(r)[0] || {};
     const n = Number(row.reports);
