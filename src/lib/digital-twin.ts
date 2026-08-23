@@ -1036,6 +1036,22 @@ const PROFILE_COLUMNS_BY_ASPECT: Record<string, readonly string[]> = {
 /** The profile aspects, named once so the read condition and the column build cannot disagree. */
 const PROFILE_ASPECTS: readonly TwinAspect[] = ['education', 'experience', 'claimed_capabilities', 'achievements'];
 
+/**
+ * EVERYTHING this module composes out of hr_employee_profile.
+ *
+ * Four list columns and the row's timestamp. Written as a type so a later reader can see at a
+ * glance that there is no field here for a bank account, a tax identifier or a protected attribute
+ * to land in — the columns NEVER_COMPOSED refuses have nowhere to go even if somebody selected one.
+ */
+interface TwinProfile {
+  education: ProfileEntry[];
+  experience: ProfileEntry[];
+  skills: ProfileEntry[];
+  achievements: ProfileEntry[];
+  /** When the person last saved their profile. The provenance timestamp on every entry below. */
+  updatedAt: string | null;
+}
+
 const MAX_PROFILE_ENTRIES = 40;
 const MAX_ENTRY_TEXT = 2000;
 
@@ -1231,12 +1247,42 @@ export async function buildDigitalTwin(
   }
 
   // ---- THE PROFILE-BACKED ASPECTS ----------------------------------------------------------------
-  // getProfile() returns bank and tax blocks. They are dropped here and never referenced again: the
-  // twin has no field shaped to hold them.
-  let profile: Awaited<ReturnType<typeof getProfile>> = null;
-  if (person.employeeId && (has('education') || has('experience') || has('claimed_capabilities') || has('achievements'))) {
+  // hr_employee_profile, read directly, with ONLY the columns the grants allow — the same shape as
+  // the employee read above and for the same reason. getProfile() is deliberately not called: it
+  // selects date of birth, nationality, address, photograph, bank account and tax identifiers off
+  // hr_employees, which NEVER_COMPOSED says are absent from this model for EVERY viewer, and
+  // reading them in order to drop them is precisely the fetch-then-hide this module refuses.
+  //
+  // The condition and the column list both come from PROFILE_ASPECTS, so they cannot disagree.
+  let profile: TwinProfile | null = null;
+  if (person.employeeId && PROFILE_ASPECTS.some((a) => has(a))) {
+    const wanted = new Set<string>(PROFILE_COLUMNS_BY_ASPECT.base);
+    for (const a of PROFILE_ASPECTS) if (has(a)) for (const c of PROFILE_COLUMNS_BY_ASPECT[a]) wanted.add(c);
+    const screened = screenColumns(Array.from(wanted));
     try {
-      profile = await getProfile(person.employeeId);
+      // The table may not exist yet on a database where nobody has opened a profile. A missing row
+      // is not an error either: it means the person has not filled anything in, which is an empty
+      // list rather than an unreadable aspect.
+      await ensureProfileSchema();
+      const cols = sql.raw(screened.allowed.map((c) => 'p.' + c).join(', '));
+      const r = rowsOf(await db.execute(sql`
+        SELECT ${cols}
+          FROM hr_employee_profile p
+         WHERE p.employee_id = ${person.employeeId}::uuid
+         LIMIT 1`));
+      if (r.length) {
+        const row = r[0];
+        // A column the grants did not ask for was never selected, so it is absent from the row and
+        // parses to an empty list. That is the same answer as "the person listed nothing", and it
+        // is the correct one: an aspect the viewer cannot see must not be composed either way.
+        profile = {
+          education: profileEntries(row.education),
+          experience: profileEntries(row.experience),
+          skills: profileEntries(row.skills),
+          achievements: profileEntries(row.achievements),
+          updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+        };
+      }
     } catch (e: any) {
       note('education', e);
     }

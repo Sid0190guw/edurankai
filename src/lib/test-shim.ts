@@ -55,10 +55,11 @@ type Matchers = {
   not: Omit<Matchers, 'not'>;
 };
 
-function build(actual: any, negate: boolean): any {
+function build(actual: any, negate: boolean, label?: string): any {
   const check = (good: boolean, what: string) => {
     const ok = negate ? !good : good;
-    record((negate ? 'not ' : '') + what, ok, ok ? undefined : 'got ' + show(actual));
+    const described = (label ? label + ': ' : '') + (negate ? 'not ' : '') + what;
+    record(described, ok, ok ? undefined : 'got ' + show(actual));
   };
   return {
     toBe: (x: unknown) => check(Object.is(actual, x), 'is ' + show(x)),
@@ -82,9 +83,21 @@ function build(actual: any, negate: boolean): any {
   };
 }
 
-export function expect(actual: any): Matchers {
-  const m = build(actual, false);
-  m.not = build(actual, true);
+/**
+ * `expect(value)` or `expect(value, 'what this case is')`.
+ *
+ * THE SECOND ARGUMENT EXISTS BECAUSE SUITES WERE ALREADY PASSING ONE. Vitest accepts a label there,
+ * so a test written against Vitest and later moved onto this shim compiles fine at runtime — JS
+ * ignores the extra argument — and fails `tsc` with "Expected 1 arguments, but got 2". Four such
+ * call sites appeared in notify-audience.test.ts, in a loop over eleven notification types where
+ * the label is the ONLY thing distinguishing one assertion from the next.
+ *
+ * Dropping the labels would have typechecked and made the failure output useless. Accepting them
+ * and printing them makes the two runners agree and the output better, so that is what this does.
+ */
+export function expect(actual: any, label?: string): Matchers {
+  const m = build(actual, false, label);
+  m.not = build(actual, true, label);
   return m as Matchers;
 }
 

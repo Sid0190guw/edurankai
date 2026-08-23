@@ -40,6 +40,9 @@
 import { db } from '@/lib/db';
 import { sql, type SQL } from 'drizzle-orm';
 import { holdsCapability, leadsDepartment } from '@/lib/auth/capability';
+// idEq() is the index-usable form of `column = id`. It replaces the `column::text = $1` casts that
+// used to be written here by hand — see the note on employeeFilter() for what those cost.
+import { idEq } from '@/lib/workforce/scale';
 import { resolveIsIntern } from '@/lib/auth/intern-signals';
 
 // postgres-js resolves to a plain array, never a { rows } object. Declared before everything that
@@ -102,6 +105,18 @@ export interface Workspace {
   probationEndDate: string | null;
   confirmationDate: string | null;
   photoUrl: string | null;
+  /**
+   * ISO 4217, off the employee record. NOT salary and not a bank detail - it is the unit an amount
+   * is labelled in, and three self-service pages (expenses, loans, payslips) render money.
+   *
+   * It rides on this read rather than being fetched separately, which is the whole point: the row is
+   * already being selected here, so the column is free. src/lib/workforce/identity.ts used to run a
+   * second SELECT for it on every one of the nine pages that resolve identity through the gate -
+   * including the six that never render an amount. Null when HR never set one; a page must then say
+   * so rather than assuming a currency, because guessing the unit on somebody's pay is worse than
+   * omitting it.
+   */
+  currency: string | null;
   /** The person's OWN department, off hr_employees. Display only — it never grants scope.
    *  Null for anyone added by hand: the manual add and edit forms never write department_id. */
   department: WorkspaceDepartment | null;
@@ -171,7 +186,7 @@ export const DEPARTMENT_COVERAGE_NOTICE =
 const EMPLOYEE_COLUMNS = sql`
   id, employee_code, full_name, designation, department_id,
   employment_type, employment_status, onboarding_status, work_mode,
-  joining_date, probation_end_date, confirmation_date, photo_url, is_active`;
+  joining_date, probation_end_date, confirmation_date, photo_url, currency, is_active`;
 
 /**
  * 'none' (there is genuinely no record) and 'failed' (the query did not run) are kept apart on
@@ -229,8 +244,44 @@ async function internSignals(employeeId: string): Promise<{
   }
 }
 
+/**
+ * ONE LOOKUP PER REQUEST, KEYED ON THE REQUEST'S OWN USER OBJECT.
+ *
+ * WHY THIS IS SAFE, which is the only thing that matters about a cache holding an authorization
+ * result. The key is the `Astro.locals.user` OBJECT, not the user id. src/middleware.ts assigns it
+ * from validateSessionToken(), which runs a fresh SELECT and builds a fresh object on every request
+ * (src/lib/auth/session.ts:36). So the key is unique per request by construction: two requests can
+ * never share an entry, and an HR edit is visible on the very next page load. A WeakMap means the
+ * entry disappears with the request rather than being held for the life of the process.
+ *
+ * WHY IT IS WORTH HAVING. lookupWorkspace() is two indexed reads (the employee row, then the
+ * department name), and a single render of the workspace home page reaches it through
+ * composeWorkspace() and again through every self-service helper on the page. Nine pages under
+ * /portal/employee now resolve identity through resolveEmployeeIdentity(), which is another caller
+ * on the same request. Without this, the same two reads run three or four times to answer a question
+ * whose answer cannot change mid-request.
+ *
+ * The PROMISE is cached, not the resolved value, so two callers on the same tick share one round
+ * trip instead of racing. A rejection is not possible here — the body fails closed and returns a
+ * status — but a cached rejected promise would be, which is why nothing throws out of it.
+ */
+const requestWorkspaceCache = new WeakMap<object, Promise<WorkspaceLookup>>();
+
 async function lookupWorkspace(user: WorkspaceUser | null | undefined): Promise<WorkspaceLookup> {
   if (!user?.id) return { status: 'none', workspace: null };
+  // Only memoize when the caller handed us a real object to key on. A synthesised `{ id, email }`
+  // literal built inside a helper is a different object every call and would simply never hit.
+  if (typeof user === 'object') {
+    const hit = requestWorkspaceCache.get(user as object);
+    if (hit) return hit;
+    const p = lookupWorkspaceUncached(user);
+    requestWorkspaceCache.set(user as object, p);
+    return p;
+  }
+  return lookupWorkspaceUncached(user);
+}
+
+async function lookupWorkspaceUncached(user: WorkspaceUser): Promise<WorkspaceLookup> {
 
   // A CAPABILITY, NOT A ROLE NAME. This was `role === 'hr' || role === 'super_admin'`, and those two
   // roles are exactly — and only — the ones PERMS_BY_ROLE grants 'employee.manage' to, so the set
@@ -325,8 +376,10 @@ async function lookupWorkspace(user: WorkspaceUser | null | undefined): Promise<
   let departmentName: string | null = null;
   if (departmentId) {
     try {
+      // idEq(), not `id::text = $1`: the cast on the column was hiding the primary key from the
+      // planner on a lookup that runs on every workspace render.
       const d = rows(await db.execute(sql`
-        SELECT name FROM departments WHERE id::text = ${departmentId} LIMIT 1`))[0];
+        SELECT name FROM departments WHERE ${idEq(sql`id`, departmentId)} LIMIT 1`))[0];
       departmentName = d?.name ? String(d.name) : null;
     } catch (e: any) {
       logFail('[workspace-access] department', e);
@@ -373,6 +426,7 @@ async function lookupWorkspace(user: WorkspaceUser | null | undefined): Promise<
       joiningDate: asDate(row.joining_date),
       probationEndDate: asDate(row.probation_end_date),
       confirmationDate: asDate(row.confirmation_date),
+      currency: asText(row.currency),
       photoUrl: asText(row.photo_url),
       department: departmentId ? { id: departmentId, name: departmentName } : null,
       scopeDepartmentId,
@@ -591,25 +645,39 @@ export interface HasEmployee { employeeId?: string | null }
  * no resolved scope, so a page that skipped its gate, or a lead whose department was never set,
  * shows nothing rather than everything.
  *
- * Both sides are compared as text: the key is a varchar(50) slug in src/lib/db/schema.ts:81 and a
- * UUID in db/hr-schema.sql:32, and ::uuid would throw on a slug.
+ * THE COMPARISON USED TO BE `column::text = $1` UNCONDITIONALLY, and that was a scan.
+ *
+ * The reason for the cast was real and is preserved: the key is a varchar(50) slug in
+ * src/lib/db/schema.ts:81 and a UUID in db/hr-schema.sql:32, and a bare `::uuid` would throw on a
+ * slug. But a cast on the COLUMN is a cast the index cannot see through, so every department-scoped
+ * list in this product was a sequential scan of hr_employees. At the roll size this portal is now
+ * built for that is a full read of ten million rows to draw an eight-name card.
+ *
+ * idEq() keeps both behaviours and picks between them by INSPECTING THE VALUE rather than casting
+ * the column: a well-formed uuid becomes `column = $1` (index-usable, and Postgres binds the
+ * parameter to the column's own type, so it is equally correct against a varchar column); anything
+ * else falls back to the old `column::text = $1`, which is what a slug needs and cannot throw.
  *
  * @param column defaults to `e.department_id`; pass a static fragment such as sql`emp.department_id`
  *               for a different alias. Never build this from request input.
  */
 export function departmentFilter(scope: HasDepartmentScope | null | undefined, column: SQL = sql`e.department_id`): SQL {
-  const id = String(scope?.scopeDepartmentId || '').trim();
-  if (!id) return sql`false`;
-  return sql`${column}::text = ${id}`;
+  return idEq(column, scope?.scopeDepartmentId);
 }
 
 /**
  * Narrow to one person — the signed-in one. Returns `false` when no workspace resolved.
  * Every hr_* table (hr_attendance, hr_time_logs, hr_task_log, hr_daily_reports, hr_leave_request,
  * hr_clock_events) is keyed by employee_id = hr_employees.id, never by users.id.
+ *
+ * THIS IS THE HOTTEST PREDICATE IN THE PRODUCT, and it was the one that could not use an index.
+ * `employee_id::text = $1` defeats hr_attendance_emp_idx, hr_time_logs_emp_date_idx,
+ * hr_task_log_emp_date_idx and every other (employee_id, …) index in db/hr-schema.sql. hr_attendance
+ * alone gains one row per person per working day; at ten million people that is on the order of two
+ * and a half billion rows a year, and "your attendance this month" was reading all of them.
+ * idEq() emits `employee_id = $1` for the well-formed uuid that this value always is in practice,
+ * and keeps the old text comparison for anything malformed so nothing can start throwing.
  */
 export function employeeFilter(scope: HasEmployee | null | undefined, column: SQL = sql`employee_id`): SQL {
-  const id = String(scope?.employeeId || '').trim();
-  if (!id) return sql`false`;
-  return sql`${column}::text = ${id}`;
+  return idEq(column, scope?.employeeId);
 }

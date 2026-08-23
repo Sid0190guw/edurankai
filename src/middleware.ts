@@ -73,6 +73,12 @@ const PATH_SECTION: [string, string][] = ([
   ['/admin/offer/blank', 'custom_offer'],
   ['/admin/offers', 'offers'],
   ['/admin/offer', 'offers'],
+  // HORIZON — the assembled employee intelligence record (PATCH-11). Mapped to `employees` rather
+  // than a section key of its own: a new section key would add a row to the role-permission matrix,
+  // which is a policy change, and this surface is strictly narrower than the employee desk already
+  // is. The page then asks for `people.view_360` in its own frontmatter and gates each of its twelve
+  // tabs separately, so this entry is the outer door and not the whole lock.
+  ['/admin/horizon', 'employees'],
   ['/admin/hr/employees', 'employees'],
   ['/admin/hr/leave', 'leave'],
   ['/admin/hr/attendance', 'attendance'],

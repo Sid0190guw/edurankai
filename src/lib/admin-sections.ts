@@ -29,6 +29,15 @@ export const ADMIN_SECTION_GROUPS: AdminSectionGroup[] = [
   {
     label: 'People & HR',
     sections: [
+      // TALENT-TO-ORGANIZATION — docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md.
+      // Four keys, not one, because they gate four genuinely different desks: running recruitment,
+      // admitting somebody to the organization, holding the identity register, and deciding what
+      // anybody can reach. Collapsing them into one key would hand the hiring desk the access
+      // console, which is the separation spec section 35 exists to enforce.
+      { key: 'talent', label: 'Talent console', hint: 'Opportunities, candidates, selection pipeline' },
+      { key: 'talent_onboarding', label: 'Onboarding & codes', hint: 'Selected candidates, onboarding codes, onboarding review' },
+      { key: 'talent_identity', label: 'Identity registry', hint: 'Employee, intern, fellow and member identities' },
+      { key: 'talent_access', label: 'Access management', hint: 'Access groups, policy and provisioning' },
       { key: 'hr', label: 'HR Management' },
       { key: 'employees', label: 'Employees' },
       { key: 'leave', label: 'Leave' },

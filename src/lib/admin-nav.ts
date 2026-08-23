@@ -347,6 +347,25 @@ export const ADMIN_NAV: AdminNavEntry[] = [
     children: [
       { id: 'hr',             label: 'Overview',        href: '/admin/hr',                       icon: 'home',     section: 'hr' },
       { id: 'hr-employees',   label: 'Employees',       href: '/admin/hr/employees',             icon: 'users',    section: 'employees' },
+      // HORIZON (PATCH-11) — one person as one record across twelve sections, each naming where it
+      // got what it shows. Filed under `employees` beside the employee desk because it is a READ of
+      // the same people and is strictly narrower: the page additionally requires `people.view_360`
+      // and gates every tab on its own capability. It does not replace the employee record screen —
+      // that one is where a value is edited, this one is where a value is explained.
+      { id: 'horizon-records', label: 'Intelligence records', href: '/admin/horizon',            icon: 'grid',     section: 'employees' },
+      // HORIZON INTEGRATION (PATCH-20) — the build's own state: which patches are reachable, which
+      // concepts have two owners, and which Definition-of-Done items are actually proven rather than
+      // asserted. Filed under `settings` and NOT `employees`, because it is the one HORIZON screen
+      // that reads no person at all: every value on it is about code and table declarations, so the
+      // narrower people sections would file it with reads it does not perform.
+      { id: 'horizon-integration', label: 'HORIZON integration', href: '/admin/horizon/integration', icon: 'grid', section: 'settings' },
+      // THE SIGNAL QUEUE — changes the platform noticed in records the organisation already keeps,
+      // in four bands, each one naming its evidence. Filed under `hr` rather than a narrower people
+      // section because /admin/hr/* is what middleware gates on by longest-prefix match, and the page
+      // then applies its own per-band, per-relationship policy on top (signal-visibility.ts), which is
+      // strictly narrower than the section. A link is a disclosure even when the page behind it is
+      // locked; this one reveals only that a signal queue exists.
+      { id: 'hr-signals', label: 'Signals', href: '/admin/hr/signals', icon: 'chart', section: 'hr' },
       { id: 'hr-onboarding',  label: 'Joining documents', href: '/admin/hr/onboarding',          icon: 'document', section: 'employees' },
       // THE ONBOARDING JOURNEY — the tracked sequence a joiner works through (equipment, accounts,
       // introductions, first-week reading, policy acknowledgements), each step with an owner resolved
@@ -361,6 +380,16 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // /admin/hr/* on 'hr' — so an HR account can open all four by typing the URL today while the
       // sidebar pretends they do not exist. Mapping them to 'hr' makes the menu tell the truth.
       { id: 'hr-requisitions',label: 'Requisitions',    href: '/admin/hr/requisitions',          icon: 'document', section: 'hr' },
+      // ROLE COMPARISON — one person's recorded evidence against several roles' recorded
+      // requirements, side by side and deliberately unranked (src/lib/horizon/role-compare.ts).
+      //
+      // SECTION 'hr' AND NOT 'employees', for the same reason the roles-requirements entry above
+      // carries a comment: the page's own gate is can(user, 'match.run'), held below super_admin by
+      // `hr` alone. The 'employees' section is wider, so filing it there would put this link in
+      // sidebars belonging to accounts the page then bounces — offering somebody a link the door
+      // refuses. 'hr' is held below super_admin by `hr`, and `hr` holds match.run, so every account
+      // offered this entry can actually open it.
+      { id: 'hr-role-compare', label: 'Role comparison', href: '/admin/hr/role-compare',         icon: 'grid',     section: 'hr' },
       { id: 'hr-bgv',         label: 'BGV (verification)', href: '/admin/hr/bgv',                icon: 'shield',   section: 'hr' },
       { id: 'hr-classification',label: 'Classification register', href: '/admin/hr/classification', icon: 'grid', section: 'hr' },
       // THE EMPLOYEE LIFECYCLE. Every one is an /admin/hr/* page, which middleware.ts already gates on
@@ -432,6 +461,35 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       { id: 'hr-perf-cycles', label: 'Appraisal cycles', href: '/admin/hr/performance/cycles',   icon: 'chart',    section: 'hr' },
       { id: 'hr-skills',      label: 'Skills',          href: '/admin/hr/performance/skills',    icon: 'grid',     section: 'hr' },
       { id: 'hr-learning',    label: 'Assigned learning', href: '/admin/hr/performance/learning', icon: 'book',    section: 'hr' },
+      // THE FEEDBACK RECORD. Same '/admin/hr' prefix, so middleware's longest-prefix match already
+      // gates it on the 'hr' section, and the page then asks for `performance.manage` in its own
+      // frontmatter and refuses IN PLACE rather than bouncing — the same shape as the three above.
+      // It is the ONLY surface that shows the people-desk feedback channel, the per-item weighting
+      // and the patterns across individual authors; a reporting manager reads their own reports'
+      // feedback from the workspace, through the reporting line, and reaches none of that.
+      { id: 'hr-feedback',    label: 'Feedback record', href: '/admin/hr/performance/feedback',  icon: 'chat',     section: 'hr' },
+      // THE HR INTELLIGENCE VIEW. Same '/admin/hr' prefix, so middleware's longest-prefix match
+      // already gates it on the 'hr' section; the page then asks for `employee.manage` OR
+      // `people.view_360` through can() and refuses IN PLACE with a sentence, the same shape as the
+      // four above. It reads across the surfaces beside it — appraisals, skills, learning, feedback
+      // — and adds no source data of its own; what it adds is the reading and the six actions.
+      //
+      // IT IS NOT THE MANAGER VIEW. A reporting line does not open it: a team lead reading their
+      // reports' delivery is a different record for a different question. And it is not the 360
+      // record either — that assembles who somebody IS, this one reads what they NEED.
+      { id: 'hr-intelligence', label: 'HR intelligence', href: '/admin/hr/intelligence',         icon: 'chart',    section: 'hr' },
+      // THE FUSION DESK. Same '/admin/hr' prefix, so middleware's longest-prefix match already gates
+      // it on the 'hr' section; the page then asks for `performance.manage` through can() and
+      // otherwise opens only the people the ORGANISATION GRAPH records the viewer as responsible
+      // for — a per-row relationship, resolved by src/lib/performance-scope.ts, not a capability.
+      // It refuses IN PLACE with a sentence, the same shape as its neighbours.
+      //
+      // IT IS A SEPARATE ENTRY FROM 'HR intelligence' ABOVE, DELIBERATELY. That one reads what a
+      // person NEEDS and offers actions. This one reads the same person along ten named dimensions
+      // and reports what five kinds of evidence AGREE and CONTRADICT about each — it takes no
+      // action, moves nothing, and produces no overall score for anybody. Two questions, two
+      // screens; merging them would put a number and a button on the same row about a human.
+      { id: 'hr-fusion',      label: 'Intelligence profile', href: '/admin/hr/fusion',           icon: 'grid',     section: 'hr' },
       // WORKPLACE SERVICES. New surfaces, new section keys - so nothing here is "newly mapped" from
       // an older hand-written list: the page, the sidebar entry and the capability were written
       // together and ask the same question. Only super_admin and `hr` hold these sections today.
@@ -610,6 +668,15 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   { id: 'custom-offer', label: 'Custom Offer', href: '/admin/offer/blank', icon: 'file-text', section: 'custom_offer' },
   { id: 'hei-dashboard', label: 'HEI Control Plane', href: '/admin/hei', icon: 'book', section: 'hei_findings' },
   { id: 'roles', label: 'Roles', href: '/admin/roles', icon: 'briefcase', section: 'roles' },
+  // DIVISIONS — the level between a department and a posting, and the console the Extreme-Scale
+  // department is imported and published from.
+  //
+  // SECTION 'roles', NOT A NEW KEY, for the reason this file's header gives about the Recruitment
+  // group: a new section key creates a checkbox in /admin/team/roles that nothing enforces, and —
+  // because a section nobody has been granted is a section nobody holds — it would hide this page
+  // from every restricted admin on the day it shipped. The page's own gate is
+  // can(roles.view) || can(roles.edit), so 'roles' is EXACTLY the population the door admits.
+  { id: 'role-divisions', label: 'Divisions', href: '/admin/roles/divisions', icon: 'grid', section: 'roles' },
   // THE EVALUATION PIPELINE. Read-only register of the internal stages an application is worked
   // through, and the published step each one projects onto.
   //

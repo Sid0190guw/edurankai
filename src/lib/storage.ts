@@ -4,6 +4,11 @@
 // in the kernel (no blob needed), so replay works even with no object store. Blob media needs
 // BLOB_READ_WRITE_TOKEN; without it we fall back to an in-memory dev store and report it honestly
 // (we never claim CDN-scale VOD from the dev fallback).
+//
+// `BinaryLike` is imported as a TYPE ONLY. node:crypto itself is still loaded lazily, inside the
+// two signers, exactly as before — a type-only import is erased and never becomes a require().
+import type { BinaryLike } from 'node:crypto';
+
 export interface StoredObject { url: string; key: string }
 export interface BlobStore {
   kind: string;
@@ -46,9 +51,25 @@ function vercelBlobStore(): BlobStore {
 // any S3 API). No vendor SDK — a single SigV4-signed PUT over standard HTTPS via node:crypto, so
 // it adds zero dependencies and speaks the open S3 standard. Configure with S3_ENDPOINT,
 // S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY (+ optional S3_REGION, S3_PUBLIC_BASE_URL).
-async function toBytes(data: Uint8Array | Blob | ArrayBuffer | string): Promise<Uint8Array> {
+/**
+ * The bytes of a request body, typed as fetch() actually accepts them.
+ *
+ * BodyInit takes an ArrayBuffer-backed view only — a SharedArrayBuffer-backed Uint8Array is not a
+ * valid body — so the caller's array is re-viewed rather than asserted. The ArrayBuffer case is a
+ * VIEW OVER THE SAME BYTES, not a copy, which matters when the body is a media file.
+ */
+type BodyBytes = Uint8Array<ArrayBuffer>;
+
+function bodyBytes(u8: Uint8Array): BodyBytes {
+  const buf = u8.buffer;
+  // A real check, not an assertion: the shared case is the one fetch() cannot take, and copying is
+  // the only way to hand it over. Nothing in this project produces one today.
+  return buf instanceof ArrayBuffer ? new Uint8Array(buf, u8.byteOffset, u8.byteLength) : new Uint8Array(u8);
+}
+
+async function toBytes(data: Uint8Array | Blob | ArrayBuffer | string): Promise<BodyBytes> {
   if (typeof data === 'string') return new TextEncoder().encode(data);
-  if (data instanceof Uint8Array) return data;
+  if (data instanceof Uint8Array) return bodyBytes(data);
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (typeof (data as any)?.arrayBuffer === 'function') return new Uint8Array(await (data as Blob).arrayBuffer());
   return new Uint8Array(0);
@@ -56,10 +77,10 @@ async function toBytes(data: Uint8Array | Blob | ArrayBuffer | string): Promise<
 function encodePath(p: string): string { return p.split('/').map(encodeURIComponent).join('/'); }
 
 async function s3SignedPut(cfg: { endpoint: string; region: string; bucket: string; accessKey: string; secretKey: string },
-  key: string, body: Uint8Array, contentType: string): Promise<boolean> {
+  key: string, body: BodyBytes, contentType: string): Promise<boolean> {
   const crypto = await import('node:crypto');
-  const sha256hex = (b: crypto.BinaryLike) => crypto.createHash('sha256').update(b).digest('hex');
-  const hmac = (k: crypto.BinaryLike, d: string) => crypto.createHmac('sha256', k).update(d).digest();
+  const sha256hex = (b: BinaryLike) => crypto.createHash('sha256').update(b).digest('hex');
+  const hmac = (k: BinaryLike, d: string) => crypto.createHmac('sha256', k).update(d).digest();
   const host = new URL(cfg.endpoint).host;
   const now = new Date();
   const amzdate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');       // YYYYMMDDTHHMMSSZ
@@ -180,8 +201,8 @@ export async function presignedUpload(key: string, opts: { expiresInSeconds?: nu
   const expires = Math.min(3600, Math.max(60, opts.expiresInSeconds || 900));
 
   const crypto = await import('node:crypto');
-  const sha256hex = (b: crypto.BinaryLike) => crypto.createHash('sha256').update(b).digest('hex');
-  const hmac = (k: crypto.BinaryLike, d: string) => crypto.createHmac('sha256', k).update(d).digest();
+  const sha256hex = (b: BinaryLike) => crypto.createHash('sha256').update(b).digest('hex');
+  const hmac = (k: BinaryLike, d: string) => crypto.createHmac('sha256', k).update(d).digest();
 
   const host = new URL(endpoint).host;
   const now = new Date();

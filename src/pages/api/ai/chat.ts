@@ -2,7 +2,7 @@
 // No DB access, no user data exposure. Routes through the first-party LLM gateway
 // (self-hosted 'own' model → env-Anthropic fallback), never api.anthropic.com directly.
 import type { APIRoute } from 'astro';
-import { complete } from '@/lib/llm/gateway';
+import { complete, type ChatMessage } from '@/lib/llm/gateway';
 import { clientIp, overPublicFormLimit } from '@/lib/public-form-limit';
 
 const FAQ_SYSTEM = `You are the EduRankAI Help Assistant - a friendly FAQ and support bot for edurankai.in.
@@ -95,7 +95,7 @@ export const POST: APIRoute = async ({ request }) => {
     }
 
     // Limit conversation length to prevent runaway cost/latency.
-    const recentMessages = messages.slice(-10).map((m: any) => ({
+    const recentMessages: ChatMessage[] = messages.slice(-10).map((m: any): ChatMessage => ({
       role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || ''),
     }));
 

@@ -286,6 +286,17 @@ export const REQUIREMENTS: readonly EnvRequirement[] = Object.freeze([
     breaks: 'Nothing to set — the host injects it. Where it is absent the integration layer falls back to NODE_ENV to decide whether this deployment may mail real people, so a self-hosted production deployment must set NODE_ENV=production or it will behave as development and hold mail back.' },
   { name: 'VERCEL_REGION', severity: 'optional',
     breaks: 'Nothing to set — the host injects it. The metrics payload reports no region.' },
+  // ---- the two flags the 2026-08-23 outage left behind ----
+  //
+  // Both are read by code that is on the request path of every page, and neither was on this
+  // checklist — which is what the "checklist matches the code" test was failing on. An operator
+  // moving this application to a new host had no way to learn either of them existed, and one of
+  // them decides whether the application is allowed to alter its own schema.
+  { name: 'SCHEMA_BOOTSTRAP', severity: 'optional',
+    breaks: 'Nothing breaks when it is unset, and that is the point: it DEFAULTS TO OFF IN PRODUCTION. With it off the application never runs CREATE TABLE or ALTER TABLE on the request path, which is the fix for the 2026-08-23 outage — request-path ALTERs took an ACCESS EXCLUSIVE lock on `roles`, queued every reader behind it and exhausted the connection pooler. The consequence is that a NEW table or column does not create itself on the live site: apply the migration by hand (the files in db/), or set SCHEMA_BOOTSTRAP=on, deploy, confirm /api/health reports missingCount 0, then unset it again.' },
+  { name: 'DB_TIMEOUT_MS', severity: 'optional',
+    breaks: 'Nothing, unless the database stops answering. It bounds how long a query may hang before withDbTimeout() rejects it, and it defaults to 8000ms. On 2026-08-23 the transaction pooler accepted connections and authenticated fine while never answering a query, so postgres-js waited forever and /api/health hung along with every other route — meaning nothing anywhere reported an outage that had been running for a quarter of an hour. Keep it well under the platform gateway timeout so the page decides what a visitor sees rather than the platform.' },
+
   { name: 'VERCEL_GIT_COMMIT_SHA', severity: 'optional',
     breaks: 'Nothing to set — the host injects it. The health endpoint and the metrics payload cannot say which commit is serving, which is the first question asked when two deployments behave differently.' },
 ]);

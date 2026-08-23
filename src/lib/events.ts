@@ -151,6 +151,11 @@ export const EVENTS = {
   ROLE_PUBLISHED: 'role.published',
   KNOWLEDGE_UPDATED: 'knowledge.updated',
   LOCATION_RECORDED: 'location.recorded',
+  // Added by HORIZON Patch 01 (src/lib/horizon/intake). Purely additive: nothing that already reads
+  // this object changes. Published when something has changed that a derived profile should be
+  // rebuilt from — a REQUEST, never an instruction and never a result. The payload carries
+  // identifiers only; no personal values travel on the bus.
+  PROFILE_RECOMPUTE_REQUESTED: 'profile.recompute_requested',
 } as const;
 
 export type KnownEvent = (typeof EVENTS)[keyof typeof EVENTS];

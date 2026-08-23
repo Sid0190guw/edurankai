@@ -746,6 +746,19 @@ export type Permission =
   // withdrawing a link are changes to a record about a person and each is re-checked at the write
   // against the SENSITIVE key below.
   | 'people.view_360'
+  // OPEN THE FOUNDATIONAL COMPUTATION DETAIL BEHIND A DERIVED STATEMENT on a person's HR
+  // intelligence record. GRANTED TO NO BUILT-IN ROLE, and it is in this union so that it can be
+  // CATALOGUED rather than so that it can be handed out: src/lib/auth/registry.ts describes what
+  // holding it would mean, and an administrator reads that before granting it rather than
+  // discovering the key only in code.
+  //
+  // NECESSARY AND NOT SUFFICIENT. src/lib/hr-intelligence/access.ts (FOUNDATIONAL) checks this key,
+  // a purpose typed for that particular read, and the subject's recorded unexpired consent as three
+  // independent questions; failing any one drops the reader back to the ordinary HR view. The
+  // people-desk key does not confer it and cannot be used to reach it.
+  //
+  // SENSITIVE. It is the deepest reading this platform offers about a named person.
+  | 'people.intelligence.foundational'
   // MAINTAIN THE PERSON SPINE AND THE SKILL GRAPH: /admin/skills/ontology, and the identity writes
   // on /admin/people/[id]. Create a person root, state that a login, an application or an employee
   // record is that person, withdraw such a statement, add a skill to the catalogue, record a
@@ -907,7 +920,50 @@ export type Permission =
   // IT VERIFIES NOTHING, GRADES NOTHING AND AWARDS NOTHING. Those were considered as keys of their
   // own and deliberately not created: verification and grading are per-row relationships, not a
   // standing power over a cohort, and awarding is not something this platform does at all.
-  | 'eims.enrolment.manage';
+  | 'eims.enrolment.manage'
+  // ---------------------------------------------------------------------------------------------
+  // TALENT-TO-ORGANIZATION — docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md section 22.
+  //
+  // NINE KEYS, NOT THIRTY. The spec lists a fuller vocabulary; only the keys an implemented surface
+  // actually enforces are added here. A key nobody asks for answers false for every role including
+  // super_admin (there is no wildcard in can()), so a speculative grant is a console that silently
+  // does not open — this project has shipped that exact defect before.
+  //
+  // NO PRIOR POPULATION TO PRESERVE. Every one of these gates a surface that did not exist, so each
+  // is granted to the narrowest defensible holder rather than converted from an existing test.
+  //
+  // WHAT IS DELIBERATELY NOT HERE: no key for "is a manager", "is a department head", "works in
+  // Engineering". Those are relationships and attributes, resolved per ROW from the Organization
+  // Graph and from the identity record. Spec 20.2: if it is a relationship it is not a role, and a
+  // capability that encodes one cannot answer "of whom?".
+  | 'talent.view' | 'talent.manage'
+  | 'selection.decide' | 'selection.approve_onboarding'
+  | 'onboarding.code.issue' | 'onboarding.approve'
+  | 'identity.manage' | 'access.manage'
+  | 'document.view_sensitive'
+  // ---------------------------------------------------------------------------------------------
+  // HORIZON PROFESSIONAL INTERPRETATION (PATCH 03). Three keys, and they are three because the
+  // powers are genuinely different: seeing a neutral dimension, causing one to be produced, and
+  // seeing the internal computation behind it are not the same act and should not admit the same
+  // population.
+  //
+  // ALL THREE ARE SENSITIVE. What sits behind them is an INFERENCE about a named person, drawn from
+  // indirect inputs. It is the weakest thing this platform holds about anybody and it is also the
+  // easiest to misread as a finding, which is exactly the combination that makes an unrecorded grant
+  // dangerous. Every read behind these keys writes an audit row BEFORE it returns anything, and a
+  // read that could not be logged returns a refusal instead of the data.
+  //
+  // `horizon.interpretation.trace` IS SUPER_ADMIN ALONE, and deliberately narrower than the other
+  // two: it exposes which upstream inputs produced a dimension and the arithmetic that combined
+  // them. That is the internal computation detail, and a role without this key does not merely get a
+  // screen that declines to render it — the fields are absent from the object it receives.
+  //
+  // NONE OF THE THREE DECIDES ANYTHING. No holder of any of them may make or support a hiring,
+  // rejection, promotion, termination or disciplinary decision on what they show; that is stated on
+  // every output, stored with every record, and is not a property of the key.
+  | 'horizon.interpretation.view'
+  | 'horizon.interpretation.compute'
+  | 'horizon.interpretation.trace';
 
 // Exported so a read-only console can SHOW the matrix instead of a second, hand-typed copy of it
 // drifting away from the real one (/admin/access-preview). Nothing outside this file may decide
@@ -1219,7 +1275,20 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // which internships exist and who is on one is the same desk that already decides what the
     // completion document says. Neither of them verifies an hour or grades anybody.
     'eims.outcomes.manage', 'eims.credit.configure', 'eims.record.issue',
-    'eims.programme.configure', 'eims.enrolment.manage'
+    'eims.programme.configure', 'eims.enrolment.manage',
+    // TALENT-TO-ORGANIZATION. The founder holds the whole lifecycle. Note that holding all nine does
+    // NOT bypass the separation-of-duties rule for a sensitive position (spec 35): that rule compares
+    // the ACTOR on the selection decision to the actor issuing the code, and one account doing both
+    // is refused at the call site whatever it holds here.
+    'talent.view', 'talent.manage',
+    'selection.decide', 'selection.approve_onboarding',
+    'onboarding.code.issue', 'onboarding.approve',
+    'identity.manage', 'access.manage',
+    'document.view_sensitive',
+    // HORIZON PROFESSIONAL INTERPRETATION. No prior population to preserve — the surface did not
+    // exist. Granted to the narrowest defensible holders: the two accounts that already read every
+    // employee record one at a time. The trace key stops here and goes no further.
+    'horizon.interpretation.view', 'horizon.interpretation.compute', 'horizon.interpretation.trace'
   ],
   hr: [
     'admin.access',
@@ -1358,12 +1427,40 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // that here replaces the implicit version of the same authority rather than widening it, and the
     // mentor and manager edges an enrolment records are org-graph rows, not grants.
     'eims.outcomes.manage', 'eims.credit.configure', 'eims.record.issue',
-    'eims.programme.configure', 'eims.enrolment.manage'
+    'eims.programme.configure', 'eims.enrolment.manage',
+    // TALENT-TO-ORGANIZATION — the People Operations desk. It runs the pipeline, approves an
+    // onboarding, creates the identity and reads identity-class documents.
+    //
+    // NOT 'access.manage'. Spec 35 separates People Operations from the Access Administrator on
+    // purpose: the desk that decides somebody joins must not also be the desk that decides what they
+    // can reach. Today that leaves access administration with super_admin alone, which is narrow and
+    // correct until an access_admin role exists.
+    //
+    // NOT 'selection.decide' either — HR approves a selection FOR ONBOARDING (the second act), while
+    // the decision itself belongs to the hiring desk. Two acts, two keys, spec 6B rule 1.
+    'talent.view', 'talent.manage',
+    'selection.approve_onboarding',
+    'onboarding.code.issue', 'onboarding.approve',
+    'identity.manage',
+    'document.view_sensitive',
+    // HORIZON PROFESSIONAL INTERPRETATION. The people desk may see the neutral dimensions and may
+    // cause them to be produced. NOT 'horizon.interpretation.trace': the internal computation behind
+    // an indication is a different power from reading the indication, on the same reasoning that
+    // keeps access administration away from this desk two blocks above.
+    'horizon.interpretation.view', 'horizon.interpretation.compute'
   ],
   recruiter: [
     'admin.access',
     'roles.view',
     'applications.view', 'applications.edit', 'applications.score',
+    // TALENT-TO-ORGANIZATION — the hiring desk. Runs opportunities and pipelines, and records the
+    // selection decision with a written reason and their own name on it.
+    //
+    // NOT 'selection.approve_onboarding', NOT 'onboarding.code.issue', NOT 'identity.manage', and
+    // NOT 'document.view_sensitive'. A hiring manager decides who is selected; they do not admit
+    // anyone to the organization and they never see a candidate's identity documents (spec 32.2
+    // rule 1 and section 35).
+    'talent.view', 'talent.manage', 'selection.decide',
     // A recruiter can see who is checking a candidate's letter, but answering on the record is
     // HR's call — read-only here.
     'offers.view',
@@ -1377,6 +1474,10 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     'admin.access',
     'roles.view',
     'applications.view', 'applications.score',
+    // TALENT-TO-ORGANIZATION — read only, and scoped further in the query. `talent.view` opens the
+    // console; WHICH candidates an evaluator sees is decided per row by their assignment
+    // (tal_opportunity_evaluator), never by this key. Spec 21.3: the scope is applied in the SQL.
+    'talent.view',
     // Same reasoning as recruiter, one step narrower: a reviewer already opens the full application
     // of anybody in this list, so hiding the referral that produced it would be a distinction
     // without a difference. No reward authority.
@@ -1387,6 +1488,10 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     'admin.access',
     'roles.view', 'roles.edit',
     'applications.view', 'applications.edit', 'applications.score',
+    // TALENT-TO-ORGANIZATION — read only, department-scoped in the query, never by this key.
+    // A department head reads their own department's hiring; getHeadedDepartmentIds() from the
+    // Organization Graph decides which department that is, per row.
+    'talent.view',
     // The ONLY holder of this key, and the only role requireTeamLead() admits. It grants no approval
     // authority: department_head holds no HR section in ROLE_SECTIONS and approverRole() returns
     // nothing for it, so a department head can decide a request today only by being that employee's
@@ -1496,7 +1601,9 @@ export type PermissionAction = 'view' | 'edit' | 'delete' | 'export';
  * If user has no custom roles, returns false (caller can fall through to legacy can()).
  */
 export async function userCanAccess(userId: string, pageKey: string, action: PermissionAction): Promise<boolean> {
-  const userRolesRows = await (await database()).select({ roleId: userRoleAssignments.roleId })
+  // The projection's shape, stated rather than inferred: database() is imported lazily and is
+  // therefore untyped, so its rows arrive as `any`. role_id is uuid NOT NULL in src/lib/db/schema.ts.
+  const userRolesRows: { roleId: string }[] = await (await database()).select({ roleId: userRoleAssignments.roleId })
     .from(userRoleAssignments)
     .where(eq(userRoleAssignments.userId, userId));
   if (userRolesRows.length === 0) return false;
@@ -1529,19 +1636,34 @@ const ROLE_SECTIONS: Record<string, string[]> = {
     'projects',
     'roles', 'departments', 'interviews', 'interviews_manual', 'interviews_ai',
     'events', 'content', 'custom_offer',
+    // TALENT-TO-ORGANIZATION. Added here for exactly the reason the 'projects' note above gives, and
+    // it is the single most common way a new console ships unreachable on this project: the section
+    // gate in middleware.ts and the capability gate on the page are TWO doors, and a role granted the
+    // key without the section is bounced before the page's own check ever runs. `hr` holds
+    // talent.view, talent.manage, onboarding.approve and identity.manage, so it is offered all three
+    // sections it can act in. NOT 'talent_access' — access administration is a separate desk (spec
+    // 35), and `hr` is not granted access.manage above.
+    'talent', 'talent_onboarding', 'talent_identity',
   ],
   recruiter: [
     'dashboard', 'applications', 'offers', 'messages', 'dms',
     'roles', 'interviews', 'interviews_manual', 'interviews_ai',
     'tests', 'tests_proctoring', 'custom_offer',
+    // The hiring desk reaches the talent console and nothing past it. No onboarding, no identity
+    // registry, no access administration.
+    'talent',
   ],
   reviewer: [
     'dashboard', 'applications', 'interviews', 'interviews_manual', 'interviews_ai',
     'tests', 'tests_proctoring',
+    // Opens the console; the evaluation queue inside it is filtered to their own assignments in SQL.
+    'talent',
   ],
   department_head: [
     'dashboard', 'applications', 'offers', 'roles',
     'interviews', 'interviews_manual', 'interviews_ai', 'custom_offer',
+    // Opens the console; scoped to their own department in SQL, from the Organization Graph.
+    'talent',
   ],
   marketing: [
     'dashboard', 'content', 'products', 'events',
@@ -1623,11 +1745,11 @@ export function defaultSectionKeysForRole(role: string): Set<string> | null {
 export async function getViewableSectionKeys(user: { id: string; role: string } | null): Promise<Set<string> | null> {
   if (!user) return new Set();
   if (user.role === 'super_admin') return null;
-  const assigns = await (await database()).select({ roleId: userRoleAssignments.roleId })
+  const assigns: { roleId: string }[] = await (await database()).select({ roleId: userRoleAssignments.roleId })
     .from(userRoleAssignments)
     .where(eq(userRoleAssignments.userId, user.id));
   if (assigns.length > 0) {
-    const roleIds = assigns.map(r => r.roleId);
+    const roleIds = assigns.map((r) => r.roleId);
     const perms = await (await database()).select({ pageKey: rolePermissions.pageKey, canView: rolePermissions.canView })
       .from(rolePermissions)
       .where(inArray(rolePermissions.roleId, roleIds));

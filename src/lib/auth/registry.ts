@@ -462,6 +462,17 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     group: 'People',
     description: 'Open one human as one record: which login, application and employee record are the same person and how each of those links was established, the employment values somebody typed, the skills they have recorded with a checked level shown differently from a stated one, the certificates this platform issued, and the reporting line resolved from the Organization Graph. It adds no data anybody with the people desk cannot already open one screen at a time — what it adds is the join and the labelling. It never reads wellness, pay, bank details, date of birth or gender, and there is no score, rating or prediction about a person anywhere behind it.',
   },
+  // GRANTED TO NO BUILT-IN ROLE, DELIBERATELY, and catalogued anyway so an administrator can read
+  // what it means before granting it rather than discovering it only in code. Holding it is
+  // NECESSARY AND NOT SUFFICIENT: src/lib/hr-intelligence/access.ts checks the key, a purpose stated
+  // for that particular read, and the subject's recorded unexpired consent as three separate
+  // questions, and failing any one of them drops the reader back to the ordinary HR view.
+  'people.intelligence.foundational': {
+    label: 'Open the foundational computation detail behind a reading',
+    group: 'People',
+    description: 'See the deep computation underneath a derived statement on a person\'s HR intelligence record, including any traditional computational method a registered provider supplies. THE PEOPLE DESK KEY DOES NOT CONFER THIS and cannot be used to reach it: HR sees actionable intelligence, and this tier is a separate decision about a separate kind of reading. It opens nothing on its own — the read also needs a purpose typed for that specific occasion and the subject\'s consent on record and unexpired, both checked independently, and this platform has no consent registry for the purpose, so today the answer is always that consent is not on record. Anything a provider returns is kept apart from the professional interpretation of it, is never presented as established scientific fact, and always ranks below work the person demonstrably did: a reading that cannot name the demonstrated evidence outranking it is refused rather than shown. No provider is registered on this platform.',
+    sensitive: true,
+  },
   'skills.administer': {
     label: 'Maintain the skill graph and person identity',
     group: 'People',
@@ -698,6 +709,90 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     label: 'Enrol interns and record their mentor and manager',
     group: 'People',
     description: 'Put a named person onto an internship programme with a start date and an end date, record which mentor and which reporting manager the Organization Graph should name for them, and close the enrolment as completed or withdrawn with a written reason. SENSITIVE because an enrolment is what binds a person to a rule set — the ceiling, the required hours, the credit conversion and the rubric they will be measured under — so moving somebody between programmes changes what their record will say without touching a single hour. It confers NO authority over anybody: the mentor and manager edges it records are rows in the Organization Graph, and every later question — may this person verify these hours, approve this week, assess this outcome — is answered per row from that graph at the write, never from this key. It verifies no hours, grades nobody, and awards nothing.',
+    sensitive: true,
+  },
+
+  // ---------------------------------------------------------------------------------------------
+  // TALENT-TO-ORGANIZATION — docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md.
+  //
+  // SIX OF THE NINE ARE SENSITIVE, and the test for that flag here is the one this catalogue already
+  // uses: does holding it decide what somebody's record says about them, or decide what another
+  // person may reach? Selecting a candidate, admitting them to the organization, issuing the
+  // authorization that lets them in, creating the identity every later grant hangs off, editing the
+  // access policy, and opening a person's government identity documents all answer yes.
+  // ---------------------------------------------------------------------------------------------
+  'talent.view': {
+    label: 'Open the talent console',
+    group: 'Hiring',
+    description: 'Read the recruitment-to-organization console: opportunities, candidates, selection stages and the onboarding queue. It shows no scores an evaluator has not submitted, no identity documents, and no payroll. WHICH records a holder actually sees is decided per row — an evaluator sees their own assignments, a department head their own department, a hiring manager their own opportunities — so this key opens the surface and never widens the set behind it.',
+  },
+  'talent.manage': {
+    label: 'Run recruitment',
+    group: 'Hiring',
+    description: 'Create and publish opportunities, configure the selection pipeline an opportunity runs, assign evaluators, manage recruitment sources, and move a candidate between stages. It decides nothing about a candidate: a stage outcome is a record of what happened, and the selection decision itself needs its own key.',
+  },
+  'selection.decide': {
+    label: 'Record a selection decision',
+    group: 'Hiring',
+    description: 'Record that a candidate is selected, waitlisted or not selected, with a written reason and the deciding person\'s own name attached permanently. SENSITIVE because this row is what every later act in the lifecycle descends from — an onboarding code may only be issued against it, and no assessment score, proctoring flag or model output can produce one: the deciding account is a NOT NULL column precisely so an automated selection cannot be expressed. It does not admit anybody to the organization; approving a selected candidate for onboarding is a separate desk and a separate key.',
+    sensitive: true,
+  },
+  'selection.approve_onboarding': {
+    label: 'Approve a selected candidate for onboarding',
+    group: 'People',
+    description: 'The second act after a selection decision: confirm that a selected candidate may be admitted to the onboarding system. SENSITIVE because it is the gate an onboarding code is issued against, and separating it from the decision is what stops one person taking somebody from applicant to employee alone. It creates no code and no identity.',
+    sensitive: true,
+  },
+  'onboarding.code.issue': {
+    label: 'Issue and revoke onboarding codes',
+    group: 'People',
+    description: 'Generate the authorization a selected candidate uses to enter onboarding, and revoke, extend or reissue one. The secret is shown once at generation and is never recoverable afterwards — not from this console, not from the database, not from the logs — so no holder of this key can read back a code somebody already has. SENSITIVE because the code is what lets a person begin becoming an organizational identity. It grants that person NOTHING else: a redeemed code opens one onboarding form and touches no department, no system and no permission.',
+    sensitive: true,
+  },
+  'onboarding.approve': {
+    label: 'Approve a completed onboarding',
+    group: 'People',
+    description: 'Review a submitted onboarding — its answers and its document references — and approve it, request changes, or refuse it with a reason. SENSITIVE because approval is what creates the organizational identity every later access grant hangs off. Opening a candidate\'s government identity documents needs its own key on top of this one.',
+    sensitive: true,
+  },
+  'identity.manage': {
+    label: 'Create and change organizational identities',
+    group: 'People',
+    description: 'Issue an identity code, and suspend, terminate, transfer or convert an identity with a written reason. SENSITIVE because an identity\'s status is the first term in every access calculation: a suspended identity resolves to no access at all, whatever else it holds. Codes are immutable and never reused, including after termination, so this key can void an identity and can never renumber one.',
+    sensitive: true,
+  },
+  'access.manage': {
+    label: 'Administer access groups and policy',
+    group: 'System',
+    description: 'Define access groups, decide which groups a department, a position or an identity type implies, review a generated access proposal before it is provisioned, and grant time-bounded access by hand. SENSITIVE because it decides what everybody else can reach. Access is DERIVED from identity, position, department and status — a manual grant is an exception, is always time-bounded, and stays visibly marked as manual in every later reconciliation.',
+    sensitive: true,
+  },
+  'document.view_sensitive': {
+    label: 'Open identity documents',
+    group: 'People',
+    description: 'Open the government-identity and tax-registration references a joiner submits, as opposed to the ordinary academic and experience documents. SENSITIVE because these are the most personal records the platform touches. Every open is written to the audit log with a reason BEFORE the link is revealed, on the same terms as a legal-hold access, and the document itself lives in the person\'s own drive — this key controls the reference, and cannot revoke the file.',
+    sensitive: true,
+  },
+
+  // ---------------------------------------------------------------------------------------------
+  // HORIZON PROFESSIONAL INTERPRETATION (PATCH 03). Three keys over one body of data, split by act.
+  // ---------------------------------------------------------------------------------------------
+  'horizon.interpretation.view': {
+    label: 'View professional interpretations',
+    group: 'People',
+    description: 'See the neutral professional dimensions the interpretation layer produces about a named person - the level, the confidence, the plain-language explanation, the professional implications and the limitations. SENSITIVE because what sits behind it is an INFERENCE drawn from indirect inputs, which is the weakest thing this platform holds about anybody and the easiest to misread as a finding. Every open requires a stated purpose and writes an audit row BEFORE anything is returned; a read that cannot be logged returns a refusal rather than the data. It shows no internal computation, and it decides nothing: no hiring, rejection, promotion, termination or disciplinary decision may be made or supported on what it shows.',
+    sensitive: true,
+  },
+  'horizon.interpretation.compute': {
+    label: 'Produce a professional interpretation',
+    group: 'People',
+    description: 'Cause the interpretation layer to read the foundational input for a named person and record a new interpretation against them. SENSITIVE because it creates a durable record about somebody rather than reading one, and because a record that says the system declined to interpret is as consequential as one that says it did. It is refused outright when no consent reference is attached to the input, before any arithmetic runs. It confers no authority to act on the result and no sight of the computation behind it.',
+    sensitive: true,
+  },
+  'horizon.interpretation.trace': {
+    label: 'Open the interpretation trace',
+    group: 'People',
+    description: 'See which upstream inputs produced each professional dimension and the arithmetic that combined them - the explainability record and the fingerprint that links an interpretation back to the input it came from. SENSITIVE, and deliberately the narrowest of the three: this is the internal computation detail, and a role without this key does not merely get a screen that declines to render it - the fields are absent from the object that role receives. It is the key that makes an interpretation auditable, so a grant of it must be provably on the record.',
     sensitive: true,
   },
 };

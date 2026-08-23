@@ -2179,8 +2179,13 @@ export async function claimCountsBySkill(skillIds: readonly string[]): Promise<S
       // An unrecognised level or kind is NOT folded into the nearest known one: a row this module
       // cannot name is left out of the ladder and said so in the sentence, rather than quietly
       // counted as something it may not be.
-      if (isEvidenceLevel(r.evidence_level)) entry.byLevel[r.evidence_level] += n;
-      if (isSubjectKind(r.subject_kind)) entry.byKind[r.subject_kind] += n;
+      // Read into a local first: rowsOf() hands back untyped rows, and a guard applied straight to
+      // a property of one narrows nothing, so the counter below would have been indexed by an
+      // unchecked value.
+      const level: unknown = r.evidence_level;
+      const kind: unknown = r.subject_kind;
+      if (isEvidenceLevel(level)) entry.byLevel[level] += n;
+      if (isSubjectKind(kind)) entry.byKind[kind] += n;
       entry.claims += n;
       entry.evidenceRows += Number(r.ev) || 0;
       total += n;
