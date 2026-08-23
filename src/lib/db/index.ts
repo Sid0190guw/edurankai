@@ -90,3 +90,45 @@ export function sqlClient(): ReturnType<typeof postgres> {
 export async function getDb(_runtimeEnv?: any) {
   return db;
 }
+
+// A DATABASE THAT NEVER ANSWERS MUST NOT BECOME A PAGE THAT NEVER LOADS.
+//
+// On 2026-08-23 at 07:01 UTC every route that queries Postgres stopped responding — not with an
+// error, with nothing at all: no status, no body, requests held open past 100 seconds. Routes that
+// touch no table (/about, /portal/login) kept serving in ~0.3s throughout, which is how we know the
+// function was healthy and the database was not. /api/health, whose whole contract is to return 503
+// when the database is unreachable, hung with the rest of them, so nothing anywhere reported an
+// outage that had been running for a quarter of an hour.
+//
+// connect_timeout does not cover this case. The transaction pooler accepts the TCP connection and
+// completes authentication perfectly well; it is the QUERY that never comes back, because the
+// pooler has no upstream session to hand it to. From the client's side the connection looks
+// healthy, so postgres-js waits — and it has no query timeout of its own to wait against. With
+// max:1, the invocation behind it waits too.
+//
+// This bounds the wait. It does NOT make queries succeed and it is not a fix for the database being
+// down; it converts an infinite hang into a rejected promise, which the caller can already handle —
+// most of them are wrapped in a try/catch with a fallback that has never had the chance to run.
+//
+// Deliberately shorter than any gateway timeout, so the page decides what a visitor sees rather
+// than the platform.
+export const DB_TIMEOUT_MS = Number(process.env.DB_TIMEOUT_MS || 8000);
+
+export class DbTimeoutError extends Error {
+  constructor(label: string, ms: number) {
+    super('database did not answer within ' + ms + 'ms (' + label + ')');
+    this.name = 'DbTimeoutError';
+  }
+}
+
+export function withDbTimeout<T>(work: Promise<T>, label: string, ms: number = DB_TIMEOUT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    work,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new DbTimeoutError(label, ms)), ms);
+    }),
+    // The losing promise keeps running; only the waiting stops. Clearing the timer matters because
+    // a pending timeout keeps the serverless instance's event loop alive after the response is sent.
+  ]).finally(() => clearTimeout(timer!)) as Promise<T>;
+}

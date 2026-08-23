@@ -36,6 +36,11 @@
 //      The names stay on /api/health/deep and on the /admin/ops bootstrap panel.
 import type { APIRoute } from 'astro';
 import { quickHealth, publicErrorSummary } from '@/lib/observability-health';
+// A health check that can hang is not a health check. On 2026-08-23 this route held requests open
+// past 100 seconds while the database was unreachable, so the one endpoint whose entire job is to
+// turn an outage into a 503 reported nothing at all for the quarter hour the site was down. The
+// catch below was always correct; it simply never ran, because the query never rejected.
+import { withDbTimeout } from '@/lib/db';
 
 export const prerender = false;
 
@@ -48,7 +53,10 @@ const json = (body: any, status: number): Response =>
 
 export const GET: APIRoute = async () => {
   try {
-    const h = await quickHealth();
+    // 5s, not the default: this route is polled by a monitor, and a monitor that waits is a monitor
+    // that misses. A database this far past a warm round trip (~140ms measured) is already an
+    // outage, whatever it eventually answers.
+    const h = await withDbTimeout(quickHealth(), 'health.quick', 5000);
     // Scrubbed once, then used for BOTH the database field and the checks array — the raw reason
     // reached the public body through two paths, and fixing only one of them would have been worse
     // than fixing neither, because it would read as fixed.
@@ -72,13 +80,19 @@ export const GET: APIRoute = async () => {
     // a Postgres failure lives on e.cause, never on e.message) recorded where operators can read it
     // — edu_error_log gets it unredacted, the response gets the scrubbed class.
     const message = publicErrorSummary(e?.cause?.message || e?.message || 'health check failed');
-    try { const { trackError } = await import('@/lib/logger'); await trackError('health.check_failed', e, {}); } catch { /* never let logging mask the outage */ }
+    // BOUNDED, because this writes to edu_error_log — the same database that has just failed to
+    // answer. An unbounded await here would hang the 503 exactly as long as the check it is
+    // reporting on, which is how the failure path becomes the failure.
+    try {
+      const { trackError } = await import('@/lib/logger');
+      await withDbTimeout(trackError('health.check_failed', e, {}), 'health.trackError', 2000);
+    } catch { /* never let logging mask the outage */ }
     return json({ status: 'down', at: new Date().toISOString(), database: { ok: false, latencyMs: -1, error: message }, checks: [{ name: 'database', ok: false, critical: true, detail: message }] }, 503);
   }
 };
 
 // HEAD, so an uptime monitor can poll for the status code alone without transferring a body.
 export const HEAD: APIRoute = async () => {
-  const h = await quickHealth().catch(() => null);
+  const h = await withDbTimeout(quickHealth(), 'health.quick.head', 5000).catch(() => null);
   return new Response(null, { status: h ? h.httpCode : 503, headers: { 'cache-control': 'no-store, max-age=0' } });
 };
