@@ -1,4 +1,4 @@
-﻿// DB connection - simplified for Vercel (Node.js runtime)
+// DB connection - simplified for Vercel (Node.js runtime)
 // Local dev also uses Node, so single driver works everywhere
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
@@ -38,10 +38,18 @@ function connect(): any {
   // in sequence anyway. idle_timeout hands it back between bursts, max_lifetime recycles it, and
   // connect_timeout turns a saturated pooler into a fast, loggable error rather than a hang that
   // reads from outside as the whole site being down.
+  //
+  // idle_timeout WAS 20, and that was measurably wrong. The function region and the database region
+  // differ, so re-establishing a connection costs a TCP handshake, a TLS handshake and Postgres auth
+  // across that distance -- measured at ~1.4s against a ~177ms warm round trip. At 20 seconds, an
+  // instance serving anything less than constant traffic dropped its connection between almost every
+  // request and paid that 1.4s again, which is a worse experience than the leak this was fixing.
+  // 300s keeps a working instance warm while still handing the connection back when it goes quiet;
+  // max:1 is what actually bounds pooler usage, so a longer idle window costs nothing there.
   _client = postgres(connectionString, {
     prepare: false,
     max: 1,
-    idle_timeout: 20,
+    idle_timeout: 300,
     max_lifetime: 60 * 30,
     connect_timeout: 10,
   });
