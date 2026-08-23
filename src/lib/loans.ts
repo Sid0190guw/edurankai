@@ -518,7 +518,6 @@ export async function requestLoan(input: LoanRequestInput): Promise<LoanResult> 
   if (startMonth < 1 || startMonth > 12) return { ok: false, error: 'Pick the month recovery starts in.' };
   if (startYear < 2000 || startYear > 2100) return { ok: false, error: 'That is not a year this payroll covers.' };
 
-  const currency = String(input?.currency || 'INR').slice(0, 8) || 'INR';
   const requestedBy = isUuid(input?.requestedByUserId) ? String(input.requestedByUserId) : null;
 
   // THE ARITHMETIC, FROZEN ONTO THE ROW. See the header: flat, simple, uncompounded, and stated in
@@ -537,6 +536,19 @@ export async function requestLoan(input: LoanRequestInput): Promise<LoanResult> 
     if (emp.is_active === false) {
       return { ok: false, error: 'That employee record is closed. Somebody who has left cannot take a new loan; anything outstanding is settled on their exit instead.' };
     }
+
+    // THE UNIT COMES OFF THE EMPLOYEE RECORD, NOT OFF A DEFAULT.
+    //
+    // This used to read `String(input?.currency || 'INR')`, and NEITHER caller passes a currency —
+    // not the portal loan form and not /admin/hr/payroll/loans. So every salary advance and every
+    // loan in this system was stamped INR, including for anyone HR pays in something else, and the
+    // amount then rendered next to the wrong symbol on the request, the approval and the payslip.
+    //
+    // The employee row is already being selected here for the is_active check, so the column is
+    // free. An explicit input still wins, because the admin form may one day offer the choice; the
+    // fallback is now the person's own recorded currency and only then INR. Resolved AFTER the read
+    // rather than above it: `const` is not hoisted, and the value depends on `emp`.
+    const currency = String(input?.currency || emp.currency || 'INR').slice(0, 8) || 'INR';
 
     // ONE LIVE AGREEMENT OF EACH KIND AT A TIME. Two overlapping advances mean two deductions in one
     // month against a net that may not carry them, and the person finds out on payday.
