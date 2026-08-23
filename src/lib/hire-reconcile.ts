@@ -184,33 +184,126 @@ export interface EmployeeNoAccount {
   email: string | null;
   joiningDate: string | null;
   reason: string;
+  /**
+   * WHICH of the four ways this can be true. The page groups on it, because only two of them are
+   * somebody's problem today.
+   *
+   *   'no-address-matches'  nothing on the record matches any account. THIS IS THE STRANDED ONE.
+   *   'account-deleted'     user_id points at a users row that is gone.
+   *   'two-accounts-match'  two accounts answer to addresses on this record; the gate refuses to
+   *                         guess, so the person is refused too.
+   *   'awaiting-first-signin'  exactly one account matches an address on file. Nobody is stuck:
+   *                         the gate resolves them by email and stamps user_id on first sign-in.
+   */
+  state: 'no-address-matches' | 'account-deleted' | 'two-accounts-match' | 'awaiting-first-signin';
+  /** False for 'awaiting-first-signin'. True when a human has to do something. */
+  blocked: boolean;
 }
 
 /**
  * On the register, and cannot sign in.
  *
- * Two different facts, and the row says which: user_id is NULL (nobody ever linked an account), or
- * user_id points at a users row that is no longer there.
+ * =================================================================================================
+ * THIS CHECK USED TO ASK A DIFFERENT QUESTION FROM THE DOOR, AND SO IT CRIED WOLF
+ * =================================================================================================
+ *
+ * It listed every active employee with `user_id IS NULL`. But user_id is NOT the link the workspace
+ * gate uses. src/lib/auth/workspace-access.ts:317-362 tries user_id first and then FALLS BACK to
+ * `work_email`, `personal_email` and `email`, matched case-insensitively against users.email — and
+ * on a match it BACKFILLS user_id so the next request takes the indexed path. So every employee who
+ * simply had not signed in yet appeared here as "cannot sign in", beside the people who genuinely
+ * cannot, with nothing distinguishing them. That count also fed `urgentCount`.
+ *
+ * A list that is mostly false is not read, and this one had a true row in it. On 2026-08-23 a joiner
+ * emailed to say she could not find anywhere to mark her attendance. She was on the applicant shell
+ * because the gate could not resolve her to an employee record; the state that would have shown that
+ * to HR before she wrote in was buried in a list of colleagues who were perfectly fine.
+ *
+ * So this now asks EXACTLY what the gate asks, and reports the four distinct answers. Only three of
+ * them are a person to act on; `awaiting-first-signin` is carried so the page can say "and N more
+ * will resolve themselves", which is a different sentence from silence.
+ *
+ * Matched on all THREE address columns, including work_email — the old row rendered
+ * `COALESCE(email, personal_email)`, so the address printed on screen was not necessarily the
+ * address the gate would have matched on.
+ *
+ * NO WRITE. This resolves nothing; the backfill belongs to the sign-in path where the account is
+ * proven, not to a report that could stamp a guess onto somebody's record.
  */
 export async function employeesWithoutAccount(limit = 50): Promise<Check<EmployeeNoAccount>> {
   return check('employeesWithoutAccount', async () => rowsOf(await db.execute(sql`
-    SELECT e.id, e.full_name, e.employee_code, COALESCE(e.email, e.personal_email) AS email,
-           e.joining_date, (e.user_id IS NULL) AS never_linked
+    SELECT e.id, e.full_name, e.employee_code, e.joining_date,
+           COALESCE(e.work_email, e.email, e.personal_email) AS email,
+           (e.user_id IS NULL) AS never_linked,
+           (e.user_id IS NOT NULL AND u.id IS NULL) AS account_deleted,
+           (SELECT COUNT(*) FROM users m
+             WHERE lower(m.email) IN (
+               lower(COALESCE(e.work_email, '')),
+               lower(COALESCE(e.personal_email, '')),
+               lower(COALESCE(e.email, ''))
+             )
+               AND COALESCE(e.work_email, e.personal_email, e.email) IS NOT NULL
+           )::int AS matching_accounts
       FROM hr_employees e
       LEFT JOIN users u ON u.id = e.user_id
      WHERE e.is_active = true
        AND (e.user_id IS NULL OR u.id IS NULL)
      ORDER BY e.joining_date DESC NULLS LAST, e.created_at DESC
-     LIMIT ${cap(limit)}`)).map((r: any) => ({
+     LIMIT ${cap(limit)}`)).map(classifyNoAccount));
+}
+
+/**
+ * One row of that query, turned into one of the four states. PURE, exported, and tested in
+ * src/lib/hire-reconcile.test.ts — the whole value of this check is that it agrees with
+ * src/lib/auth/workspace-access.ts, and an agreement nothing asserts is an agreement that lasts
+ * until the next edit.
+ */
+export function classifyNoAccount(r: any): EmployeeNoAccount {
+  const base = {
     employeeId: String(r.id),
     fullName: String(r.full_name || ''),
     employeeCode: r.employee_code ? String(r.employee_code) : null,
     email: r.email ? String(r.email) : null,
     joiningDate: dateOnly(r.joining_date),
-    reason: r.never_linked
-      ? 'No account has ever been linked to this employee record.'
-      : 'The account this record points at no longer exists.',
-  })));
+  };
+  const matches = Number(r.matching_accounts) || 0;
+
+  // Order matters: a dangling user_id is a fact about THIS record and outranks whatever the address
+  // columns would have matched, because the gate's PRIMARY lookup is the one that failed.
+  if (r.account_deleted) {
+    return {
+      ...base,
+      state: 'account-deleted',
+      blocked: true,
+      reason: 'The account this record points at no longer exists. Nothing will resolve this on its own.',
+    };
+  }
+  if (matches > 1) {
+    return {
+      ...base,
+      state: 'two-accounts-match',
+      blocked: true,
+      reason: 'More than one account answers to an address on this record, so the workspace gate '
+        + 'refuses to guess which one is theirs. Leave one address on this record only.',
+    };
+  }
+  if (matches === 1) {
+    return {
+      ...base,
+      state: 'awaiting-first-signin',
+      blocked: false,
+      reason: 'An account already exists for an address on this record. They are linked the first '
+        + 'time they sign in with it; nobody needs to do anything.',
+    };
+  }
+  return {
+    ...base,
+    state: 'no-address-matches',
+    blocked: true,
+    reason: 'No account anywhere matches the work, personal or contact address on this record, so '
+      + 'signing in gives them the applicant view with no workspace and no attendance. Put the '
+      + 'address they actually sign in with on this record.',
+  };
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -705,7 +798,11 @@ export async function reconciliationReport(): Promise<ReconciliationReport> {
     // Deliberately NOT every list. Onboarding still running and an offer that lapsed are ordinary;
     // a signed hire with no record, a person who cannot sign in, a leaver still active and a leaver
     // still on the graph are each somebody stuck or somebody holding access they should not.
-    urgentCount: signedNoEmployee.rows.length + handoffs.rows.length + noAccount.rows.length
+    // noAccount counts only the BLOCKED rows. An employee whose address already has an account is
+    // linked the moment they sign in, and counting them as urgent is how this number stopped meaning
+    // anything — see the note on employeesWithoutAccount().
+    urgentCount: signedNoEmployee.rows.length + handoffs.rows.length
+      + noAccount.rows.filter((r) => r.blocked).length
       + openLeavers.rows.length + openEdges.rows.length + exitsWithReports.rows.length,
     failedChecks: all.filter((c) => c.error).length,
   };
