@@ -34,7 +34,12 @@ const seeds = [
   { key: 'hiring_response_sla_days', value: '5', category: 'hiring', label: 'Application response SLA (days)', description: 'How many business days to respond to applicants', input_type: 'number' },
   { key: 'hiring_internship_duration', value: '3 months', category: 'hiring', label: 'Default internship duration', description: '', input_type: 'text' },
   { key: 'hiring_apprenticeship_duration', value: '6 months', category: 'hiring', label: 'Default apprenticeship duration', description: '', input_type: 'text' },
-  { key: 'hiring_remote_default', value: 'true', category: 'hiring', label: 'Remote-first default', description: 'New roles default to remote', input_type: 'bool' },
+  // Was 'hiring_remote_default' = true, "New roles default to remote". Nothing here is remote
+  // (src/lib/work-mode.ts): permanent engagements are on site and only internships and
+  // apprenticeships may be hybrid. A seeded default that says otherwise is how the wrong mode
+  // gets back onto a new role, so the setting now records the mode a new role starts in and
+  // the only two values it may hold.
+  { key: 'hiring_default_work_mode', value: 'on-site', category: 'hiring', label: 'Default work mode for new roles', description: 'on-site, or hybrid (internships and apprenticeships only). Never remote.', input_type: 'text' },
 
   // Feature flags
   { key: 'feature_applicant_portal', value: 'true', category: 'features', label: 'Applicant portal enabled', description: 'Allow applicants to log in and track', input_type: 'bool' },
@@ -42,6 +47,17 @@ const seeds = [
   { key: 'feature_signup_enabled', value: 'true', category: 'features', label: 'Public signup enabled', description: 'Allow new applicants to create accounts', input_type: 'bool' },
   { key: 'feature_maintenance_mode', value: 'false', category: 'features', label: 'Maintenance mode', description: 'Show maintenance page to all public visitors', input_type: 'bool' }
 ];
+
+// Keys that were seeded once and are now wrong. The loop below only ever INSERTs when a key is
+// absent, so renaming a seed leaves the old row sitting in an already-seeded database forever --
+// 'hiring_remote_default' = true ("New roles default to remote") would have survived this rename
+// on production and gone on contradicting the policy in src/lib/work-mode.ts, beside the new key
+// rather than instead of it.
+const RETIRED_KEYS = ['hiring_remote_default'];
+for (const key of RETIRED_KEYS) {
+  const gone = await sql`DELETE FROM site_settings WHERE key = ${key} RETURNING key`;
+  console.log(gone.length ? "  retired: " + key : "  absent:  " + key);
+}
 
 for (const s of seeds) {
   const exists = await sql`SELECT key FROM site_settings WHERE key = ${s.key}`;

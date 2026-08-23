@@ -585,7 +585,10 @@ export function offerEngagementSentence(
   p: EngagementPolicy,
   agreed: { workMode?: string | null; duration?: string | null; hoursCommitment?: string | null } = {},
 ): string {
-  const mode = (agreed.workMode || '').trim() || 'Remote';
+  // Defaults to on site, never remote. An offer letter saved before the work-mode policy existed
+  // has no agreed mode at all, and this line used to fill that gap with "Remote" -- putting a
+  // promise of remote work into a letter nobody had agreed to. See src/lib/work-mode.ts.
+  const mode = (agreed.workMode || '').trim() || 'On-Site';
   const term = (agreed.duration || '').trim()
     || (p.durationWeeks ? p.durationWeeks + ' weeks' : 'the agreed term');
   const hours = (agreed.hoursCommitment || '').trim() || describeCommitment(p);

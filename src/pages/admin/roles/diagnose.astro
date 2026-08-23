@@ -12,6 +12,7 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { can } from '@/lib/auth/permissions';
 import { sql } from 'drizzle-orm';
+import { correctedLocation, violatesWorkModePolicy } from '@/lib/work-mode';
 
 // Declared HERE, above the POST handler that uses it. It previously sat below, and `const` is not
 // hoisted — so every Repair run died on "Cannot access 'rows' before initialization" while the
@@ -78,11 +79,66 @@ if (Astro.request.method === 'POST') {
       repairMsg = 'Repair failed: ' + (e?.cause?.message || e?.message || 'unknown');
     }
   }
+
+  // Work-mode repair. The catalogue and every rendering surface were corrected in code, but the
+  // roles ALREADY in this table still carry the string they were imported with -- and that string
+  // is what an exported feed, an offer letter draft and an admin export read. This rewrites only
+  // the rows that contradict the policy, and leaves a role with a genuine bespoke site alone.
+  if (fd.get('_action') === 'work-mode') {
+    try {
+      const candidates = rows(await db.execute(sql`
+        SELECT slug, engagement_type, level, location FROM roles`));
+      const fixes = candidates
+        .filter((r: any) => violatesWorkModePolicy(r.engagement_type, r.level, r.location))
+        .map((r: any) => ({
+          slug: String(r.slug),
+          loc: correctedLocation(r.engagement_type, r.level, r.location),
+        }));
+
+      if (!fixes.length) {
+        repairMsg = 'No role advertises remote work. Nothing to repair.';
+      } else {
+        // ONE statement, not one per role. A round trip per row is what makes a 700-role table take
+        // minutes from a serverless region; the whole correction is a single VALUES join.
+        const pairs = fixes.map((f) => sql`(${f.slug}::varchar, ${f.loc}::varchar)`);
+        await db.execute(sql`
+          UPDATE roles AS r
+             SET location = v.loc, updated_at = now()
+            FROM (VALUES ${sql.join(pairs, sql`, `)}) AS v(slug, loc)
+           WHERE r.slug = v.slug`);
+        const hybrid = fixes.filter((f) => /hybrid/i.test(f.loc)).length;
+        repairMsg = `Work mode corrected on ${fixes.length} role(s): `
+          + `${fixes.length - hybrid} set to on-site, ${hybrid} to on-site / hybrid (internships and apprenticeships). `
+          + `${candidates.length - fixes.length} role(s) were already correct.`;
+      }
+    } catch (e: any) {
+      repairMsg = 'Work-mode repair failed: ' + (e?.cause?.message || e?.message || 'unknown');
+    }
+  }
 }
 
 type Check = { label: string; ok: boolean | null; detail: string };
 const checks: Check[] = [];
 const add = (label: string, ok: boolean | null, detail: string) => checks.push({ label, ok, detail });
+
+// 0. Does any live role still advertise remote work? The careers pages clamp this at render time,
+// so nothing remote is SHOWN either way -- but the stored string is what feeds exports, the public
+// jobs feed's mirror and the offer-letter drafts, so it still has to be corrected.
+try {
+  const wm = rows(await db.execute(sql`SELECT slug, engagement_type, level, location FROM roles`));
+  const bad = wm.filter((r: any) => violatesWorkModePolicy(r.engagement_type, r.level, r.location));
+  add(
+    'Work mode: on-site, hybrid for trainees only',
+    bad.length === 0,
+    bad.length === 0
+      ? `All ${wm.length} role(s) store a location consistent with the policy.`
+      : `${bad.length} of ${wm.length} role(s) still store a remote or wrongly-hybrid location — e.g. `
+        + bad.slice(0, 3).map((r: any) => r.slug + ' ("' + r.location + '")').join(', ')
+        + '. Use "Correct work mode on every role" above.',
+  );
+} catch (e: any) {
+  add('Work mode: on-site, hybrid for trainees only', null, 'Could not read: ' + (e?.cause?.message || e?.message));
+}
 
 const AICTE_COLS = ['keywords', 'learning_outcomes', 'qualification_type', 'qualifications', 'specialisations',
   'no_of_interns', 'perks', 'internship_mode', 'working_days_per_week', 'hours_per_week',
@@ -205,6 +261,16 @@ const failed = checks.filter((c) => c.ok === false).length;
       </button>
       <span style="font-size:11.5px;color:#6e6e78;margin-left:10px;">
         Runs in bulk. Only fills rows that are actually empty, so hand edits are never overwritten.
+      </span>
+    </form>
+
+    <form method="POST" style="margin-bottom:18px;">
+      <input type="hidden" name="_action" value="work-mode" />
+      <button type="submit" style="background:#FF4F00;border:0;color:#fff;font-weight:700;font-size:13px;padding:10px 18px;border-radius:8px;cursor:pointer;">
+        Correct work mode on every role
+      </button>
+      <span style="font-size:11.5px;color:#6e6e78;margin-left:10px;">
+        Permanent roles become on-site; internships and apprenticeships become on-site / hybrid. One statement, and only rows that contradict the policy are touched.
       </span>
     </form>
 

@@ -13,8 +13,12 @@
 //     Post-Quantum Cryptography (covered by 'Quantum Cryptography Intern'), and Quantum
 //     Generative AI / Quantum Reinforcement Learning (both inside 'Quantum AI Intern' scope).
 import type { CatalogRole } from './role-catalog';
+import { locationLabel } from '@/lib/work-mode';
 
-const REMOTE_IN = 'Remote / Hybrid (India)';
+// Work mode is decided by the one policy module, not by a per-file constant: eleven copies of
+// 'Remote / Hybrid (India)' is how every advertised role came to claim remote work. Internships
+// and apprenticeships may be on site or hybrid; nothing here is remote.
+const TRAINEE_LOCATION = locationLabel('hybrid');
 // Fully in person, in India, at a location deliberately not published — this is a high-protocol
 // secure programme. careers/[slug].astro detects that no city is named here and emits only
 // addressCountry in the JobPosting JSON-LD rather than pushing this whole string into
@@ -65,7 +69,7 @@ function role(r: {
     level: 'Intern',
     function: r.about.split('.')[0] + '.',
     engagementType: 'Internship',
-    location: REMOTE_IN,
+    location: TRAINEE_LOCATION,
     duration: r.duration || '3 Months',
     salary: r.salary || 'Unpaid — internship certificate, mentorship, and real project experience',
     about: ABOUT_INTRO + ' ' + r.about,

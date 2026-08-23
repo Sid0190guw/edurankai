@@ -8,8 +8,12 @@
 // Government Relations, Institutional Partnerships, Corporate Affairs, Process Improvement — the
 // role below states plainly what it does differently, and does not restate the neighbour.
 import type { CatalogRole } from './role-catalog';
+import { locationLabel } from '@/lib/work-mode';
 
-const REMOTE_IN = 'Remote / Hybrid (India)';
+// Work mode is decided by the one policy module, not by a per-file constant: eleven copies of
+// 'Remote / Hybrid (India)' is how every advertised role came to claim remote work. Internships
+// and apprenticeships may be on site or hybrid; nothing here is remote.
+const TRAINEE_LOCATION = locationLabel('hybrid');
 
 const STANDARD_TERMS = {
   internshipMode: 'Full-Time' as const,
@@ -50,7 +54,7 @@ function role(r: {
     level: 'Intern',
     function: r.about.split('.')[0] + '.',
     engagementType: 'Internship',
-    location: REMOTE_IN,
+    location: TRAINEE_LOCATION,
     duration: r.duration || '3 Months',
     salary: r.salary || 'Unpaid — internship certificate, mentorship, and real project experience',
     about: ABOUT_INTRO + ' ' + r.about,
