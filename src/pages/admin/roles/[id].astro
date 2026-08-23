@@ -8,6 +8,13 @@ import { logAudit } from '@/lib/audit';
 import { eq, asc, and, ne } from 'drizzle-orm';
 import { getProductOptions, setRoleProducts, getRoleProducts, setRoleOpenings, getRoleOpenings } from '@/lib/role-products';
 import { getRoleAicte, setRoleAicte } from '@/lib/role-aicte';
+import { violatesWorkModePolicy, workModePolicyMessage } from '@/lib/work-mode';
+import { getRoleExtension, setRoleExtension, setJobStatus, statusOf } from '@/lib/xscale/roles-ext';
+import { listDivisions } from '@/lib/xscale/divisions';
+import {
+  JOB_STATUSES, RESEARCH_CLASSIFICATIONS, CAREER_LADDER, SCALE_BANDS,
+  allowedTransitions, classificationEvidence, clampExp, scaleRangeText,
+} from '@/lib/xscale/taxonomy';
 
 const user = Astro.locals.user!;
 const canEdit = can(user, 'roles.edit');
@@ -22,6 +29,13 @@ let currentProducts = await getRoleProducts(id);
 let currentOpenings = await getRoleOpenings(id);
 let currentAicte = await getRoleAicte(id);
 
+// EVERY const BEFORE THE POST HANDLER THAT READS IT. `const` is not hoisted, and a handler placed
+// above its own dependencies throws on its first line while the page still reports success — the
+// failure at the top of this project's working rules, which broke apply step 5 and the roles
+// Repair button.
+let currentExt = await getRoleExtension(id);
+const divisionOptions = (await listDivisions({ includeHidden: true })).rows;
+
 let errorMsg = '';
 let okMsg = '';
 
@@ -35,6 +49,38 @@ if (Astro.request.method === 'POST' && canEdit) {
   const fd = await Astro.request.formData();
   const intent = fd.get('_intent');
 
+  // ---- STATUS TRANSITION. Its own intent, deliberately separate from Save. -------------------
+  //
+  // Publishing and closing a posting are not the same act as editing its wording, and merging them
+  // into one button is how somebody closes a role while fixing a typo. setJobStatus() writes
+  // `is_open` in the same statement: nine existing surfaces filter on that column and know nothing
+  // about job_status, so writing only the new one would produce a Close that closed the posting on
+  // this page and nowhere else.
+  if (intent === 'set_status') {
+    const next = String(fd.get('job_status') || '').toUpperCase();
+    const permitted = allowedTransitions(currentExt.jobStatus || (current.isOpen ? 'PUBLISHED' : 'CLOSED'));
+    if (!permitted.includes(next as any)) {
+      errorMsg = 'That transition is not allowed from the current status. Permitted: ' + permitted.join(', ') + '.';
+    } else {
+      try {
+        await setJobStatus(id, next as any);
+        await logAudit({
+          userId: user.id, action: 'role.status', entity: 'role', entityId: id,
+          diff: { from: currentExt.jobStatus, to: next }, ipAddress: Astro.clientAddress,
+        });
+        currentExt = await getRoleExtension(id);
+        const refreshed = await db.select().from(roles).where(eq(roles.id, id)).limit(1);
+        current = refreshed[0];
+        okMsg = next === 'PUBLISHED'
+          ? 'Published. This posting is now live on the careers site and accepting applications.'
+          : 'Status set to ' + next + '. It is no longer accepting applications, and the submission path refuses it server-side.';
+      } catch (e: any) {
+        console.error('[admin/roles/[id]] status change failed:', e?.cause?.message || e?.message);
+        errorMsg = 'The status was NOT changed: ' + (e?.cause?.message || e?.message || 'unknown database error');
+      }
+    }
+  }
+
   if (intent === 'delete') {
     await db.delete(roles).where(eq(roles.id, id));
     await logAudit({
@@ -47,6 +93,12 @@ if (Astro.request.method === 'POST' && canEdit) {
     });
     return Astro.redirect('/admin/roles');
   }
+
+  // ---- THE SAVE PATH RUNS ONLY FOR A SAVE. ---------------------------------------------------
+  // The status form above posts job_status and nothing else. Without this guard the whole
+  // validate-and-update block below runs on a status change too, roleSchema.safeParse() fails on
+  // the empty title, and the page reports a validation error over a status change that succeeded.
+  if (intent !== 'set_status') {
 
   // AICTE-portal-format fields (stored separately — see src/lib/role-aicte.ts)
   const aicteData = {
@@ -86,8 +138,17 @@ if (Astro.request.method === 'POST' && canEdit) {
 
   const parsed = roleSchema.safeParse(candidate);
 
+  // Same work-mode policy as the create form: on site for permanent roles, hybrid only for
+  // internships and apprenticeships, never remote. Checked on edit too, or the wording just comes
+  // back one role at a time.
+  const workModeProblem = violatesWorkModePolicy(
+    candidate.engagementType as string, candidate.level as string, candidate.location as string,
+  ) ? workModePolicyMessage(candidate.engagementType as string, candidate.level as string) : '';
+
   if (!parsed.success) {
     errorMsg = parsed.error.errors.map((e) => e.path.join('.') + ': ' + e.message).join('  ·  ');
+  } else if (workModeProblem) {
+    errorMsg = workModeProblem;
   } else {
     // ONE try/catch around every write, and the exception is reported, never swallowed. This save
     // had no catch: an update the database refused (the engagement enum holds three labels, this
@@ -108,6 +169,46 @@ if (Astro.request.method === 'POST' && canEdit) {
       await setRoleProducts(id, productTags);
       await setRoleOpenings(id, openings);
       await setRoleAicte(id, aicteData);
+
+      // ---- RESEARCH FACETS ------------------------------------------------------------------
+      // jobStatus is deliberately NOT taken from this form: it has its own intent above. Passing
+      // null here means "leave whatever is there", so saving a wording change cannot unpublish a
+      // live posting as a side effect.
+      const numOrNullField = (name: string): number | null => {
+        const raw = (fd.get(name) as string) || '';
+        if (raw.trim() === '') return null;
+        const n = parseInt(raw, 10);
+        return Number.isFinite(n) ? n : null;
+      };
+      const rawMin = numOrNullField('scaleMinExp');
+      const rawMax = numOrNullField('scaleMaxExp');
+      // Clamped into the declared span, and ordered, so a transposed pair cannot publish a range
+      // that reads backwards.
+      const extMin = rawMin === null ? null : clampExp(rawMin);
+      const extMax = rawMax === null ? null : clampExp(rawMax);
+      const orderedMin = (extMin !== null && extMax !== null) ? Math.min(extMin, extMax) : extMin;
+      const orderedMax = (extMin !== null && extMax !== null) ? Math.max(extMin, extMax) : extMax;
+      const extData = {
+        divisionId: ((fd.get('divisionId') as string) || '').trim() || null,
+        researchClassification: ((fd.get('researchClassification') as string) || '').trim() || null,
+        scaleMinExp: orderedMin,
+        scaleMaxExp: orderedMax,
+        skillCategories: fd.getAll('skillCategories').map((v) => String(v)).filter(Boolean),
+        careerLevel: numOrNullField('careerLevel'),
+        jobStatus: null,
+        validThrough: ((fd.get('validThrough') as string) || '').trim() || null,
+        preferredSkills: parseLines(fd.get('preferredSkills') as string),
+        tools: parseLines(fd.get('tools') as string),
+        deliverables: parseLines(fd.get('deliverables') as string),
+        evaluationCriteria: parseLines(fd.get('evaluationCriteria') as string),
+        reportingTo: ((fd.get('reportingTo') as string) || '').trim() || null,
+        collaboratesWith: parseLines(fd.get('collaboratesWith') as string),
+        applicationInstructions: ((fd.get('applicationInstructions') as string) || '').trim() || null,
+        integrityNote: ((fd.get('integrityNote') as string) || '').trim() || null,
+      };
+      await setRoleExtension(id, { ...extData, jobStatus: currentExt.jobStatus });
+      currentExt = await getRoleExtension(id);
+
       currentProducts = productTags;
       currentOpenings = openings || 0;
       currentAicte = aicteData;
@@ -132,12 +233,42 @@ if (Astro.request.method === 'POST' && canEdit) {
         + ' — the stored role is unchanged. Your edits are still on this form.';
     }
   }
+  } // end save-path guard
 }
 
 const LEVELS = ['C-Level', 'Lead', 'Senior', 'Mid', 'Junior', 'Intern', 'Apprentice'];
 // Exactly the three labels the `engagement_type` Postgres enum accepts. See the note on
 // engagementSchema in src/lib/validators.ts before adding a fourth.
 const ENGAGEMENTS = ['Full-Time', 'Internship', 'Apprenticeship'];
+
+// ---- RESEARCH FACETS: view model. Every comparison is computed HERE, never in the markup — a `<`
+// inside a JSX expression breaks .astro parsing, and so does a typed Record<string,string> map.
+const effective = statusOf({
+  jobStatus: currentExt.jobStatus, isOpen: current.isOpen, applicationDeadline: current.applicationDeadline,
+});
+const declaredStatus = currentExt.jobStatus || (current.isOpen ? 'PUBLISHED' : 'CLOSED');
+const nextStatuses = allowedTransitions(declaredStatus);
+const deadlineOverrides = effective.key !== declaredStatus;
+const hasExtScale = typeof currentExt.scaleMinExp === 'number' && typeof currentExt.scaleMaxExp === 'number';
+const extScaleText = hasExtScale
+  ? scaleRangeText(currentExt.scaleMinExp as number, currentExt.scaleMaxExp as number) : '';
+const extEvidence = classificationEvidence(
+  currentExt.researchClassification, currentExt.scaleMinExp, currentExt.scaleMaxExp,
+);
+const selectedSkillCats = new Set(currentExt.skillCategories);
+const SKILL_CATEGORY_OPTIONS = [
+  'PHYSICS', 'MATHEMATICS', 'CHEMISTRY', 'BIOLOGY', 'MATERIALS', 'NANOENGINEERING', 'QUANTUM',
+  'SEMICONDUCTORS', 'ELECTRONICS', 'COMPUTER_SCIENCE', 'ARTIFICIAL_INTELLIGENCE',
+  'SCIENTIFIC_COMPUTING', 'MECHANICAL_ENGINEERING', 'CIVIL_ENGINEERING', 'AEROSPACE',
+  'ENERGY', 'ENVIRONMENT', 'ASTROPHYSICS', 'COSMOLOGY',
+];
+const extPreferredText = currentExt.preferredSkills.join('\n');
+const extToolsText = currentExt.tools.join('\n');
+const extDeliverablesText = currentExt.deliverables.join('\n');
+const extEvaluationText = currentExt.evaluationCriteria.join('\n');
+const extCollaboratorsText = currentExt.collaboratesWith.join('\n');
+const extValidThrough = currentExt.validThrough ? currentExt.validThrough.slice(0, 10) : '';
+const hasDivisionOptions = divisionOptions.length > 0;
 
 const respText = (current.responsibilities || []).join('\n');
 const skillsText = (current.skills || []).join('\n');
@@ -167,6 +298,40 @@ const eligText = (current.eligibility || []).join('\n');
         {okMsg}
       </div>
     )}
+
+    <!-- ================= PUBLICATION STATUS =================
+         A SEPARATE FORM, deliberately. Publishing and closing a posting are not the same act as
+         editing its wording, and one Save button that does both is how somebody closes a role while
+         fixing a typo. Only the transitions permitted from the current status are offered, and the
+         handler re-checks them server-side — the list here is a convenience, not the gate. -->
+    <div class="admin-card" style="margin-bottom:18px;">
+      <div class="admin-card-title">Publication status</div>
+      <p style="font-size:12.5px;color:#8a8a94;line-height:1.7;margin:8px 0 12px;">
+        Declared status: <strong style="color:#fff;font-family:'Geist Mono',monospace;">{declaredStatus}</strong>.
+        Effective status: <strong style="color:#fff;font-family:'Geist Mono',monospace;">{effective.key}</strong>.
+        {effective.acceptsApplications ? ' This posting is accepting applications.' : ' This posting is NOT accepting applications, and the submission path refuses it server-side — not by hiding the button.'}
+      </p>
+      {deadlineOverrides && (
+        <p style="font-size:12.5px;color:#fbbf24;line-height:1.7;margin:0 0 12px;">
+          The deadline has passed, so the effective status differs from the declared one. The site already
+          treats this posting as closed; the column simply disagrees with the behaviour. Setting it to CLOSED
+          here removes that disagreement.
+        </p>
+      )}
+      {canEdit && (
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          {nextStatuses.map((st) => (
+            <form method="POST">
+              <input type="hidden" name="job_status" value={st} />
+              <button type="submit" name="_intent" value="set_status" class="admin-btn" style="padding:6px 13px;font-size:11.5px;">
+                {st === 'PUBLISHED' ? 'Publish' : 'Set ' + st}
+              </button>
+            </form>
+          ))}
+        </div>
+      )}
+      {!canEdit && <p style="font-size:12px;color:#6e6e78;margin:0;">You hold read access only.</p>}
+    </div>
 
     <form method="POST" class="admin-card" style="display:flex;flex-direction:column;gap:18px;">
 
@@ -238,6 +403,7 @@ const eligText = (current.eligibility || []).join('\n');
         <div>
           <label class="rolefield-label">Location *</label>
           <input name="location" required value={current.location} class="rolefield-input" disabled={!canEdit} />
+          <p class="text-[0.68rem] text-white/40 mt-1">On site for permanent roles. Hybrid only for internships and apprenticeships. Never remote.</p>
         </div>
         <div>
           <label class="rolefield-label">Duration *</label>
@@ -360,6 +526,136 @@ const eligText = (current.eligibility || []).join('\n');
           <input type="checkbox" name="isFeatured" checked={current.isFeatured} disabled={!canEdit} style="accent-color:#FF4F00;width:14px;height:14px;" />
           <span>Featured</span>
         </label>
+      </div>
+
+      <!-- ================= RESEARCH CLASSIFICATION =================
+           Optional on every posting. Leaving the classification and the scale range empty is what a
+           non-research role looks like, and it is the correct state for the ~988 postings that are
+           not research roles — nothing here is required and nothing is defaulted into place. -->
+      <div style="border-top:1px solid #15151a;padding-top:18px;">
+        <div class="admin-card-title" style="margin-bottom:4px;">Research classification</div>
+        <p style="font-size:12px;color:#8a8a94;line-height:1.7;margin:0 0 14px;">
+          Fill these in for a research posting. A scale range published WITHOUT a classification reads to a
+          candidate as a claim about what we can build, so the public page shows the classification and the
+          evidential standing beside the range, every time.
+        </p>
+
+        {hasExtScale && (
+          <p style="font-size:12px;color:#cfd6da;margin:0 0 14px;font-family:'Geist Mono',monospace;">
+            Current: {extScaleText}{extEvidence ? ' — ' + extEvidence.label : ''}
+          </p>
+        )}
+        {extEvidence && (
+          <p style="font-size:12px;color:#c0a35e;line-height:1.7;margin:-8px 0 14px;">{extEvidence.statement}</p>
+        )}
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+          <div>
+            <label class="rolefield-label">Division</label>
+            <select name="divisionId" class="rolefield-input" disabled={!canEdit}>
+              <option value="">Not in a division</option>
+              {divisionOptions.map((d) => (
+                <option value={d.id} selected={currentExt.divisionId === d.id}>{d.name}</option>
+              ))}
+            </select>
+            {!hasDivisionOptions && (
+              <p style="font-size:11px;color:#8a8a94;margin:6px 0 0;line-height:1.6;">
+                No divisions in the register. Either none have been imported, or the migration has not been
+                applied — <a href="/admin/roles/divisions" style="color:#9bd1ff;">Divisions</a> says which.
+              </p>
+            )}
+          </div>
+          <div>
+            <label class="rolefield-label">Research classification</label>
+            <select name="researchClassification" class="rolefield-input" disabled={!canEdit}>
+              <option value="">Not classified</option>
+              {RESEARCH_CLASSIFICATIONS.map((c) => (
+                <option value={c.key} selected={currentExt.researchClassification === c.key}>{c.label}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px;margin-bottom:16px;">
+          <div>
+            <label class="rolefield-label">Scale min (log10 m)</label>
+            <input type="number" name="scaleMinExp" min="-100" max="100" step="1" value={currentExt.scaleMinExp ?? ''} class="rolefield-input" disabled={!canEdit} />
+          </div>
+          <div>
+            <label class="rolefield-label">Scale max (log10 m)</label>
+            <input type="number" name="scaleMaxExp" min="-100" max="100" step="1" value={currentExt.scaleMaxExp ?? ''} class="rolefield-input" disabled={!canEdit} />
+          </div>
+          <div>
+            <label class="rolefield-label">Career rung (0-10)</label>
+            <select name="careerLevel" class="rolefield-input" disabled={!canEdit}>
+              <option value="">Not set</option>
+              {CAREER_LADDER.map((r) => (
+                <option value={String(r.level)} selected={currentExt.careerLevel === r.level}>L{r.level} · {r.label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label class="rolefield-label">Valid through</label>
+            <input type="date" name="validThrough" value={extValidThrough} class="rolefield-input" disabled={!canEdit} />
+          </div>
+        </div>
+
+        <div style="margin-bottom:16px;">
+          <label class="rolefield-label">Disciplines</label>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;">
+            {SKILL_CATEGORY_OPTIONS.map((k) => (
+              <label style="display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:#cfd6da;background:#08080a;border:1px solid #1f1f26;border-radius:6px;padding:5px 9px;cursor:pointer;">
+                <input type="checkbox" name="skillCategories" value={k} checked={selectedSkillCats.has(k)} disabled={!canEdit} style="accent-color:#FF4F00;width:13px;height:13px;" />
+                <span>{k}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+          <div>
+            <label class="rolefield-label">Preferred skills (one per line)</label>
+            <textarea name="preferredSkills" rows="4" class="rolefield-input" disabled={!canEdit}>{extPreferredText}</textarea>
+          </div>
+          <div>
+            <label class="rolefield-label">Tools (one per line)</label>
+            <textarea name="tools" rows="4" class="rolefield-input" disabled={!canEdit}>{extToolsText}</textarea>
+          </div>
+          <div>
+            <label class="rolefield-label">Deliverables (one per line)</label>
+            <textarea name="deliverables" rows="4" class="rolefield-input" disabled={!canEdit}>{extDeliverablesText}</textarea>
+          </div>
+          <div>
+            <label class="rolefield-label">Evaluation criteria (one per line)</label>
+            <textarea name="evaluationCriteria" rows="4" class="rolefield-input" disabled={!canEdit}>{extEvaluationText}</textarea>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+          <div>
+            <label class="rolefield-label">Reports to</label>
+            <input type="text" name="reportingTo" value={currentExt.reportingTo || ''} class="rolefield-input" disabled={!canEdit} />
+          </div>
+          <div>
+            <label class="rolefield-label">Collaborates with (one per line)</label>
+            <textarea name="collaboratesWith" rows="2" class="rolefield-input" disabled={!canEdit}>{extCollaboratorsText}</textarea>
+          </div>
+        </div>
+
+        <div style="margin-bottom:16px;">
+          <label class="rolefield-label">Application instructions</label>
+          <textarea name="applicationInstructions" rows="3" class="rolefield-input" disabled={!canEdit}>{currentExt.applicationInstructions || ''}</textarea>
+        </div>
+
+        <div>
+          <label class="rolefield-label">Integrity note — what this work is, and what it is not</label>
+          <textarea name="integrityNote" rows="4" class="rolefield-input" disabled={!canEdit}>{currentExt.integrityNote || ''}</textarea>
+          <p style="font-size:11px;color:#8a8a94;margin:6px 0 0;line-height:1.6;">
+            Shown on the public posting, above the apply button. This is where a speculative programme says so
+            in the words a specialist would use. Do not leave it empty on a posting whose scale range sits where
+            no experiment reaches.
+          </p>
+        </div>
       </div>
 
       {canEdit && (

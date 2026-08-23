@@ -10,6 +10,15 @@ import {
   describeCommitment, describeProgrammeTotal, commitmentFacts, isInternshipPolicy,
   aicteCreditEquivalent, AICTE_HOURS_PER_CREDIT,
 } from '@/lib/engagement-policy';
+import { stripOwnershipPromise } from '@/lib/compensation-text';
+import { resolveWorkMode, displayLocation, workModeSentence, jobLocationType } from '@/lib/work-mode';
+import ScaleStrip from '@/components/careers/ScaleStrip.astro';
+import { getRoleExtension } from '@/lib/xscale/roles-ext';
+import { getDivisionById } from '@/lib/xscale/divisions';
+import {
+  SCALE_DISCLAIMER, careerRung, classificationDef, classificationEvidence, effectiveJobStatus,
+  scaleRangeText, skillCategoryLabel,
+} from '@/lib/xscale/taxonomy';
 
 const { slug } = Astro.params;
 if (!slug) return Astro.redirect('/careers');
@@ -18,7 +27,37 @@ const found = await db.select().from(roles).where(eq(roles.slug, slug)).limit(1)
 if (found.length === 0) return Astro.redirect('/careers');
 
 const r = found[0];
-if (!r.isOpen) return Astro.redirect('/careers');
+
+// A CLOSED POSTING IS SHOWN AS CLOSED. It used to redirect to /careers, which is the wrong answer to
+// two different questions at once: somebody following a link they were sent is told nothing about
+// what happened to the role, and somebody mid-application is dropped on a list with no explanation.
+// Worse, a redirect made "closed" a matter of the LIST rather than the POSTING — the row was gone
+// from view while the apply flow, which keys on the role slug, would still have taken a submission.
+//
+// The status comes from effectiveJobStatus(), which is deadline-aware: a posting whose deadline has
+// passed is closed whether or not anybody remembered to change its status.
+const roleExtension = await getRoleExtension(String(r.id));
+const jobStatus = effectiveJobStatus({
+  jobStatus: roleExtension.jobStatus,
+  isOpen: r.isOpen,
+  applicationDeadline: r.applicationDeadline,
+});
+// DRAFT and ARCHIVED are not public at all — an unfinished advertisement is not an advertisement.
+// 404, with a page, rather than a redirect that would imply the link is fine.
+const roleIsHidden = !jobStatus.publiclyVisible;
+if (roleIsHidden) {
+  return new Response(null, { status: 302, headers: { Location: '/careers?gone=' + encodeURIComponent(slug) } });
+}
+const acceptsApplications = jobStatus.acceptsApplications;
+const closedNote = jobStatus.publicNote;
+
+// Work mode, decided once, before anything that renders or serialises it. Permanent roles are on
+// site; internships and apprenticeships may be on site or hybrid; nothing is remote. `locationText`
+// is what the candidate sees: a role with a real bespoke site keeps its own wording, and a row that
+// still carries the old "Remote / Hybrid (India)" string is shown as what it actually is, without
+// waiting for the database to be corrected.
+const workMode = resolveWorkMode(r.engagementType, r.level, r.location);
+const locationText = displayLocation(r.engagementType, r.level, r.location);
 
 // The application_fee_amount / application_fee_currency columns are added via
 // runtime ALTER and aren't in the Drizzle schema, so fetch them separately.
@@ -39,6 +78,35 @@ const deptName = deptResult.length > 0 ? deptResult[0].name : 'EduRankAI';
 
 // AICTE-portal-format fields (optional; blank for most permanent/senior roles).
 const aicte = await getRoleAicte(r.id);
+
+// ---- RESEARCH FACETS (Extreme-Scale department; null on every other role) --------------------
+// getRoleExtension() was already called above, because the closed-state decision needs job_status
+// from it. Nothing here re-queries.
+const division = roleExtension.divisionId ? await getDivisionById(roleExtension.divisionId) : null;
+const classification = classificationDef(roleExtension.researchClassification);
+const evidence = classificationEvidence(
+  roleExtension.researchClassification, roleExtension.scaleMinExp, roleExtension.scaleMaxExp,
+);
+const rung = careerRung(roleExtension.careerLevel);
+const hasScaleRange = typeof roleExtension.scaleMinExp === 'number'
+  && typeof roleExtension.scaleMaxExp === 'number';
+const scaleRangeLabel = hasScaleRange
+  ? scaleRangeText(roleExtension.scaleMinExp as number, roleExtension.scaleMaxExp as number)
+  : '';
+const isResearchPosting = !!(classification || division || hasScaleRange);
+// Every comparison hoisted: a `<` inside a JSX expression breaks .astro parsing.
+const hasPreferredSkills = roleExtension.preferredSkills.length > 0;
+const hasTools = roleExtension.tools.length > 0;
+const hasDeliverables = roleExtension.deliverables.length > 0;
+const hasEvaluation = roleExtension.evaluationCriteria.length > 0;
+const hasCollaborators = roleExtension.collaboratesWith.length > 0;
+const hasSkillCategories = roleExtension.skillCategories.length > 0;
+const hasIntegrityNote = !!roleExtension.integrityNote;
+const hasApplicationInstructions = !!roleExtension.applicationInstructions;
+const hasReportingTo = !!roleExtension.reportingTo;
+const deadlineLabel = r.applicationDeadline
+  ? new Date(r.applicationDeadline).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'long', year: 'numeric' })
+  : '';
 
 // WORKING TIME COMES FROM ONE MODULE, NOT FROM THIS PAGE.
 //
@@ -98,22 +166,34 @@ const framing = levelFraming[r.level] || { tagline: '', scope: '' };
 // show its stipend instead of the unpaid notice. Telling a candidate that a paid role is unpaid
 // misrepresents the offer, and it is the kind of error someone only discovers after they have
 // turned down other work.
+// The stored salary text is free-form and some rows still promise equity the firm does not
+// offer (EduRankAI is a proprietorship). Sanitise ONCE here, then render only this value - the
+// band, the page title, the meta description and the stipend callout all read the same string,
+// so a promise removed from one and left in another would be worse than not removing it at all.
+const salaryText = stripOwnershipPromise(r.salary);
 const isTrainee = r.level === 'Intern' || r.level === 'Apprentice';
-const paysStipend = !!r.salary && !/^\s*unpaid\b/i.test(String(r.salary));
+const paysStipend = !!salaryText && !/^\s*unpaid\b/i.test(salaryText);
 const showCompensation = !isTrainee || paysStipend;
 
 const applyHref = '/apply?role=' + r.slug;
 
+// Work mode is not described here in prose that can drift from the posting. It comes from
+// src/lib/work-mode.ts, which derives it from the engagement: permanent roles are on site,
+// internships and apprenticeships may be on site or hybrid, nothing is remote. These lines used
+// to promise "limited remote flexibility" and "remote in rare, pre-approved cases", which is what
+// applicants were reading and acting on.
 const engagementInfo: Record<string, string> = {
-  'Full-Time': 'Permanent role. Full-time commitment. Primarily on-site, with limited remote flexibility.',
-  'Internship': 'Full-time and on-site at our campus. Structured, hands-on mentorship. Remote only in rare, pre-approved cases.',
-  'Apprenticeship': 'Six months, on-site. Structured mentorship. Remote only in rare, pre-approved cases.'
+  'Full-Time': 'Permanent role. Full-time commitment.',
+  'Internship': 'Structured, hands-on mentorship for a fixed term.',
+  'Apprenticeship': 'Six months. Structured mentorship.'
 };
-const engagementText = engagementInfo[r.engagementType] || '';
+const engagementText = ((engagementInfo[r.engagementType] || '') + ' ' + workModeSentence(workMode, r.engagementType)).trim();
 
 // Parse the freeform salary text into a structured range for Google Jobs.
-// Understands both "up to ₹120 LPA + equity" and "INR 20,00,000 - 40,00,000
+// Understands both "up to ₹120 LPA" and "INR 20,00,000 - 40,00,000
 // per annum" (Indian digit grouping). Monthly stipends are never structured.
+// Salary text is monetary compensation only -- EduRankAI is a proprietorship, so a
+// role's stored salary string must never promise an ownership or profit-linked share.
 function parseSalaryINR(text: string | null | undefined): { min: number | null; max: number | null } | null {
   if (!text) return null;
   const s = String(text);
@@ -130,18 +210,20 @@ function parseSalaryINR(text: string | null | undefined): { min: number | null; 
   if (!nums.length) return null;
   return { min: nums.length > 1 ? Math.min(...nums) : null, max: Math.max(...nums) };
 }
-const salaryRange = parseSalaryINR(r.salary);
+const salaryRange = parseSalaryINR(salaryText);
 const salaryMaxINR = salaryRange?.max ?? null;
-// On-site roles (e.g. Kolkata finance) must not be marked TELECOMMUTE, or
-// Google flags the listing. Remote is the default posture elsewhere.
-const isRemoteRole = !r.location || /remote|hybrid|worldwide|your campus|field/i.test(r.location);
+// Nothing here is remote, so nothing is ever marked TELECOMMUTE. This used to be a regex over the
+// stored location string, and because every catalogue row said "Remote / Hybrid (India)" it made
+// TELECOMMUTE the default for the entire careers portal -- including the internships, which Google
+// then listed as remote work. The mode now comes from the engagement, and a stale database row
+// cannot change it.
 
 // For an on-site role, work out whether the location string actually names a city. Remove the words
 // that describe the ARRANGEMENT rather than the place, then flatten the leftover punctuation; if
 // nothing meaningful remains, the site is undisclosed and no addressLocality should be published.
 // Deliberately does NOT strip parentheticals wholesale: "On-site (Pune, India)" keeps its city that
 // way, whereas dropping the bracketed part would silently discard it.
-const onsiteLocality = isRemoteRole ? '' : (r.location || '')
+const onsiteLocality = (locationText || '')
   .replace(/exact location disclosed on selection|disclosed on selection|location withheld|to be confirmed/gi, '')
   .replace(/\b(on-?site|onsite|in[- ]person|undisclosed|confidential|india|bharat|tbc|tba)\b/gi, '')
   .replace(/[()\[\]]/g, ' ')
@@ -156,7 +238,16 @@ const yearsExp = expByLevel[r.level || 'Mid'] ?? 0;
 
 const today = new Date();
 const datePostedISO = new Date(r.createdAt).toISOString().split('T')[0];
-const validThrough = new Date(today.getTime() + 60 * 24 * 3600 * 1000).toISOString();
+// Google requires validThrough. A flat 60-day window was published for EVERY posting regardless of
+// its actual deadline, which meant a role closing next week was advertised to Google as open for two
+// months — and a role with a later deadline was dropped from results early. Use the real deadline
+// where the posting has one; keep the 60-day window only as the fallback for postings with none.
+const declaredDeadline = r.applicationDeadline
+  ? new Date(r.applicationDeadline)
+  : (roleExtension.validThrough ? new Date(roleExtension.validThrough) : null);
+const validThrough = declaredDeadline && Number.isFinite(declaredDeadline.getTime())
+  ? declaredDeadline.toISOString()
+  : new Date(today.getTime() + 60 * 24 * 3600 * 1000).toISOString();
 
 const clean = (s: string | null | undefined) => (s || '').replace(/\s+/g, ' ').trim();
 
@@ -208,23 +299,21 @@ const jobPostingSchema: any = {
   },
   jobLocation: {
     '@type': 'Place',
-    address: isRemoteRole
-      ? { '@type': 'PostalAddress', addressCountry: 'IN', addressRegion: 'Remote / Worldwide' }
-      // Only emit addressLocality when the location string actually names a place. Some roles
-      // deliberately withhold the site (secure/high-protocol programmes), and passing the raw
-      // string through would put junk like "On-site, India (exact location disclosed on selection)"
-      // into structured data as if it were a city name. Country-only is valid; it just cannot match
-      // city-level searches, which is the intended trade-off for not disclosing the site.
-      : (onsiteLocality
-        ? { '@type': 'PostalAddress', addressCountry: 'IN', addressLocality: onsiteLocality }
-        : { '@type': 'PostalAddress', addressCountry: 'IN' }),
+    // Only emit addressLocality when the location string actually names a place. Some roles
+    // deliberately withhold the site (secure/high-protocol programmes), and passing the raw
+    // string through would put junk like "On-site, India (exact location disclosed on selection)"
+    // into structured data as if it were a city name. Country-only is valid; it just cannot match
+    // city-level searches, which is the intended trade-off for not disclosing the site.
+    address: onsiteLocality
+      ? { '@type': 'PostalAddress', addressCountry: 'IN', addressLocality: onsiteLocality }
+      : { '@type': 'PostalAddress', addressCountry: 'IN' },
   },
 };
-if (isRemoteRole) {
-  jobPostingSchema.jobLocationType = 'TELECOMMUTE';
-  // Google requires a REAL country here. "Any" is not a country and gets the property
-  // discarded, which for a TELECOMMUTE posting can cost Google Jobs eligibility entirely.
-  jobPostingSchema.applicantLocationRequirements = { '@type': 'Country', name: 'India' };
+// jobLocationType is deliberately never set. Google reads TELECOMMUTE as "done away from any
+// employer site", and its own guidance is that a hybrid role is not TELECOMMUTE -- it has a real
+// place of work. Setting it here is what put every posting into remote job searches.
+if (jobLocationType(workMode)) {
+  jobPostingSchema.jobLocationType = jobLocationType(workMode);
 }
 // Intern + Apprentice compensation is NOT published — stipend is discussed at
 // the offer stage. JSON-LD baseSalary is only emitted for permanent roles.
@@ -242,7 +331,7 @@ if (salaryMaxINR && r.level !== 'Intern' && r.level !== 'Apprentice') {
 // up-front so the result wins on senior search queries.
 const seniorTitle = ['C-Level', 'Lead'].includes(r.level || '');
 const pageTitle = seniorTitle
-  ? r.title + ' (Equity + up to ' + (r.salary || 'top market band') + ') | ' + deptName + ' | EduRankAI'
+  ? r.title + ' (up to ' + (salaryText || 'top market band') + ') | ' + deptName + ' | EduRankAI'
   : r.title + ' - ' + deptName + ' - EduRankAI Careers';
 
 // The meta description MUST be unique per role. Every catalogue role's `about` opens with the
@@ -258,7 +347,7 @@ const cut = (s: string, n: number) => {
 };
 const roleLine = clean(r.function) || clean(r.about);
 const metaDesc = seniorTitle
-  ? cut(`${r.title} at EduRankAI. ${r.salary ? r.salary + '. ' : ''}${roleLine}`, 185)
+  ? cut(`${r.title} at EduRankAI. ${salaryText ? salaryText + '. ' : ''}${roleLine}`, 185)
   : cut(`${r.title} - ${deptName} at EduRankAI. ${roleLine}`, 165);
 
 // JSON.stringify does not escape "<", so a role field containing "</script>" would break out of
@@ -286,7 +375,7 @@ const jobPostingJson = JSON.stringify(jobPostingSchema).replace(/</g, '\\u003c')
       <div class="flex flex-wrap gap-2">
         <span class={'text-[0.7rem] font-bold uppercase tracking-wider px-2.5 py-1 rounded-md border ' + levelClass}>{r.level}</span>
         <span class="text-[0.7rem] font-semibold text-ink-soft bg-cream-2 border border-ink/10 px-2.5 py-1 rounded-md">{r.engagementType}</span>
-        <span class="text-[0.7rem] font-semibold text-ink-soft bg-cream-2 border border-ink/10 px-2.5 py-1 rounded-md">{r.location}</span>
+        <span class="text-[0.7rem] font-semibold text-ink-soft bg-cream-2 border border-ink/10 px-2.5 py-1 rounded-md">{locationText}</span>
         {r.duration && <span class="text-[0.7rem] font-semibold text-ink-soft bg-cream-2 border border-ink/10 px-2.5 py-1 rounded-md">{r.duration}</span>}
       </div>
     </div>
@@ -298,7 +387,7 @@ const jobPostingJson = JSON.stringify(jobPostingSchema).replace(/</g, '\\u003c')
       {showCompensation && (
         <div class="bg-cream-2 border border-ink/10 rounded-xl p-4">
           <p class="text-[0.62rem] font-mono uppercase tracking-[0.15em] text-ink-soft mb-2 font-bold">Compensation</p>
-          <p class="text-[0.88rem] text-ink leading-snug font-medium">{r.salary}</p>
+          <p class="text-[0.88rem] text-ink leading-snug font-medium">{salaryText}</p>
         </div>
       )}
       <div class="bg-cream-2 border border-ink/10 rounded-xl p-4">
@@ -322,7 +411,66 @@ const jobPostingJson = JSON.stringify(jobPostingSchema).replace(/</g, '\\u003c')
     {isTrainee && paysStipend && (
       <div class="flex items-start gap-2.5 bg-gold-bg border border-gold-border rounded-xl px-4 py-3.5 mb-12">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#8a6a12" stroke-width="2" class="mt-0.5 shrink-0"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
-        <p class="text-[0.84rem] text-gold-deep leading-relaxed">This is a <b>paid {r.engagementType === 'Apprenticeship' ? 'apprenticeship' : 'internship'}</b> — {r.salary}.</p>
+        <p class="text-[0.84rem] text-gold-deep leading-relaxed">This is a <b>paid {r.engagementType === 'Apprenticeship' ? 'apprenticeship' : 'internship'}</b> — {salaryText}.</p>
+      </div>
+    )}
+
+    <!-- ================= RESEARCH CLASSIFICATION =================
+         Rendered only for a posting that carries one, so nothing changes on the ~988 roles that do
+         not. It sits ABOVE the role description on purpose: a scale range read after the job title
+         has already done its work is a scale range read as a capability claim. What the work IS
+         comes before what the work sounds like. -->
+    {isResearchPosting && (
+      <div class="mb-12 bg-white border border-ink/10 rounded-2xl p-5 md:p-6" style="border-left:4px solid #FF4F00;">
+        <p class="text-[0.62rem] font-mono uppercase tracking-[0.15em] text-burn mb-2 font-bold">Research classification</p>
+
+        <div class="flex flex-wrap items-center gap-2 mb-4">
+          {classification && (
+            <span class="text-[0.76rem] font-semibold text-burn bg-burn-pale border border-burn-dim rounded-full px-3 py-1">{classification.label}</span>
+          )}
+          {evidence && (
+            <span class="text-[0.76rem] font-medium text-ink-2 bg-cream-2 border border-ink/10 rounded-full px-3 py-1">{evidence.label}</span>
+          )}
+          {rung && (
+            <span class="text-[0.76rem] font-medium text-ink-2 bg-cream-2 border border-ink/10 rounded-full px-3 py-1">Level {rung.level} &middot; {rung.label}</span>
+          )}
+          {division && (
+            <a href={'/careers/division/' + division.slug} class="text-[0.76rem] font-semibold text-sky bg-sky-bg border border-sky-border rounded-full px-3 py-1 no-underline hover:opacity-80">{division.name} &rarr;</a>
+          )}
+        </div>
+
+        {classification && (
+          <p class="text-[0.9rem] text-ink-2 leading-[1.75] mb-3">{classification.summary} {classification.outputs}</p>
+        )}
+
+        {evidence && (
+          <p class="text-[0.9rem] text-ink-2 leading-[1.75] mb-4">
+            <strong class="font-semibold">{evidence.label}.</strong> {evidence.statement}
+          </p>
+        )}
+
+        {hasScaleRange && (
+          <div class="mb-4">
+            <ScaleStrip minExp={roleExtension.scaleMinExp} maxExp={roleExtension.scaleMaxExp} showDisclaimer={false} />
+          </div>
+        )}
+
+        {hasIntegrityNote && (
+          <p class="text-[0.86rem] text-ink-2 leading-[1.7] bg-cream-2 border border-ink/10 rounded-xl p-4 mb-3">{roleExtension.integrityNote}</p>
+        )}
+
+        <p class="text-[0.78rem] text-ink-soft leading-relaxed m-0">{SCALE_DISCLAIMER}</p>
+
+        {hasSkillCategories && (
+          <div class="mt-4 pt-4 border-t border-ink/8">
+            <p class="text-[0.7rem] font-semibold uppercase tracking-wider text-ink-soft mb-2">Disciplines</p>
+            <div class="flex flex-wrap gap-1.5">
+              {roleExtension.skillCategories.map((k) => (
+                <a href={'/careers/opportunities?skillcat=' + k} class="text-[0.74rem] text-ink-2 bg-cream-2 border border-ink/10 rounded-lg px-2.5 py-1 no-underline hover:border-ink/25 transition-colors">{skillCategoryLabel(k) || k}</a>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     )}
 
@@ -512,20 +660,119 @@ const jobPostingJson = JSON.stringify(jobPostingSchema).replace(/</g, '\\u003c')
       </ol>
     </div>
 
+    <!-- What this role hands over, and what it is judged on. A research posting that says what you
+         will do but not what "done" looks like leaves the candidate guessing at the bar. -->
+    {(hasPreferredSkills || hasTools || hasDeliverables || hasEvaluation || hasReportingTo || hasCollaborators) && (
+      <div class="mb-12">
+        <p class="text-[0.62rem] font-mono uppercase tracking-[0.15em] text-burn mb-2 font-bold">The standard</p>
+        <h2 class="font-display text-xl md:text-2xl font-semibold text-ink mb-5">What you deliver, and how it is judged</h2>
+
+        <div class="grid gap-4 md:grid-cols-2">
+          {hasDeliverables && (
+            <div class="bg-white border border-ink/10 rounded-2xl p-5">
+              <h3 class="font-display text-[1rem] font-semibold text-ink m-0 mb-3">Deliverables</h3>
+              <ul class="space-y-2 m-0 p-0 list-none">
+                {roleExtension.deliverables.map((d) => (
+                  <li class="text-[0.87rem] text-ink-2 leading-[1.6] pl-4 relative">
+                    <span class="absolute left-0 top-[0.55em] w-1.5 h-1.5 rounded-full bg-burn"></span>{d}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {hasEvaluation && (
+            <div class="bg-white border border-ink/10 rounded-2xl p-5">
+              <h3 class="font-display text-[1rem] font-semibold text-ink m-0 mb-3">Evaluation criteria</h3>
+              <ul class="space-y-2 m-0 p-0 list-none">
+                {roleExtension.evaluationCriteria.map((c) => (
+                  <li class="text-[0.87rem] text-ink-2 leading-[1.6] pl-4 relative">
+                    <span class="absolute left-0 top-[0.55em] w-1.5 h-1.5 rounded-full bg-sky"></span>{c}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {hasPreferredSkills && (
+            <div class="bg-white border border-ink/10 rounded-2xl p-5">
+              <h3 class="font-display text-[1rem] font-semibold text-ink m-0 mb-1">Preferred, not required</h3>
+              <p class="text-[0.78rem] text-ink-soft m-0 mb-3">Nothing in this list is a bar to applying.</p>
+              <div class="flex flex-wrap gap-1.5">
+                {roleExtension.preferredSkills.map((sk) => (
+                  <span class="text-[0.74rem] text-ink-2 bg-cream-2 border border-ink/8 rounded-lg px-2.5 py-1">{sk}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          {hasTools && (
+            <div class="bg-white border border-ink/10 rounded-2xl p-5">
+              <h3 class="font-display text-[1rem] font-semibold text-ink m-0 mb-3">Tools you would work in</h3>
+              <div class="flex flex-wrap gap-1.5">
+                {roleExtension.tools.map((t) => (
+                  <span class="text-[0.74rem] text-ink-2 bg-cream-2 border border-ink/8 rounded-lg px-2.5 py-1">{t}</span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {(hasReportingTo || hasCollaborators) && (
+          <div class="mt-4 bg-cream-2 border border-ink/10 rounded-2xl p-5">
+            {hasReportingTo && (
+              <p class="text-[0.87rem] text-ink-2 leading-relaxed m-0 mb-2">
+                <strong class="font-semibold">Reports to:</strong> {roleExtension.reportingTo}
+              </p>
+            )}
+            {hasCollaborators && (
+              <p class="text-[0.87rem] text-ink-2 leading-relaxed m-0">
+                <strong class="font-semibold">Works with:</strong> {roleExtension.collaboratesWith.join(', ')}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+    )}
+
     <div class="mt-12">
       <BeforeYouApply feeAmount={roleFeeAmount ?? undefined} feeCurrency={roleFeeCurrency} roleLevel={r.level} engagementType={r.engagementType} />
     </div>
 
-    <div class="bg-white border-2 border-burn rounded-2xl p-6 md:p-8">
-      <h3 class="font-display text-xl md:text-2xl font-semibold text-ink mb-3">Ready to apply?</h3>
-      <p class="text-[0.9rem] text-ink-soft mb-5 leading-relaxed">
-        We read every application personally. If you are the right person for this role &mdash; regardless of pedigree, background, or where you are based &mdash; you will hear back from us within five business days.
-      </p>
-      <div class="flex flex-col sm:flex-row gap-3">
-        <a href={applyHref} class="btn-primary flex-1 justify-center inline-flex items-center gap-2 text-center">Apply for {r.title} <span>&rarr;</span></a>
-        <a href="/careers" class="btn-ghost flex-1 justify-center">See all open roles</a>
+    {acceptsApplications && (
+      <div class="bg-white border-2 border-burn rounded-2xl p-6 md:p-8">
+        <h3 class="font-display text-xl md:text-2xl font-semibold text-ink mb-3">Ready to apply?</h3>
+        <p class="text-[0.9rem] text-ink-soft mb-5 leading-relaxed">
+          We read every application personally. If you are the right person for this role &mdash; regardless of pedigree, background, or where you are based &mdash; you will hear back from us within five business days.
+        </p>
+        {hasApplicationInstructions && (
+          <p class="text-[0.88rem] text-ink-2 mb-5 leading-[1.7] bg-cream-2 border border-ink/10 rounded-xl p-4">{roleExtension.applicationInstructions}</p>
+        )}
+        {deadlineLabel && (
+          <p class="text-[0.84rem] font-semibold text-ink-2 mb-4">Applications close on {deadlineLabel}.</p>
+        )}
+        <div class="flex flex-col sm:flex-row gap-3">
+          <a href={applyHref} class="btn-primary flex-1 justify-center inline-flex items-center gap-2 text-center">Apply for {r.title} <span>&rarr;</span></a>
+          <a href="/careers" class="btn-ghost flex-1 justify-center">See all open roles</a>
+        </div>
       </div>
-    </div>
+    )}
+
+    <!-- CLOSED / PAUSED. The posting stays readable and says plainly what happened. There is no
+         apply button, and there is no hidden one either: the submission path refuses this role
+         server-side (refuseIfNotAccepting in src/lib/xscale/roles-ext.ts), so posting the form by
+         hand does not get past it. -->
+    {!acceptsApplications && (
+      <div class="bg-white border-2 rounded-2xl p-6 md:p-8" style="border-color:#9a3412;">
+        <h3 class="font-display text-xl md:text-2xl font-semibold text-ink mb-3">This role is not accepting applications</h3>
+        <p class="text-[0.9rem] text-ink-2 mb-4 leading-relaxed">{closedNote}</p>
+        <p class="text-[0.86rem] text-ink-soft mb-5 leading-relaxed">
+          The description is left up so that you can see what it was, and so a link somebody sent you still
+          leads somewhere. If you had started an application for it, nothing you entered has been submitted.
+        </p>
+        <div class="flex flex-col sm:flex-row gap-3">
+          <a href="/careers" class="btn-primary flex-1 justify-center">See all open roles</a>
+          <a href="/careers/opportunities" class="btn-ghost flex-1 justify-center">Search by field and scale</a>
+        </div>
+      </div>
+    )}
 
     {relatedRoles.length > 0 && (
       <div class="mt-16 pt-12 border-t border-ink/10">
@@ -546,7 +793,10 @@ const jobPostingJson = JSON.stringify(jobPostingSchema).replace(/</g, '\\u003c')
     )}
   </section>
 
-  <!-- Sticky apply bar - appears after user scrolls past the hero -->
+  <!-- Sticky apply bar - appears after user scrolls past the hero. Rendered only when the posting
+       actually accepts applications; a floating Apply button over a closed role is a promise the
+       submission path is going to refuse. -->
+  {acceptsApplications && (
   <div id="stickyApply" style="position:fixed;left:0;right:0;bottom:0;z-index:40;background:rgba(255,255,255,0.96);backdrop-filter:blur(14px);border-top:1px solid rgba(0,0,0,0.1);padding:10px 5vw;transform:translateY(100%);transition:transform 0.25s ease;box-shadow:0 -4px 22px rgba(0,0,0,0.06);">
     <div style="max-width:1100px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;">
       <div style="min-width:0;flex:1;">
@@ -556,6 +806,7 @@ const jobPostingJson = JSON.stringify(jobPostingSchema).replace(/</g, '\\u003c')
       <a href={applyHref} class="btn-primary" style="flex-shrink:0;font-size:13px;padding:9px 18px;white-space:nowrap;">Apply &rarr;</a>
     </div>
   </div>
+  )}
 
   <script is:inline>
     (function() {

@@ -66,7 +66,7 @@ for (const dept of departments) {
           is_open, sort_order
         ) VALUES (
           ${slug}, ${dbDeptId}, ${role.title}, ${role.level}, ${role.func || ""},
-          ${engagement}, ${role.location || "Remote / Any"}, ${role.duration || ""}, ${role.salary || ""}, ${role.about || ""},
+          ${engagement}, ${role.location || "On-site — Kolkata, West Bengal, India"}, ${role.duration || ""}, ${role.salary || ""}, ${role.about || ""},
           ${JSON.stringify(role.responsibilities || [])}::jsonb,
           ${JSON.stringify(role.skills || [])}::jsonb,
           ${JSON.stringify(role.eligibility || [])}::jsonb,

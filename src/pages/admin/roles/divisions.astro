@@ -1,0 +1,524 @@
+---
+// /admin/roles/divisions — THE DIVISION CONSOLE AND THE EXTREME-SCALE IMPORT.
+//
+// Three jobs, in the order an operator needs them:
+//
+//   1. Say honestly whether the migration has been applied. db/xscale-schema.sql is run by hand
+//      (SCHEMA_BOOTSTRAP is off in production), so "the button did nothing" has exactly one likely
+//      cause and this page names it instead of failing quietly.
+//   2. Import the department, its divisions and its postings — IN THAT ORDER, in one operation, so
+//      there is never a posting in the catalogue without its division and its classification.
+//   3. Publish. Every imported posting arrives as a DRAFT. Publishing a hundred and seventy-nine
+//      job advertisements on one click is not an import, it is an accident; a human publishes a
+//      division at a time and can see what they are about to make public.
+//
+// GATE: `roles.edit` to change anything, `roles.view` to read. The middleware maps /admin/roles to
+// the `roles` section, so this page inherits the same door as the rest of the catalogue console —
+// no new section key, which would appear as a checkbox in /admin/team/roles that nothing enforces
+// and would hide this page from every restricted admin on the day it shipped.
+//
+// EVERY const IS DECLARED BEFORE THE POST HANDLER READS IT. `const` is not hoisted, and a handler
+// placed above its dependencies throws on its first line while the page still reports success —
+// the failure recorded at the top of this project's working rules.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+export const maxDuration = 60;
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
+import { logAudit } from '@/lib/audit';
+import { departments } from '@/lib/db/schema';
+import { xscaleInstallStatus } from '@/lib/xscale/schema';
+import { listDivisions, insertDivisionIfMissing, setDivisionVisible, upsertDivision } from '@/lib/xscale/divisions';
+import { setRoleExtensionBulk, backfillJobStatus } from '@/lib/xscale/roles-ext';
+import { XSCALE_DEPARTMENT, XSCALE_DIVISIONS, XSCALE_ROLES, XSCALE_DEPARTMENT_ID } from '@/data/xscale-catalog';
+import { JOB_STATUSES, scaleRangeText, classificationLabel } from '@/lib/xscale/taxonomy';
+
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const reasonOf = (e: any): string => e?.cause?.message || e?.message || String(e);
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+const canView = can(user as any, 'roles.view') || can(user as any, 'roles.edit');
+if (!canView) return Astro.redirect('/admin?denied=roles');
+const canEdit = can(user as any, 'roles.edit');
+
+let flash = '';
+let problem = '';
+
+// -------------------------------------------------------------------------------------------------
+//   ACTIONS
+// -------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  if (!canEdit) {
+    problem = 'You do not hold roles.edit, so nothing was changed.';
+  } else {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('_action') || '');
+    try {
+      // ---- IMPORT: department, then divisions, then postings, then their classifications -------
+      if (action === 'import') {
+        // Time-boxed against the 60s function ceiling declared above. Everything is idempotent, so
+        // the button can simply be clicked again until it reports nothing remaining — which is what
+        // the existing catalogue import does and why it says so on screen rather than appearing stuck.
+        const DEADLINE = Date.now() + 45_000;
+        const outOfTime = () => Date.now() >= DEADLINE;
+
+        // 1. The department.
+        await db.insert(departments).values({
+          id: XSCALE_DEPARTMENT.id,
+          name: XSCALE_DEPARTMENT.name,
+          icon: XSCALE_DEPARTMENT.icon,
+          description: XSCALE_DEPARTMENT.description,
+          sortOrder: 5,
+        }).onConflictDoNothing();
+
+        // 2. The divisions. insertDivisionIfMissing, not upsert: an editor who has reworded a
+        //    division's charter must not have that edit overwritten by the next click.
+        let divisionsAdded = 0;
+        for (let i = 0; i < XSCALE_DIVISIONS.length; i++) {
+          const d = XSCALE_DIVISIONS[i];
+          const added = await insertDivisionIfMissing({
+            id: d.id,
+            departmentId: XSCALE_DEPARTMENT_ID,
+            slug: d.slug,
+            name: d.name,
+            code: d.code,
+            summary: d.summary,
+            charter: d.charter,
+            researchClassification: d.classification,
+            scaleMinExp: d.scaleMinExp,
+            scaleMaxExp: d.scaleMaxExp,
+            domains: d.domains,
+            skillCategories: d.skillCategories as string[],
+            collaboratesWith: d.collaboratesWith,
+            integrityNote: d.integrityNote,
+            sortOrder: i * 10,
+            isVisible: true,
+          });
+          if (added) divisionsAdded++;
+        }
+
+        // 3. The postings. Insert base rows for anything whose slug is missing, in bulk.
+        const existingRows = await db.execute(sql`SELECT slug FROM roles WHERE department_id = ${XSCALE_DEPARTMENT_ID}`);
+        const have = new Set(rowsOf(existingRows).map((x) => String(x.slug)));
+        const missing = XSCALE_ROLES.filter((r) => !have.has(r.slug));
+
+        let rolesAdded = 0;
+        let remaining = 0;
+        const CHUNK = 40;
+        for (let i = 0; i < missing.length; i += CHUNK) {
+          if (outOfTime()) { remaining = missing.length - i; break; }
+          const batch = missing.slice(i, i + CHUNK);
+          const payload = batch.map((r) => ({
+            slug: r.slug,
+            department_id: r.departmentId,
+            title: r.title,
+            level: r.level,
+            fn: r.function,
+            engagement_type: r.engagementType,
+            location: r.location,
+            duration: r.duration,
+            salary: r.salary,
+            about: r.about,
+            responsibilities: r.responsibilities,
+            skills: r.skills,
+            eligibility: r.eligibility,
+            is_featured: r.isFeatured === true,
+            openings: r.openings ?? 1,
+          }));
+          // ONE statement per chunk. The role level and engagement type are enum columns, so the
+          // text from jsonb has to be cast explicitly — postgres will not do it implicitly here and
+          // the error it gives ("column level is of type role_level but expression is of type text")
+          // names the column rather than the cast, which sends you looking in the wrong place.
+          //
+          // is_open is FALSE and job_status is DRAFT: an import must not publish anything.
+          const res = await db.execute(sql`
+            INSERT INTO roles (
+              slug, department_id, title, level, function, engagement_type, location, duration,
+              salary, about, responsibilities, skills, eligibility, is_open, is_featured, sort_order
+            )
+            SELECT d.slug, d.department_id, d.title, d.level::role_level, d.fn,
+                   d.engagement_type::engagement_type, d.location, d.duration, d.salary, d.about,
+                   d.responsibilities, d.skills, d.eligibility, FALSE, d.is_featured, 100
+              FROM jsonb_to_recordset(${JSON.stringify(payload)}::jsonb) AS d(
+                slug text, department_id text, title text, level text, fn text,
+                engagement_type text, location text, duration text, salary text, about text,
+                responsibilities jsonb, skills jsonb, eligibility jsonb, is_featured boolean,
+                openings int)
+            ON CONFLICT (slug) DO NOTHING
+            RETURNING id`);
+          rolesAdded += rowsOf(res).length;
+        }
+
+        // 4. The classifications, in bulk, for EVERY posting in the department — including ones a
+        //    previous run inserted before it ran out of time. A base row without its classification
+        //    is exactly the misrepresentation this whole design exists to prevent, so this is not
+        //    conditional on the insert above having happened this click.
+        let classified = 0;
+        if (!outOfTime()) {
+          classified = await setRoleExtensionBulk(XSCALE_ROLES.map((r) => ({
+            slug: r.slug,
+            ext: {
+              divisionId: r.divisionId,
+              researchClassification: r.researchClassification,
+              scaleMinExp: r.scaleMinExp,
+              scaleMaxExp: r.scaleMaxExp,
+              skillCategories: r.skillCategories,
+              careerLevel: r.careerLevel,
+              // Only set DRAFT on rows that have no status yet — never demote a posting somebody
+              // has already published back to a draft on the next click.
+              jobStatus: null,
+              preferredSkills: r.preferredSkills,
+              tools: r.tools,
+              deliverables: r.deliverables,
+              evaluationCriteria: r.evaluationCriteria,
+              reportingTo: r.reportingTo,
+              collaboratesWith: r.collaboratesWith,
+              applicationInstructions: r.applicationInstructions,
+              integrityNote: r.integrityNote,
+            },
+          })));
+          // Anything still without a status becomes a DRAFT, which is what a freshly imported,
+          // is_open=false posting is.
+          await db.execute(sql`
+            UPDATE roles SET job_status = 'DRAFT'
+             WHERE department_id = ${XSCALE_DEPARTMENT_ID} AND job_status IS NULL`);
+        }
+
+        await logAudit({
+          userId: user.id, action: 'xscale.import', entity: 'department',
+          entityId: XSCALE_DEPARTMENT_ID,
+          diff: { divisionsAdded, rolesAdded, classified, remaining },
+        }).catch(() => {});
+
+        flash = 'Imported. ' + divisionsAdded + ' divisions added, ' + rolesAdded + ' postings added, '
+          + classified + ' postings classified.'
+          + (remaining > 0
+            ? ' ' + remaining + ' postings were left for the next click — the import is time-boxed against the function ceiling and everything it does is idempotent, so click Import again.'
+            : ' Nothing remaining.')
+          + ' Every posting is a DRAFT and is NOT public until you publish it below.';
+      }
+
+      // ---- PUBLISH / UNPUBLISH a whole division ------------------------------------------------
+      if (action === 'publish_division' || action === 'close_division') {
+        const divisionId = String(fd.get('division_id') || '');
+        if (!divisionId) throw new Error('No division named.');
+        const publish = action === 'publish_division';
+        const status = publish ? 'PUBLISHED' : 'CLOSED';
+        // is_open is written in the same statement. Nine existing surfaces filter on it and know
+        // nothing about job_status; writing only the new column would mean a "Close" that closed the
+        // posting on this page and nowhere else.
+        const res = await db.execute(sql`
+          UPDATE roles SET job_status = ${status}, is_open = ${publish}, updated_at = NOW()
+           WHERE division_id = ${divisionId}
+           RETURNING id`);
+        const n = rowsOf(res).length;
+        await logAudit({
+          userId: user.id, action: 'xscale.division.' + (publish ? 'publish' : 'close'),
+          entity: 'division', entityId: divisionId, diff: { affected: n },
+        }).catch(() => {});
+        flash = n + ' postings in that division are now ' + (publish ? 'PUBLISHED and live on the careers site.' : 'CLOSED and no longer accepting applications.');
+      }
+
+      // ---- SHOW / HIDE a division --------------------------------------------------------------
+      if (action === 'toggle_visible') {
+        const divisionId = String(fd.get('division_id') || '');
+        const visible = String(fd.get('visible') || '') === '1';
+        await setDivisionVisible(divisionId, visible);
+        flash = visible ? 'Division is visible on the careers site.' : 'Division is hidden. Its postings are unaffected; hide is not close.';
+      }
+
+      // ---- EDIT one division's wording ---------------------------------------------------------
+      if (action === 'save_division') {
+        const divisionId = String(fd.get('division_id') || '');
+        const current = (await listDivisions({ includeHidden: true })).rows.find((d) => d.id === divisionId);
+        if (!current) throw new Error('That division is not in the register.');
+        await upsertDivision({
+          ...current,
+          name: String(fd.get('name') || current.name),
+          summary: String(fd.get('summary') || current.summary),
+          charter: String(fd.get('charter') || current.charter),
+          integrityNote: String(fd.get('integrity_note') || current.integrityNote),
+          sortOrder: Number(fd.get('sort_order') || current.sortOrder) || 0,
+        });
+        flash = 'Division saved.';
+      }
+
+      // ---- BACKFILL job_status across the whole catalogue --------------------------------------
+      if (action === 'backfill_status') {
+        const n = await backfillJobStatus();
+        flash = n + ' postings had no job status and were set from is_open. Nothing that already had one was touched.';
+      }
+    } catch (e: any) {
+      // The real Postgres reason is on e.cause; e.message is only the failed SQL, and logging that
+      // alone destroys the one line that says WHY.
+      console.error('[admin/divisions]', reasonOf(e), e);
+      problem = 'Nothing was changed: ' + reasonOf(e);
+    }
+  }
+}
+
+// -------------------------------------------------------------------------------------------------
+//   READS
+// -------------------------------------------------------------------------------------------------
+const install = await xscaleInstallStatus();
+const installed = install.installed;
+const installUnreadable = install.readable === false;
+const missingList = [...install.missingTables, ...install.missingRoleColumns];
+const hasMissing = missingList.length > 0;
+
+const divisionList = await listDivisions({ includeHidden: true, departmentId: XSCALE_DEPARTMENT_ID });
+
+// Status counts per division, in ONE query. Fifteen divisions with a count per status each is
+// sixty round trips otherwise.
+let statusByDivision: Record<string, Record<string, number>> = {};
+let countsReadable = true;
+try {
+  const r = await db.execute(sql`
+    SELECT division_id, COALESCE(job_status, 'PUBLISHED') AS st, COUNT(*)::int AS n
+      FROM roles
+     WHERE division_id IS NOT NULL
+     GROUP BY division_id, COALESCE(job_status, 'PUBLISHED')`);
+  for (const row of rowsOf(r)) {
+    const d = String(row.division_id);
+    if (!statusByDivision[d]) statusByDivision[d] = {};
+    statusByDivision[d][String(row.st)] = Number(row.n || 0);
+  }
+} catch (e: any) {
+  countsReadable = false;
+  console.error('[admin/divisions] counts:', reasonOf(e));
+}
+
+// How much of the catalogue is actually in the database, so the import button can say what is left.
+let inDbCount = 0;
+let inDbReadable = true;
+try {
+  const r = await db.execute(sql`SELECT COUNT(*)::int AS n FROM roles WHERE department_id = ${XSCALE_DEPARTMENT_ID}`);
+  inDbCount = Number(rowsOf(r)[0]?.n || 0);
+} catch (e: any) {
+  inDbReadable = false;
+  console.error('[admin/divisions] catalogue count:', reasonOf(e));
+}
+
+// Every comparison hoisted out of the markup.
+const catalogueCount = XSCALE_ROLES.length;
+const catalogueDivisions = XSCALE_DIVISIONS.length;
+const outstanding = Math.max(0, catalogueCount - inDbCount);
+const hasOutstanding = outstanding > 0;
+const registerEmpty = divisionList.rows.length === 0;
+const registerUnreadable = divisionList.readable === false;
+
+const rows = divisionList.rows.map((d) => {
+  const counts = statusByDivision[d.id] || {};
+  const published = counts['PUBLISHED'] || 0;
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  return {
+    d,
+    counts,
+    published,
+    total,
+    hasAny: total > 0,
+    anyPublished: published > 0,
+    scale: (typeof d.scaleMinExp === 'number' && typeof d.scaleMaxExp === 'number')
+      ? scaleRangeText(d.scaleMinExp, d.scaleMaxExp) : '',
+    classification: classificationLabel(d.researchClassification),
+  };
+});
+
+const CARD = 'background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:16px 18px;margin-bottom:16px;';
+const HD = "font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 10px;";
+const statusOrder = JOB_STATUSES.map((s) => s.key);
+---
+
+<AdminLayout title="Divisions" activeNav="roles">
+  <div style="max-width:1100px;margin:0 auto;padding:20px 16px 90px;">
+    <p style="font-size:10.5px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;font-family:'Geist Mono',monospace;font-weight:700;">Hiring</p>
+    <h1 style="font-size:24px;color:#fff;margin:6px 0 4px;font-weight:700;">Divisions</h1>
+    <p style="font-size:13px;color:#9aa6b6;margin:0 0 20px;line-height:1.6;max-width:70ch;">
+      The level between a department and a posting. A division declares the scale range it works at, the kind
+      of research it does, and the honest limits of that work — and every posting inside it inherits them.
+    </p>
+
+    {flash && <div style={CARD + 'border-left:3px solid #10b981;'}><p style="font-size:13px;color:#d7e3ea;margin:0;line-height:1.6;">{flash}</p></div>}
+    {problem && <div style={CARD + 'border-left:3px solid #f87171;'}><p style="font-size:13px;color:#fca5a5;margin:0;line-height:1.6;">{problem}</p></div>}
+
+    <!-- =================== MIGRATION STATE, FIRST =================== -->
+    <div style={CARD + (installed ? 'border-left:3px solid #10b981;' : 'border-left:3px solid #fbbf24;')}>
+      <p style={HD}>Migration</p>
+      {installUnreadable && (
+        <p style="font-size:13px;color:#fca5a5;margin:0;line-height:1.6;">
+          The database could not be asked whether the migration is applied. Nothing below is trustworthy until
+          that is resolved.
+        </p>
+      )}
+      {!installUnreadable && installed && (
+        <p style="font-size:13px;color:#6ee7b7;margin:0;line-height:1.6;">
+          Applied. The <code>divisions</code> table and all sixteen role columns are present.
+        </p>
+      )}
+      {!installUnreadable && !installed && (
+        <div>
+          <p style="font-size:13px;color:#fbbf24;margin:0 0 8px;line-height:1.6;">
+            NOT APPLIED. {missingList.length} {missingList.length === 1 ? 'object is' : 'objects are'} missing, so the
+            import and everything below it will fail. Schema bootstrap is deliberately off in production
+            (an ALTER on <code>roles</code> on the request path took the site down on 2026-08-23), so this is
+            applied by hand, once:
+          </p>
+          <pre style="font-size:12px;color:#9bd1ff;background:#08080b;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;margin:0 0 8px;overflow-x:auto;">psql "$DATABASE_URL" -f db/xscale-schema.sql</pre>
+          {hasMissing && (
+            <p style="font-size:11.5px;color:#8a8a94;margin:0;line-height:1.6;font-family:'Geist Mono',monospace;">
+              Missing: {missingList.join(', ')}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+
+    <!-- =================== IMPORT =================== -->
+    <div style={CARD}>
+      <p style={HD}>Extreme-Scale department</p>
+      <p style="font-size:13px;color:#9aa6b6;margin:0 0 10px;line-height:1.6;">
+        {catalogueDivisions} divisions and {catalogueCount} postings, generated from
+        <code> src/data/xscale-catalog.ts</code>. The import is idempotent and edit-safe: a posting is inserted
+        only if its slug is missing, and a division is inserted only if its id is missing, so a wording change
+        made here is never overwritten.
+      </p>
+      <p style="font-size:13px;color:#c0a35e;margin:0 0 12px;line-height:1.6;">
+        Everything imports as a <strong>DRAFT</strong> and is not public. Publish a division at a time below,
+        when you have read what it says.
+      </p>
+      {inDbReadable && (
+        <p style="font-size:12px;color:#cfd6da;margin:0 0 12px;font-family:'Geist Mono',monospace;">
+          {inDbCount} of {catalogueCount} in the database{hasOutstanding ? ' · ' + outstanding + ' outstanding' : ' · nothing outstanding'}
+        </p>
+      )}
+      {!inDbReadable && (
+        <p style="font-size:12px;color:#fca5a5;margin:0 0 12px;">The catalogue count could not be read, so "outstanding" is unknown rather than zero.</p>
+      )}
+      {canEdit && (
+        <form method="POST" style="display:flex;gap:8px;flex-wrap:wrap;">
+          <input type="hidden" name="_action" value="import" />
+          <button type="submit" class="admin-btn admin-btn-primary" style="padding:8px 16px;font-size:12px;">Import the department</button>
+        </form>
+      )}
+      {!canEdit && <p style="font-size:12px;color:#8a8a94;margin:0;">You hold read access only.</p>}
+    </div>
+
+    <!-- =================== BACKFILL =================== -->
+    {canEdit && (
+      <div style={CARD}>
+        <p style={HD}>Job status backfill</p>
+        <p style="font-size:13px;color:#9aa6b6;margin:0 0 12px;line-height:1.6;">
+          Every posting written before the status workflow existed has a NULL <code>job_status</code>. Readers
+          treat that as PUBLISHED, so the site is correct either way — this only fills the column in so the
+          console stops showing a blank status for the whole catalogue. It never overwrites a status somebody set.
+        </p>
+        <form method="POST">
+          <input type="hidden" name="_action" value="backfill_status" />
+          <button type="submit" class="admin-btn" style="padding:7px 14px;font-size:12px;">Backfill from is_open</button>
+        </form>
+      </div>
+    )}
+
+    <!-- =================== THE REGISTER =================== -->
+    {registerUnreadable && (
+      <div style={CARD + 'border-left:3px solid #f87171;'}>
+        <p style="font-size:13px;color:#fca5a5;margin:0;line-height:1.6;">
+          The division register could not be read. That is NOT the same as there being no divisions, and nothing
+          on this page should be read as "the import has not been run".
+        </p>
+      </div>
+    )}
+
+    {!registerUnreadable && registerEmpty && (
+      <div style={CARD}>
+        <p style="font-size:13px;color:#9aa6b6;margin:0;line-height:1.6;">
+          No divisions in the register yet. Run the import above.
+        </p>
+      </div>
+    )}
+
+    {rows.map((row) => (
+      <div style={CARD}>
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+          <div style="min-width:0;flex:1;">
+            <p style="font-size:10.5px;color:#8a8a94;font-family:'Geist Mono',monospace;margin:0 0 3px;letter-spacing:0.08em;">
+              {row.d.code}{row.scale ? ' · ' + row.scale : ''}{row.classification ? ' · ' + row.classification : ''}
+            </p>
+            <p style="font-size:15px;font-weight:700;color:#fff;margin:0 0 4px;">{row.d.name}</p>
+            <p style="font-size:12.5px;color:#9aa6b6;margin:0 0 8px;line-height:1.6;max-width:75ch;">{row.d.summary}</p>
+            <p style="font-size:11.5px;color:#8a8a94;margin:0;line-height:1.6;max-width:75ch;">{row.d.integrityNote}</p>
+          </div>
+          <div style="flex-shrink:0;text-align:right;">
+            <a href={'/careers/division/' + row.d.slug} style="font-size:11.5px;color:#9bd1ff;text-decoration:none;">View public page &rarr;</a>
+            <p style="font-size:11px;color:#8a8a94;margin:6px 0 0;">{row.d.isVisible ? 'Visible' : 'Hidden'}</p>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0;">
+          {statusOrder.map((st) => (
+            (row.counts[st] || 0) > 0 && (
+              <span style="font-size:11px;color:#cfd6da;font-family:'Geist Mono',monospace;background:#08080b;border:1px solid #1a1a1f;border-radius:6px;padding:3px 8px;">
+                {st} {row.counts[st]}
+              </span>
+            )
+          ))}
+          {!row.hasAny && countsReadable && (
+            <span style="font-size:11px;color:#8a8a94;">No postings imported into this division yet.</span>
+          )}
+          {!countsReadable && (
+            <span style="font-size:11px;color:#fca5a5;">Counts unreadable.</span>
+          )}
+        </div>
+
+        {canEdit && (
+          <div style="display:flex;gap:8px;flex-wrap:wrap;border-top:1px solid #1a1a1f;padding-top:12px;">
+            <form method="POST">
+              <input type="hidden" name="_action" value="publish_division" />
+              <input type="hidden" name="division_id" value={row.d.id} />
+              <button type="submit" class="admin-btn admin-btn-primary" style="padding:6px 12px;font-size:11.5px;">Publish all {row.total}</button>
+            </form>
+            <form method="POST">
+              <input type="hidden" name="_action" value="close_division" />
+              <input type="hidden" name="division_id" value={row.d.id} />
+              <button type="submit" class="admin-btn" style="padding:6px 12px;font-size:11.5px;">Close all</button>
+            </form>
+            <form method="POST">
+              <input type="hidden" name="_action" value="toggle_visible" />
+              <input type="hidden" name="division_id" value={row.d.id} />
+              <input type="hidden" name="visible" value={row.d.isVisible ? '0' : '1'} />
+              <button type="submit" class="admin-btn" style="padding:6px 12px;font-size:11.5px;">{row.d.isVisible ? 'Hide division' : 'Show division'}</button>
+            </form>
+            <a href={'/admin/roles?dept=' + XSCALE_DEPARTMENT_ID} class="admin-btn" style="padding:6px 12px;font-size:11.5px;text-decoration:none;">Edit postings</a>
+          </div>
+        )}
+
+        {canEdit && (
+          <details style="margin-top:12px;">
+            <summary style="font-size:11.5px;color:#9bd1ff;cursor:pointer;">Edit this division's wording</summary>
+            <form method="POST" style="display:grid;gap:8px;margin-top:10px;">
+              <input type="hidden" name="_action" value="save_division" />
+              <input type="hidden" name="division_id" value={row.d.id} />
+              <label style="font-size:11px;color:#8a8a94;">Name
+                <input type="text" name="name" value={row.d.name} class="rolefield-input" style="width:100%;" />
+              </label>
+              <label style="font-size:11px;color:#8a8a94;">Summary
+                <textarea name="summary" rows="2" class="rolefield-input" style="width:100%;">{row.d.summary}</textarea>
+              </label>
+              <label style="font-size:11px;color:#8a8a94;">Charter
+                <textarea name="charter" rows="3" class="rolefield-input" style="width:100%;">{row.d.charter}</textarea>
+              </label>
+              <label style="font-size:11px;color:#8a8a94;">Integrity note (shown above the openings on the public page)
+                <textarea name="integrity_note" rows="4" class="rolefield-input" style="width:100%;">{row.d.integrityNote}</textarea>
+              </label>
+              <label style="font-size:11px;color:#8a8a94;">Sort order
+                <input type="number" name="sort_order" value={row.d.sortOrder} class="rolefield-input" style="width:120px;" />
+              </label>
+              <div><button type="submit" class="admin-btn admin-btn-primary" style="padding:6px 14px;font-size:11.5px;">Save</button></div>
+            </form>
+          </details>
+        )}
+      </div>
+    ))}
+  </div>
+</AdminLayout>

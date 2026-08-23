@@ -63,7 +63,7 @@ for (const dept of allDepts) {
           ${role.level},
           ${role.func || null},
           ${role.type || null},
-          ${role.location || 'Remote'},
+          ${role.location || 'On-site — Kolkata, West Bengal, India'},
           ${role.duration || null},
           ${role.salary || null},
           ${role.about || null},

@@ -1,0 +1,342 @@
+---
+// /admin/recruitment/dashboard — THE NUMBERS, IN ONE PLACE.
+//
+// Postings by status, applications by status, by department, by division and by career level.
+// /admin/applications is still the pipeline you work in and /admin/roles is still the catalogue you
+// edit; this page answers "what is the state of hiring" without opening either.
+//
+// EVERY COUNT SAYS WHETHER IT COULD BE READ. A dashboard that renders 0 for a query that failed is
+// worse than one that renders nothing: zero applications and an unreadable applications table look
+// identical on screen and lead to opposite decisions. Each block below carries its own `readable`
+// flag and says so.
+//
+// THE READS ARE GROUPED, NOT ONE PER TILE. Five GROUP BY queries, not thirty COUNT(*) round trips —
+// the shape this project has already paid for twice on pages that looked fine locally.
+//
+// GATE: `applications.view`, the capability that already means "read the applicant pipeline", held
+// by super_admin, hr, recruiter, reviewer and department_head. can() rather than hasPermission(),
+// so a hand-typed section row cannot spell the key into existence.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
+import { JOB_STATUSES, careerRung } from '@/lib/xscale/taxonomy';
+
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const reasonOf = (e: any): string => e?.cause?.message || e?.message || String(e);
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user as any, 'applications.view')) return Astro.redirect('/admin?denied=applications');
+
+// ---- POSTINGS BY STATUS ------------------------------------------------------------------------
+let postingsByStatus: Record<string, number> = {};
+let postingsReadable = true;
+try {
+  const r = await db.execute(sql`
+    SELECT COALESCE(job_status, CASE WHEN is_open THEN 'PUBLISHED' ELSE 'CLOSED' END) AS st,
+           COUNT(*)::int AS n
+      FROM roles
+     GROUP BY 1`);
+  postingsByStatus = Object.fromEntries(rowsOf(r).map((x) => [String(x.st), Number(x.n || 0)]));
+} catch (e: any) {
+  postingsReadable = false;
+  console.error('[recruitment/dashboard] postings:', reasonOf(e));
+}
+const totalPostings = Object.values(postingsByStatus).reduce((a, b) => a + b, 0);
+
+// Deadline-expired postings still marked PUBLISHED. Counted separately because effectiveJobStatus()
+// treats them as closed while the column still says otherwise, and the gap between those two is
+// exactly the thing somebody needs to fix.
+let expiredButPublished = 0;
+let expiredReadable = true;
+try {
+  const r = await db.execute(sql`
+    SELECT COUNT(*)::int AS n FROM roles
+     WHERE COALESCE(job_status, 'PUBLISHED') = 'PUBLISHED'
+       AND application_deadline IS NOT NULL
+       AND application_deadline < NOW()`);
+  expiredButPublished = Number(rowsOf(r)[0]?.n || 0);
+} catch (e: any) {
+  expiredReadable = false;
+  console.error('[recruitment/dashboard] expired:', reasonOf(e));
+}
+
+// ---- APPLICATIONS BY STATUS --------------------------------------------------------------------
+let appsByStatus: { status: string; n: number }[] = [];
+let appsReadable = true;
+try {
+  const r = await db.execute(sql`
+    SELECT status::text AS st, COUNT(*)::int AS n
+      FROM applications
+     WHERE is_archived = FALSE
+     GROUP BY 1
+     ORDER BY 2 DESC`);
+  appsByStatus = rowsOf(r).map((x) => ({ status: String(x.st), n: Number(x.n || 0) }));
+} catch (e: any) {
+  appsReadable = false;
+  console.error('[recruitment/dashboard] applications:', reasonOf(e));
+}
+const totalApplications = appsByStatus.reduce((a, b) => a + b.n, 0);
+
+// ---- APPLICATIONS BY DEPARTMENT ----------------------------------------------------------------
+let appsByDept: { name: string; n: number }[] = [];
+let deptReadable = true;
+try {
+  const r = await db.execute(sql`
+    SELECT COALESCE(d.name, a.department_snapshot, 'Not recorded') AS name, COUNT(*)::int AS n
+      FROM applications a
+      LEFT JOIN roles ro ON ro.id = a.role_id
+      LEFT JOIN departments d ON d.id = ro.department_id
+     WHERE a.is_archived = FALSE
+     GROUP BY 1
+     ORDER BY 2 DESC
+     LIMIT 20`);
+  appsByDept = rowsOf(r).map((x) => ({ name: String(x.name), n: Number(x.n || 0) }));
+} catch (e: any) {
+  deptReadable = false;
+  console.error('[recruitment/dashboard] by department:', reasonOf(e));
+}
+
+// ---- APPLICATIONS BY DIVISION ------------------------------------------------------------------
+// Tolerates the divisions table not existing: on a database where db/xscale-schema.sql has not been
+// run this simply reports itself unreadable rather than taking the page down.
+let appsByDivision: { name: string; n: number }[] = [];
+let divisionReadable = true;
+try {
+  const r = await db.execute(sql`
+    SELECT v.name AS name, COUNT(*)::int AS n
+      FROM applications a
+      JOIN roles ro ON ro.id = a.role_id
+      JOIN divisions v ON v.id = ro.division_id
+     WHERE a.is_archived = FALSE
+     GROUP BY 1
+     ORDER BY 2 DESC
+     LIMIT 20`);
+  appsByDivision = rowsOf(r).map((x) => ({ name: String(x.name), n: Number(x.n || 0) }));
+} catch (e: any) {
+  divisionReadable = false;
+  console.error('[recruitment/dashboard] by division:', reasonOf(e));
+}
+
+// ---- APPLICATIONS BY CAREER LEVEL --------------------------------------------------------------
+let appsByLevel: { label: string; n: number }[] = [];
+let levelReadable = true;
+try {
+  const r = await db.execute(sql`
+    SELECT COALESCE(a.level::text, 'Not recorded') AS lv, COUNT(*)::int AS n
+      FROM applications a
+     WHERE a.is_archived = FALSE
+     GROUP BY 1
+     ORDER BY 2 DESC`);
+  appsByLevel = rowsOf(r).map((x) => ({ label: String(x.lv), n: Number(x.n || 0) }));
+} catch (e: any) {
+  levelReadable = false;
+  console.error('[recruitment/dashboard] by level:', reasonOf(e));
+}
+
+// ---- APPLICATIONS BY RESEARCH RUNG -------------------------------------------------------------
+let appsByRung: { rung: number; label: string; n: number }[] = [];
+let rungReadable = true;
+try {
+  const r = await db.execute(sql`
+    SELECT ro.career_level AS rung, COUNT(*)::int AS n
+      FROM applications a
+      JOIN roles ro ON ro.id = a.role_id
+     WHERE a.is_archived = FALSE AND ro.career_level IS NOT NULL
+     GROUP BY 1
+     ORDER BY 1 ASC`);
+  appsByRung = rowsOf(r).map((x) => {
+    const rung = Number(x.rung);
+    return { rung, label: careerRung(rung)?.label || ('Level ' + rung), n: Number(x.n || 0) };
+  });
+} catch (e: any) {
+  rungReadable = false;
+  console.error('[recruitment/dashboard] by rung:', reasonOf(e));
+}
+
+// Every comparison hoisted out of the markup.
+const statusTiles = JOB_STATUSES.map((s) => ({ key: s.key, label: s.label, n: postingsByStatus[s.key] || 0 }));
+const hasApps = appsByStatus.length > 0;
+const hasDept = appsByDept.length > 0;
+const hasDivision = appsByDivision.length > 0;
+const hasLevel = appsByLevel.length > 0;
+const hasRung = appsByRung.length > 0;
+const hasExpired = expiredButPublished > 0;
+
+const maxDept = Math.max(1, ...appsByDept.map((x) => x.n));
+const maxDivision = Math.max(1, ...appsByDivision.map((x) => x.n));
+const maxLevel = Math.max(1, ...appsByLevel.map((x) => x.n));
+const maxRung = Math.max(1, ...appsByRung.map((x) => x.n));
+
+const CARD = 'background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:16px 18px;margin-bottom:16px;';
+const HD = "font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 12px;";
+const UNREADABLE = 'font-size:12.5px;color:#fca5a5;margin:0;line-height:1.6;';
+
+function pct(n: number, max: number): string {
+  const v = Math.round((n / max) * 100);
+  return String(Math.max(2, Math.min(100, v))) + '%';
+}
+---
+
+<AdminLayout title="Recruitment dashboard" activeNav="applications">
+  <div style="max-width:1100px;margin:0 auto;padding:20px 16px 90px;">
+    <p style="font-size:10.5px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;font-family:'Geist Mono',monospace;font-weight:700;">Hiring</p>
+    <h1 style="font-size:24px;color:#fff;margin:6px 0 4px;font-weight:700;">Recruitment dashboard</h1>
+    <p style="font-size:13px;color:#9aa6b6;margin:0 0 20px;line-height:1.6;max-width:70ch;">
+      Postings and applications, counted. Every block says whether it could actually be read — a count of zero
+      and a query that failed look identical on a dashboard, and they lead to opposite decisions.
+    </p>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px;">
+      <a href="/admin/applications" class="admin-btn" style="padding:7px 14px;font-size:12px;text-decoration:none;">The pipeline &rarr;</a>
+      <a href="/admin/roles" class="admin-btn" style="padding:7px 14px;font-size:12px;text-decoration:none;">The catalogue &rarr;</a>
+      <a href="/admin/roles/divisions" class="admin-btn" style="padding:7px 14px;font-size:12px;text-decoration:none;">Divisions &rarr;</a>
+      <a href="/admin/recruitment" class="admin-btn" style="padding:7px 14px;font-size:12px;text-decoration:none;">Recruitment hub &rarr;</a>
+    </div>
+
+    <!-- =================== POSTINGS =================== -->
+    <div style={CARD}>
+      <p style={HD}>Postings</p>
+      {!postingsReadable && <p style={UNREADABLE}>The roles table could not be read. These are not zeroes; they are unknowns.</p>}
+      {postingsReadable && (
+        <div>
+          <p style="font-size:32px;font-weight:800;color:#fff;margin:0 0 12px;line-height:1;">{totalPostings}<span style="font-size:13px;font-weight:500;color:#8a8a94;margin-left:8px;">total</span></p>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;">
+            {statusTiles.map((t) => (
+              <div style="background:#08080b;border:1px solid #1a1a1f;border-radius:10px;padding:10px 12px;">
+                <p style="font-size:10.5px;color:#8a8a94;margin:0;font-family:'Geist Mono',monospace;letter-spacing:0.06em;">{t.label}</p>
+                <p style="font-size:22px;font-weight:800;color:#fff;margin:3px 0 0;line-height:1;">{t.n}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {expiredReadable && hasExpired && (
+        <p style="font-size:12.5px;color:#fbbf24;margin:12px 0 0;line-height:1.6;">
+          {expiredButPublished} {expiredButPublished === 1 ? 'posting is' : 'postings are'} still marked PUBLISHED with a
+          deadline that has passed. The site already treats them as closed and refuses applications to them — the
+          column just disagrees with the behaviour, and that gap is worth closing on
+          <a href="/admin/roles" style="color:#9bd1ff;"> the catalogue</a>.
+        </p>
+      )}
+      {!expiredReadable && (
+        <p style="font-size:12px;color:#fca5a5;margin:12px 0 0;">The expired-deadline check could not run.</p>
+      )}
+    </div>
+
+    <!-- =================== APPLICATIONS BY STATUS =================== -->
+    <div style={CARD}>
+      <p style={HD}>Applications by status</p>
+      {!appsReadable && <p style={UNREADABLE}>The applications table could not be read.</p>}
+      {appsReadable && !hasApps && <p style="font-size:12.5px;color:#8a8a94;margin:0;">No applications on file. That is a real zero, not a failed read.</p>}
+      {appsReadable && hasApps && (
+        <div>
+          <p style="font-size:32px;font-weight:800;color:#fff;margin:0 0 12px;line-height:1;">{totalApplications}<span style="font-size:13px;font-weight:500;color:#8a8a94;margin-left:8px;">not archived</span></p>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;">
+            {appsByStatus.map((a) => (
+              <a href={'/admin/applications?status=' + a.status} style="background:#08080b;border:1px solid #1a1a1f;border-radius:10px;padding:10px 12px;text-decoration:none;display:block;">
+                <p style="font-size:10.5px;color:#8a8a94;margin:0;font-family:'Geist Mono',monospace;letter-spacing:0.06em;">{a.status}</p>
+                <p style="font-size:22px;font-weight:800;color:#fff;margin:3px 0 0;line-height:1;">{a.n}</p>
+              </a>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+
+    <!-- =================== BY DEPARTMENT =================== -->
+    <div style={CARD}>
+      <p style={HD}>Applications by department</p>
+      {!deptReadable && <p style={UNREADABLE}>Could not be read.</p>}
+      {deptReadable && !hasDept && <p style="font-size:12.5px;color:#8a8a94;margin:0;">Nothing to group yet.</p>}
+      {deptReadable && hasDept && (
+        <div style="display:grid;gap:7px;">
+          {appsByDept.map((x) => (
+            <div style="display:grid;grid-template-columns:1fr 46px;gap:10px;align-items:center;">
+              <div>
+                <p style="font-size:12.5px;color:#cfd6da;margin:0 0 3px;">{x.name}</p>
+                <div style="height:5px;background:#08080b;border-radius:3px;overflow:hidden;">
+                  <div style={'height:100%;background:#FF7040;width:' + pct(x.n, maxDept) + ';'}></div>
+                </div>
+              </div>
+              <p style="font-size:13px;color:#fff;margin:0;text-align:right;font-family:'Geist Mono',monospace;font-weight:700;">{x.n}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+
+    <!-- =================== BY DIVISION =================== -->
+    <div style={CARD}>
+      <p style={HD}>Applications by division</p>
+      {!divisionReadable && (
+        <p style={UNREADABLE}>
+          The divisions table could not be read. On a database where <code>db/xscale-schema.sql</code> has not
+          been applied yet, that is expected — see <a href="/admin/roles/divisions" style="color:#9bd1ff;">Divisions</a>.
+        </p>
+      )}
+      {divisionReadable && !hasDivision && <p style="font-size:12.5px;color:#8a8a94;margin:0;">No applications against a division-assigned posting yet.</p>}
+      {divisionReadable && hasDivision && (
+        <div style="display:grid;gap:7px;">
+          {appsByDivision.map((x) => (
+            <div style="display:grid;grid-template-columns:1fr 46px;gap:10px;align-items:center;">
+              <div>
+                <p style="font-size:12.5px;color:#cfd6da;margin:0 0 3px;">{x.name}</p>
+                <div style="height:5px;background:#08080b;border-radius:3px;overflow:hidden;">
+                  <div style={'height:100%;background:#9bd1ff;width:' + pct(x.n, maxDivision) + ';'}></div>
+                </div>
+              </div>
+              <p style="font-size:13px;color:#fff;margin:0;text-align:right;font-family:'Geist Mono',monospace;font-weight:700;">{x.n}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+
+    <!-- =================== BY LEVEL AND RUNG =================== -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;">
+      <div style={CARD + 'margin:0;'}>
+        <p style={HD}>By seniority</p>
+        {!levelReadable && <p style={UNREADABLE}>Could not be read.</p>}
+        {levelReadable && !hasLevel && <p style="font-size:12.5px;color:#8a8a94;margin:0;">Nothing to group yet.</p>}
+        {levelReadable && hasLevel && (
+          <div style="display:grid;gap:7px;">
+            {appsByLevel.map((x) => (
+              <div style="display:grid;grid-template-columns:1fr 46px;gap:10px;align-items:center;">
+                <div>
+                  <p style="font-size:12.5px;color:#cfd6da;margin:0 0 3px;">{x.label}</p>
+                  <div style="height:5px;background:#08080b;border-radius:3px;overflow:hidden;">
+                    <div style={'height:100%;background:#6ee7b7;width:' + pct(x.n, maxLevel) + ';'}></div>
+                  </div>
+                </div>
+                <p style="font-size:13px;color:#fff;margin:0;text-align:right;font-family:'Geist Mono',monospace;font-weight:700;">{x.n}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div style={CARD + 'margin:0;'}>
+        <p style={HD}>By research rung</p>
+        {!rungReadable && <p style={UNREADABLE}>Could not be read.</p>}
+        {rungReadable && !hasRung && <p style="font-size:12.5px;color:#8a8a94;margin:0;">No applications against a rung-assigned posting yet.</p>}
+        {rungReadable && hasRung && (
+          <div style="display:grid;gap:7px;">
+            {appsByRung.map((x) => (
+              <div style="display:grid;grid-template-columns:1fr 46px;gap:10px;align-items:center;">
+                <div>
+                  <p style="font-size:12.5px;color:#cfd6da;margin:0 0 3px;">L{x.rung} &middot; {x.label}</p>
+                  <div style="height:5px;background:#08080b;border-radius:3px;overflow:hidden;">
+                    <div style={'height:100%;background:#c0a35e;width:' + pct(x.n, maxRung) + ';'}></div>
+                  </div>
+                </div>
+                <p style="font-size:13px;color:#fff;margin:0;text-align:right;font-family:'Geist Mono',monospace;font-weight:700;">{x.n}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  </div>
+</AdminLayout>
