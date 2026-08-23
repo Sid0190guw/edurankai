@@ -85,7 +85,7 @@
 
 import { db, sqlClient } from './db';
 import { sql } from 'drizzle-orm';
-import { ensureOnce } from './ensure-once';
+import { ensureOnce, guardedDdl } from './ensure-once';
 
 // Declared before every function below that uses it. `const` is not hoisted, and a const declared
 // under its first use has taken pages down on this project.
@@ -307,7 +307,7 @@ const ORG_STRUCTURES_DDL = ORG_TEAMS_DDL + ORG_POSITIONS_DDL + ORG_ASSIGNMENTS_D
 // force a retry would never fire. The send itself is identical to ensureBatch's: one simple-protocol
 // message, one implicit transaction, and only string literals declared above — never user input.
 async function sendDdlBatch(ddl: string): Promise<void> {
-  await sqlClient().unsafe(ddl).simple();
+  await sqlClient().unsafe(guardedDdl(ddl)).simple();
 }
 
 /**

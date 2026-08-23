@@ -10,7 +10,26 @@
 // transient DB hiccup must not poison the process for its lifetime.
 const cache = new Map<string, Promise<void>>();
 
+// A KILL SWITCH FOR EVERY SCHEMA BOOTSTRAP IN THE CODEBASE, SETTABLE WITHOUT A DEPLOY.
+//
+// There are ~192 ensureOnce() keys and ~689 CREATE/ALTER statements behind them, and every one of
+// them runs on the request path of a cold serverless instance. That is survivable until it is not:
+// on 2026-08-23 the site served nothing but its database-free pages for the better part of an hour,
+// and there was no way to stop the DDL short of shipping a commit into an outage.
+//
+// Set SCHEMA_BOOTSTRAP=off in the platform's environment variables and every ensure becomes a
+// resolved promise. Nothing else changes: callers already tolerate a missing table — that tolerance
+// is why the swallow below exists — so the failure mode is a feature reporting no rows rather than a
+// site that will not load. Turn it back on to let a genuinely new table create itself, then off.
+//
+// Read per call, not once at module scope, so the value is whatever the environment says NOW rather
+// than whatever it said when this instance happened to boot.
+function bootstrapDisabled(): boolean {
+  return String(process.env.SCHEMA_BOOTSTRAP || '').toLowerCase() === 'off';
+}
+
 export function ensureOnce(key: string, fn: () => Promise<void>): Promise<void> {
+  if (bootstrapDisabled()) return Promise.resolve();
   let p = cache.get(key);
   if (!p) {
     p = fn().catch((e) => {
@@ -55,6 +74,48 @@ export function ensureOnce(key: string, fn: () => Promise<void>): Promise<void> 
 export function ensureBatch(key: string, ddl: string): Promise<void> {
   return ensureOnce(key, async () => {
     const { sqlClient } = await import('@/lib/db');
-    await sqlClient().unsafe(ddl).simple();
+    // A BATCH THAT CANNOT GET ITS LOCK MUST GIVE UP, NOT QUEUE.
+    //
+    // This is the part batching got wrong, and it took the site down on 2026-08-23. Every statement
+    // here is idempotent and nearly all of them are no-ops in production — the table exists, the
+    // column exists — but ALTER TABLE takes its ACCESS EXCLUSIVE lock BEFORE it evaluates IF NOT
+    // EXISTS, and inside one transaction it holds every lock it takes until commit. One batch
+    // therefore holds an exclusive lock on `roles` (thirteen ALTERs) for the length of the whole
+    // batch, and a pending exclusive lock queues AHEAD of readers: every SELECT on that table waits
+    // behind it. As separate statements each lock was taken and released in turn, so this never
+    // showed.
+    //
+    // A deploy is what makes it fatal, because a deploy makes every instance cold at the same
+    // moment: they all run these bootstraps at once and contend with each other on the same tables.
+    // Each one blocked on a lock is also holding a session on the transaction pooler, which is how a
+    // schema bootstrap becomes an empty connection pool and a site that answers only on the pages
+    // that never touch the database.
+    //
+    // An EXPLICIT transaction, not the implicit one a multi-statement simple query already creates:
+    // SET LOCAL has no effect outside a transaction block, and being certain of that is the whole
+    // point of the statement. 3 seconds is far longer than an uncontended no-op ALTER needs and far
+    // shorter than a request can afford to spend queuing. On timeout the batch rolls back whole,
+    // ensureOnce drops the key, and the next request retries — by which time whoever held the lock
+    // has almost certainly finished.
+    await sqlClient().unsafe(guardedDdl(ddl)).simple();
   });
+}
+
+/**
+ * Wrap a block of idempotent DDL so it cannot hold a table — or a pooler session — indefinitely.
+ *
+ * Exported because several bootstraps send their DDL through sqlClient().unsafe().simple() directly
+ * rather than through ensureBatch(), and a guard that only half the batches use is not a guard.
+ *
+ * An EXPLICIT transaction, not the implicit one a multi-statement simple query already creates:
+ * SET LOCAL has no effect outside a transaction block, and being certain of that is the whole point
+ * of the statement.
+ */
+export function guardedDdl(ddl: string): string {
+  const body = ddl.trim().replace(/;[ \t\r\n]*$/, '');
+  return `BEGIN;
+SET LOCAL lock_timeout = '3s';
+SET LOCAL statement_timeout = '20s';
+${body};
+COMMIT;`;
 }

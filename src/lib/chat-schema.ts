@@ -59,7 +59,7 @@
 // scripts/setup-chat-audit.mjs, which a fresh database would never have had run against it).
 import { db, sqlClient } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { ensureOnce } from '@/lib/ensure-once';
+import { ensureOnce, guardedDdl } from '@/lib/ensure-once';
 import { logEvent } from '@/lib/logger';
 
 // Declared before every function that uses them: `const` is not hoisted, and a handler that reaches
@@ -145,7 +145,7 @@ async function batch(ddl: string): Promise<void> {
   // how the original shape mismatch stayed hidden for eight weeks — so the rejection is left to
   // propagate. Every string passed here is a literal of idempotent DDL, never built from input,
   // which is what makes the simple protocol safe to use.
-  await sqlClient().unsafe(ddl).simple();
+  await sqlClient().unsafe(guardedDdl(ddl)).simple();
 }
 
 const CHAT_CHANNELS_DDL = `

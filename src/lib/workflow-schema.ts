@@ -70,7 +70,7 @@
 
 import { db, sqlClient } from './db';
 import { sql } from 'drizzle-orm';
-import { ensureOnce } from './ensure-once';
+import { ensureOnce, guardedDdl } from './ensure-once';
 
 // Declared before every function below that uses it. `const` is not hoisted, and a const declared
 // under its first use throws on the first line of whatever reads it — that pattern has taken pages
@@ -277,7 +277,7 @@ export function ensureWorkflowSchema(): Promise<void> {
 
 async function createWorkflowTables(): Promise<void> {
   // workflow_instances and its twelve column assertions, in one message.
-  await sqlClient().unsafe(WORKFLOW_INSTANCES_DDL).simple();
+  await sqlClient().unsafe(guardedDdl(WORKFLOW_INSTANCES_DDL)).simple();
 
   // NO CHECK CONSTRAINT ON `state` OR `domain`, and no foreign key to the domain tables. Same three
   // reasons as org_relationships:
@@ -319,7 +319,7 @@ async function createWorkflowTables(): Promise<void> {
   // The three workflow_instances indexes and the whole of workflow_steps — the next unguarded run,
   // in its original order. Concatenated so it travels as ONE message while each block keeps the
   // comments that belong above it.
-  await sqlClient().unsafe(WORKFLOW_INSTANCE_INDEXES_DDL + WORKFLOW_STEPS_DDL).simple();
+  await sqlClient().unsafe(guardedDdl(WORKFLOW_INSTANCE_INDEXES_DDL + WORKFLOW_STEPS_DDL)).simple();
 
   try {
     // ONE PENDING DECISION PER PERSON PER STEP. Without this, two routing passes over the same
