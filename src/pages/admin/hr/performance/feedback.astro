@@ -1,0 +1,574 @@
+---
+// /admin/hr/performance/feedback — THE PEOPLE-DESK VIEW OF ONE PERSON'S FEEDBACK RECORD.
+//
+// =================================================================================================
+// THE GATE
+// =================================================================================================
+//
+// `performance.manage`, asked with can() — which reads PERMS_BY_ROLE alone and never the registry,
+// for the same reason /admin/hr/performance/cycles states: page_key is free text, so a hand-typed
+// custom-role row could spell `performance.manage` and a registry-based check would then admit
+// somebody nobody deliberately granted this to.
+//
+// AND IT REFUSES OUT LOUD, in place. A silent redirect is how people conclude the product is broken
+// and go and ask for a wider role than they need.
+//
+// =================================================================================================
+// WHAT THIS CONSOLE DOES, AND THE ONE THING IT DELIBERATELY CANNOT
+// =================================================================================================
+//
+// It shows the aggregate, every reason the aggregate is what it is, and the items underneath it.
+// It is the ONLY view that sees the people-desk channel, the per-item weighting, and the readings
+// about individual AUTHORS — somebody has to be able to notice one person quietly marking a whole
+// team down, and that somebody is this desk.
+//
+// IT DECIDES NOTHING. There is no button here that promotes, rates, flags for exit, or writes to
+// anybody's appraisal. The only write on the page is withdrawing an item, which needs a reason and
+// keeps the item. A number on this screen is an input to a conversation a human then has.
+//
+// =================================================================================================
+// EVERY `const` ABOVE THE POST HANDLER
+// =================================================================================================
+//
+// `const` is not hoisted, and a handler reaching a later declaration throws on its first line while
+// the page reports success. That pattern took down apply step 5 and the /admin/roles/diagnose
+// Repair button on this project.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import {
+  resolvePerfViewer,
+  employeeHeader,
+  rowsOf,
+  isUuid,
+  logFail,
+  PERF_MANAGE,
+} from '@/lib/performance-scope';
+import { getFeedbackSignal } from '@/lib/horizon/feedback/contract';
+import { withdrawFeedback } from '@/lib/horizon/feedback/capture';
+import {
+  FEEDBACK_SOURCE_LABELS,
+  FEEDBACK_CONTEXT_LABELS,
+  FEEDBACK_CONFIDENTIALITY_LABELS,
+  EVIDENCE_QUALITY_LABELS,
+  CONFIDENCE_BAND_LABELS,
+  FEEDBACK_SOURCE_WEIGHT_REASONS,
+} from '@/lib/horizon/feedback/types';
+
+const PATH = '/admin/hr/performance/feedback';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=' + encodeURIComponent(PATH));
+
+// ---- Gate ----------------------------------------------------------------------------------------
+const hasConsole = can(user as any, 'admin.access');
+if (!hasConsole) return Astro.redirect('/admin');
+const allowed = can(user as any, PERF_MANAGE);
+
+// ---- Helpers, all declared before the handler that uses them --------------------------------------
+const back = (msg: string, emp: string) =>
+  Astro.redirect(PATH + (emp ? '?emp=' + encodeURIComponent(emp) + '&' : '?')
+    + 'msg=' + encodeURIComponent(msg.slice(0, 300)));
+
+const fmtDate = (iso: string | null) =>
+  iso ? new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+
+/** A 1..5 score as a percentage of the bar. Hoisted because JSX cannot hold the arithmetic cleanly. */
+const scorePct = (n: number | null) => (n === null ? 0 : Math.max(0, Math.min(100, Math.round((n / 5) * 100))));
+
+const sourceLabel = (k: string) => FEEDBACK_SOURCE_LABELS[k as keyof typeof FEEDBACK_SOURCE_LABELS] || k;
+const contextLabel = (k: string) => FEEDBACK_CONTEXT_LABELS[k as keyof typeof FEEDBACK_CONTEXT_LABELS] || k;
+const evidenceLabel = (k: string) => EVIDENCE_QUALITY_LABELS[k as keyof typeof EVIDENCE_QUALITY_LABELS] || k;
+const bandLabel = (k: string) => CONFIDENCE_BAND_LABELS[k as keyof typeof CONFIDENCE_BAND_LABELS] || k;
+const confLabel = (k: string) => FEEDBACK_CONFIDENTIALITY_LABELS[k as keyof typeof FEEDBACK_CONFIDENTIALITY_LABELS] || k;
+const weightReason = (k: string) => FEEDBACK_SOURCE_WEIGHT_REASONS[k as keyof typeof FEEDBACK_SOURCE_WEIGHT_REASONS] || '';
+
+// =================================================================================================
+// WRITES — skipped entirely when the gate refused. No query runs on the denied path.
+// =================================================================================================
+if (Astro.request.method === 'POST') {
+  if (!allowed) return Astro.redirect(PATH);
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const emp = String(fd.get('emp') || '');
+
+  if (action === 'withdraw') {
+    const r = await withdrawFeedback({
+      feedbackId: String(fd.get('feedback_id') || ''),
+      actorUserId: String(user.id),
+      actorHoldsPeopleDesk: true,
+      reason: String(fd.get('reason') || ''),
+    });
+    return back(
+      r.ok
+        ? 'Withdrawn. The item stays on the record with your reason against it and no longer counts '
+          + 'towards any figure.'
+        : (r.error || 'Could not withdraw that item.'),
+      emp,
+    );
+  }
+
+  return back('That action is not one this page performs.', emp);
+}
+
+// =================================================================================================
+// READS
+// =================================================================================================
+const params = Astro.url.searchParams;
+const msg = String(params.get('msg') || '').slice(0, 300);
+const q = String(params.get('q') || '').slice(0, 80).trim();
+const empId = String(params.get('emp') || '');
+
+let viewer: any = null;
+let people: { id: string; name: string; designation: string | null; code: string | null }[] = [];
+let header: { id: string; fullName: string; designation: string | null } | null = null;
+let envelope: any = null;
+
+if (allowed) {
+  viewer = await resolvePerfViewer(String(user.id), (k: string) => can(user as any, k as any));
+
+  // The picker. A LIKE over active employees, capped — this desk is org-wide by definition, so the
+  // list is not scoped by relationship; it is scoped by the capability that opened the page.
+  try {
+    const like = '%' + q.replace(/[%_]/g, '') + '%';
+    const filter = q ? sql`AND (e.full_name ILIKE ${like} OR e.employee_code ILIKE ${like})` : sql``;
+    const rows = rowsOf(await db.execute(sql`
+      SELECT e.id, e.full_name, e.designation, e.employee_code
+        FROM hr_employees e
+       WHERE e.is_active = true ${filter}
+       ORDER BY e.full_name ASC
+       LIMIT 60`));
+    people = rows.map((r: any) => ({
+      id: String(r.id),
+      name: r.full_name ? String(r.full_name) : 'Unnamed record',
+      designation: r.designation ? String(r.designation) : null,
+      code: r.employee_code ? String(r.employee_code) : null,
+    }));
+  } catch (e: any) {
+    logFail('admin/hr/performance/feedback', 'people', e);
+  }
+
+  if (isUuid(empId)) {
+    header = await employeeHeader(empId);
+    envelope = await getFeedbackSignal(empId, {
+      viewer,
+      purpose: 'people_desk_review',
+      includeItems: true,
+    });
+  }
+}
+
+// ---- Everything the JSX needs, computed here. No comparisons inside JSX expressions. --------------
+const signal = envelope && envelope.signal ? envelope.signal : null;
+const items = envelope ? envelope.items : [];
+const dims = signal ? signal.dimensions : [];
+const flags = signal ? signal.flags : [];
+const attentionFlags = flags.filter((f: any) => f.severity === 'attention');
+const noteFlags = flags.filter((f: any) => f.severity === 'note');
+const hasOverall = !!signal && signal.overall !== null;
+const scoredCount = dims.filter((d: any) => d.score !== null).length;
+const unscoredCount = dims.length - scoredCount;
+const sourceTypeRows = signal
+  ? Object.keys(signal.sourceTypeCounts).map((k) => ({ key: k, label: sourceLabel(k), n: signal.sourceTypeCounts[k] }))
+  : [];
+const empHref = (id: string) => PATH + '?emp=' + encodeURIComponent(id) + (q ? '&q=' + encodeURIComponent(q) : '');
+const isDenied = !!envelope && envelope.denied === true;
+---
+
+<AdminLayout title="Feedback record" activeNav="hr">
+  <style>
+    .fb{max-width:1080px}
+    .fb h1{font-size:22px;font-weight:700;letter-spacing:-.01em;margin:0 0 4px}
+    .fb .lede{font-size:13.5px;line-height:1.6;color:#6b6255;margin:0 0 18px;max-width:74ch}
+    .fb .flash{background:rgba(5,150,105,.09);border:1px solid rgba(5,150,105,.3);color:#065f46;
+      border-radius:10px;padding:11px 13px;font-size:13px;line-height:1.5;margin-bottom:16px;
+      overflow-wrap:anywhere}
+    .fb .deny{background:#fbf7f1;border:1px solid #eadecd;color:#6d470d;border-radius:12px;
+      padding:16px;font-size:13.5px;line-height:1.6;max-width:70ch}
+    .fb .card{background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:16px;margin-bottom:14px}
+    .fb .card h2{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;
+      letter-spacing:.13em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px}
+    .fb .muted{font-size:12.5px;line-height:1.55;color:#6b6255;overflow-wrap:anywhere}
+    .fb .notice{background:#fbf7f1;border:1px solid #eadecd;color:#6d470d;border-radius:10px;
+      padding:11px 13px;font-size:12.5px;line-height:1.6;margin:10px 0;overflow-wrap:anywhere}
+    .fb .notice.hard{background:rgba(220,38,38,.06);border-color:rgba(220,38,38,.3);color:#8a1c1c}
+    .fb label{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9.5px;
+      letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;
+      margin:10px 0 4px}
+    .fb input,.fb select,.fb textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;
+      border-radius:9px;padding:10px 12px;font-size:14px;font-family:inherit;color:#1a1510;
+      outline:none;min-height:44px}
+    .fb textarea{min-height:64px;resize:vertical}
+    .fb input:focus,.fb select:focus,.fb textarea:focus{border-color:#c2410c}
+    .fb .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:11px 18px;
+      font-size:14px;font-weight:650;cursor:pointer;font-family:inherit;min-height:44px;margin-top:12px}
+    .fb .btn.ghost{background:#fff;color:#6b6255;border:1px solid #e6ddcd}
+    .fb .btn.slim{padding:9px 14px;font-size:13px;margin-top:0}
+    .fb .people{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}
+    .fb .person{display:inline-flex;flex-direction:column;gap:1px;padding:8px 12px;border-radius:10px;
+      border:1px solid #e6ddcd;background:#fff;color:#3b332a;text-decoration:none;font-size:13px;
+      min-height:44px;justify-content:center}
+    .fb .person[aria-current="page"]{background:#1a1510;border-color:#1a1510;color:#fff}
+    .fb .person small{font-size:10.5px;color:#9a8f7d}
+    .fb .person[aria-current="page"] small{color:#c9bfae}
+    .fb .stats{display:flex;flex-wrap:wrap;gap:9px;margin:12px 0}
+    .fb .stat{flex:1 1 140px;border:1px solid #ece4d6;border-radius:11px;padding:11px 13px;background:#fff}
+    .fb .stat b{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:19px;line-height:1.2}
+    .fb .stat span{display:block;margin-top:3px;font-size:10.5px;letter-spacing:.06em;
+      text-transform:uppercase;color:#9a8f7d}
+    .fb .dim{border-bottom:1px solid #f4efe6;padding:12px 0}
+    .fb .dim:last-child{border-bottom:none}
+    .fb .dimhead{display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap}
+    .fb .dimhead b{font-size:14px;font-weight:650}
+    .fb .num{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:17px;font-weight:700}
+    .fb .bar{height:7px;border-radius:4px;background:#f1ebe0;margin:7px 0 6px;overflow:hidden}
+    .fb .bar i{display:block;height:100%;background:#c2410c;border-radius:4px}
+    .fb .pill{display:inline-block;font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;
+      font-weight:700;padding:3px 8px;border-radius:999px;border:1px solid #e6ddcd;color:#6b6255;
+      background:#faf7f1;margin-right:5px}
+    .fb .pill.warn{border-color:rgba(220,38,38,.3);color:#8a1c1c;background:rgba(220,38,38,.05)}
+    .fb .pill.ok{border-color:rgba(5,150,105,.3);color:#065f46;background:rgba(5,150,105,.06)}
+    .fb details{border:1px solid #ece4d6;border-radius:12px;background:#fff;margin:8px 0;overflow:hidden}
+    .fb details>summary{list-style:none;cursor:pointer;padding:11px 14px;font-size:13px;font-weight:650;
+      min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+    .fb details>summary::-webkit-details-marker{display:none}
+    .fb details .inner{padding:0 14px 14px}
+    .fb .contrib{border-top:1px solid #f4efe6;padding:9px 0;font-size:12.5px;line-height:1.55;color:#3b332a}
+    .fb .steps{margin:6px 0 0;padding-left:16px;color:#6b6255;font-size:12px;line-height:1.6}
+    .fb .item{border:1px solid #ece4d6;border-radius:12px;padding:13px;margin-bottom:10px;background:#fff}
+    .fb .item.withdrawn{opacity:.55}
+    .fb .kv{display:flex;flex-wrap:wrap;gap:5px 12px;margin:7px 0;font-size:11.5px;color:#9a8f7d}
+    .fb .ev{background:#faf7f1;border:1px solid #f1ebe0;border-radius:9px;padding:10px 12px;
+      font-size:13px;line-height:1.6;color:#3b332a;margin-top:8px;overflow-wrap:anywhere}
+    .fb .exp{font-size:12px;line-height:1.65;color:#6b6255}
+    .fb .exp b{color:#3b332a;font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace;display:block;margin:9px 0 3px}
+    .fb .exp ul{margin:0;padding-left:16px}
+    .fb .searchrow{display:grid;grid-template-columns:1fr;gap:8px;align-items:end}
+    @media (min-width:760px){ .fb .searchrow{grid-template-columns:1fr auto} }
+  </style>
+
+  <div class="fb">
+    <h1>Feedback record</h1>
+    <p class="lede">
+      Structured feedback about one person, from their reporting manager, team lead, the people desk,
+      colleagues and themselves. This is the only view that includes the people-desk channel, the
+      weighting behind each figure, and the patterns across individual authors.
+    </p>
+
+    {msg && <div class="flash">{msg}</div>}
+
+    {!allowed && (
+      <div class="deny">
+        <p><b>This is the people desk.</b> You hold the admin console but not this desk, so the page
+        shows nothing rather than half of somebody's record.</p>
+        <p style="margin:8px 0 0">It opens with the same key as the appraisal desk. A reporting
+        manager reads their own reports' feedback from the workspace, through the reporting line,
+        and needs none of this.</p>
+      </div>
+    )}
+
+    {allowed && (
+      <div class="card">
+        <h2>Who</h2>
+        <form method="get" class="searchrow">
+          <div>
+            <label for="q">Search by name or employee code</label>
+            <input id="q" name="q" value={q} placeholder="Start typing a name" autocomplete="off" />
+          </div>
+          <button class="btn slim" type="submit" style="margin-top:0">Search</button>
+        </form>
+        {people.length === 0 && (
+          <p class="muted" style="margin-top:10px">
+            No active employee matches that. Clear the search to see the list again.
+          </p>
+        )}
+        <div class="people">
+          {people.map((p) => (
+            <a class="person" href={empHref(p.id)} aria-current={p.id === empId ? 'page' : undefined}>
+              {p.name}
+              <small>{p.designation || p.code || 'No designation recorded'}</small>
+            </a>
+          ))}
+        </div>
+      </div>
+    )}
+
+    {allowed && !empId && (
+      <div class="notice">
+        Choose somebody above. Nothing is read, and no access is logged, until you do.
+      </div>
+    )}
+
+    {allowed && empId && !header && (
+      <div class="notice hard">
+        No employee record with that id. Nothing was read.
+      </div>
+    )}
+
+    {allowed && header && isDenied && (
+      <div class="notice hard">
+        This record could not be opened for your account. That is the fail-closed path: it shows
+        nothing rather than guessing.
+      </div>
+    )}
+
+    {allowed && header && signal && (
+      <>
+        <div class="card">
+          <h2>{header.fullName}</h2>
+          <p class="muted">{header.designation || 'No designation recorded'}</p>
+
+          <div class="notice">{signal.decisionNotice}</div>
+
+          <div class="stats">
+            <div class="stat">
+              <b>{hasOverall ? signal.overall : 'None'}</b>
+              <span>Overall out of 5</span>
+            </div>
+            <div class="stat">
+              <b>{signal.sourceCount}</b>
+              <span>Independent sources</span>
+            </div>
+            <div class="stat">
+              <b>{signal.itemCount}</b>
+              <span>Items counted</span>
+            </div>
+            <div class="stat">
+              <b>{scoredCount}</b>
+              <span>Dimensions scored</span>
+            </div>
+          </div>
+
+          {!hasOverall && (
+            <div class="notice">
+              <b>No overall figure, deliberately.</b> {signal.explanation.output} A figure built from
+              too few independent sources says more about who happened to write something than about
+              the person it is attached to.
+            </div>
+          )}
+
+          {hasOverall && (
+            <p class="muted">
+              Confidence: <b>{signal.overallBand}</b>. {bandLabel(signal.overallBand)}.
+            </p>
+          )}
+
+          {signal.redactionNote && <div class="notice">{signal.redactionNote}</div>}
+
+          <p class="muted" style="margin-top:10px">
+            Sources on this record:
+            {sourceTypeRows.length === 0 && ' none yet.'}
+            {sourceTypeRows.map((s) => (
+              <span class="pill">{s.n} {s.label}</span>
+            ))}
+          </p>
+        </div>
+
+        {attentionFlags.length > 0 && (
+          <div class="card">
+            <h2>Needs a human eye</h2>
+            {attentionFlags.map((f: any) => (
+              <div class="notice hard">
+                <b>{f.kind.split('_').join(' ')}</b>
+                <div style="margin-top:4px">{f.summary}</div>
+                <div style="margin-top:5px;font-size:11.5px;opacity:.8">
+                  Drawn from {f.evidenceRefs.length} item(s) on this record.
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {noteFlags.length > 0 && (
+          <div class="card">
+            <h2>Worth knowing</h2>
+            {noteFlags.map((f: any) => (
+              <div class="notice">{f.summary}</div>
+            ))}
+          </div>
+        )}
+
+        <div class="card">
+          <h2>By dimension</h2>
+          {dims.length === 0 && (
+            <p class="muted">Nobody has rated any dimension yet, so there is nothing to show.</p>
+          )}
+          {unscoredCount > 0 && (
+            <p class="muted" style="margin-bottom:10px">
+              {unscoredCount} dimension(s) below are left blank rather than estimated. Fewer than two
+              independent people have rated them.
+            </p>
+          )}
+          {dims.map((d: any) => (
+            <div class="dim">
+              <div class="dimhead">
+                <b>{d.label}</b>
+                <span class="num">{d.score === null ? 'No score' : d.score}</span>
+              </div>
+              <div class="bar"><i style={'width:' + scorePct(d.score) + '%'}></i></div>
+              <div>
+                <span class="pill">{d.sourceCount} source(s)</span>
+                <span class="pill">{d.itemCount} item(s)</span>
+                {d.score !== null && <span class="pill">{d.band} confidence</span>}
+                {d.outlierCount > 0 && <span class="pill warn">{d.outlierCount} outlier(s)</span>}
+                {d.disagreement !== 'none' && <span class="pill warn">disagreement</span>}
+                {d.selfRating !== null && <span class="pill">self {d.selfRating}</span>}
+              </div>
+
+              {d.disagreementNote && <div class="notice">{d.disagreementNote}</div>}
+
+              {d.selfGapLabel === 'rates_self_higher' && (
+                <p class="muted" style="margin-top:6px">
+                  They rate themselves {d.selfGap} above where the others put them. Kept out of the
+                  score on purpose, and shown here because the gap is the useful part.
+                </p>
+              )}
+              {d.selfGapLabel === 'rates_self_lower' && (
+                <p class="muted" style="margin-top:6px">
+                  They rate themselves below where the others put them. Worth reading the items before
+                  concluding anything from that.
+                </p>
+              )}
+
+              <details>
+                <summary>How this figure was built</summary>
+                <div class="inner">
+                  <div class="exp">
+                    <b>Inputs</b>
+                    <ul>{d.explanation.inputs.map((s: string) => <li>{s}</li>)}</ul>
+                    <b>Processing</b>
+                    <ul>{d.explanation.processing.map((s: string) => <li>{s}</li>)}</ul>
+                    <b>Output</b>
+                    <div>{d.explanation.output}</div>
+                    <b>Confidence</b>
+                    <div>{d.explanation.confidence}</div>
+                    <b>Computed</b>
+                    <div>{d.explanation.computedAt}</div>
+                  </div>
+
+                  <b class="exp" style="display:block;margin-top:12px">Every contribution</b>
+                  {d.contributions.map((c: any) => (
+                    <div class="contrib">
+                      <div>
+                        <b>{c.authorName}</b> ({sourceLabel(c.sourceType)}) rated this
+                        <b> {c.rating}</b> on {fmtDate(c.createdAt)}.
+                        {c.isOutlier && <span class="pill warn" style="margin-left:6px">outlier</span>}
+                      </div>
+                      <div style="margin-top:3px;color:#9a8f7d">
+                        Final weight {c.weight} of 1.00. Evidence: {evidenceLabel(c.evidenceQuality).toLowerCase()}.
+                      </div>
+                      <ul class="steps">
+                        {c.weightSteps.map((s: any) => (
+                          <li><b>{s.factor}</b> x{s.value} — {s.reason}</li>
+                        ))}
+                      </ul>
+                      <div class="muted" style="margin-top:4px;font-style:italic">
+                        {weightReason(c.sourceType)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            </div>
+          ))}
+        </div>
+
+        <div class="card">
+          <h2>The items themselves</h2>
+          <p class="muted">
+            Every figure above is made of these. Read them before you use a number from this page in
+            a conversation about somebody's work.
+          </p>
+          {items.length === 0 && (
+            <p class="muted" style="margin-top:10px">No structured feedback on this record yet.</p>
+          )}
+          {items.map((i: any) => (
+            <div class={i.status === 'withdrawn' ? 'item withdrawn' : 'item'}>
+              <div>
+                <b>{i.authorName}</b>
+                <span class="pill" style="margin-left:6px">{sourceLabel(i.sourceType)}</span>
+                {i.sourceVerified && <span class="pill ok">relationship confirmed</span>}
+                {!i.sourceVerified && <span class="pill warn">stated, not confirmed</span>}
+                {i.confidentiality === 'hr_channel' && <span class="pill warn">people-desk channel</span>}
+                {i.status === 'withdrawn' && <span class="pill warn">withdrawn</span>}
+              </div>
+              <div class="kv">
+                <span>{fmtDate(i.createdAt)}</span>
+                <span>{contextLabel(i.context)}</span>
+                {i.periodStart && <span>Period {i.periodStart} to {i.periodEnd || 'open'}</span>}
+                <span>{evidenceLabel(i.evidenceQuality)}</span>
+              </div>
+              {i.sourceVerifiedNote && <p class="muted">{i.sourceVerifiedNote}</p>}
+              {i.contextNote && <p class="muted">{i.contextNote}</p>}
+
+              {i.ratings.length > 0 && (
+                <div style="margin-top:7px">
+                  {i.ratings.map((r: any) => (
+                    <span class="pill">{r.dimension.split('_').join(' ')} {r.rating}</span>
+                  ))}
+                </div>
+              )}
+
+              {i.evidence && <div class="ev">{i.evidence}</div>}
+
+              {i.examples.length > 0 && (
+                <div style="margin-top:8px">
+                  {i.examples.map((ex: any) => (
+                    <div class="ev">
+                      <b>{ex.occurredOn || 'Undated'}</b> — {ex.description}
+                      {ex.referenceUrl && (
+                        <div style="margin-top:4px">
+                          <a href={ex.referenceUrl} rel="noopener noreferrer" target="_blank">Linked reference</a>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {i.status === 'withdrawn' && (
+                <p class="muted" style="margin-top:8px">
+                  Withdrawn {fmtDate(i.withdrawnAt)}. Reason on record: {i.withdrawnReason}
+                </p>
+              )}
+
+              {i.status !== 'withdrawn' && (
+                <details>
+                  <summary>Withdraw this item</summary>
+                  <div class="inner">
+                    <p class="muted">
+                      Withdrawing keeps the item and its author on the record and stops it counting
+                      towards any figure. There is no delete, here or anywhere: an item that could be
+                      erased could be erased by whoever it embarrassed.
+                    </p>
+                    <form method="POST">
+                      <input type="hidden" name="action" value="withdraw" />
+                      <input type="hidden" name="emp" value={empId} />
+                      <input type="hidden" name="feedback_id" value={i.id} />
+                      <label for={'wr-' + i.id}>Why. This stays on the record.</label>
+                      <textarea id={'wr-' + i.id} name="reason" required maxlength="1000"
+                        placeholder="Written about the wrong person; duplicate of an earlier item; the author asked for it to be withdrawn."></textarea>
+                      <button class="btn slim" type="submit" style="margin-top:10px">Withdraw</button>
+                    </form>
+                  </div>
+                </details>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <div class="card">
+          <h2>How this record was read</h2>
+          <p class="muted">{envelope.viewNotice}</p>
+          <p class="muted" style="margin-top:8px">
+            Contract {signal.contractVersion}. Computed {signal.computedAt}. The same figures are
+            served to every other part of this product through one function, so nothing else can
+            arrive at a different number for this person.
+          </p>
+        </div>
+      </>
+    )}
+  </div>
+</AdminLayout>

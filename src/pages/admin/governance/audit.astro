@@ -1,0 +1,247 @@
+---
+// /admin/governance/audit — the required audit answer, for one person, over one window.
+//
+//   WHO accessed WHAT, WHEN, WHY / under which permission, WHAT was changed,
+//   WHICH intelligence version was used, and WHAT human action followed.
+//
+// OPENING THIS SCREEN IS ITSELF AN ACCESS, and it goes through the same gate as everything else:
+// a purpose, a written reason, and a row in the access log naming you. The subject can see that row.
+// A reporting screen exempt from the rules it reports on would be the one unwatched door in the
+// building.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import {
+  PURPOSES, auditAnswer, authorizeGovernedRead, governancePermissions, holdsGovernancePermission,
+  isPurpose, MIN_HIGH_IMPACT_PURPOSE,
+} from '@/lib/horizon/governance';
+import type { AuditAnswer } from '@/lib/horizon/governance';
+// SubjectRef IS NOT RE-EXPORTED BY THE GOVERNANCE BARREL, deliberately — that module's own header
+// says subjects, actors and organisation ids live in @/lib/horizon/ids and are not re-exported
+// through it, so importing the type from there is the fix rather than widening its contract.
+import {
+  DEFAULT_ORGANISATION_ID, SUBJECT_ID_SCHEMES, SUBJECT_KINDS, isSubjectRef, type SubjectRef,
+} from '@/lib/horizon/ids';
+
+const currentUser = Astro.locals.user;
+if (!currentUser) return Astro.redirect('/admin/login');
+
+const held = await governancePermissions(currentUser.id, Astro.locals);
+if (!holdsGovernancePermission(held.permissions, 'horizon.governance.view')) {
+  return Astro.redirect('/admin?denied=horizon.governance.view');
+}
+const mayReadTrail = holdsGovernancePermission(held.permissions, 'horizon.audit.view');
+
+const url = new URL(Astro.request.url);
+const subjectKind = String(url.searchParams.get('kind') || 'employee');
+const subjectId = String(url.searchParams.get('subject') || '').trim();
+const purpose = String(url.searchParams.get('purpose') || '');
+const justification = String(url.searchParams.get('why') || '').trim();
+
+const daysRaw = parseInt(url.searchParams.get('days') || '90', 10);
+const days = Number.isFinite(daysRaw) ? Math.min(1825, Math.max(1, daysRaw)) : 90;
+const from = new Date(Date.now() - days * 86400000);
+
+// THE KINDS THIS SYSTEM ACTUALLY HAS, not a hopeful list. `user`, `candidate`, `intern` and
+// `contractor` were offered here and every one of them is rejected by isSubjectRef(), so a lookup
+// against any of them returned an empty trail that read exactly like "this person was never
+// accessed" — the worst possible wrong answer from an audit screen.
+const scheme = String(url.searchParams.get('scheme') || (subjectKind === 'employee' ? 'hr_employee' : 'tal_person'));
+const subjectKinds = SUBJECT_KINDS as readonly string[];
+const subjectSchemes = SUBJECT_ID_SCHEMES as readonly string[];
+const askedFor = subjectId.length > 0 && isPurpose(purpose);
+
+let answer: AuditAnswer | null = null;
+let refusal = '';
+let accessLogId: string | null = null;
+
+if (askedFor) {
+  const subject: SubjectRef = {
+    kind: subjectKind as any, id: subjectId as any,
+    idScheme: scheme as any, organisationId: DEFAULT_ORGANISATION_ID,
+  };
+  if (!isSubjectRef(subject)) {
+    refusal = 'That subject kind and id scheme do not go together, so there is nothing to look up. '
+      + 'An employee is anchored on hr_employee; an applicant on tal_person, application or user.';
+  } else {
+  // authorizeGovernedRead, not `authorizeAccess` — that name has never existed in
+  // src/lib/horizon/governance. Importing it failed the PRODUCTION BUILD outright (rollup:
+  // "authorizeAccess is not exported"), so nothing shipped at all while this page sat unopenable.
+  const decision = await authorizeGovernedRead({
+    actor: {
+      id: currentUser.id,
+      email: currentUser.email,
+      name: currentUser.name,
+      ip: Astro.request.headers.get('x-forwarded-for') || null,
+      userAgent: Astro.request.headers.get('user-agent') || null,
+    },
+    subject,
+    purpose,
+    justification,
+    // `recordType` and `fields` were passed here too and are not part of GovernedReadRequest.
+    // The gate decides the audience from the purpose and the permission; naming a record type it
+    // does not read only made the call look narrower than it is.
+    locals: Astro.locals,
+  });
+  accessLogId = decision.accessLogId;
+  if (decision.allowed) {
+    answer = await auditAnswer(subject, from);
+  } else {
+    refusal = decision.reason;
+  }
+  } // end isSubjectRef guard
+}
+
+function when(value: string): string {
+  if (!value) return '';
+  try {
+    return new Date(value).toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric',
+      hour: 'numeric', minute: '2-digit',
+    });
+  } catch { return value; }
+}
+
+// Hoisted: a `<` inside a JSX expression breaks .astro parsing.
+const entryCount = answer ? answer.entries.length : 0;
+const hasEntries = entryCount > 0;
+const hasOmissions = answer ? answer.omitted.length > 0 : false;
+const purposeOptions = PURPOSES.filter((p) => ['grievance_investigation', 'legal_or_regulatory', 'security_incident', 'subject_access_request'].includes(p.purpose));
+---
+
+<AdminLayout title="Governance audit trail" activeNav="audit">
+  <div class="admin-page" style="max-width:1400px;">
+
+    <div class="admin-page-header" style="margin-bottom:20px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow"><a href="/admin/governance" style="color:inherit;">Governance</a></div>
+        <h1 class="admin-page-title">Audit trail</h1>
+        <p class="admin-page-sub">
+          Who accessed what, when, under which permission, what changed, which intelligence version was used,
+          and what human action followed.
+        </p>
+      </div>
+    </div>
+
+    {!mayReadTrail && (
+      <div class="admin-card" style="padding:16px;margin-bottom:16px;border-left:3px solid #fbbf24;">
+        You can open this screen but you do not hold <code>horizon.audit.view</code>, so no trail will be shown.
+      </div>
+    )}
+
+    <form method="GET" class="admin-card" style="display:grid;gap:12px;margin-bottom:18px;padding:16px;">
+      <div style="display:grid;grid-template-columns:150px 160px 1fr 160px;gap:12px;">
+        <div>
+          <label class="rolefield-label">Subject kind</label>
+          <select name="kind" class="rolefield-input">
+            {subjectKinds.map((k) => <option value={k} selected={subjectKind === k}>{k}</option>)}
+          </select>
+        </div>
+        <div>
+          <label class="rolefield-label">Id scheme</label>
+          <select name="scheme" class="rolefield-input">
+            {subjectSchemes.map((sc) => <option value={sc} selected={scheme === sc}>{sc}</option>)}
+          </select>
+        </div>
+        <div>
+          <label class="rolefield-label">Subject id</label>
+          <input type="text" name="subject" class="rolefield-input" value={subjectId} placeholder="the id in the table that owns this subject" />
+        </div>
+        <div>
+          <label class="rolefield-label">Window</label>
+          <select name="days" class="rolefield-input">
+            <option value="30" selected={days === 30}>Last 30 days</option>
+            <option value="90" selected={days === 90}>Last 90 days</option>
+            <option value="365" selected={days === 365}>Last year</option>
+            <option value="1825" selected={days === 1825}>Last five years</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:260px 1fr;gap:12px;">
+        <div>
+          <label class="rolefield-label">Why are you reading this</label>
+          <select name="purpose" class="rolefield-input">
+            <option value="">Choose a purpose</option>
+            {purposeOptions.map((p) => <option value={p.purpose} selected={purpose === p.purpose}>{p.label}</option>)}
+          </select>
+        </div>
+        <div>
+          <label class="rolefield-label">Written reason (recorded, and the subject may ask to see it)</label>
+          <input type="text" name="why" class="rolefield-input" value={justification} minlength={MIN_HIGH_IMPACT_PURPOSE} placeholder="the specific matter this relates to" />
+        </div>
+      </div>
+      <div>
+        <button type="submit" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:11px;">Open the trail</button>
+      </div>
+    </form>
+
+    {refusal && (
+      <div class="admin-card" style="padding:16px;margin-bottom:16px;border-left:3px solid #f87171;">
+        <strong>Refused.</strong> {refusal}
+        {accessLogId && <div style="margin-top:6px;color:#a0a0ab;font-size:12px;">The refusal was recorded as {accessLogId}.</div>}
+      </div>
+    )}
+
+    {answer && (
+      <div class="admin-card" style="padding:0;margin-bottom:16px;">
+        <div style="padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);">
+          <strong>{entryCount} entries</strong>
+          <span style="color:#a0a0ab;"> for {answer.subject.kind} {answer.subject.id}, {when(answer.window.from)} to {when(answer.window.to)}.</span>
+          {accessLogId && <span style="color:#a0a0ab;"> This reading was recorded as {accessLogId}.</span>}
+        </div>
+        {!hasEntries && (
+          <div style="padding:16px;color:#a0a0ab;">
+            Nothing is recorded for this person in this window. That is a real answer and not an error: it means
+            nobody opened their record, no signal was produced about them, and no decision was taken.
+          </div>
+        )}
+        {hasEntries && (
+          <table class="admin-table" style="min-width:1100px;">
+            <thead>
+              <tr>
+                <th style="width:150px;">When</th>
+                <th style="width:150px;">Who</th>
+                <th style="width:190px;">What</th>
+                <th style="width:170px;">Why / permission</th>
+                <th style="width:150px;">Changed</th>
+                <th style="width:130px;">Version</th>
+                <th>What followed</th>
+              </tr>
+            </thead>
+            <tbody>
+              {answer.entries.map((e) => (
+                <tr>
+                  <td style="font-size:11px;">{when(e.at)}</td>
+                  <td style="font-size:11px;">{e.actorLabel}</td>
+                  <td style="font-size:11px;">{e.what}</td>
+                  <td style="font-size:11px;">
+                    {e.why}
+                    {e.permission && <div style="color:#a0a0ab;font-family:monospace;">{e.permission}</div>}
+                  </td>
+                  <td style="font-size:11px;color:#a0a0ab;">{e.changed}</td>
+                  <td style="font-size:11px;font-family:monospace;color:#a0a0ab;">{e.intelligenceVersion || ''}</td>
+                  <td style="font-size:11px;color:#a0a0ab;">{e.humanAction || ''}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {hasOmissions && (
+          <div style="padding:14px 16px;border-top:1px solid rgba(255,255,255,.06);color:#fbbf24;font-size:12px;">
+            <strong>Not everything is shown.</strong>
+            <ul style="margin:6px 0 0;padding-left:18px;">
+              {answer.omitted.map((o) => <li>{o.what}: {o.why}</li>)}
+            </ul>
+          </div>
+        )}
+      </div>
+    )}
+
+    {!askedFor && (
+      <div class="admin-card" style="padding:16px;color:#a0a0ab;">
+        Name a subject and a purpose. There is no browse-everybody mode on this screen, and there is not going to
+        be one: the answer to "why were you reading that person's trail" has to exist in writing, and it has to
+        have been written before the reading rather than reconstructed afterwards.
+      </div>
+    )}
+
+  </div>
+</AdminLayout>

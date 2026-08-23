@@ -1,0 +1,760 @@
+---
+// /portal/employee/feedback — STRUCTURED FEEDBACK, FROM THE PERSON GIVING IT AND ABOUT THE PERSON
+// RECEIVING IT.
+//
+// =================================================================================================
+// FOUR THINGS ON ONE SCREEN
+// =================================================================================================
+//
+//   Give     structured feedback about a colleague: what relationship you are speaking from, what
+//            period, what circumstance, a rating on the dimensions you actually observed, and the
+//            evidence behind it.
+//   Myself   the self-reflection. Captured in full, never averaged into the aggregate, shown beside
+//            it as a gap.
+//   About me every item on your own record with every author named, and the aggregate, and every
+//            reason the aggregate is what it is.
+//   Written  what you have written about other people, so you can find and withdraw your own.
+//
+// THIS IS NOT THE OLDER FEEDBACK TAB, AND IT DOES NOT REPLACE IT. /portal/employee/performance keeps
+// its lightweight any-to-any note exactly as it is; this is the structured item that carries
+// dimensions, a period and evidence, and both write to the same table. A note left there stays a
+// note and never appears as a rating here.
+//
+// =================================================================================================
+// WHAT IT REFUSES TO DO
+// =================================================================================================
+//
+//   NO ANONYMOUS FEEDBACK. The author is recorded and shown. Anonymous feedback about a named
+//   individual, readable by their manager, is a tool for something other than feedback.
+//   NO RATING WITHOUT EVIDENCE. Submitting a rating with nothing written is refused, with the
+//   reason. Drafts are free — forcing prose before somebody has finished thinking produces prose
+//   written to satisfy a validator.
+//   NO BLANK FILLED IN. A dimension you did not observe is left blank, and a blank is recorded as
+//   non-observation rather than as a middling 3.
+//
+// =================================================================================================
+// MOBILE FIRST, NO CLIENT JAVASCRIPT
+// =================================================================================================
+//
+// Around nine in ten of these people are on a phone. 360px is the design width, every control clears
+// 44px, tabs are links, forms are forms, and disclosure is native <details>. Every write is
+// POST-then-redirect so a refresh never resubmits.
+//
+// EVERY `const` IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted, and a handler reaching a
+// later declaration throws on its first line while the page reports success.
+import { composeWorkspace } from '@/lib/workforce/composer';
+import EmployeeShell from '@/components/workforce/EmployeeShell.astro';
+import { resolvePerfViewer, employeeHeader, isUuid, PERF_MANAGE } from '@/lib/performance-scope';
+import { feedbackRecipients } from '@/lib/performance';
+import { submitStructuredFeedback, withdrawFeedback, SOURCE_OPTIONS, RATING_MIN, RATING_MAX } from '@/lib/horizon/feedback/capture';
+import { getFeedbackSignal } from '@/lib/horizon/feedback/contract';
+import { readItemsByAuthor } from '@/lib/horizon/feedback/read';
+import {
+  FEEDBACK_DIMENSIONS,
+  FEEDBACK_DIMENSION_META,
+  FEEDBACK_CONTEXTS,
+  FEEDBACK_CONTEXT_LABELS,
+  FEEDBACK_SOURCE_LABELS,
+  FEEDBACK_CONFIDENTIALITY_LABELS,
+  EVIDENCE_QUALITY_LABELS,
+  CONFIDENCE_BAND_LABELS,
+} from '@/lib/horizon/feedback/types';
+
+const PATH = '/portal/employee/feedback';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+// ---- Constants and helpers, ALL declared before the POST handler ---------------------------------
+const VIEWS = [
+  { key: 'give', label: 'Give' },
+  { key: 'self', label: 'Myself' },
+  { key: 'about-me', label: 'About me' },
+  { key: 'written', label: 'I wrote' },
+] as const;
+
+const RATINGS = [1, 2, 3, 4, 5];
+
+const DIMS = FEEDBACK_DIMENSIONS.map((d) => FEEDBACK_DIMENSION_META[d]);
+
+const back = (msg: string, view: string) =>
+  Astro.redirect(PATH + '?view=' + encodeURIComponent(view) + '&msg=' + encodeURIComponent(msg.slice(0, 300)));
+
+const fmtDate = (iso: string | null) =>
+  iso ? new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+
+const scorePct = (n: number | null) => (n === null ? 0 : Math.max(0, Math.min(100, Math.round((n / 5) * 100))));
+
+const sourceLabel = (k: string) => FEEDBACK_SOURCE_LABELS[k as keyof typeof FEEDBACK_SOURCE_LABELS] || k;
+const contextLabel = (k: string) => FEEDBACK_CONTEXT_LABELS[k as keyof typeof FEEDBACK_CONTEXT_LABELS] || k;
+const evidenceLabel = (k: string) => EVIDENCE_QUALITY_LABELS[k as keyof typeof EVIDENCE_QUALITY_LABELS] || k;
+const bandLabel = (k: string) => CONFIDENCE_BAND_LABELS[k as keyof typeof CONFIDENCE_BAND_LABELS] || k;
+const dimLabel = (k: string) =>
+  (FEEDBACK_DIMENSION_META[k as keyof typeof FEEDBACK_DIMENSION_META] || { label: k }).label;
+
+/** Pull `rating_<dimension>` out of a form body into the shape capture.ts wants. */
+const ratingsFromForm = (fd: FormData) =>
+  FEEDBACK_DIMENSIONS
+    .map((d) => ({ dimension: d, raw: String(fd.get('rating_' + d) || '') }))
+    .filter((r) => r.raw !== '')
+    .map((r) => ({ dimension: r.dimension, rating: Number(r.raw), comment: null }));
+
+/** Two optional example slots, both free to be left empty. */
+const examplesFromForm = (fd: FormData) =>
+  [0, 1]
+    .map((i) => ({
+      dimension: String(fd.get('ex_dim_' + i) || '') || null,
+      occurredOn: String(fd.get('ex_when_' + i) || '') || null,
+      description: String(fd.get('ex_what_' + i) || ''),
+      referenceUrl: String(fd.get('ex_url_' + i) || '') || null,
+    }))
+    .filter((e) => e.description.trim().length > 0);
+
+// ---- The composition, then the scope. One of each per request. ------------------------------------
+let composed: any = null;
+try {
+  composed = await composeWorkspace(user as any, { locals: Astro.locals, next: PATH });
+} catch (e: any) {
+  // A composition that cannot be built is not guessed at. holds() then answers false for everything,
+  // which lands the viewer on the narrowest scope — the safe direction.
+  console.error('[portal/employee/feedback] compose', e?.cause?.message || e?.message);
+}
+
+const holds = (key: string): boolean => {
+  try {
+    return composed?.context?.holds ? composed.context.holds(key) === true : false;
+  } catch {
+    return false;
+  }
+};
+
+const viewer = await resolvePerfViewer(String(user.id), holds);
+const holdsPeopleDesk = holds(PERF_MANAGE);
+
+// =================================================================================================
+// WRITES
+// =================================================================================================
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const view = String(fd.get('view') || 'give');
+
+  if (!viewer.employeeId) {
+    return back('This account has no employee record, so there is nothing to save against it.', view);
+  }
+
+  if (action === 'give' || action === 'draft') {
+    const r = await submitStructuredFeedback(
+      {
+        subjectEmployeeId: String(fd.get('subject') || ''),
+        authorUserId: String(user.id),
+        authorEmployeeId: viewer.employeeId,
+        authorName: viewer.fullName || String((user as any).name || ''),
+        sourceType: String(fd.get('source_type') || 'peer') as any,
+        context: String(fd.get('context') || 'day_to_day') as any,
+        contextNote: String(fd.get('context_note') || ''),
+        periodStart: String(fd.get('period_start') || ''),
+        periodEnd: String(fd.get('period_end') || ''),
+        evidence: String(fd.get('evidence') || ''),
+        confidentiality: String(fd.get('confidentiality') || 'standard') as any,
+        ratings: ratingsFromForm(fd),
+        examples: examplesFromForm(fd),
+        status: action === 'draft' ? 'draft' : 'submitted',
+      },
+      { authorHoldsPeopleDesk: holdsPeopleDesk },
+    );
+    if (!r.ok) return back(r.error || 'Could not save that.', view);
+    return back(
+      action === 'draft'
+        ? 'Saved as a draft. Nobody else can see it, and it counts towards nothing until you send it.'
+        : 'Sent. It counts as "' + evidenceLabel(r.evidenceQuality || 'none').toLowerCase() + '". '
+          + (r.sourceVerified
+            ? 'Your relationship to them was confirmed against the organisation chart.'
+            : 'Your stated relationship could not be confirmed against the organisation chart, so it '
+              + 'is recorded as stated.'),
+      view,
+    );
+  }
+
+  if (action === 'self') {
+    const r = await submitStructuredFeedback(
+      {
+        subjectEmployeeId: viewer.employeeId,
+        authorUserId: String(user.id),
+        authorEmployeeId: viewer.employeeId,
+        authorName: viewer.fullName || String((user as any).name || ''),
+        sourceType: 'self',
+        context: String(fd.get('context') || 'cycle_review') as any,
+        contextNote: String(fd.get('context_note') || ''),
+        periodStart: String(fd.get('period_start') || ''),
+        periodEnd: String(fd.get('period_end') || ''),
+        evidence: String(fd.get('evidence') || ''),
+        confidentiality: 'standard',
+        ratings: ratingsFromForm(fd),
+        examples: examplesFromForm(fd),
+        status: 'submitted',
+      },
+      { authorHoldsPeopleDesk: holdsPeopleDesk },
+    );
+    return back(
+      r.ok
+        ? 'Recorded. Your own rating is never averaged into your score — it sits beside it, so the '
+          + 'difference stays visible.'
+        : (r.error || 'Could not save that.'),
+      'self',
+    );
+  }
+
+  if (action === 'withdraw') {
+    const r = await withdrawFeedback({
+      feedbackId: String(fd.get('feedback_id') || ''),
+      actorUserId: String(user.id),
+      actorHoldsPeopleDesk: false,
+      reason: String(fd.get('reason') || ''),
+    });
+    return back(
+      r.ok
+        ? 'Withdrawn. It stays on the record with your reason against it and no longer counts towards '
+          + 'any figure.'
+        : (r.error || 'Could not withdraw that.'),
+      'written',
+    );
+  }
+
+  return back('That action is not one this page performs.', view);
+}
+
+// =================================================================================================
+// READS
+// =================================================================================================
+const params = Astro.url.searchParams;
+const msg = String(params.get('msg') || '').slice(0, 300);
+const requested = String(params.get('view') || 'give');
+const view = (VIEWS as readonly { key: string }[]).some((v) => v.key === requested) ? requested : 'give';
+const preselect = String(params.get('about') || '');
+
+let recipients: { id: string; name: string; designation: string | null }[] = [];
+let envelope: any = null;
+let written: any[] = [];
+
+if (viewer.employeeId) {
+  if (view === 'give') {
+    recipients = await feedbackRecipients(viewer);
+  }
+  if (view === 'about-me' || view === 'self') {
+    envelope = await getFeedbackSignal(viewer.employeeId, {
+      viewer,
+      purpose: view === 'self' ? 'self_review' : 'self_review',
+      includeItems: true,
+    });
+  }
+  if (view === 'written') {
+    written = await readItemsByAuthor(String(user.id), 50);
+  }
+}
+
+// ---- Everything the JSX needs, computed here. No comparisons inside JSX expressions. ---------------
+const signal = envelope && envelope.signal ? envelope.signal : null;
+const myItems = envelope ? envelope.items.filter((i: any) => i.sourceType !== 'self') : [];
+const mySelfItems = envelope ? envelope.items.filter((i: any) => i.sourceType === 'self') : [];
+const dims = signal ? signal.dimensions : [];
+const hasOverall = !!signal && signal.overall !== null;
+const scoredDims = dims.filter((d: any) => d.score !== null);
+const gapDims = dims.filter((d: any) => d.selfGapLabel === 'rates_self_higher' || d.selfGapLabel === 'rates_self_lower');
+const hrefFor = (k: string) => PATH + '?view=' + k;
+const validPreselect = isUuid(preselect) ? preselect : '';
+const noRecipients = recipients.length === 0;
+const graphEmpty = viewer.initialized === false;
+---
+
+<EmployeeShell title="Feedback" person={viewer.fullName || (user as any).name} width={640} bottomPad={48} bare>
+
+<nav class="tabs" aria-label="Feedback views">
+  {VIEWS.map((v) => (
+    <a class="tab" href={hrefFor(v.key)} aria-current={v.key === view ? 'page' : null}>{v.label}</a>
+  ))}
+</nav>
+
+<main class="wrap">
+  {msg && <p class="flash">{msg}</p>}
+
+  {!viewer.employeeId && (
+    <div class="empty">
+      <b>There is no employee record on this account</b>
+      <p class="muted">Feedback is attached to an employee record and this account does not have one.
+      The people desk creates the record; nothing on this page can create it for you.</p>
+    </div>
+  )}
+
+  {/* ------------------------------------------------------------------------------------ GIVE */}
+  {view === 'give' && viewer.employeeId && (
+    <>
+      <div class="notice">
+        Feedback here is never anonymous. Your name goes on it, the person can read it, and so can
+        whoever answers for their work unless you route it to the people desk below.
+      </div>
+
+      {graphEmpty && (
+        <div class="notice">
+          The organisation chart has not been set up yet, so nothing can confirm who manages or leads
+          whom. You can still write feedback: it is recorded with your relationship stated rather than
+          confirmed.
+        </div>
+      )}
+
+      {noRecipients && (
+        <div class="empty">
+          <b>Nobody is in reach yet</b>
+          <p class="muted">The people you can write about are the ones the organisation chart already
+          connects you to — your manager, anyone reporting to you, and anyone you are named as a
+          reviewer for. On a chart that has not been populated, that list is empty. This is not a
+          search over the whole staff directory, on purpose.</p>
+        </div>
+      )}
+
+      {!noRecipients && (
+        <div class="card">
+          <h3>About a colleague</h3>
+          <form method="post">
+            <input type="hidden" name="view" value="give" />
+
+            <label for="subject">Who this is about</label>
+            <select id="subject" name="subject" required>
+              <option value="">Choose a person</option>
+              {recipients.map((r) => (
+                <option value={r.id} selected={r.id === validPreselect}>
+                  {r.name}{r.designation ? ' — ' + r.designation : ''}
+                </option>
+              ))}
+            </select>
+
+            <label for="source_type">What you are to them</label>
+            <select id="source_type" name="source_type" required>
+              {SOURCE_OPTIONS.map((s) => <option value={s.value}>{s.label}</option>)}
+            </select>
+            <p class="muted">Checked against the organisation chart when you send it. If the chart
+            disagrees, the item is still kept and recorded as stated rather than confirmed — a recent
+            team change looks exactly like that.</p>
+
+            <div class="row2">
+              <div>
+                <label for="context">What this is about</label>
+                <select id="context" name="context" required>
+                  {FEEDBACK_CONTEXTS.map((c) => (
+                    <option value={c} selected={c === 'day_to_day'}>{contextLabel(c)}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label for="confidentiality">Who can read it</label>
+                <select id="confidentiality" name="confidentiality">
+                  <option value="standard">{FEEDBACK_CONFIDENTIALITY_LABELS.standard}</option>
+                  <option value="hr_channel">{FEEDBACK_CONFIDENTIALITY_LABELS.hr_channel}</option>
+                </select>
+              </div>
+            </div>
+
+            <label for="context_note">Anything the circumstance needs said</label>
+            <input id="context_note" name="context_note" maxlength="1000"
+              placeholder="Optional. Which project, which incident" />
+
+            <div class="row2">
+              <div>
+                <label for="period_start">Period from</label>
+                <input id="period_start" type="date" name="period_start" />
+              </div>
+              <div>
+                <label for="period_end">Period to</label>
+                <input id="period_end" type="date" name="period_end" />
+              </div>
+            </div>
+
+            <p class="dt" style="margin-top:16px">Rate only what you saw</p>
+            <p class="muted">Leave a dimension blank if you did not observe it. A blank is recorded as
+            "not observed" and costs nothing. A guess becomes a number on somebody's record.</p>
+
+            {DIMS.map((d) => (
+              <div class="dimrow">
+                <label for={'rating_' + d.key} class="dimlabel">{d.label}</label>
+                <p class="dimhint">{d.prompt}</p>
+                <select id={'rating_' + d.key} name={'rating_' + d.key}>
+                  <option value="">Did not observe</option>
+                  {RATINGS.map((n) => <option value={n}>{n}</option>)}
+                </select>
+              </div>
+            ))}
+
+            <label for="evidence" style="margin-top:16px">What you saw that makes you say this</label>
+            <textarea id="evidence" name="evidence" maxlength="8000"
+              placeholder="Name what happened. This is required to send a rating, and it is the single largest thing that decides how much the rating counts."></textarea>
+            <p class="muted">A rating with nothing written behind it counts for the least the system
+            gives anything. A sentence naming what you saw changes that; a dated example changes it
+            more.</p>
+
+            <details>
+              <summary>Add an example or two</summary>
+              <div class="inner">
+                {[0, 1].map((i) => (
+                  <div class="exblock">
+                    <label for={'ex_what_' + i}>What happened</label>
+                    <input id={'ex_what_' + i} name={'ex_what_' + i} maxlength="2000"
+                      placeholder="Optional" />
+                    <div class="row2">
+                      <div>
+                        <label for={'ex_when_' + i}>When</label>
+                        <input id={'ex_when_' + i} type="date" name={'ex_when_' + i} />
+                      </div>
+                      <div>
+                        <label for={'ex_dim_' + i}>Which dimension</label>
+                        <select id={'ex_dim_' + i} name={'ex_dim_' + i}>
+                          <option value="">Not specific to one</option>
+                          {DIMS.map((d) => <option value={d.key}>{d.label}</option>)}
+                        </select>
+                      </div>
+                    </div>
+                    <label for={'ex_url_' + i}>A link to it</label>
+                    <input id={'ex_url_' + i} name={'ex_url_' + i} maxlength="1000"
+                      placeholder="Optional. A link, never an upload" />
+                  </div>
+                ))}
+              </div>
+            </details>
+
+            <div class="btns">
+              <button class="btn" type="submit" name="action" value="give">Send</button>
+              <button class="btn ghost" type="submit" name="action" value="draft" formnovalidate>Save a draft</button>
+            </div>
+          </form>
+        </div>
+      )}
+    </>
+  )}
+
+  {/* ------------------------------------------------------------------------------------ SELF */}
+  {view === 'self' && viewer.employeeId && (
+    <>
+      <div class="notice">
+        Your own rating is never averaged into your score. It sits beside it, so the difference
+        between how you see your work and how the people around you see it stays visible instead of
+        being averaged away.
+      </div>
+
+      {gapDims.length > 0 && (
+        <div class="card">
+          <h3>Where you and everyone else differ</h3>
+          {gapDims.map((d: any) => (
+            <div class="kv">
+              <span>{d.label}</span>
+              <b>You {d.selfRating} · others {d.score}</b>
+            </div>
+          ))}
+          <p class="muted" style="margin-top:10px">Neither number is the true one. A gap is a
+          conversation, not a correction.</p>
+        </div>
+      )}
+
+      <div class="card">
+        <h3>Self-reflection</h3>
+        <form method="post">
+          <input type="hidden" name="view" value="self" />
+          <input type="hidden" name="action" value="self" />
+
+          <div class="row2">
+            <div>
+              <label for="s_context">What period this is about</label>
+              <select id="s_context" name="context">
+                {FEEDBACK_CONTEXTS.map((c) => (
+                  <option value={c} selected={c === 'cycle_review'}>{contextLabel(c)}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label for="s_start">From</label>
+              <input id="s_start" type="date" name="period_start" />
+            </div>
+          </div>
+          <label for="s_end">To</label>
+          <input id="s_end" type="date" name="period_end" />
+
+          <p class="dt" style="margin-top:16px">Rate yourself, honestly, on what you can point at</p>
+          {DIMS.map((d) => (
+            <div class="dimrow">
+              <label for={'rating_' + d.key} class="dimlabel">{d.label}</label>
+              <p class="dimhint">{d.prompt}</p>
+              <select id={'rating_' + d.key} name={'rating_' + d.key}>
+                <option value="">Skip this one</option>
+                {RATINGS.map((n) => <option value={n}>{n}</option>)}
+              </select>
+            </div>
+          ))}
+
+          <label for="s_evidence" style="margin-top:16px">What you would point at</label>
+          <textarea id="s_evidence" name="evidence" maxlength="8000"
+            placeholder="The work you would show somebody who asked what you did this period."></textarea>
+
+          <button class="btn" type="submit">Record it</button>
+        </form>
+      </div>
+
+      {mySelfItems.length > 0 && (
+        <div class="card">
+          <h3>Your earlier reflections</h3>
+          {mySelfItems.map((i: any) => (
+            <div class="note">
+              <div class="note__h">
+                <span class="note__a">{contextLabel(i.context)}</span>
+                <span class="note__d">{fmtDate(i.createdAt)}</span>
+              </div>
+              {i.ratings.map((r: any) => (
+                <span class="pill">{dimLabel(r.dimension)} {r.rating}</span>
+              ))}
+              {i.evidence && <p class="note__b" style="margin-top:7px">{i.evidence}</p>}
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  )}
+
+  {/* -------------------------------------------------------------------------------- ABOUT ME */}
+  {view === 'about-me' && viewer.employeeId && signal && (
+    <>
+      <div class="notice">{signal.decisionNotice}</div>
+
+      <div class="card">
+        <h2>{hasOverall ? signal.overall + ' out of 5' : 'No overall figure yet'}</h2>
+        <p class="muted">
+          {hasOverall
+            ? 'Confidence: ' + signal.overallBand + '. ' + bandLabel(signal.overallBand) + '.'
+            : signal.explanation.output}
+        </p>
+        <div class="kv" style="margin-top:10px"><span>Independent sources</span><b>{signal.sourceCount}</b></div>
+        <div class="kv"><span>Items counted</span><b>{signal.itemCount}</b></div>
+        <div class="kv"><span>Dimensions scored</span><b>{scoredDims.length}</b></div>
+      </div>
+
+      {!hasOverall && (
+        <div class="notice">
+          <b>This is deliberate, not a gap in the page.</b> Below two independent sources this system
+          produces no score at all, so one person's opinion cannot become your record.
+        </div>
+      )}
+
+      {signal.flags.length > 0 && (
+        <div class="card">
+          <h3>What to know about the shape of this</h3>
+          {signal.flags.map((f: any) => (
+            <div class="notice">{f.summary}</div>
+          ))}
+        </div>
+      )}
+
+      {dims.length > 0 && (
+        <div class="card">
+          <h3>By dimension</h3>
+          {dims.map((d: any) => (
+            <div class="dimscore">
+              <div class="dimscore__h">
+                <b>{d.label}</b>
+                <span class="num">{d.score === null ? 'No score' : d.score}</span>
+              </div>
+              <div class="bar"><i style={'width:' + scorePct(d.score) + '%'}></i></div>
+              <div>
+                <span class="pill">{d.sourceCount} source(s)</span>
+                {d.score !== null && <span class="pill">{d.band}</span>}
+                {d.disagreement !== 'none' && <span class="pill open">they disagree</span>}
+                {d.selfRating !== null && <span class="pill">you said {d.selfRating}</span>}
+              </div>
+              {d.disagreementNote && <p class="muted" style="margin-top:6px">{d.disagreementNote}</p>}
+              <details>
+                <summary>Why this number</summary>
+                <div class="inner">
+                  <p class="dt">Inputs</p>
+                  <ul class="exp">{d.explanation.inputs.map((s: string) => <li>{s}</li>)}</ul>
+                  <p class="dt">How it was worked out</p>
+                  <ul class="exp">{d.explanation.processing.map((s: string) => <li>{s}</li>)}</ul>
+                  <p class="dt">Confidence</p>
+                  <p class="exp">{d.explanation.confidence}</p>
+                </div>
+              </details>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div class="card">
+        <h3>Everything written about you</h3>
+        <p class="muted">{envelope.viewNotice}</p>
+        {myItems.length === 0 && (
+          <p class="muted" style="margin-top:10px">Nobody has left structured feedback about you yet.</p>
+        )}
+        {myItems.map((i: any) => (
+          <div class="note">
+            <div class="note__h">
+              <span class="note__a">{i.authorName}</span>
+              <span class="note__d">{fmtDate(i.createdAt)}</span>
+            </div>
+            <div>
+              <span class="pill">{sourceLabel(i.sourceType)}</span>
+              <span class="pill">{contextLabel(i.context)}</span>
+              {i.confidentiality === 'hr_channel' && <span class="pill open">people-desk channel</span>}
+            </div>
+            {i.ratings.length > 0 && (
+              <div style="margin-top:7px">
+                {i.ratings.map((r: any) => <span class="pill">{dimLabel(r.dimension)} {r.rating}</span>)}
+              </div>
+            )}
+            {i.evidence && <p class="note__b" style="margin-top:7px">{i.evidence}</p>}
+            {i.examples.map((ex: any) => (
+              <p class="note__b" style="margin-top:6px">
+                <b>{ex.occurredOn || 'Undated'}</b> — {ex.description}
+              </p>
+            ))}
+          </div>
+        ))}
+      </div>
+    </>
+  )}
+
+  {/* --------------------------------------------------------------------------------- WRITTEN */}
+  {view === 'written' && viewer.employeeId && (
+    <div class="card">
+      <h3>Feedback you wrote</h3>
+      <p class="muted">You can withdraw anything you wrote. Withdrawing keeps it on the record with
+      your reason against it and stops it counting towards any figure. There is no delete: an item
+      that could be erased could be erased by whoever it embarrassed.</p>
+
+      {written.length === 0 && (
+        <p class="muted" style="margin-top:12px">You have not written any structured feedback yet.</p>
+      )}
+
+      {written.map((i: any) => (
+        <div class="note">
+          <div class="note__h">
+            <span class="note__a">{i.subjectName}</span>
+            <span class="note__d">{fmtDate(i.createdAt)}</span>
+          </div>
+          <div>
+            <span class="pill">{sourceLabel(i.sourceType)}</span>
+            <span class="pill">{contextLabel(i.context)}</span>
+            <span class="pill">{evidenceLabel(i.evidenceQuality)}</span>
+            {i.status === 'draft' && <span class="pill open">draft</span>}
+            {i.status === 'withdrawn' && <span class="pill open">withdrawn</span>}
+          </div>
+          {i.ratings.length > 0 && (
+            <div style="margin-top:7px">
+              {i.ratings.map((r: any) => <span class="pill">{dimLabel(r.dimension)} {r.rating}</span>)}
+            </div>
+          )}
+          {i.evidence && <p class="note__b" style="margin-top:7px">{i.evidence}</p>}
+          {i.status === 'withdrawn' && (
+            <p class="muted" style="margin-top:7px">Withdrawn {fmtDate(i.withdrawnAt)}: {i.withdrawnReason}</p>
+          )}
+          {i.status !== 'withdrawn' && (
+            <details>
+              <summary>Withdraw this</summary>
+              <div class="inner">
+                <form method="post">
+                  <input type="hidden" name="view" value="written" />
+                  <input type="hidden" name="action" value="withdraw" />
+                  <input type="hidden" name="feedback_id" value={i.id} />
+                  <label for={'wr-' + i.id}>Why. This stays on the record.</label>
+                  <textarea id={'wr-' + i.id} name="reason" required maxlength="1000"
+                    placeholder="I wrote this about the wrong person; I no longer stand behind it."></textarea>
+                  <button class="btn slim" type="submit" style="margin-top:10px">Withdraw</button>
+                </form>
+              </div>
+            </details>
+          )}
+        </div>
+      ))}
+    </div>
+  )}
+
+  <p class="foot">
+    Nothing on this page decides anything. Ratings and the figures built from them are advisory: a
+    named person reads the items and decides, and may disagree with every line of it. No automated
+    figure here can move anybody through a hiring, promotion, pay, disciplinary or exit decision.
+  </p>
+</main>
+
+</EmployeeShell>
+
+<style is:global>
+    .tabs{display:flex;gap:6px;overflow-x:auto;padding:0 2px 10px;-webkit-overflow-scrolling:touch}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:38px;padding:8px 15px;
+      border:1px solid var(--emp-line-2);border-radius:999px;background:var(--emp-surface);
+      color:var(--emp-muted);font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap}
+    .tab[aria-current="page"]{background:var(--emp-ink);border-color:var(--emp-ink);color:#fff}
+    .flash{background:rgba(5,150,105,.09);border:1px solid rgba(5,150,105,.3);color:#065f46;
+      border-radius:10px;padding:11px 13px;font-size:13px;line-height:1.5;margin-bottom:14px;
+      overflow-wrap:anywhere}
+    .card{background:var(--emp-surface);border:1px solid var(--emp-line);border-radius:16px;
+      padding:16px;margin-bottom:13px;box-shadow:0 8px 26px rgba(26,21,16,.045)}
+    .card h2{font-size:19px;font-weight:700;letter-spacing:-.01em;margin:0 0 4px;overflow-wrap:anywhere}
+    .card h3{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:10px;letter-spacing:.13em;
+      text-transform:uppercase;color:var(--emp-muted);font-weight:700;margin:0 0 11px}
+    .muted{font-size:12.5px;line-height:1.55;color:var(--emp-muted);overflow-wrap:anywhere}
+    .empty{background:#fbf8f2;border:1px dashed #e0d5c0;border-radius:14px;padding:18px 16px;
+      margin-bottom:13px}
+    .empty b{display:block;font-size:14px;margin-bottom:5px}
+    .notice{background:var(--emp-warn-bg);border:1px solid var(--emp-warn-line);color:var(--emp-warn-ink);
+      border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.6;margin-bottom:12px;
+      overflow-wrap:anywhere}
+    label,.dt{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:10px;letter-spacing:.1em;
+      text-transform:uppercase;color:var(--emp-muted);font-weight:700;display:block;margin:10px 0 4px}
+    input,select,textarea{width:100%;background:var(--emp-surface-2);border:1px solid var(--emp-line-2);
+      border-radius:9px;padding:11px 12px;font-size:16px;font-family:inherit;color:var(--emp-ink);
+      min-height:44px}
+    textarea{min-height:88px;resize:vertical}
+    input:focus,select:focus,textarea:focus{border-color:var(--emp-accent)}
+    input:focus-visible,select:focus-visible,textarea:focus-visible,
+    .btn:focus-visible,a:focus-visible,summary:focus-visible,button:focus-visible{
+      outline:3px solid var(--emp-accent-deep);outline-offset:2px}
+    .row2{display:grid;grid-template-columns:1fr;gap:9px}
+    .btn{background:var(--emp-accent);color:#fff;border:none;border-radius:10px;padding:12px 18px;
+      font-size:14px;font-weight:650;cursor:pointer;font-family:inherit;width:100%;min-height:44px;
+      margin-top:12px}
+    .btn.ghost{background:var(--emp-surface);color:var(--emp-muted);border:1px solid var(--emp-line-2)}
+    .btn.slim{width:auto;padding:9px 14px;font-size:13px;margin-top:0}
+    .btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+    .btns .btn{width:auto;flex:1 1 140px;margin-top:0}
+    .dimrow{border-top:1px solid #f2ece0;padding:9px 0 4px}
+    .dimlabel{margin-top:0}
+    .dimhint{font-size:12px;line-height:1.5;color:var(--emp-muted);margin:0 0 6px}
+    .exblock{border-top:1px solid #f2ece0;padding-top:8px;margin-top:8px}
+    .exblock:first-child{border-top:none;padding-top:0;margin-top:0}
+    .dimscore{border-top:1px solid #f2ece0;padding:12px 0}
+    .dimscore:first-of-type{border-top:none}
+    .dimscore__h{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+    .dimscore__h b{font-size:14.5px;font-weight:650}
+    .num{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:16px;font-weight:700}
+    .bar{height:7px;border-radius:99px;background:#f0e9db;overflow:hidden;margin:8px 0 6px}
+    .bar i{display:block;height:100%;background:var(--emp-accent);border-radius:99px}
+    .pill{display:inline-block;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9.5px;
+      font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;
+      background:#f2ece0;color:var(--emp-muted);margin:0 5px 5px 0}
+    .pill.open{background:rgba(194,65,12,.1);color:#9a3412}
+    .note{border:1px solid var(--emp-line);border-radius:12px;padding:12px 13px;margin-bottom:9px;
+      background:var(--emp-surface)}
+    .note__h{display:flex;justify-content:space-between;gap:9px;align-items:baseline;margin-bottom:6px}
+    .note__a{font-size:13.5px;font-weight:650;overflow-wrap:anywhere}
+    .note__d{font-size:11px;color:var(--emp-muted);flex:none}
+    .note__b{font-size:13.5px;line-height:1.55;overflow-wrap:anywhere;white-space:pre-wrap;margin:0}
+    .kv{display:flex;justify-content:space-between;gap:10px;padding:8px 0;
+      border-bottom:1px solid #f2ece0;font-size:13.5px}
+    .kv:last-child{border-bottom:none}
+    .kv span{color:var(--emp-muted);flex:none}
+    .exp{font-size:12.5px;line-height:1.6;color:var(--emp-muted);margin:0 0 8px;padding-left:16px}
+    details{border:1px solid var(--emp-line);border-radius:12px;background:var(--emp-surface);
+      margin:10px 0;overflow:hidden}
+    details>summary{list-style:none;cursor:pointer;padding:13px 15px;font-size:13.5px;font-weight:650;
+      min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+    details>summary::-webkit-details-marker{display:none}
+    details>summary::after{content:'+';font-family:ui-monospace,monospace;color:var(--emp-muted);font-size:17px}
+    details[open]>summary::after{content:'\2212'}
+    details .inner{padding:0 15px 15px}
+    .foot{font-size:11.5px;line-height:1.6;color:var(--emp-muted);padding:14px 2px 0;
+      border-top:1px solid var(--emp-line);margin-top:16px;overflow-wrap:anywhere}
+    @media (min-width:560px){ .row2{grid-template-columns:1fr 1fr} }
+</style>

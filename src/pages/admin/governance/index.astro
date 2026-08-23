@@ -1,0 +1,259 @@
+---
+// /admin/governance — PATCH 17's console. The state of the governance layer itself.
+//
+// This page answers four questions an operator has to be able to answer before anybody relies on
+// this layer, and it answers each of them honestly rather than showing a green tick:
+//
+//   Is it installed?        The tables exist, or they do not. SCHEMA_BOOTSTRAP is off in production.
+//   Can it be granted?      The permission keys are in the catalogue, or nobody but a super admin has them.
+//   Is the guarantee real?  High-impact recommendations sitting unreviewed are the measure of that.
+//   Is anybody probing it?  Refused accesses, which is the row a denial exists to leave behind.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+// THREE OF THESE NAMES HAD NEVER EXISTED, AND THE PRODUCTION BUILD FAILED ON THEM.
+// `listRecordTypes`, `registeredWithdrawalHandlers` and `unreviewedHighImpact` are not exported by
+// @/lib/horizon/governance and never were, so rollup refused to link this page and NOTHING shipped.
+// Each is replaced below by the real function that answers the same question:
+//   listRecordTypes()             -> retentionClasses()      the record classes this layer governs
+//   unreviewedHighImpact(14)      -> awaitingHumanReview(14) the same count, from the same table
+//   registeredWithdrawalHandlers  -> registeredSweepers()    the registry that actually exists
+// The withdrawal-handler registry is not a renamed function — there is no such registry anywhere in
+// this layer. The row it fed is re-labelled below to name what IS registered rather than reporting
+// "None" about an extension point that was never built.
+import {
+  HORIZON_PERMISSIONS, PURPOSES, awaitingHumanReview, governanceInstallStatus, governancePermissions,
+  governancePublishStatus, holdsGovernancePermission, registeredErasureParticipants,
+  registeredSweepers, retentionClasses,
+} from '@/lib/horizon/governance';
+
+const currentUser = Astro.locals.user;
+if (!currentUser) return Astro.redirect('/admin/login');
+
+const held = await governancePermissions(currentUser.id, Astro.locals);
+const mayView = holdsGovernancePermission(held.permissions, 'horizon.governance.view');
+if (!mayView) return Astro.redirect('/admin?denied=horizon.governance.view');
+
+const mayPublish = held.permissions.has('*') || holdsGovernancePermission(held.permissions, 'horizon.governance.view');
+
+const install = await governanceInstallStatus();
+const installed = !install.degraded && install.missing.length === 0;
+
+// Nothing below this line queries a table that might not exist unless it does exist. Every one of
+// these reads tolerates a missing table and returns nothing, but running them against a database
+// that has none of them is a page-load of guaranteed-empty round trips for no reason.
+const publish = installed ? await governancePublishStatus() : { total: HORIZON_PERMISSIONS.length, publishedCount: 0, missing: [], degraded: true };
+const unreviewed = installed
+  ? await awaitingHumanReview(14)
+  : { count: 0, oldest: null, readable: false };
+
+let deniedCount = 0;
+let deniedReadable = installed;
+if (installed) {
+  try {
+    const { db } = await import('@/lib/db');
+    const { sql } = await import('drizzle-orm');
+    const r: any = await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM hgov_access_log
+       WHERE allowed = false AND created_at > NOW() - INTERVAL '30 days'`);
+    const list = Array.isArray(r) ? r : (r?.rows || []);
+    deniedCount = Number(list[0]?.n || 0);
+  } catch { deniedReadable = false; }
+}
+
+const retentionSweepers = registeredSweepers();
+const erasureParticipants = registeredErasureParticipants();
+const recordClasses = retentionClasses();
+
+// Hoisted out of the markup: `<` inside a JSX expression breaks .astro parsing, and so does a typed
+// Record<string,string> map. Both have taken pages down on this project.
+// awaitingHumanReview reports a count, and separately whether the table could be read at all.
+// `readable: false` is NOT zero outstanding reviews — it is "we do not know", and saying nothing is
+// outstanding because a query failed is the exact shape of dishonest green tick this page rejects.
+const unreviewedCount = unreviewed.count;
+const unreviewedReadable = unreviewed.readable;
+const hasUnreviewed = unreviewedCount > 0;
+const publishIncomplete = publish.publishedCount < publish.total;
+const flash = new URL(Astro.request.url).searchParams.get('done') || '';
+---
+
+<AdminLayout title="HORIZON governance" activeNav="audit">
+  <div class="admin-page" style="max-width:1200px;">
+
+    <div class="admin-page-header" style="margin-bottom:20px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">Governance, security and audit</div>
+        <h1 class="admin-page-title">HORIZON governance</h1>
+        <p class="admin-page-sub">
+          Who may read a person's record, for what stated reason, with whose consent, and what happened afterwards.
+        </p>
+      </div>
+    </div>
+
+    {flash && <div class="admin-card" style="padding:12px 16px;margin-bottom:16px;border-left:3px solid #10b981;">{flash}</div>}
+
+    <!-- 1. INSTALLED -->
+    <div class="admin-card" style="padding:16px;margin-bottom:16px;">
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 10px;">Storage</h2>
+      {install.degraded && (
+        <p style="margin:0;color:#fbbf24;">
+          The database could not be asked which tables exist. This is reported as unknown rather than as installed.
+        </p>
+      )}
+      {!install.degraded && installed && (
+        <p style="margin:0;color:#10b981;">All {install.present.length} governance tables are present.</p>
+      )}
+      {!install.degraded && !installed && (
+        <div>
+          <p style="margin:0 0 8px;color:#fbbf24;">
+            {install.missing.length} of {install.present.length + install.missing.length} tables are missing, so nothing is being recorded yet.
+          </p>
+          <p style="margin:0 0 8px;color:#a0a0ab;font-size:12px;">
+            Schema bootstrap is off in production by default, so these will not create themselves. Run
+            <code>db/horizon-governance-schema.sql</code> against the database once, by hand. It is idempotent.
+          </p>
+          <p style="margin:0;font-family:monospace;font-size:11px;color:#a0a0ab;">{install.missing.join(', ')}</p>
+        </div>
+      )}
+    </div>
+
+    <!-- 2. GRANTABLE -->
+    <div class="admin-card" style="padding:16px;margin-bottom:16px;">
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 10px;">Permissions</h2>
+      {publish.degraded && <p style="margin:0;color:#fbbf24;">The permission catalogue could not be read.</p>}
+      {!publish.degraded && !publishIncomplete && (
+        <p style="margin:0;color:#10b981;">
+          All {publish.total} HORIZON permissions are in the catalogue and can be granted from the roles console.
+        </p>
+      )}
+      {!publish.degraded && publishIncomplete && (
+        <div>
+          <p style="margin:0 0 10px;">
+            {publish.publishedCount} of {publish.total} permissions are in the catalogue. Until they are published
+            nobody but a super admin holds them, and no custom role can be given them.
+          </p>
+          <p style="margin:0 0 12px;color:#a0a0ab;font-size:12px;">
+            Publishing does not grant anything to anybody. It makes the keys available to be granted, and records
+            you as the person who added them.
+          </p>
+          {mayPublish && (
+            <form method="POST" action="/api/admin/governance/publish">
+              <button type="submit" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:11px;">
+                Publish the permission keys
+              </button>
+            </form>
+          )}
+        </div>
+      )}
+    </div>
+
+    <!-- 3. IS THE HUMAN-IN-THE-LOOP GUARANTEE REAL -->
+    <div class="admin-card" style="padding:16px;margin-bottom:16px;">
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 10px;">Human review</h2>
+      {hasUnreviewed && (
+        <div>
+          <p style="margin:0 0 8px;color:#f87171;">
+            {unreviewedCount} high-impact recommendations have been open for more than fourteen days with no
+            decision recorded against them.
+          </p>
+          <p style="margin:0;color:#a0a0ab;font-size:12px;">
+            This is the number that says whether the guarantee is real. A recommendation nobody reviews is a
+            recommendation acting as a decision, whatever the policy says.
+          </p>
+        </div>
+      )}
+      {!hasUnreviewed && (
+        <p style="margin:0;color:#10b981;">
+          {unreviewedReadable
+            ? 'No high-impact recommendation has been left unreviewed for more than fourteen days.'
+            : 'The review queue could not be read, so this is not a clean bill of health — it is an unknown.'}
+        </p>
+      )}
+    </div>
+
+    <!-- 4. REFUSALS -->
+    <div class="admin-card" style="padding:16px;margin-bottom:16px;">
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 10px;">Refused accesses</h2>
+      {!deniedReadable && <p style="margin:0;color:#fbbf24;">The access log could not be read.</p>}
+      {deniedReadable && (
+        <p style="margin:0;">
+          {deniedCount} access attempts were refused in the last thirty days.
+          <span style="color:#a0a0ab;"> A refusal leaves a row on purpose; it is the more interesting half of the trail.</span>
+        </p>
+      )}
+    </div>
+
+    <!-- WHERE TO GO -->
+    <div class="admin-card" style="padding:16px;margin-bottom:16px;">
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 12px;">Screens</h2>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <a href="/admin/governance/audit" class="admin-btn" style="padding:7px 14px;font-size:11px;">Audit trail</a>
+        <a href="/admin/governance/consent" class="admin-btn" style="padding:7px 14px;font-size:11px;">Consent register</a>
+        <a href="/admin/governance/retention" class="admin-btn" style="padding:7px 14px;font-size:11px;">Retention and erasure</a>
+        <a href="/admin/team/roles" class="admin-btn" style="padding:7px 14px;font-size:11px;">Grant these permissions</a>
+      </div>
+    </div>
+
+    <!-- WHAT IS WIRED IN -->
+    <div class="admin-card" style="padding:16px;margin-bottom:16px;">
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 12px;">What is wired in</h2>
+      <p style="margin:0 0 12px;color:#a0a0ab;font-size:12px;">
+        Other patches register themselves with this layer at load. An empty list here is the truthful state, not
+        a fault: it means no producing patch has connected yet, and this layer governs only what it is told about.
+      </p>
+      <table class="admin-table" style="min-width:600px;">
+        <thead><tr><th style="width:220px;">Extension point</th><th>Registered</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Record classes governed</td>
+            <td>{recordClasses.join(', ')}</td>
+          </tr>
+          <tr>
+            <td>Retention sweepers</td>
+            <td>{retentionSweepers.length === 0 ? 'None. Retention is computed and reported, but no owning module has registered to act on its own tables yet.' : retentionSweepers.join(', ')}</td>
+          </tr>
+          <tr>
+            <td>Erasure participants</td>
+            <td>{erasureParticipants.length === 0 ? 'None. An erasure removes this layer\'s own records only; anything held elsewhere is untouched and the report says so.' : erasureParticipants.map((p) => p.name).join(', ')}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- THE MATRIX, AS A DOCUMENT -->
+    <div class="admin-card" style="padding:16px;margin-bottom:16px;">
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 12px;">Purposes</h2>
+      <table class="admin-table" style="min-width:700px;">
+        <thead><tr><th style="width:200px;">Purpose</th><th style="width:150px;">Reaches up to</th><th>What it is for</th></tr></thead>
+        <tbody>
+          {PURPOSES.map((p) => (
+            <tr>
+              <td style="font-family:monospace;font-size:11px;">{p.purpose}</td>
+              <td style="font-size:11px;">{p.maxClass}</td>
+              <td style="font-size:12px;color:#a0a0ab;">{p.description}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="admin-card" style="padding:16px;">
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 12px;">Permission keys</h2>
+      <table class="admin-table" style="min-width:700px;">
+        <thead><tr><th style="width:260px;">Key</th><th style="width:110px;">Grant</th><th>What it opens</th></tr></thead>
+        <tbody>
+          {HORIZON_PERMISSIONS.map((p) => (
+            <tr>
+              <td style="font-family:monospace;font-size:11px;">{p.key}</td>
+              <td style="font-size:11px;">{p.explicitGrantOnly ? 'Explicit only' : 'Standard'}</td>
+              <td style="font-size:12px;color:#a0a0ab;">{p.description}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p style="margin:12px 0 0;color:#a0a0ab;font-size:12px;">
+        "Explicit only" means the super-admin wildcard does not satisfy the key. Somebody has to be granted it by
+        name, and being the founder is not that grant.
+      </p>
+    </div>
+
+  </div>
+</AdminLayout>

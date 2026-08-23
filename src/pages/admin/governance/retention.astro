@@ -1,0 +1,270 @@
+---
+// /admin/governance/retention — how long each class of record is kept, what happens when the period
+// ends, and the erasure requests that are open right now.
+//
+// THE SWEEP DEFAULTS TO A DRY RUN and there is no way to make it not. A button that deletes on the
+// first click is one somebody presses to see what it does.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import {
+  applyRetention, governancePermissions, holdsGovernancePermission, listErasureRequests,
+  listRetentionPolicies, registeredErasureParticipants, retentionDue,
+} from '@/lib/horizon/governance';
+
+const currentUser = Astro.locals.user;
+if (!currentUser) return Astro.redirect('/admin/login');
+
+const held = await governancePermissions(currentUser.id, Astro.locals);
+if (!holdsGovernancePermission(held.permissions, 'horizon.governance.view')) {
+  return Astro.redirect('/admin?denied=horizon.governance.view');
+}
+const mayManage = holdsGovernancePermission(held.permissions, 'horizon.retention.manage');
+const mayRequest = holdsGovernancePermission(held.permissions, 'horizon.erasure.request');
+const mayApprove = holdsGovernancePermission(held.permissions, 'horizon.erasure.approve');
+
+const url = new URL(Astro.request.url);
+const flash = url.searchParams.get('done') || '';
+const problem = url.searchParams.get('error') || '';
+const showDryRun = url.searchParams.get('dryrun') === '1';
+
+const policies = await listRetentionPolicies();
+const due = await retentionDue();
+const requests = await listErasureRequests(undefined, 50);
+const participants = registeredErasureParticipants();
+
+// The dry run is a READ. It is safe to run on a page load, and it is the only thing on this screen
+// that reports what a sweep would actually touch.
+const dryRun = showDryRun ? await applyRetention({ id: currentUser.id }, { dryRun: true }) : [];
+
+const dueByClass: Record<string, number> = {};
+const readableByClass: Record<string, boolean> = {};
+for (const d of due) { dueByClass[d.recordClass] = d.dueCount; readableByClass[d.recordClass] = d.readable; }
+
+function when(value: string | null): string {
+  if (!value) return '';
+  try {
+    return new Date(value).toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit',
+    });
+  } catch { return value; }
+}
+
+// Everything comparative is computed here. A `<` inside a JSX expression breaks .astro parsing.
+const policyRows = policies.map((p) => ({
+  ...p,
+  dueCount: dueByClass[p.recordClass] ?? 0,
+  readable: readableByClass[p.recordClass] !== false,
+  locked: p.recordClass === 'access_log' || p.recordClass === 'decision_log' || p.recordClass === 'consent',
+}));
+const hasRequests = requests.length > 0;
+const hasParticipants = participants.length > 0;
+const hasDryRun = dryRun.length > 0;
+const ACTIONS = ['review', 'anonymise', 'delete'];
+---
+
+<AdminLayout title="Retention and erasure" activeNav="audit">
+  <div class="admin-page" style="max-width:1250px;">
+
+    <div class="admin-page-header" style="margin-bottom:20px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow"><a href="/admin/governance" style="color:inherit;">Governance</a></div>
+        <h1 class="admin-page-title">Retention and erasure</h1>
+        <p class="admin-page-sub">
+          A schedule that applies to everybody, and a request path for one person. They are different acts and
+          they are kept apart.
+        </p>
+      </div>
+    </div>
+
+    {flash && <div class="admin-card" style="padding:12px 16px;margin-bottom:16px;border-left:3px solid #10b981;">{flash}</div>}
+    {problem && <div class="admin-card" style="padding:12px 16px;margin-bottom:16px;border-left:3px solid #f87171;">{problem}</div>}
+
+    <!-- POLICY -->
+    <div class="admin-card" style="padding:0;margin-bottom:16px;">
+      <div style="padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);">
+        <strong>Retention policy</strong>
+        <span style="color:#a0a0ab;"> Every period states why it is what it is. A period with no recorded basis is a number somebody made up.</span>
+      </div>
+      <table class="admin-table" style="min-width:1000px;">
+        <thead>
+          <tr>
+            <th style="width:170px;">Record class</th>
+            <th style="width:90px;">Keep</th>
+            <th style="width:110px;">Then</th>
+            <th style="width:90px;">Past due</th>
+            <th>Basis</th>
+            {mayManage && <th style="width:230px;">Change</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {policyRows.map((p) => (
+            <tr>
+              <td style="font-family:monospace;font-size:11px;">{p.recordClass}</td>
+              <td style="font-size:11px;">{p.retainDays} days</td>
+              <td style="font-size:11px;">{p.action}</td>
+              <td style="font-size:11px;color:#a0a0ab;">{p.readable ? p.dueCount : 'unknown'}</td>
+              <td style="font-size:12px;color:#a0a0ab;">
+                {p.basis}
+                {p.overriddenBy && <div style="color:#fbbf24;">Overridden by an administrator.</div>}
+              </td>
+              {mayManage && (
+                <td>
+                  <form method="POST" action="/api/admin/governance/retention" style="display:flex;gap:4px;align-items:center;">
+                    <input type="hidden" name="action" value="policy" />
+                    <input type="hidden" name="recordClass" value={p.recordClass} />
+                    <input type="number" name="retainDays" class="rolefield-input" value={p.retainDays} min="1" style="width:70px;font-size:11px;padding:4px 6px;" />
+                    <select name="then" class="rolefield-input" style="font-size:11px;padding:4px 6px;width:90px;">
+                      {ACTIONS.map((a) => <option value={a} selected={p.action === a}>{a}</option>)}
+                    </select>
+                    <input type="text" name="basis" class="rolefield-input" placeholder="why" style="font-size:11px;padding:4px 6px;width:110px;" />
+                    <button type="submit" class="admin-btn" style="padding:4px 8px;font-size:11px;">Set</button>
+                  </form>
+                  {p.locked && <div style="font-size:10px;color:#a0a0ab;margin-top:3px;">Cannot be set to delete automatically.</div>}
+                </td>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- SWEEP -->
+    <div class="admin-card" style="padding:16px;margin-bottom:16px;">
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 8px;">The sweep</h2>
+      <p style="margin:0 0 12px;color:#a0a0ab;font-size:12px;">
+        Classes marked <code>review</code> are never touched automatically; they are counted and left for a person
+        to decide. Nothing on this project runs the sweep on a timer yet, so it happens when somebody runs it.
+      </p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <a href="/admin/governance/retention?dryrun=1" class="admin-btn" style="padding:7px 14px;font-size:11px;">Show what a sweep would touch</a>
+        {mayManage && (
+          <form method="POST" action="/api/admin/governance/retention" onsubmit="return confirm('This removes or de-identifies rows that are past their retention period. It cannot be undone. Continue?')">
+            <input type="hidden" name="action" value="sweep" />
+            <button type="submit" class="admin-btn" style="padding:7px 14px;font-size:11px;color:#f87171;">Run it for real</button>
+          </form>
+        )}
+      </div>
+      {hasDryRun && (
+        <table class="admin-table" style="min-width:600px;margin-top:14px;">
+          <thead><tr><th style="width:180px;">Record class</th><th style="width:140px;">Would do</th><th style="width:90px;">Rows</th><th>Note</th></tr></thead>
+          <tbody>
+            {dryRun.map((r) => (
+              <tr>
+                <td style="font-family:monospace;font-size:11px;">{r.recordClass}</td>
+                <td style="font-size:11px;">{r.action}</td>
+                <td style="font-size:11px;">{r.affected}</td>
+                <td style="font-size:11px;color:#a0a0ab;">{r.note}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+
+    <!-- ERASURE -->
+    <div class="admin-card" style="padding:16px;margin-bottom:16px;">
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 8px;">Erasure and anonymisation</h2>
+      <p style="margin:0 0 12px;color:#a0a0ab;font-size:12px;">
+        A request is made by one named person and approved by a different one. Self-approval is refused and there
+        is no setting that turns that off. An open legal matter naming the person blocks the request, and so does
+        being unable to read the legal-hold register at all.
+      </p>
+      {!hasParticipants && (
+        <p style="margin:0 0 12px;color:#fbbf24;font-size:12px;">
+          No other patch has registered an erasure participant, so an erasure will act on this layer's own records
+          and nothing else. Anything held elsewhere stays where it is, and the report on each request says so.
+        </p>
+      )}
+      {mayRequest && (
+        <form method="POST" action="/api/admin/governance/erasure" style="display:grid;grid-template-columns:130px 200px 130px 1fr 110px;gap:10px;align-items:end;">
+          <input type="hidden" name="action" value="request" />
+          <div>
+            <label class="rolefield-label">Kind</label>
+            <select name="kind" class="rolefield-input" style="font-size:11px;padding:5px 6px;">
+              <option value="employee">employee</option>
+              <option value="user">user</option>
+              <option value="candidate">candidate</option>
+              <option value="intern">intern</option>
+              <option value="contractor">contractor</option>
+            </select>
+          </div>
+          <div>
+            <label class="rolefield-label">Subject id</label>
+            <input type="text" name="subject" class="rolefield-input" style="font-size:11px;padding:5px 6px;" />
+          </div>
+          <div>
+            <label class="rolefield-label">Action</label>
+            <select name="mode" class="rolefield-input" style="font-size:11px;padding:5px 6px;">
+              <option value="anonymise">anonymise</option>
+              <option value="delete">delete</option>
+            </select>
+          </div>
+          <div>
+            <label class="rolefield-label">Reason</label>
+            <input type="text" name="reason" class="rolefield-input" minlength="15" style="font-size:11px;padding:5px 6px;" />
+          </div>
+          <div>
+            <button type="submit" class="admin-btn admin-btn-primary" style="padding:6px 12px;font-size:11px;">Open request</button>
+          </div>
+        </form>
+      )}
+    </div>
+
+    <div class="admin-card" style="padding:0;">
+      <div style="padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);"><strong>Requests</strong></div>
+      {!hasRequests && <div style="padding:16px;color:#a0a0ab;">No erasure request has been opened.</div>}
+      {hasRequests && (
+        <table class="admin-table" style="min-width:1000px;">
+          <thead>
+            <tr>
+              <th style="width:150px;">Opened</th>
+              <th style="width:170px;">Subject</th>
+              <th style="width:100px;">Action</th>
+              <th style="width:110px;">Status</th>
+              <th>Reason / blockers</th>
+              <th style="width:190px;">Decide</th>
+            </tr>
+          </thead>
+          <tbody>
+            {requests.map((r) => (
+              <tr>
+                <td style="font-size:11px;">{when(r.createdAt)}</td>
+                <td style="font-size:11px;font-family:monospace;">{r.subject.kind}:{r.subject.id}</td>
+                <td style="font-size:11px;">{r.action}</td>
+                <td style="font-size:11px;">{r.status}</td>
+                <td style="font-size:11px;color:#a0a0ab;">
+                  {r.reason}
+                  {r.blockers.map((b) => <div style="color:#f87171;">{b}</div>)}
+                </td>
+                <td>
+                  {mayApprove && r.status === 'requested' && (
+                    <div style="display:flex;gap:4px;">
+                      <form method="POST" action="/api/admin/governance/erasure">
+                        <input type="hidden" name="action" value="approve" />
+                        <input type="hidden" name="id" value={r.id} />
+                        <button type="submit" class="admin-btn" style="padding:4px 8px;font-size:11px;">Approve</button>
+                      </form>
+                      <form method="POST" action="/api/admin/governance/erasure" style="display:flex;gap:3px;">
+                        <input type="hidden" name="action" value="reject" />
+                        <input type="hidden" name="id" value={r.id} />
+                        <input type="text" name="reason" class="rolefield-input" placeholder="why" style="font-size:11px;padding:3px 5px;width:70px;" />
+                        <button type="submit" class="admin-btn" style="padding:4px 8px;font-size:11px;">Refuse</button>
+                      </form>
+                    </div>
+                  )}
+                  {mayApprove && r.status === 'approved' && (
+                    <form method="POST" action="/api/admin/governance/erasure" onsubmit="return confirm('This carries out the erasure. It cannot be undone. Continue?')">
+                      <input type="hidden" name="action" value="execute" />
+                      <input type="hidden" name="id" value={r.id} />
+                      <button type="submit" class="admin-btn" style="padding:4px 8px;font-size:11px;color:#f87171;">Carry it out</button>
+                    </form>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+
+  </div>
+</AdminLayout>

@@ -1,0 +1,290 @@
+---
+// /admin/hr/signals/[id] — ONE SIGNAL, AND THE WHOLE OF ITS WORKING.
+//
+// This is the screen the whole patch is for. A signal on a list is a sentence; here it has to answer
+// for itself, in the order the system's own rule requires:
+//
+//   INPUTS -> PROCESSING -> OUTPUT -> EVIDENCE -> CONFIDENCE -> TIMESTAMP
+//
+// Everything below is READ FROM THE STORED ROW, never recomputed. An explanation regenerated from
+// today's detectors explains today's detectors, not the row somebody acted on last month.
+//
+// THE REVIEW FORM IS THE POINT OF THE PAGE. A verdict here does not change the evidence and does not
+// delete the detector's output; it appends one attributed row to an append-only log. A second
+// reviewer who disagrees appends a second one, and the disagreement is shown rather than averaged
+// away.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import {
+  acknowledgeSignal,
+  dismissSignal,
+  evidenceForSignal,
+  explainStored,
+  getSignal,
+  recordSignalReview,
+  resolveSignal,
+  reviewDisagreement,
+  signalHistory,
+  startSignalReview,
+  resolveViewerAccess,
+  REVIEW_VERDICTS,
+  REVIEW_VERDICT_LABELS,
+} from '@/lib/horizon/signal-engine';
+import { seesBand, redactForPolicy } from '@/lib/horizon/signal-visibility';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'hr', 'view'))) return Astro.redirect('/admin');
+
+const id = String(Astro.params.id || '');
+const viewer = { id: String(user.id), role: String(user.role || '') };
+
+let flash = '';
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const note = String(fd.get('note') || '');
+  if (action === 'acknowledge') {
+    const r = await acknowledgeSignal(id, viewer);
+    flash = r.ok ? 'Acknowledged.' : 'Error: ' + r.error;
+  } else if (action === 'start_review') {
+    const r = await startSignalReview(id, viewer);
+    flash = r.ok ? 'Marked as in review.' : 'Error: ' + r.error;
+  } else if (action === 'record_review') {
+    const r = await recordSignalReview(id, viewer, String(fd.get('verdict') || ''), note);
+    flash = r.ok ? 'Your review is on the record, with your name against it.' : 'Error: ' + r.error;
+  } else if (action === 'resolve') {
+    const r = await resolveSignal(id, viewer, note);
+    flash = r.ok ? 'Resolved.' : 'Error: ' + r.error;
+  } else if (action === 'dismiss') {
+    const r = await dismissSignal(id, viewer, note);
+    flash = r.ok ? 'Dismissed.' : 'Error: ' + r.error;
+  }
+  return Astro.redirect('/admin/hr/signals/' + id + '?msg=' + encodeURIComponent(flash));
+}
+
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const signal = await getSignal(id);
+const access = await resolveViewerAccess(viewer);
+
+// FAIL CLOSED, AND SAY WHICH. A signal outside this viewer's band or scope is not shown, and the
+// page says so rather than rendering an empty shell that reads like a deleted record.
+const allowed =
+  !!signal &&
+  access.policy.scope !== 'none' &&
+  seesBand(access.policy, signal.band) &&
+  (access.policy.scope === 'all' || access.reportEmployeeIds.indexOf(signal.subjectId) >= 0);
+
+const evidence = allowed && access.policy.maySeeEvidence ? await evidenceForSignal(id) : [];
+const history = allowed ? await signalHistory(id) : [];
+const reviews = reviewDisagreement(history);
+const chain = allowed && access.policy.maySeeComputation && signal ? explainStored(signal, evidence) : null;
+const shown = allowed && signal ? redactForPolicy(signal as any, access.policy) : null;
+
+const BAND_COLOR: Record<string, string> = { green: '#34d399', blue: '#60a5fa', yellow: '#fbbf24', red: '#f87171' };
+const fmt = (d: any) => (d ? new Date(d).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }) : '—');
+const verdictList = REVIEW_VERDICTS.map((v) => ({ value: v, label: REVIEW_VERDICT_LABELS[v] }));
+const hasEvidence = evidence.length > 0;
+const hasHistory = history.length > 0;
+const canAct = access.policy.mayResolve;
+---
+<AdminLayout title="Signal" activeNav="">
+  <div class="admin-page" style="max-width:900px;">
+    <p class="back"><a href="/admin/hr/signals">Back to signals</a></p>
+    {msg && <div class="flash">{msg}</div>}
+
+    {!signal && <p class="empty">No signal with that id.</p>}
+    {signal && !allowed && (
+      <p class="empty">
+        This signal exists and is not yours to read. Access is decided by your role and by your
+        relationship to the person it is about; both were checked and neither reached.
+      </p>
+    )}
+
+    {signal && allowed && (
+      <article>
+        <header class="head" style={'border-left-color:' + BAND_COLOR[signal.band]}>
+          <span class="pill" style={'background:' + BAND_COLOR[signal.band]}>{signal.bandLabel}</span>
+          <h1>{signal.title}</h1>
+          <p class="who">
+            {signal.subjectName || signal.subjectId} · {signal.dimension} · {signal.category} · {signal.status}
+          </p>
+          <p class="what">{signal.explanation}</p>
+          {signal.downgradeReason && <p class="downgrade">{signal.downgradeReason}</p>}
+        </header>
+
+        <section class="box">
+          <h2>What it recommends</h2>
+          <ul>
+            {signal.recommendedActions.map((a: any) => (
+              <li>{a.label} <span class="to">— addressed to {String(a.addressedTo).split('_').join(' ')}</span></li>
+            ))}
+          </ul>
+          <p class="fine">
+            {signal.humanReviewRequired
+              ? 'This signal requires a named human to review it before anything follows from it.'
+              : 'No review is required. Whatever follows from this is a human’s call in any case.'}
+            {signal.touchesDecision
+              ? ' It is marked as capable of being quoted in a ' + signal.touchesDecision +
+                ' discussion, which is why it was held to a stricter evidence floor. It authorises nothing.'
+              : ''}
+          </p>
+        </section>
+
+        {chain && (
+          <section class="box">
+            <h2>How it was reached</h2>
+
+            <h3>1 · Inputs — what was read</h3>
+            <ul>{chain.inputs.map((i: any) => <li><code>{i.source}</code> — {i.description}</li>)}</ul>
+
+            <h3>2 · Processing — how it became this</h3>
+            <p>{chain.processing}</p>
+
+            <h3>3 · Output</h3>
+            <p>{chain.output.whatChanged}</p>
+
+            <h3>4 · Evidence</h3>
+            {!hasEvidence && <p class="fine">No evidence rows came back for this signal. That is worth investigating: a signal is refused at generation unless it names at least one.</p>}
+            {hasEvidence && (
+              <table>
+                <thead><tr><th>Record</th><th>Kind</th><th>Strength</th><th>When</th></tr></thead>
+                <tbody>
+                  {evidence.map((e: any) => (
+                    <tr>
+                      <td>{e.summary}</td>
+                      <td>{String(e.sourceType).split('_').join(' ')}</td>
+                      <td>{String(e.evidenceClass).split('_').join(' ')}</td>
+                      <td>{fmt(e.timestamp)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            {chain.contextNote && <p class="fine">{chain.contextNote}</p>}
+
+            <h3>5 · Confidence</h3>
+            <p class="conf">{chain.confidence.band} ({chain.confidence.value})</p>
+            <ul class="terms">{chain.confidence.terms.map((t: string) => <li>{t}</li>)}</ul>
+
+            <h3>6 · Time</h3>
+            <p class="fine">
+              Covers {fmt(chain.timestamp.periodStart)} to {fmt(chain.timestamp.periodEnd)}.
+              Expires {fmt(chain.timestamp.expiresAt)} — a signal that never expires becomes a
+              permanent mark on a person, so this one does not.
+            </p>
+            <p class="fine">
+              Produced by detector <code>{signal.detectorKey}</code> version {signal.detectorVersion},
+              recorded as {signal.layer} and usable as {String(signal.decisionUse).split('_').join(' ')}.
+            </p>
+          </section>
+        )}
+
+        {!chain && (
+          <section class="box">
+            <h2>How it was reached</h2>
+            <p class="fine">
+              The engine's inputs, its processing rule and the arithmetic behind its confidence figure
+              are withheld from your role. That is deliberate rather than missing.
+            </p>
+          </section>
+        )}
+
+        {canAct && (
+          <section class="box">
+            <h2>Record what you found</h2>
+            <p class="fine">
+              A verdict does not change the evidence and does not close the signal. It is one attributed
+              row on a log that cannot be edited. If somebody else has already reviewed this and you
+              disagree, say so — both readings stay on the record.
+            </p>
+            <form method="POST" class="review">
+              <input type="hidden" name="action" value="record_review" />
+              <select name="verdict">
+                {verdictList.map((v) => <option value={v.value}>{v.label}</option>)}
+              </select>
+              <textarea name="note" rows="3" placeholder="What did you find? A sentence is enough, and it is required."></textarea>
+              <button type="submit" class="ghost">Record my review</button>
+            </form>
+
+            <form method="POST" class="row">
+              <input type="hidden" name="action" value="acknowledge" />
+              <button type="submit" class="ghost">Acknowledge</button>
+            </form>
+            <form method="POST" class="row">
+              <input type="hidden" name="action" value="start_review" />
+              <button type="submit" class="ghost">Mark in review</button>
+            </form>
+            <form method="POST" class="row wide">
+              <input type="text" name="note" placeholder="Why — a sentence somebody can read later" />
+              <button type="submit" name="action" value="resolve" class="ghost">Resolve</button>
+              <button type="submit" name="action" value="dismiss" class="ghost">Dismiss</button>
+            </form>
+          </section>
+        )}
+
+        <section class="box">
+          <h2>What has happened to this signal</h2>
+          {reviews.disagreement && (
+            <p class="disagree">
+              The reviewers do not agree. {reviews.verdicts.map((v: any) => v.count + ' said "' + v.verdict.split('_').join(' ') + '"').join('; ')}.
+              Both readings stand; neither becomes the organisation's view on its own.
+            </p>
+          )}
+          {!hasHistory && <p class="fine">Nothing on the lifecycle log yet.</p>}
+          {hasHistory && (
+            <ol class="log">
+              {history.map((h: any) => (
+                <li>
+                  <span class="act">{h.action.split('_').join(' ')}</span>
+                  <span class="when">{fmt(h.at)}</span>
+                  {h.verdict && <span class="verdict">{h.verdict.split('_').join(' ')}</span>}
+                  {h.notified && <span class="notified">notified</span>}
+                  {h.reason && <p class="reason">{h.reason}</p>}
+                  {h.note && <p class="reason">{h.note}</p>}
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+      </article>
+    )}
+  </div>
+</AdminLayout>
+
+<style>
+  .back { font-size: 12.5px; margin-bottom: 12px; }
+  .flash { margin: 0 0 16px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3); color: #6ee7b7; border-radius: 8px; padding: 10px 14px; font-size: 13px; }
+  .empty { font-size: 13.5px; opacity: 0.75; padding: 24px 0; }
+  .head { border-left: 3px solid #444; padding-left: 14px; margin-bottom: 18px; }
+  .head h1 { font-size: 22px; margin: 8px 0 4px; }
+  .pill { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; color: #11131a; border-radius: 999px; padding: 2px 8px; font-weight: 600; }
+  .who { font-size: 12px; opacity: 0.7; margin: 0 0 8px; }
+  .what { font-size: 14px; margin: 0; }
+  .downgrade { font-size: 12.5px; opacity: 0.85; border-left: 2px solid #fbbf24; padding-left: 10px; margin: 10px 0 0; }
+  .box { border: 1px solid #2a2a33; border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+  .box h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.75; margin: 0 0 10px; }
+  .box h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.6; margin: 16px 0 6px; }
+  .box ul, .box ol { padding-left: 18px; font-size: 13px; }
+  .box li { margin-bottom: 4px; }
+  .to { opacity: 0.55; }
+  .fine { font-size: 12px; opacity: 0.7; margin: 8px 0 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 6px; }
+  th { text-align: left; font-weight: 500; opacity: 0.6; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #2a2a33; padding: 6px 8px 6px 0; }
+  td { padding: 6px 8px 6px 0; border-bottom: 1px solid rgba(42,42,51,0.6); vertical-align: top; }
+  .conf { font-size: 14px; margin: 4px 0; }
+  .terms { font-size: 12px; opacity: 0.8; }
+  .review { display: flex; flex-direction: column; gap: 8px; max-width: 560px; margin-bottom: 12px; }
+  .review select, .review textarea, .row input[type=text] { background: transparent; border: 1px solid #2a2a33; border-radius: 6px; padding: 7px 9px; font-size: 12.5px; color: inherit; font-family: inherit; }
+  .row { display: inline-flex; gap: 6px; margin-right: 8px; margin-top: 6px; }
+  .row.wide { display: flex; max-width: 560px; }
+  .row.wide input[type=text] { flex: 1; }
+  .ghost { background: transparent; border: 1px solid #2a2a33; border-radius: 6px; padding: 6px 12px; font-size: 12px; color: inherit; cursor: pointer; }
+  .ghost:hover { border-color: #6b7280; }
+  .disagree { font-size: 12.5px; border-left: 2px solid #fbbf24; padding-left: 10px; margin: 0 0 10px; }
+  .log li { margin-bottom: 10px; }
+  .act { font-size: 12.5px; font-weight: 600; margin-right: 8px; }
+  .when, .verdict, .notified { font-size: 11px; opacity: 0.6; margin-right: 8px; }
+  .reason { font-size: 12px; opacity: 0.75; margin: 2px 0 0; }
+  code { font-size: 11.5px; opacity: 0.85; }
+</style>

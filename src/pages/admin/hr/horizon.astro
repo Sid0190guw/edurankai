@@ -1,0 +1,498 @@
+---
+// /admin/hr/horizon — TIME INTELLIGENCE, THE PEOPLE-DESK VIEW.
+//
+// =================================================================================================
+// WHAT THIS SCREEN IS AND IS NOT
+// =================================================================================================
+//
+// It shows what the platform can say about one person's work across seven stretches of time, with
+// the records behind every sentence named. It is a READING SCREEN. There is no rating on it, no
+// ranking, no comparison between people and no button that changes anybody's status, because
+// nothing this engine produces may drive a hiring, promotion, discipline or exit outcome on its own.
+//
+// The only write on the page is "rebuild this reading", which recomputes from the same records and
+// supersedes the previous version rather than overwriting it.
+//
+// =================================================================================================
+// THE GATE IS THE SAME ONE THE MASTER RECORD USES
+// =================================================================================================
+//
+// Self, or a relationship the Organization Graph records, or an organization-wide capability. It is
+// resolved by src/lib/horizon/temporal, which asks src/lib/performance-scope the same way
+// src/lib/digital-twin.ts does. Two screens answering the same question differently is a defect this
+// repository has already paid for once, in the two performance consoles that gated the same table
+// two different ways.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { rowsOf } from '@/lib/performance-scope';
+import { can } from '@/lib/auth/permissions';
+import {
+  readHorizonsFor,
+  recomputeFor,
+  resultHistory,
+  temporalHealth,
+  deriveEvents,
+  HORIZONS,
+  HORIZON_SPECS,
+  VERSIONED_HORIZONS,
+  LAYER_LABELS,
+  LAYER_MEANING,
+  CONFIDENCE_BAND_LABELS,
+  confidenceBand,
+  PROJECTION_DISCLAIMER,
+  BIRTH_CYCLE_PRECONDITIONS,
+  currentBirthGate,
+  type Horizon,
+} from '@/lib/horizon/temporal';
+
+// EVERY const BEFORE the POST handler that reads it. `const` is not hoisted, and that has broken a
+// POST handler on this project on its first line while the page reported success.
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const PATH = '/admin/hr/horizon';
+const holds = (key: string): boolean => can(user as any, key as any);
+const targetId = String(Astro.url.searchParams.get('id') || '').trim();
+const requested = String(Astro.url.searchParams.get('h') || 'month');
+const active: Horizon = (HORIZONS as readonly string[]).indexOf(requested) >= 0
+  ? (requested as Horizon)
+  : 'month';
+
+let okMsg = '';
+let errorMsg = '';
+
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || '');
+    const id = String(form.get('employeeId') || '').trim();
+    if (action === 'recompute' && id) {
+      // The gate is asked again for the WRITE. Reading a horizon and rebuilding it are different
+      // permissions, and a page that checked once at the top would let a reader post.
+      const check = await readHorizonsFor({ viewerUserId: String(user.id), employeeId: id, holds });
+      if (!check.access.granted || !check.access.mayRecompute) {
+        errorMsg = 'You may read this record but not rebuild it. ' + check.access.because;
+      } else {
+        const today = new Date().toISOString().slice(0, 10);
+        const r = await recomputeFor(id, today, 'requested from /admin/hr/horizon');
+        if (r.blind) {
+          errorMsg = 'Nothing was rebuilt: every evidence source was unreadable, so the previous '
+            + 'versions stay in place rather than being replaced by empty ones.';
+        } else {
+          okMsg = 'Rebuilt ' + r.stored.length + ' versioned horizons.'
+            + (r.refused.length ? ' ' + r.refused.length + ' were refused.' : '');
+        }
+      }
+    }
+  } catch (e: any) {
+    // Never swallow. A bare catch on a write path hid a total sign-in outage on this project.
+    errorMsg = 'The rebuild failed: ' + (e?.cause?.message || e?.message || 'unknown');
+  }
+}
+
+// ---- the directory, when no person is selected ---------------------------------------------------
+let people: any[] = [];
+let peopleError = '';
+if (!targetId) {
+  try {
+    people = rowsOf(await db.execute(sql`
+      SELECT id::text AS id, full_name, employee_code, designation
+        FROM hr_employees
+       WHERE is_active = true AND employment_status = 'active'
+       ORDER BY full_name ASC
+       LIMIT 100`));
+  } catch (e: any) {
+    peopleError = e?.cause?.message || e?.message || 'unknown';
+  }
+}
+
+// ---- the reading, when one is ---------------------------------------------------------------------
+let view: Awaited<ReturnType<typeof readHorizonsFor>> | null = null;
+let viewError = '';
+let history: Awaited<ReturnType<typeof resultHistory>> = [];
+let events: ReturnType<typeof deriveEvents> = [];
+let personName = '';
+if (targetId) {
+  try {
+    view = await readHorizonsFor({ viewerUserId: String(user.id), employeeId: targetId, holds });
+    if (view.access.granted) {
+      const nameRows = rowsOf(await db.execute(sql`
+        SELECT full_name, employee_code FROM hr_employees WHERE id = ${targetId}::uuid LIMIT 1`));
+      personName = nameRows.length ? String(nameRows[0].full_name || '') : '';
+      if ((VERSIONED_HORIZONS as readonly string[]).indexOf(active) >= 0) {
+        history = await resultHistory(targetId, active, 8);
+      }
+      if (view.set) events = deriveEvents(view.set, view.stored);
+    }
+  } catch (e: any) {
+    viewError = e?.cause?.message || e?.message || 'unknown';
+  }
+}
+
+let health: Awaited<ReturnType<typeof temporalHealth>> | null = null;
+try {
+  health = await temporalHealth();
+} catch {
+  health = null;
+}
+
+const reading = view?.set?.readings?.[active] || null;
+const blind = view?.set?.blind === true;
+const cycles = view?.set?.cycles || null;
+const access = view?.access || null;
+const mayRecompute = access?.mayRecompute === true;
+const notVersioned = view?.notYetVersioned || [];
+const isNotVersioned = notVersioned.indexOf(active) >= 0;
+
+// Comparisons hoisted: `<` inside a JSX expression breaks .astro parsing.
+const confValue = reading ? reading.confidence.value : 0;
+const confBand = confidenceBand(confValue);
+const confLabel = CONFIDENCE_BAND_LABELS[confBand];
+const confPct = Math.round(confValue * 100);
+const ceilingPct = reading ? Math.round(reading.confidence.ceiling * 100) : 0;
+const underspanned = reading ? reading.confidence.underspanned : false;
+
+const tabs = HORIZONS.map((h) => ({
+  key: h,
+  label: HORIZON_SPECS[h].label,
+  href: PATH + '?id=' + encodeURIComponent(targetId) + '&h=' + h,
+  current: h === active,
+  versioned: HORIZON_SPECS[h].cadence === 'versioned',
+}));
+
+const readableSources = reading ? reading.evidenceSources.filter((s) => !s.unreadable) : [];
+const unreadableSources = reading ? reading.evidenceSources.filter((s) => s.unreadable) : [];
+const birthGate = currentBirthGate();
+const birthGateOpen = birthGate.deploymentEnabled === true;
+---
+
+<AdminLayout title="Time Intelligence">
+  <div class="hz-wrap">
+    <header class="hz-top">
+      <div>
+        <h1>Time Intelligence</h1>
+        <p class="hz-sub">
+          What the records say about a person's work over seven stretches of time, with the source of
+          every statement named. Nothing here rates, ranks or decides.
+        </p>
+      </div>
+      {targetId && <a class="hz-back" href={PATH}>All people</a>}
+    </header>
+
+    {okMsg && <p class="hz-ok">{okMsg}</p>}
+    {errorMsg && <p class="hz-err">{errorMsg}</p>}
+
+    {health && (
+      <p class="hz-health">{health.sentence}</p>
+    )}
+
+    {!targetId && (
+      <section class="hz-card">
+        <h2>Choose a person</h2>
+        {peopleError && (
+          <p class="hz-err">The employee list could not be read. ({peopleError})</p>
+        )}
+        {!peopleError && people.length === 0 && (
+          <p class="hz-quiet">No active employees are on record.</p>
+        )}
+        <ul class="hz-people">
+          {people.map((p) => (
+            <li>
+              <a href={PATH + '?id=' + encodeURIComponent(p.id)}>
+                <b>{p.full_name}</b>
+                <span>{p.employee_code}{p.designation ? ' · ' + p.designation : ''}</span>
+              </a>
+            </li>
+          ))}
+        </ul>
+        {people.length === 100 && (
+          <p class="hz-quiet">Showing the first hundred by name.</p>
+        )}
+      </section>
+    )}
+
+    {targetId && viewError && (
+      <p class="hz-err">
+        The reading could not be built. This is a fault on our side and says nothing about this
+        person's work. ({viewError})
+      </p>
+    )}
+
+    {targetId && access && !access.granted && (
+      <section class="hz-card">
+        <h2>Not shown</h2>
+        <p class="hz-quiet">{access.because}</p>
+      </section>
+    )}
+
+    {targetId && access && access.granted && (
+      <section class="hz-card">
+        <header class="hz-person">
+          <div>
+            <h2>{personName || 'This person'}</h2>
+            <p class="hz-quiet">{access.because}</p>
+          </div>
+          {mayRecompute && (
+            <form method="POST" class="hz-rebuild">
+              <input type="hidden" name="action" value="recompute" />
+              <input type="hidden" name="employeeId" value={targetId} />
+              <button type="submit">Rebuild versioned horizons</button>
+            </form>
+          )}
+        </header>
+
+        <nav class="hz-tabs" aria-label="Time horizons">
+          {tabs.map((t) => (
+            <a href={t.href} class={t.current ? 'hz-tab is-on' : 'hz-tab'} aria-current={t.current ? 'page' : undefined}>
+              {t.label}
+              {t.versioned && <span class="hz-v" title="Saved with a version">V</span>}
+            </a>
+          ))}
+        </nav>
+
+        {blind && <p class="hz-err">{view?.set?.blindSentence}</p>}
+
+        {reading && !blind && (
+          <div class="hz-reading">
+            <p class="hz-window">
+              {reading.hint} Reading {reading.lookback.fromDay} to {reading.lookback.toDay}
+              {' '}({reading.lookback.days} days).
+            </p>
+
+            <div class="hz-conf">
+              <div class="hz-conf-bar">
+                <span class="hz-conf-fill" style={'width:' + confPct + '%'}></span>
+                <span class="hz-conf-cap" style={'left:' + ceilingPct + '%'}></span>
+              </div>
+              <p class="hz-conf-txt"><strong>{confLabel}</strong> · {confPct} of a possible {ceilingPct} for this horizon.</p>
+              <p class="hz-quiet">{reading.confidence.sentence}</p>
+              <details>
+                <summary>Confidence terms</summary>
+                <ul class="hz-terms">
+                  {reading.confidence.terms.map((t) => (
+                    <li><b>{t.name}</b> · {t.value} <span>{t.because}</span></li>
+                  ))}
+                </ul>
+              </details>
+            </div>
+
+            {underspanned && (
+              <p class="hz-warn">
+                The record is shorter than this horizon. Anything forward-looking below is a direction
+                to discuss, not a finding.
+              </p>
+            )}
+
+            {isNotVersioned && (
+              <p class="hz-note">
+                Not saved as a version yet. This was computed on load; rebuild it to put it on the
+                audit trail.
+              </p>
+            )}
+
+            {reading.sections.map((sec) => (
+              <section class="hz-sec">
+                <h3>{sec.label}</h3>
+                {sec.note && <p class="hz-secnote">{sec.note}</p>}
+                {sec.silence && <p class="hz-silence">{sec.silence}</p>}
+                <ul class="hz-signals">
+                  {sec.signals.map((s) => (
+                    <li class={'hz-sig lay-' + s.layer}>
+                      <p class="hz-sig-stmt">{s.statement}</p>
+                      <p class="hz-sig-meta">
+                        <span class="hz-chip">{LAYER_LABELS[s.layer]}</span>
+                        <span class="hz-chip-w">{s.decisionWeight === 'none' ? 'Decides nothing' : 'May support a decision'}</span>
+                      </p>
+                      <details>
+                        <summary>Inputs, processing, evidence</summary>
+                        <p class="hz-lay">{LAYER_MEANING[s.layer]}</p>
+                        <p><b>Inputs</b> · {s.inputs.join('; ')}</p>
+                        <p><b>Processing</b> · {s.processing}</p>
+                        {s.evidence.length > 0 && (
+                          <ul class="hz-ev">
+                            {s.evidence.map((e) => (
+                              <li>{e.table} · {e.rowCount} rows · {e.window}{e.unreadable ? ' (unreadable)' : ''}</li>
+                            ))}
+                          </ul>
+                        )}
+                        <p class="hz-ts">Computed {s.computedAt}. Confidence {s.confidence}.</p>
+                      </details>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ))}
+
+            <p class="hz-disc">{PROJECTION_DISCLAIMER}</p>
+          </div>
+        )}
+
+        {history.length > 0 && (
+          <section class="hz-sec">
+            <h3>Version history for this horizon</h3>
+            <ul class="hz-hist">
+              {history.map((h) => (
+                <li>
+                  <b>{h.status}</b> · computed {h.computedAt.slice(0, 10)} · engine {h.engineVersion}
+                  {' '}· confidence {h.confidenceValue}
+                  <span class="hz-quiet">{h.summary}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
+        {cycles && (
+          <section class="hz-sec">
+            <h3>Underlying cycles</h3>
+            {cycles.readings.map((c) => (
+              <div class="hz-cycle">
+                <h4>{c.cycleName}</h4>
+                <p>{c.phase}</p>
+                <p class="hz-quiet">{c.meaning}</p>
+                <p class="hz-quiet">Inputs: {c.inputs.join('; ')}</p>
+              </div>
+            ))}
+            {cycles.refusals.map((r) => (<p class="hz-silence">{r.because}</p>))}
+            {cycles.disabled.map((d) => (
+              <p class="hz-silence"><b>{d.label}</b> is off. {d.because}</p>
+            ))}
+            <p class="hz-disc">{cycles.disclaimer}</p>
+          </section>
+        )}
+
+        {events.length > 0 && (
+          <section class="hz-sec">
+            <h3>Advisory notes for the notification patch</h3>
+            <p class="hz-quiet">
+              Described here, delivered by nobody. Patch 08 owns whether any of these becomes a
+              message, to whom and how often.
+            </p>
+            <ul class="hz-events">
+              {events.map((e) => (
+                <li>
+                  <b>{e.kind}</b> · to {e.audience}
+                  <span class="hz-quiet">{e.summary}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
+        {(readableSources.length > 0 || unreadableSources.length > 0) && (
+          <section class="hz-sec">
+            <h3>Every record read</h3>
+            <ul class="hz-src">
+              {readableSources.map((s) => (
+                <li>
+                  <b>{s.label}</b> · {s.rowCount} rows · {s.verifiedRowCount} verified
+                  <span class="hz-quiet">{s.owner} — {s.because}</span>
+                </li>
+              ))}
+              {unreadableSources.map((s) => (
+                <li class="bad">
+                  <b>{s.label}</b> · UNREADABLE
+                  <span class="hz-quiet">{s.because}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+      </section>
+    )}
+
+    <section class="hz-card">
+      <h2>The date-derived cycle layer</h2>
+      <p class="hz-quiet">
+        Status: <b>{birthGateOpen ? 'ENABLED' : 'off'}</b>. It ships off. A cycle derived from a date
+        of birth is derived from age, which is a protected characteristic; the master employee record
+        refuses that column at the query level for the same reason. Enabling it is a recorded policy
+        decision, not a setting, and these are its preconditions.
+      </p>
+      <ol class="hz-pre">
+        {BIRTH_CYCLE_PRECONDITIONS.map((p) => (
+          <li><b>{p.requirement}</b><span class="hz-quiet">{p.why}</span></li>
+        ))}
+      </ol>
+    </section>
+  </div>
+</AdminLayout>
+
+<style>
+  .hz-wrap { max-width: 940px; margin: 0 auto; padding: 20px 16px 64px; }
+  .hz-top { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; margin: 0 0 16px; }
+  .hz-top h1 { margin: 0 0 4px; font-size: 24px; }
+  .hz-sub { margin: 0; color: #5b5b55; font-size: 14px; line-height: 1.5; max-width: 62ch; }
+  .hz-back { text-decoration: none; color: #24241f; border: 1px solid #e2e0da; border-radius: 999px;
+    padding: 8px 14px; font-size: 14px; white-space: nowrap; }
+  .hz-ok, .hz-err, .hz-health, .hz-warn, .hz-note, .hz-silence, .hz-disc {
+    margin: 0 0 14px; padding: 10px 13px; border-radius: 10px; font-size: 13px; line-height: 1.55;
+  }
+  .hz-ok { background: #eef7f0; border: 1px solid #c6e2ce; color: #245c34; }
+  .hz-err { background: #fdf2f2; border: 1px solid #e6c9c9; color: #7a2e2e; }
+  .hz-health { background: #f4f6f8; border: 1px solid #dde3e8; color: #3a4a57; }
+  .hz-warn { background: #fff8e6; border: 1px solid #e8d9a8; color: #6b5410; }
+  .hz-note { background: #f4f6f8; border: 1px solid #dde3e8; color: #3a4a57; }
+  .hz-silence { background: #f7f7f5; border: 1px solid #e6e4dd; color: #55554e; }
+  .hz-disc { background: #f7f7f5; border: 1px solid #e6e4dd; color: #55554e; }
+  .hz-card { border: 1px solid #e2e0da; border-radius: 14px; padding: 16px; margin: 0 0 16px; background: #fff; }
+  .hz-card h2 { margin: 0 0 8px; font-size: 18px; }
+  .hz-quiet { color: #5b5b55; font-size: 13px; line-height: 1.55; display: block; margin: 2px 0 0; }
+  .hz-people { list-style: none; margin: 0; padding: 0; }
+  .hz-people li { border-bottom: 1px solid #f0efea; }
+  .hz-people a { display: flex; flex-direction: column; gap: 2px; padding: 12px 4px;
+    text-decoration: none; color: #24241f; min-height: 44px; }
+  .hz-people span { color: #5b5b55; font-size: 13px; }
+  .hz-person { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between;
+    flex-wrap: wrap; margin: 0 0 12px; }
+  .hz-person h2 { margin: 0; }
+  .hz-rebuild button { min-height: 44px; padding: 0 16px; border-radius: 10px; border: 1px solid #24241f;
+    background: #24241f; color: #fff; font-size: 14px; cursor: pointer; }
+  .hz-tabs { display: flex; gap: 6px; overflow-x: auto; padding: 2px 0 12px; }
+  .hz-tab { flex: 0 0 auto; min-height: 44px; display: inline-flex; align-items: center; gap: 5px;
+    padding: 0 14px; border-radius: 999px; border: 1px solid #e2e0da; text-decoration: none;
+    color: #24241f; background: #fff; font-size: 14px; white-space: nowrap; }
+  .hz-tab.is-on { background: #24241f; color: #fff; border-color: #24241f; }
+  .hz-v { font-size: 10px; border: 1px solid currentColor; border-radius: 4px; padding: 0 3px; opacity: .7; }
+  .hz-window { margin: 0 0 12px; color: #5b5b55; font-size: 13px; line-height: 1.55; }
+  .hz-conf-bar { position: relative; height: 10px; border-radius: 999px; background: #f0efea; overflow: hidden; }
+  .hz-conf-fill { position: absolute; inset: 0 auto 0 0; background: #24241f; }
+  .hz-conf-cap { position: absolute; top: -3px; bottom: -3px; width: 2px; background: #c0392b; }
+  .hz-conf-txt { margin: 8px 0 2px; font-size: 14px; }
+  .hz-terms { margin: 6px 0 0; padding-left: 18px; font-size: 13px; line-height: 1.6; }
+  .hz-terms span { color: #5b5b55; display: block; }
+  .hz-sec { border-top: 1px solid #e2e0da; padding-top: 14px; margin-top: 14px; }
+  .hz-sec h3 { margin: 0 0 6px; font-size: 16px; }
+  .hz-secnote { margin: 0 0 8px; font-size: 13px; color: #6b5410; background: #fff8e6;
+    border: 1px solid #e8d9a8; border-radius: 8px; padding: 8px 10px; line-height: 1.5; }
+  .hz-signals { list-style: none; margin: 0; padding: 0; }
+  .hz-sig { border-left: 3px solid #d9d7d0; padding-left: 12px; margin: 0 0 14px; }
+  .hz-sig.lay-observed { border-left-color: #2f6f4f; }
+  .hz-sig.lay-current { border-left-color: #24241f; }
+  .hz-sig.lay-projected { border-left-color: #8a6d1f; }
+  .hz-sig.lay-foundational { border-left-color: #6b5b8a; }
+  .hz-sig-stmt { margin: 0 0 6px; line-height: 1.55; }
+  .hz-sig-meta { margin: 0 0 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .hz-chip, .hz-chip-w { font-size: 12px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid #e2e0da; color: #5b5b55; }
+  .hz-chip-w { background: #f7f7f5; }
+  summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; color: #5b5b55; font-size: 13px; }
+  .hz-sig details p { margin: 4px 0; font-size: 13px; line-height: 1.5; }
+  .hz-lay { color: #5b5b55; font-style: italic; }
+  .hz-ev { margin: 4px 0; padding-left: 18px; color: #5b5b55; font-size: 13px; line-height: 1.6; }
+  .hz-ts { color: #5b5b55; font-size: 12px; }
+  .hz-cycle { border-top: 1px dashed #eceae4; padding-top: 10px; margin-top: 10px; }
+  .hz-cycle h4 { margin: 0 0 2px; font-size: 15px; }
+  .hz-cycle p { margin: 2px 0; font-size: 14px; }
+  .hz-hist, .hz-events, .hz-src { list-style: none; margin: 8px 0 0; padding: 0; }
+  .hz-hist li, .hz-events li, .hz-src li { padding: 8px 0; border-bottom: 1px solid #f0efea; font-size: 14px; }
+  .hz-src li.bad b { color: #7a2e2e; }
+  .hz-pre { margin: 8px 0 0; padding-left: 20px; }
+  .hz-pre li { margin: 0 0 10px; font-size: 14px; line-height: 1.5; }
+  @media (max-width: 560px) {
+    .hz-top { flex-direction: column; }
+    .hz-wrap { padding: 16px 12px 56px; }
+  }
+</style>

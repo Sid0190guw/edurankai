@@ -1,0 +1,345 @@
+---
+// /admin/governance/consent — the consent register for one person.
+//
+// WHAT THIS PAGE WAS, AND WHY IT IS DIFFERENT NOW.
+//
+// It was written against a consent subsystem that does not exist and never has: it imported
+// CONSENT_NOTICE_VERSION, listConsents, consentNotice, interpretiveConsentNotice, liveStatus and a
+// ConsentRecord type from @/lib/horizon/governance, none of which are exported by that module. The
+// consequence was not a broken page — it was a broken BUILD. Rollup refused to link the import, so
+// `astro build` failed outright and NOTHING in the entire site could deploy while this file sat here.
+//
+// The real consent ledger is @/lib/horizon/intake (hzn_consent_event): append-only, one scope
+// (personal foundation data), notice-version aware, with grant, withdraw, current state and history.
+// This page is now that ledger's admin surface, and it claims nothing the ledger cannot answer.
+//
+// WHAT WAS REMOVED, AND WHY THAT IS THE HONEST OUTCOME. The old markup showed a per-purpose consent
+// table with a "lawful basis" column and a "record a consent given offline" form. There is no
+// per-purpose consent store and no basis column anywhere in this codebase, so every one of those
+// rows would have rendered `undefined` against a real person's privacy record. A register that
+// invents columns is worse than one that admits its scope.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { governancePermissions, holdsGovernancePermission } from '@/lib/horizon/governance';
+import {
+  CURRENT_NOTICE, CURRENT_NOTICE_VERSION, consentHistory, currentConsent, grantConsent,
+  needsReconsent, withdrawConsent,
+} from '@/lib/horizon/intake';
+import type { ConsentEvent, ConsentState } from '@/lib/horizon/intake';
+// Subjects, actors and organisation ids live here and are deliberately NOT re-exported through the
+// governance barrel — see that module's own header.
+import {
+  DEFAULT_ORGANISATION_ID, SUBJECT_ID_SCHEMES, SUBJECT_KINDS, isSubjectRef, type SubjectRef,
+} from '@/lib/horizon/ids';
+
+const currentUser = Astro.locals.user;
+if (!currentUser) return Astro.redirect('/admin/login');
+
+const held = await governancePermissions(currentUser.id, Astro.locals);
+if (!holdsGovernancePermission(held.permissions, 'horizon.governance.view')) {
+  return Astro.redirect('/admin?denied=horizon.governance.view');
+}
+const mayView = holdsGovernancePermission(held.permissions, 'horizon.consent.view');
+const mayManage = holdsGovernancePermission(held.permissions, 'horizon.consent.manage');
+
+// EVERY const IS DECLARED BEFORE THE POST HANDLER THAT READS IT. `const` is not hoisted, and a
+// handler placed above its own dependencies throws on its first line while the page still renders —
+// the exact failure recorded in this project's working rules.
+const url = new URL(Astro.request.url);
+const subjectKind = String(url.searchParams.get('kind') || 'employee');
+const subjectId = String(url.searchParams.get('subject') || '').trim();
+const scheme = String(url.searchParams.get('scheme') || (subjectKind === 'employee' ? 'hr_employee' : 'tal_person'));
+
+const subjectKinds = SUBJECT_KINDS as readonly string[];
+const subjectSchemes = SUBJECT_ID_SCHEMES as readonly string[];
+
+const subject: SubjectRef = {
+  kind: subjectKind as any,
+  id: subjectId as any,
+  idScheme: scheme as any,
+  organisationId: DEFAULT_ORGANISATION_ID,
+};
+const subjectIsValid = isSubjectRef(subject);
+
+let flash = '';
+let problem = '';
+
+// The POST handler lives on the page that owns the action. There is no
+// /api/admin/governance/consent route in this codebase — the old markup posted to one, so both
+// buttons were inert and returned a 404 to somebody trying to honour a withdrawal request.
+if (Astro.request.method === 'POST') {
+  if (!mayManage) {
+    problem = 'You do not hold horizon.consent.manage, so nothing was changed.';
+  } else if (!subjectIsValid) {
+    problem = 'That subject kind and id scheme do not go together, so there was nothing to act on.';
+  } else {
+    try {
+      const fd = await Astro.request.formData();
+      const action = String(fd.get('action') || '');
+      const reason = String(fd.get('reason') || '').trim();
+      const actor = {
+        kind: 'user' as const,
+        id: String(currentUser.id),
+        displayName: currentUser.name || currentUser.email || null,
+      };
+      const common = {
+        subject,
+        actor,
+        source: 'admin/governance/consent',
+        reason: reason || null,
+        ipAddress: Astro.request.headers.get('x-forwarded-for'),
+        userAgent: Astro.request.headers.get('user-agent'),
+      };
+      if (action === 'withdraw') {
+        const ev = await withdrawConsent(common as any);
+        // recordConsent RETURNS NULL ON A WRITE FAILURE rather than throwing, by design. Reporting
+        // success on a null is how a withdrawal gets told to somebody and never actually happens.
+        if (ev) flash = 'Withdrawal recorded. The ledger row names you as the person who entered it.';
+        else problem = 'The withdrawal was NOT recorded — the ledger write failed. Nothing has changed. Try again, and if it keeps failing do not tell the person it is done.';
+      } else if (action === 'grant') {
+        if (!reason) {
+          problem = 'A consent entered by an administrator needs a written record of where it was captured.';
+        } else {
+          const ev = await grantConsent(common as any);
+          if (ev) flash = 'Recorded as given on the person\'s behalf. The ledger shows it that way, which is a weaker thing than a consent they gave themselves.';
+          else problem = 'The consent was NOT recorded — the ledger write failed. Nothing has changed.';
+        }
+      } else {
+        problem = 'Unrecognised action.';
+      }
+    } catch (e: any) {
+      // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+      console.error('[governance/consent]', e?.cause?.message || e?.message);
+      problem = 'Nothing was changed: ' + (e?.cause?.message || e?.message || 'unknown error');
+    }
+  }
+}
+
+const looking = subjectId.length > 0 && mayView && subjectIsValid;
+const state: ConsentState | null = looking ? await currentConsent(subject) : null;
+const history: ConsentEvent[] = looking ? await consentHistory(subject, undefined, 100) : [];
+
+const stale = state ? needsReconsent(state) : false;
+const liveLabel = !state ? '' : (state.granted ? (stale ? 'granted (superseded wording)' : 'granted') : 'not granted');
+const liveColour = !state ? '#a0a0ab' : (state.granted ? (stale ? '#fbbf24' : '#10b981') : '#f87171');
+
+// Comparisons and lengths are computed HERE. A `<` or a typed Record<string,string> inside a JSX
+// expression breaks .astro parsing — both have taken pages down on this project before.
+const hasHistory = history.length > 0;
+const hasState = state !== null;
+const canWithdraw = mayManage && !!state && state.granted;
+const canGrant = mayManage && !!state && !state.granted;
+// The notice is a STRUCTURED document, not a bag of lines: what would be held, what it would be
+// used for, what it will never be used for, who can reach it, and how long it is kept. The limits
+// are shown beside the purposes because that is how the person was shown them, and a register that
+// reproduces only the permissions and not the promises is not reproducing the notice.
+const noticeSections: { label: string; items: readonly string[] }[] = [
+  { label: 'What would be held', items: CURRENT_NOTICE.dataCollected },
+  { label: 'What it would be used for', items: CURRENT_NOTICE.purposes },
+  { label: 'What it will never be used for', items: CURRENT_NOTICE.limits },
+  { label: 'Who can reach it', items: CURRENT_NOTICE.access },
+  { label: 'How long, and how to end it', items: CURRENT_NOTICE.retention },
+].filter((sec) => sec.items.length > 0);
+const hasNoticeSections = noticeSections.length > 0;
+
+function when(value: string | null): string {
+  if (!value) return '';
+  try {
+    return new Date(value).toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit',
+    });
+  } catch { return value; }
+}
+
+function actorLabel(ev: ConsentEvent): string {
+  if (!ev.actor) return 'the person themselves';
+  if (ev.actor.kind === 'user' || ev.actor.kind === 'employee') return ev.actor.displayName || 'an administrator';
+  return String(ev.actor.kind);
+}
+---
+
+<AdminLayout title="Consent register" activeNav="audit">
+  <div class="admin-page" style="max-width:1200px;">
+
+    <div class="admin-page-header" style="margin-bottom:20px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow"><a href="/admin/governance" style="color:inherit;">Governance</a></div>
+        <h1 class="admin-page-title">Consent register</h1>
+        <p class="admin-page-sub">
+          Current wording version {CURRENT_NOTICE_VERSION}. A live consent given under an EARLIER version is
+          shown as superseded rather than silently carried forward: somebody agreed to what they were shown.
+        </p>
+      </div>
+    </div>
+
+    {flash && <div class="admin-card" style="padding:12px 16px;margin-bottom:16px;border-left:3px solid #10b981;">{flash}</div>}
+    {problem && <div class="admin-card" style="padding:12px 16px;margin-bottom:16px;border-left:3px solid #f87171;">{problem}</div>}
+
+    {!mayView && (
+      <div class="admin-card" style="padding:16px;margin-bottom:16px;border-left:3px solid #fbbf24;">
+        You do not hold <code>horizon.consent.view</code>, so no consent record will be shown.
+      </div>
+    )}
+
+    <div class="admin-card" style="padding:16px;margin-bottom:18px;">
+      <p style="margin:0 0 12px;color:#a0a0ab;font-size:12px;">
+        This register covers ONE consent scope: the personal foundation data a person may choose to give during
+        intake. It is the only consent ledger this system keeps. Marketing permissions, mail preferences and
+        research participation are held by their own modules and are not shown here.
+      </p>
+      <form method="GET" style="display:grid;grid-template-columns:150px 160px 1fr 120px;gap:12px;align-items:end;">
+        <div>
+          <label class="rolefield-label">Subject kind</label>
+          <select name="kind" class="rolefield-input">
+            {subjectKinds.map((k) => <option value={k} selected={subjectKind === k}>{k}</option>)}
+          </select>
+        </div>
+        <div>
+          <label class="rolefield-label">Id scheme</label>
+          <select name="scheme" class="rolefield-input">
+            {subjectSchemes.map((sc) => <option value={sc} selected={scheme === sc}>{sc}</option>)}
+          </select>
+        </div>
+        <div>
+          <label class="rolefield-label">Subject id</label>
+          <input type="text" name="subject" class="rolefield-input" value={subjectId} />
+        </div>
+        <div>
+          <button type="submit" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:11px;">Look up</button>
+        </div>
+      </form>
+    </div>
+
+    {subjectId && !subjectIsValid && (
+      <div class="admin-card" style="padding:16px;margin-bottom:16px;border-left:3px solid #f87171;">
+        That subject kind and id scheme do not go together, so nothing was looked up. An employee is anchored on
+        <code> hr_employee</code>; an applicant on <code>tal_person</code>, <code>application</code> or <code>user</code>.
+      </div>
+    )}
+
+    {looking && hasState && (
+      <div class="admin-card" style="padding:16px;margin-bottom:16px;">
+        <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 12px;">Current state</h2>
+        <table class="admin-table" style="min-width:700px;">
+          <thead>
+            <tr>
+              <th style="width:200px;">Scope</th>
+              <th style="width:180px;">State</th>
+              <th style="width:170px;">Since</th>
+              <th style="width:120px;">Wording</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td style="font-family:monospace;font-size:11px;">{state.scope}</td>
+              <td style="font-size:11px;"><span style={`color:${liveColour};`}>{liveLabel}</span></td>
+              <td style="font-size:11px;color:#a0a0ab;">{when(state.granted ? state.grantedAt : state.withdrawnAt)}</td>
+              <td style="font-size:11px;color:#a0a0ab;">{state.noticeVersion || 'never asked'}</td>
+            </tr>
+          </tbody>
+        </table>
+        {stale && (
+          <p style="margin:12px 0 0;color:#fbbf24;font-size:12px;">
+            This grant is live but was given under superseded wording. It is not revoked, and it must not be used
+            under the newer notice until the person has been asked again.
+          </p>
+        )}
+        {!state.granted && (
+          <p style="margin:12px 0 0;color:#a0a0ab;font-size:12px;">
+            Nothing is on record, or the last act was a withdrawal. Either way the closed state is correct and every
+            purpose requiring this consent is refused for this person.
+          </p>
+        )}
+
+        {canWithdraw && (
+          <form method="POST" style="display:flex;gap:8px;align-items:flex-end;margin-top:16px;flex-wrap:wrap;">
+            <input type="hidden" name="action" value="withdraw" />
+            <div style="flex:1;min-width:260px;">
+              <label class="rolefield-label">Reason (recorded verbatim)</label>
+              <input type="text" name="reason" class="rolefield-input" placeholder="asked by email on 12 Aug, ticket 4417" />
+            </div>
+            <button type="submit" class="admin-btn" style="padding:7px 14px;font-size:11px;">Withdraw on their behalf</button>
+          </form>
+        )}
+        {canGrant && (
+          <form method="POST" style="display:flex;gap:8px;align-items:flex-end;margin-top:16px;flex-wrap:wrap;">
+            <input type="hidden" name="action" value="grant" />
+            <div style="flex:1;min-width:260px;">
+              <label class="rolefield-label">Where it was captured (required)</label>
+              <input type="text" name="reason" class="rolefield-input" placeholder="signed intake form ref, onboarding meeting note" />
+            </div>
+            <button type="submit" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:11px;">Record a consent given offline</button>
+          </form>
+        )}
+        {mayManage && (
+          <p style="margin:10px 0 0;color:#a0a0ab;font-size:11.5px;">
+            A consent an administrator entered is recorded as entered by an administrator, and the register shows it
+            that way. That distinction is what a challenge turns on.
+          </p>
+        )}
+      </div>
+    )}
+
+    {looking && (
+      <div class="admin-card" style="padding:0;margin-bottom:16px;">
+        <div style="padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);">
+          <strong>History</strong>
+          <span style="color:#a0a0ab;"> Append-only. This is what proves the processing was lawful while it ran.</span>
+        </div>
+        {!hasHistory && (
+          <div style="padding:16px;color:#a0a0ab;">
+            No consent event on record for this person in this scope.
+          </div>
+        )}
+        {hasHistory && (
+          <table class="admin-table" style="min-width:860px;">
+            <thead>
+              <tr>
+                <th style="width:170px;">When</th>
+                <th style="width:100px;">Event</th>
+                <th style="width:110px;">Wording</th>
+                <th style="width:170px;">By whom</th>
+                <th style="width:150px;">Where</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {history.map((h) => (
+                <tr>
+                  <td style="font-size:11px;">{when(h.occurredAt)}</td>
+                  <td style="font-size:11px;">{h.action}</td>
+                  <td style="font-size:11px;color:#a0a0ab;">{h.noticeVersion}</td>
+                  <td style="font-size:11px;color:#a0a0ab;">{actorLabel(h)}</td>
+                  <td style="font-size:11px;color:#a0a0ab;font-family:monospace;">{h.source}</td>
+                  <td style="font-size:11px;color:#a0a0ab;">{h.reason || ''}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    )}
+
+    <div class="admin-card" style="padding:16px;margin-bottom:16px;">
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 10px;">The wording people are shown</h2>
+      <p style="margin:0 0 4px;font-weight:600;font-size:12px;">
+        Version {CURRENT_NOTICE_VERSION}, effective {CURRENT_NOTICE.effectiveFrom}
+      </p>
+      <p style="margin:0 0 14px;color:#cfd6da;font-size:12.5px;">{CURRENT_NOTICE.headline}</p>
+      {hasNoticeSections && noticeSections.map((sec) => (
+        <div style="margin-bottom:12px;">
+          <p style="margin:0 0 4px;font-weight:600;font-size:12px;">{sec.label}</p>
+          <ul style="margin:0;padding-left:18px;color:#a0a0ab;font-size:12px;">
+            {sec.items.map((line) => <li style="margin-bottom:4px;">{line}</li>)}
+          </ul>
+        </div>
+      ))}
+      <p style="margin:14px 0 4px;font-weight:600;font-size:12px;">The sentence beside the tick box</p>
+      <p style="margin:0 0 10px;color:#cfd6da;font-size:12px;">{CURRENT_NOTICE.affirmation}</p>
+      <p style="margin:0;color:#a0a0ab;font-size:11.5px;">
+        Withdrawal is offered to the person at <code>{CURRENT_NOTICE.withdrawalUrl}</code>, in the notice itself
+        rather than buried in a policy page.
+      </p>
+    </div>
+
+  </div>
+</AdminLayout>

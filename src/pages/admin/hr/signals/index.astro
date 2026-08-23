@@ -1,0 +1,239 @@
+---
+// /admin/hr/signals — THE SIGNAL QUEUE. PATCH 08.
+//
+// WHAT THIS SCREEN IS FOR. The engine notices changes in records this organisation already keeps and
+// says so, in four bands. This is where somebody reads them and does something — or decides there is
+// nothing to do and says why. Nothing on this page acts on anybody: the controls are acknowledge,
+// review, resolve and dismiss, and every one of them writes a person's name and a sentence.
+//
+// THE LIST IS FILTERED BEFORE IT GETS HERE. visibleSignalsFor() applies the role policy and the
+// organisation graph and REDACTS what this viewer may not see, so a page that forgot to hide the
+// confidence arithmetic could not leak it — it never receives it. See signal-visibility.ts.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import {
+  acknowledgeSignal,
+  dismissSignal,
+  resolveSignal,
+  runSignalSweep,
+  signalCounts,
+  signalEngineSchemaState,
+  startSignalReview,
+  visibleSignalsFor,
+} from '@/lib/horizon/signal-engine';
+import { BAND_LABELS, BAND_MEANING, ATTENTION_BANDS } from '@/lib/horizon/signal-contract';
+import { scopeSentence } from '@/lib/horizon/signal-visibility';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+// Same section key middleware.ts maps /admin/hr/* to, so the page and the middleware ask one
+// question rather than two that can drift apart. The engine re-authorises every write of its own.
+if (!(await canAccessSection(user, 'hr', 'view'))) return Astro.redirect('/admin');
+
+let flash = '';
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const id = String(fd.get('id') || '');
+  const note = String(fd.get('note') || '');
+  const viewer = { id: String(user.id), role: String(user.role || '') };
+
+  if (action === 'acknowledge') {
+    const r = await acknowledgeSignal(id, viewer);
+    flash = r.ok ? 'Acknowledged.' : 'Error: ' + r.error;
+  } else if (action === 'review') {
+    const r = await startSignalReview(id, viewer);
+    flash = r.ok ? 'Marked as in review.' : 'Error: ' + r.error;
+  } else if (action === 'resolve') {
+    const r = await resolveSignal(id, viewer, note);
+    flash = r.ok ? 'Resolved.' : 'Error: ' + r.error;
+  } else if (action === 'dismiss') {
+    const r = await dismissSignal(id, viewer, note);
+    flash = r.ok ? 'Dismissed.' : 'Error: ' + r.error;
+  } else if (action === 'preview') {
+    // A DRY RUN WRITES NOTHING AND NOTIFIES NOBODY. It answers "what would a sweep do right now",
+    // which is the only honest way to look at a detector before it is pointed at people.
+    const s = await runSignalSweep({ dryRun: true, actorUserId: String(user.id) });
+    flash = s.ok
+      ? 'Dry run: read ' + s.eventsRead + ' events for ' + s.employeesRead + ' people, ' +
+        s.candidates + ' candidate(s), ' + s.refused + ' refused. Nothing was written.'
+      : 'Dry run failed: ' + s.error;
+  }
+  return Astro.redirect('/admin/hr/signals?msg=' + encodeURIComponent(flash));
+}
+
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const bandFilter = url.searchParams.get('band') || '';
+const statusFilter = url.searchParams.get('status') || 'active';
+
+const schema = await signalEngineSchemaState();
+const counts = await signalCounts();
+const view = await visibleSignalsFor(
+  { id: String(user.id), role: String(user.role || '') },
+  { status: statusFilter, band: (bandFilter || null) as any, limit: 200 },
+);
+const list = view.rows;
+
+// EVERY `<` AND `>` COMPARISON IS HOISTED OUT OF THE MARKUP. An `.astro` file cannot carry one
+// inside a JSX expression — the parser reads it as a tag and the page fails to build.
+const hasRows = list.length > 0;
+const showEmptyIsNotBroken = !hasRows && !schema.ok;
+const anyRedacted = list.some((s: any) => (s.redacted || []).length > 0);
+const scopeLine = scopeSentence(view.access.policy);
+
+const BAND_COLOR: Record<string, string> = {
+  green: '#34d399',
+  blue: '#60a5fa',
+  yellow: '#fbbf24',
+  red: '#f87171',
+};
+
+const fmt = (d: any) => (d ? new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—');
+---
+<AdminLayout title="Signals" activeNav="">
+  <div class="admin-page" style="max-width:1100px;">
+    <div class="admin-page-header"><div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">HR Management · Intelligence</div>
+      <h1 class="admin-page-title">Signals</h1>
+      <p class="admin-page-sub">
+        Changes this platform noticed in records the organisation already keeps. Every signal names its
+        evidence and its confidence, and none of them decides anything — a person does.
+      </p>
+    </div></div>
+
+    {msg && <div class="flash">{msg}</div>}
+
+    <p class="scope">{scopeLine}{view.access.degraded ? ' This list may be incomplete: a lookup of your reporting relationships did not answer.' : ''}</p>
+
+    {!schema.ok && (
+      <div class="warn">
+        The signal tables are not all present ({schema.missing.join(', ')}). An empty queue below means
+        the engine has nowhere to write, not that there is nothing to review.
+        {schema.error ? ' Reason: ' + schema.error : ''}
+      </div>
+    )}
+
+    <div class="bands">
+      {counts.byBand.map((b) => (
+        <a class="band" href={'/admin/hr/signals?band=' + b.band} style={'border-color:' + BAND_COLOR[b.band]}>
+          <span class="dot" style={'background:' + BAND_COLOR[b.band]}></span>
+          <span class="bandname">{b.label}</span>
+          <span class="bandcount">{b.open}</span>
+          <span class="bandsub">open of {b.total}</span>
+          <span class="bandmeaning">{BAND_MEANING[b.band]}</span>
+        </a>
+      ))}
+    </div>
+
+    <div class="toolbar">
+      <div class="filters">
+        <a href="/admin/hr/signals" class={bandFilter ? 'f' : 'f on'}>All bands</a>
+        {ATTENTION_BANDS.map((b) => (
+          <a href={'/admin/hr/signals?band=' + b} class={bandFilter === b ? 'f on' : 'f'}>{BAND_LABELS[b]}</a>
+        ))}
+        <span class="sep"></span>
+        <a href="/admin/hr/signals?status=active" class={statusFilter === 'active' ? 'f on' : 'f'}>Active</a>
+        <a href="/admin/hr/signals?status=resolved" class={statusFilter === 'resolved' ? 'f on' : 'f'}>Resolved</a>
+        <a href="/admin/hr/signals?status=dismissed" class={statusFilter === 'dismissed' ? 'f on' : 'f'}>Dismissed</a>
+        <a href="/admin/hr/signals?status=expired" class={statusFilter === 'expired' ? 'f on' : 'f'}>Expired</a>
+      </div>
+      <form method="POST">
+        <input type="hidden" name="action" value="preview" />
+        <button type="submit" class="ghost">Dry run detection</button>
+      </form>
+    </div>
+
+    <p class="note">
+      {counts.awaitingReview} signal(s) require a named human to review them. Detection runs on a
+      schedule; a dry run above reports what it would raise and writes nothing.
+    </p>
+
+    {showEmptyIsNotBroken && <p class="empty">Nothing to show, and the tables are not all there — read the warning above before concluding the queue is empty.</p>}
+    {!hasRows && schema.ok && <p class="empty">No signals in this view. That is a real empty queue: the tables exist and the read succeeded.</p>}
+
+    {list.map((s: any) => (
+      <article class="sig" style={'border-left-color:' + BAND_COLOR[s.band]}>
+        <header>
+          <span class="pill" style={'background:' + BAND_COLOR[s.band]}>{s.bandLabel}</span>
+          <a class="title" href={'/admin/hr/signals/' + s.id}>{s.title}</a>
+          <span class="status">{s.status}</span>
+        </header>
+        <p class="who">
+          {s.subjectName || s.subjectId} · {s.dimension} · {s.category}
+          {s.humanReviewRequired ? ' · review required' : ''}
+        </p>
+        <p class="what">{s.explanation}</p>
+        {s.downgradeReason && <p class="downgrade">{s.downgradeReason}</p>}
+        <ul class="actions">
+          {(s.recommendedActions || []).map((a: any) => <li>{a.label} <span class="to">({a.addressedTo.split('_').join(' ')})</span></li>)}
+        </ul>
+        <p class="meta">
+          Confidence {s.confidence ? s.confidence.band : 'not shown'} ·
+          seen {s.occurrenceCount} time(s) · raised {fmt(s.firstRaisedAt || s.generatedAt)} ·
+          expires {fmt(s.expiresAt)}
+          {s.evidenceRefs ? ' · ' + s.evidenceRefs.length + ' evidence item(s)' : (s.evidenceCount ? ' · ' + s.evidenceCount + ' evidence item(s)' : '')}
+        </p>
+        <div class="controls">
+          <form method="POST" class="inline">
+            <input type="hidden" name="id" value={s.id} />
+            <button type="submit" name="action" value="acknowledge" class="ghost">Acknowledge</button>
+            <button type="submit" name="action" value="review" class="ghost">Start review</button>
+          </form>
+          <form method="POST" class="inline wide">
+            <input type="hidden" name="id" value={s.id} />
+            <input type="text" name="note" placeholder="Why — a sentence somebody can read later" />
+            <button type="submit" name="action" value="resolve" class="ghost">Resolve</button>
+            <button type="submit" name="action" value="dismiss" class="ghost">Dismiss</button>
+          </form>
+          <a class="open" href={'/admin/hr/signals/' + s.id}>Open the full working</a>
+        </div>
+      </article>
+    ))}
+
+    {anyRedacted && (
+      <p class="note">
+        Some detail on this page is withheld from your role: the engine's own inputs, its processing
+        rule and the arithmetic behind the confidence figure. That is deliberate rather than missing.
+      </p>
+    )}
+  </div>
+</AdminLayout>
+
+<style>
+  .flash { margin: 0 0 16px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3); color: #6ee7b7; border-radius: 8px; padding: 10px 14px; font-size: 13px; }
+  .warn { margin: 0 0 16px; background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.35); color: #fca5a5; border-radius: 8px; padding: 10px 14px; font-size: 13px; }
+  .scope { font-size: 12.5px; opacity: 0.75; margin: 0 0 14px; }
+  .bands { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .band { display: block; border: 1px solid #2a2a33; border-left-width: 3px; border-radius: 10px; padding: 12px 14px; text-decoration: none; color: inherit; }
+  .band .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .bandname { font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.8; }
+  .bandcount { display: block; font-size: 26px; font-weight: 600; line-height: 1.2; }
+  .bandsub { font-size: 11.5px; opacity: 0.6; }
+  .bandmeaning { display: block; font-size: 11.5px; opacity: 0.6; margin-top: 6px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .f { font-size: 12px; padding: 4px 10px; border: 1px solid #2a2a33; border-radius: 999px; text-decoration: none; color: inherit; opacity: 0.75; }
+  .f.on { opacity: 1; border-color: #6b7280; }
+  .sep { width: 1px; height: 16px; background: #2a2a33; margin: 0 4px; }
+  .note { font-size: 12.5px; opacity: 0.7; margin: 8px 0 16px; }
+  .empty { font-size: 13px; opacity: 0.7; padding: 18px 0; }
+  .sig { border: 1px solid #2a2a33; border-left-width: 3px; border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
+  .sig header { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .pill { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; color: #11131a; border-radius: 999px; padding: 2px 8px; font-weight: 600; }
+  .title { font-size: 15px; font-weight: 600; text-decoration: none; color: inherit; }
+  .status { font-size: 11.5px; opacity: 0.6; margin-left: auto; }
+  .who { font-size: 12px; opacity: 0.7; margin: 6px 0 4px; }
+  .what { font-size: 13.5px; margin: 0 0 8px; }
+  .downgrade { font-size: 12px; opacity: 0.8; border-left: 2px solid #fbbf24; padding-left: 10px; margin: 0 0 8px; }
+  .actions { margin: 0 0 8px; padding-left: 18px; font-size: 12.5px; }
+  .actions .to { opacity: 0.55; }
+  .meta { font-size: 11.5px; opacity: 0.6; margin: 0 0 10px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .inline { display: flex; gap: 6px; align-items: center; }
+  .inline.wide { flex: 1 1 340px; }
+  .inline input[type=text] { flex: 1; min-width: 180px; background: transparent; border: 1px solid #2a2a33; border-radius: 6px; padding: 5px 8px; font-size: 12px; color: inherit; }
+  .ghost { background: transparent; border: 1px solid #2a2a33; border-radius: 6px; padding: 5px 10px; font-size: 12px; color: inherit; cursor: pointer; }
+  .ghost:hover { border-color: #6b7280; }
+  .open { font-size: 12px; opacity: 0.75; }
+</style>
