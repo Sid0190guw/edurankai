@@ -22,10 +22,39 @@ const cache = new Map<string, Promise<void>>();
 // is why the swallow below exists — so the failure mode is a feature reporting no rows rather than a
 // site that will not load. Turn it back on to let a genuinely new table create itself, then off.
 //
+// OFF IN PRODUCTION BY DEFAULT, AND THAT DEFAULT IS THE POINT.
+//
+// Measured on the live site, 2026-08-23. Twenty concurrent requests to the homepage alone: every one
+// answered, slowest 3.7s. The same twenty with /careers mixed in: four answered and sixteen returned
+// nothing at all before the client gave up at thirty seconds. The homepage runs one SELECT against
+// `roles`. /careers runs eighteen ALTER TABLE ... ADD COLUMN IF NOT EXISTS against `roles` first.
+//
+// That is the whole mechanism. ALTER TABLE needs ACCESS EXCLUSIVE, so it waits for the reads already
+// in flight -- and while it waits, every NEW read of `roles` queues behind it, because a pending
+// exclusive lock is granted ahead of the shared locks requested after it. Under continuous traffic
+// the table is readable in the gaps between bootstraps and not otherwise, and every request stuck in
+// that queue is holding a transaction-pooler session it cannot give back. The lock_timeout added in
+// guardedDdl() bounds how long the ALTER WAITS; it does nothing about the readers piled up behind it
+// while it does, and the retry it triggers starts the queue again on the next request.
+//
+// So production stops running DDL where visitors can wait for it. This is not a workaround for one
+// page: ~192 ensure keys and ~689 CREATE/ALTER statements sit on the request path of every cold
+// serverless instance, and any of them can do to its own tables what /careers does to `roles`.
+//
+// SCHEMA_BOOTSTRAP=on turns it back on without a code change -- set it, deploy something that needs
+// a new table, confirm /api/health reports missingCount 0, unset it. Off is also settable explicitly
+// for non-production. Nothing else changes when it is off: every caller already tolerates a missing
+// table, which is why ensureOnce swallows in the first place, so the failure mode is a feature with
+// no rows rather than a site that will not load.
+//
 // Read per call, not once at module scope, so the value is whatever the environment says NOW rather
 // than whatever it said when this instance happened to boot.
 function bootstrapDisabled(): boolean {
-  return String(process.env.SCHEMA_BOOTSTRAP || '').toLowerCase() === 'off';
+  const v = String(process.env.SCHEMA_BOOTSTRAP || '').toLowerCase();
+  if (v === 'on') return false;
+  if (v === 'off') return true;
+  // Local dev and the test suite create their schema as they go and depend on it.
+  return process.env.NODE_ENV === 'production';
 }
 
 export function ensureOnce(key: string, fn: () => Promise<void>): Promise<void> {
