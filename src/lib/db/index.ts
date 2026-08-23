@@ -46,10 +46,30 @@ function connect(): any {
   // request and paid that 1.4s again, which is a worse experience than the leak this was fixing.
   // 300s keeps a working instance warm while still handing the connection back when it goes quiet;
   // max:1 is what actually bounds pooler usage, so a longer idle window costs nothing there.
+  //
+  // max WAS 1, and that is what actually took the site down today. Under fluid/concurrent
+  // invocations one instance serves many requests at once, and with a single connection they do not
+  // run at once -- they queue, one whole request's worth of database work at a time. Measured on the
+  // live site: twenty concurrent homepage requests, one fast SELECT each, all answered, slowest
+  // 3.7s -- that is twenty queries serialised at ~150ms and it looks fine. Twenty with /careers in
+  // the mix, which needs ~1.5-2s of database work per render, and twelve of them never answered
+  // before the client gave up at thirty seconds. Same connection, arithmetic doing the rest.
+  //
+  // Five, not ten: enough that a slow page cannot block the fast ones behind it, few enough that the
+  // transaction pooler is not the next thing to run out. What exhausted the pooler before was never
+  // this number on its own -- it was postgres-js's default max:10 with idle_timeout:0, which never
+  // hands a connection back at all, plus pages opening their own clients per request (ee96b2d).
+  // Both of those are fixed; a bounded pool that returns what it borrows is not the same risk.
+  //
+  // idle_timeout drops from 300 to 60 because the reason for 300 no longer exists. It was raised
+  // when the functions ran in iad1 and the database in ap-south-1, where re-establishing a
+  // connection cost ~1.4s across two continents. The functions now run in bom1, next to the
+  // database (19e34eb), so that handshake is local and cheap, and holding five idle connections per
+  // instance for five minutes is a cost with nothing left to buy.
   _client = postgres(connectionString, {
     prepare: false,
-    max: 1,
-    idle_timeout: 300,
+    max: 5,
+    idle_timeout: 60,
     max_lifetime: 60 * 30,
     connect_timeout: 10,
   });
