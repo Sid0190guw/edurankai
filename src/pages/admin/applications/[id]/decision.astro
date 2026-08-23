@@ -1,0 +1,630 @@
+---
+// src/pages/admin/applications/[id]/decision.astro — PATCH 10's SURFACE.
+//
+// THE HIRING DECISION SUPPORT REPORT, and the form that records what a human then decided.
+//
+// TWO GATES, TWO DIFFERENT POPULATIONS, AND THE SPLIT IS THE POINT.
+//
+//   READ   `applications.score` — the capability that already means "record evaluations and scores
+//          against an application". Held by super_admin, hr, recruiter, reviewer and department_head:
+//          exactly the population that can already open /admin/interviews and read a scorecard. No
+//          new capability is invented and nobody gains sight of anything they could not already see.
+//
+//   DECIDE `selection.decide` — held by super_admin and recruiter ONLY. It already exists in
+//          src/lib/auth/registry.ts, where it is defined as recording a selection decision "with a
+//          written reason and the deciding person's own name attached permanently", and is marked
+//          SENSITIVE. That is precisely this form, so this page uses it rather than minting a
+//          fifth hiring key. A reviewer or a department head therefore READS the report and cannot
+//          record the decision, which is the separation the brief asks for.
+//
+// NOTHING ON THIS PAGE DECIDES. The support state is rendered beside the rule that produced it and
+// the sentence saying it is a reading of the record; the decision is four radio buttons a person
+// picks, a reason they must write, and their name on the row.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import {
+  buildDecisionReport,
+  recordFinalDecision,
+  FINAL_DECISIONS,
+  FINAL_DECISION_LABELS,
+  isFinalDecision,
+  stageForDecision,
+  type HiringDecisionReport,
+} from '@/lib/hiring-decision';
+import { STAGES, CLOSED_STAGES } from '@/lib/application-stages';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const { id } = Astro.params;
+if (!id) return Astro.redirect('/admin/applications');
+
+// DENY BEFORE ANYTHING IS READ. A person who may not open this report must not cause it to be built,
+// because building it reads a named candidate's evidence out of six modules.
+const mayRead = can(user as any, 'applications.score');
+if (!mayRead) return Astro.redirect('/admin/applications/' + id + '?notice=decision-support-denied');
+
+const mayDecide = can(user as any, 'selection.decide');
+
+// Declared ABOVE the POST handler that assigns them. `const` is not hoisted and a handler reaching a
+// later declaration has taken pages down on this project.
+let errorMsg = '';
+let successMsg = '';
+let stageWarning = '';
+
+// The stages a decision may move the funnel to. Built from the funnel module's own vocabulary so a
+// stage this page offers is always a stage advanceStage() will accept.
+const STAGE_OPTIONS: ReadonlyArray<readonly [string, string]> = [
+  ...STAGES.map((s) => [s.key, s.label] as const),
+  ...CLOSED_STAGES.map((s) => [s.key, s.label] as const),
+];
+
+if (Astro.request.method === 'POST') {
+  if (!mayDecide) {
+    errorMsg = 'Recording a hiring decision needs the selection.decide capability. Nothing was written.';
+  } else {
+    try {
+      const fd = await Astro.request.formData();
+      const action = String(fd.get('action') || '');
+      if (action === 'record_decision') {
+        const decision = String(fd.get('decision') || '');
+        const reasoning = String(fd.get('reasoning') || '');
+        const candidateFeedback = String(fd.get('candidate_feedback') || '');
+        const moveStage = String(fd.get('move_stage') || '');
+
+        if (!isFinalDecision(decision)) {
+          errorMsg = 'Choose one of the four decisions.';
+        } else {
+          // The report is rebuilt server-side rather than trusted from a hidden field: what gets
+          // frozen onto the decision row must be what the system actually holds, not what a form
+          // said it held.
+          const fresh = await buildDecisionReport(id);
+          const result = await recordFinalDecision({
+            applicationId: id,
+            decision,
+            reasoning,
+            actorUserId: user.id,
+            actorName: user.name || user.email || null,
+            report: fresh,
+            candidateFeedback,
+            moveStageTo: moveStage || null,
+          });
+          if (result.ok) {
+            successMsg = result.message;
+            if (result.stageWarning) stageWarning = result.stageWarning;
+          } else {
+            errorMsg = result.error;
+          }
+        }
+      }
+    } catch (e: any) {
+      // NEVER a bare catch on a decision path. The real Postgres reason lives on e.cause.
+      const reason = String(e?.cause?.message || e?.message || 'unknown error');
+      console.error('[decision] POST failed for application', id, '-', reason);
+      errorMsg = 'The decision was NOT recorded: ' + reason;
+    }
+  }
+}
+
+const report: HiringDecisionReport | null = await buildDecisionReport(id);
+if (!report) return Astro.redirect('/admin/applications');
+
+// Every comparison that would otherwise sit inside JSX is resolved here: `<` and `<=` inside a JSX
+// expression break the .astro compiler on this project.
+const hasUnreadable = report.unreadable.length > 0;
+const hasBlockers = report.support.blockers.length > 0;
+const hasContradictions = report.agreement.contradictions.length > 0;
+const hasAgreements = report.agreement.agreements.length > 0;
+const hasDecisions = report.decisions.length > 0;
+// THE FORM IS OFFERED WHENEVER THE PERSON MAY DECIDE, even when the table is not there yet.
+// Hiding it behind `schema.ok` looked safer and was worse: recordFinalDecision() calls
+// ensureHiringDecisionSchema() itself, so the first save creates the table — and a hidden form meant
+// that path could never run, leaving a hiring desk with a report they could not act on and no way to
+// find out why. The notice below says what the state is; the write reports honestly if it fails.
+const canRecord = mayDecide;
+const coverageRows = report.technicalEvidence.data;
+const hasCoverageRows = coverageRows.length > 0;
+const scorecards = report.behaviouralEvidence.data;
+const hasScorecards = scorecards.length > 0;
+const assessments = report.assessmentPerformance.data;
+const hasAssessments = assessments.length > 0;
+const assignments = report.assignments.data;
+const hasAssignments = assignments.length > 0;
+const spreads = report.agreement.dimensionSpreads;
+const hasSpreads = spreads.length > 0;
+const stageEvents = report.stageHistory.data;
+const hasStageEvents = stageEvents.length > 0;
+const priorDecisions = report.priorReadings.data.decisions;
+const hasPriorDecisions = priorDecisions.length > 0;
+const recCounts = report.interviewRecommendation.data.counts.filter((c) => c.count > 0);
+const hasRecCounts = recCounts.length > 0;
+
+const supportTone =
+  report.support.state === 'strong_hire_consideration' ? '#4ade80'
+  : report.support.state === 'hire_consideration' ? '#a3e635'
+  : report.support.state === 'do_not_recommend_at_current_stage' ? '#f87171'
+  : '#fbbf24';
+
+function statusTone(status: string): string {
+  if (status === 'evidenced') return '#4ade80';
+  if (status === 'stated') return '#fbbf24';
+  if (status === 'related') return '#60a5fa';
+  if (status === 'unreadable') return '#f87171';
+  return '#8a8a94';
+}
+
+const title = 'Hiring decision support';
+---
+
+<AdminLayout title={title}>
+
+  <div class="mb-4">
+    <a href={'/admin/applications/' + id} class="text-[0.78rem] text-white/50 hover:text-white">&larr; Back to application</a>
+  </div>
+
+  {errorMsg && <div class="bg-red-500/10 border border-red-500/30 text-red-300 rounded-lg p-3 mb-4 text-[0.85rem]">{errorMsg}</div>}
+  {successMsg && <div class="bg-leaf-bg/20 border border-leaf-border/50 text-leaf rounded-lg p-3 mb-4 text-[0.85rem]">{successMsg}</div>}
+  {stageWarning && <div class="bg-amber-500/10 border border-amber-500/30 text-amber-200 rounded-lg p-3 mb-4 text-[0.85rem]">{stageWarning}</div>}
+
+  <div class="mb-5 pb-4 border-b border-white/8">
+    <p class="font-mono text-[0.7rem] text-white/40">{report.application.applicationNumber || report.application.id.slice(0, 8)}</p>
+    <h1 class="font-display text-[1.6rem] font-semibold text-white">Hiring decision support</h1>
+    <p class="text-[0.85rem] text-white/60 mt-1">
+      For <strong class="text-white">{report.application.candidateName}</strong>
+      {report.application.roleTitle && <span> &middot; {report.application.roleTitle}</span>}
+      {report.application.department && <span class="text-white/40"> &middot; {report.application.department}</span>}
+    </p>
+    {report.application.stageLabel && (
+      <p class="text-[0.74rem] text-white/45 mt-1">Funnel stage: <strong class="text-white/75">{report.application.stageLabel}</strong></p>
+    )}
+  </div>
+
+  {hasUnreadable && (
+    <div class="bg-red-500/10 border border-red-500/30 rounded-lg p-4 mb-5">
+      <p class="text-[0.7rem] font-mono uppercase tracking-wider font-bold text-red-300 mb-2">Part of this report could not be read</p>
+      <ul class="text-[0.8rem] text-red-200/90 leading-relaxed space-y-1">
+        {report.unreadable.map((u) => <li>{u}</li>)}
+      </ul>
+      <p class="text-[0.78rem] text-white/60 mt-3 leading-relaxed">
+        Nothing below is a complete picture. A candidate who looks thin here may simply be a candidate
+        whose records did not load, and the reading is held at Further Review Required for exactly that reason.
+      </p>
+    </div>
+  )}
+
+  <!-- ============================================================================================
+       OVERALL DECISION SUPPORT. The state, the rule that produced it, and the sentence saying what
+       it is. Rendered first because it is the thing a reader will act on, and last-computed because
+       it is derived from everything below.
+       ============================================================================================ -->
+  <section class="rounded-xl border border-white/10 bg-white/5 p-5 mb-5">
+    <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/50 mb-2">Overall decision support</p>
+    <div class="flex items-center gap-2 mb-2">
+      <span class="inline-block w-2.5 h-2.5 rounded-full" style={'background:' + supportTone + ';'}></span>
+      <h2 class="font-display text-[1.25rem] font-semibold text-white">{report.support.label}</h2>
+    </div>
+    <p class="text-[0.84rem] text-white/70 leading-relaxed">{report.support.meaning}</p>
+
+    <div class="mt-4 pt-4 border-t border-white/10">
+      <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/50 mb-2">Why this reading</p>
+      <ul class="text-[0.82rem] text-white/75 leading-relaxed space-y-1.5 list-disc pl-5">
+        {report.support.because.map((b) => <li>{b}</li>)}
+      </ul>
+    </div>
+
+    {hasBlockers && (
+      <div class="mt-4 pt-4 border-t border-white/10">
+        <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-red-300 mb-2">Decision blockers</p>
+        <ul class="text-[0.82rem] text-red-200/90 leading-relaxed space-y-1.5 list-disc pl-5">
+          {report.support.blockers.map((b) => <li>{b}</li>)}
+        </ul>
+      </div>
+    )}
+
+    {report.support.whatWouldChangeIt.length > 0 && (
+      <div class="mt-4 pt-4 border-t border-white/10">
+        <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/50 mb-2">What would change this reading</p>
+        <ul class="text-[0.82rem] text-white/70 leading-relaxed space-y-1.5 list-disc pl-5">
+          {report.support.whatWouldChangeIt.map((w) => <li>{w}</li>)}
+        </ul>
+      </div>
+    )}
+
+    <details class="mt-4 pt-4 border-t border-white/10">
+      <summary class="text-[0.76rem] text-white/55 cursor-pointer select-none">How this reading was produced &mdash; inputs, rule, evidence, confidence</summary>
+      <div class="mt-3 space-y-4">
+        <div>
+          <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/45 mb-1.5">Inputs</p>
+          <ul class="text-[0.78rem] text-white/65 leading-relaxed space-y-1">
+            {report.derivation.inputs.map((i) => (
+              <li><strong class="text-white/85">{i.name}</strong> &mdash; <span class="font-mono text-[0.72rem]">{i.read}</span>. {i.sentence}</li>
+            ))}
+          </ul>
+        </div>
+        <div>
+          <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/45 mb-1.5">The rule that was applied</p>
+          <ol class="text-[0.78rem] text-white/65 leading-relaxed space-y-1 list-decimal pl-5">
+            {report.derivation.processing.map((p) => <li>{p}</li>)}
+          </ol>
+        </div>
+        <div>
+          <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/45 mb-1.5">Confidence in our records</p>
+          <p class="text-[0.78rem] text-white/65 leading-relaxed">{report.derivation.confidence.sentence}</p>
+        </div>
+        <div>
+          <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/45 mb-1.5">Computed at</p>
+          <p class="text-[0.78rem] text-white/65 font-mono">{report.derivation.computedAt}</p>
+        </div>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================================================
+       EVIDENCE-BASED ROLE FIT + TECHNICAL EVIDENCE
+       ============================================================================================ -->
+  <section class="rounded-xl border border-white/10 bg-white/5 p-5 mb-5">
+    <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/50 mb-2">Evidence-based role fit</p>
+    <p class="text-[0.82rem] text-white/65 leading-relaxed mb-4">{report.roleFit.sentence}</p>
+
+    {hasCoverageRows ? (
+      <div class="overflow-x-auto">
+        <table class="w-full text-[0.8rem]">
+          <thead>
+            <tr class="text-white/45 text-[0.68rem] font-mono uppercase tracking-wider">
+              <th class="text-left py-2 pr-3">Requirement</th>
+              <th class="text-left py-2 pr-3">Necessity</th>
+              <th class="text-left py-2 pr-3">What we hold</th>
+              <th class="text-left py-2">Recorded level</th>
+            </tr>
+          </thead>
+          <tbody>
+            {coverageRows.map((r) => (
+              <tr class="border-t border-white/8 align-top">
+                <td class="py-2.5 pr-3 text-white/85">{r.skillName}</td>
+                <td class="py-2.5 pr-3 text-white/55">{r.necessity}</td>
+                <td class="py-2.5 pr-3">
+                  <span class="inline-flex items-center gap-1.5">
+                    <span class="inline-block w-1.5 h-1.5 rounded-full" style={'background:' + statusTone(r.status) + ';'}></span>
+                    <span style={'color:' + statusTone(r.status) + ';'}>{r.statusLabel}</span>
+                  </span>
+                </td>
+                <td class="py-2.5 text-white/60">{r.levelLabel || 'Not recorded'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    ) : (
+      <p class="text-[0.8rem] text-white/45">{report.technicalEvidence.sentence}</p>
+    )}
+
+    <p class="text-[0.75rem] text-white/40 leading-relaxed mt-4 pt-3 border-t border-white/8">
+      There is no overall fit score on this page and there will not be one. A single number would have
+      to average a checked record against a keyword somebody typed on a form.
+    </p>
+  </section>
+
+  <!-- ============================================================================================
+       BEHAVIOURAL EVIDENCE + INTERVIEW RECOMMENDATION
+       ============================================================================================ -->
+  <section class="rounded-xl border border-white/10 bg-white/5 p-5 mb-5">
+    <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/50 mb-2">Behavioural evidence and interview recommendation</p>
+    <p class="text-[0.82rem] text-white/65 leading-relaxed mb-4">{report.interviewRecommendation.data.leaning}</p>
+
+    {hasRecCounts && (
+      <div class="flex flex-wrap gap-2 mb-4">
+        {recCounts.map((c) => (
+          <span class="px-2.5 py-1 rounded-md bg-white/8 border border-white/10 text-[0.76rem] text-white/75">
+            {c.label}: <strong class="text-white">{c.count}</strong>
+          </span>
+        ))}
+      </div>
+    )}
+
+    {hasScorecards ? (
+      <div class="space-y-3">
+        {scorecards.map((c) => (
+          <div class="rounded-lg border border-white/10 bg-white/4 p-3.5">
+            <div class="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+              <p class="text-[0.88rem] font-semibold text-white">{c.interviewerName}</p>
+              <p class="text-[0.72rem] font-mono text-white/45">
+                {c.roundType || 'Interview'}{c.roundNumber !== null && <span> &middot; round {c.roundNumber}</span>}
+              </p>
+            </div>
+            <p class="text-[0.8rem] text-white/75 mb-2">Recommendation: <strong class="text-white">{c.recommendationLabel}</strong></p>
+            <div class="flex flex-wrap gap-x-4 gap-y-1 text-[0.76rem] text-white/60 mb-2">
+              {c.scores.map((s) => (
+                <span>{s.label}: <strong class="text-white/85">{s.value === null ? 'not scored' : s.value}</strong></span>
+              ))}
+            </div>
+            {c.strengths && <p class="text-[0.78rem] text-white/65 leading-relaxed mt-2"><span class="text-white/40">Strengths:</span> {c.strengths}</p>}
+            {c.concerns && <p class="text-[0.78rem] text-white/65 leading-relaxed mt-1"><span class="text-white/40">Concerns:</span> {c.concerns}</p>}
+          </div>
+        ))}
+      </div>
+    ) : (
+      <p class="text-[0.8rem] text-white/45">{report.behaviouralEvidence.sentence}</p>
+    )}
+
+    <p class="text-[0.75rem] text-white/40 leading-relaxed mt-4 pt-3 border-t border-white/8">
+      Scorecards are shown side by side and are nowhere averaged into a verdict. A score is one
+      person's judgement of one conversation, recorded as such.
+    </p>
+  </section>
+
+  <!-- ============================================================================================
+       AREAS OF AGREEMENT AND CONTRADICTION
+       ============================================================================================ -->
+  <section class="rounded-xl border border-white/10 bg-white/5 p-5 mb-5">
+    <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/50 mb-2">Areas of agreement and contradiction</p>
+    <p class="text-[0.82rem] text-white/65 leading-relaxed mb-4">{report.agreement.sentence}</p>
+
+    {hasAgreements && (
+      <div class="mb-4">
+        <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-leaf mb-2">Agreement</p>
+        <ul class="text-[0.82rem] text-white/75 leading-relaxed space-y-1.5 list-disc pl-5">
+          {report.agreement.agreements.map((a) => <li>{a}</li>)}
+        </ul>
+      </div>
+    )}
+
+    {hasContradictions && (
+      <div class="mb-4">
+        <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-amber-300 mb-2">Contradiction</p>
+        <ul class="text-[0.82rem] text-amber-100/85 leading-relaxed space-y-1.5 list-disc pl-5">
+          {report.agreement.contradictions.map((c) => <li>{c}</li>)}
+        </ul>
+        <p class="text-[0.75rem] text-white/40 leading-relaxed mt-3">
+          None of these is resolved here. Resolving them is the decision, and it belongs to a person.
+        </p>
+      </div>
+    )}
+
+    {hasSpreads && (
+      <details class="mt-2">
+        <summary class="text-[0.76rem] text-white/55 cursor-pointer select-none">Per-dimension spread across the panel</summary>
+        <div class="mt-3 space-y-2">
+          {spreads.map((d) => (
+            <div class="text-[0.78rem] text-white/70">
+              <strong class="text-white/85">{d.label}</strong>
+              <span class="text-white/45"> &mdash; {d.scores.map((s) => s.interviewerName + ' ' + s.value).join(', ')}</span>
+              {d.outlier && <span class="text-amber-300"> &middot; outlier: {d.outlier.interviewerName}</span>}
+            </div>
+          ))}
+        </div>
+      </details>
+    )}
+  </section>
+
+  <!-- ============================================================================================
+       ASSESSMENT PERFORMANCE + ASSIGNMENTS
+       ============================================================================================ -->
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5">
+    <section class="rounded-xl border border-white/10 bg-white/5 p-5">
+      <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/50 mb-2">Assessment performance</p>
+      <p class="text-[0.82rem] text-white/65 leading-relaxed mb-3">{report.assessmentPerformance.sentence}</p>
+      {hasAssessments && (
+        <ul class="space-y-1.5">
+          {assessments.map((a) => (
+            <li class="text-[0.8rem] text-white/75">
+              {a.title}
+              {a.percentage !== null && <span class="text-white/50"> &middot; {a.percentage}%</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+
+    <section class="rounded-xl border border-white/10 bg-white/5 p-5">
+      <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/50 mb-2">Assignments and work samples</p>
+      <p class="text-[0.82rem] text-white/65 leading-relaxed mb-3">{report.assignments.sentence}</p>
+      {hasAssignments && (
+        <ul class="space-y-2">
+          {assignments.map((a) => (
+            <li class="text-[0.8rem] text-white/75">
+              {a.url ? (
+                <a href={a.url} target="_blank" rel="noopener" class="text-burn hover:underline">{a.title}</a>
+              ) : (
+                <span>{a.title}</span>
+              )}
+              <span class="text-white/45"> &middot; {a.status}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  </div>
+
+  <!-- ============================================================================================
+       RELEVANT INTELLIGENCE SUMMARIES + FUNNEL HISTORY
+       ============================================================================================ -->
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5">
+    <section class="rounded-xl border border-white/10 bg-white/5 p-5">
+      <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/50 mb-2">Prior readings and recorded judgements</p>
+      <p class="text-[0.82rem] text-white/65 leading-relaxed mb-3">{report.priorReadings.sentence}</p>
+      {report.priorReadings.data.matchConclusion && (
+        <p class="text-[0.78rem] text-white/60 leading-relaxed mb-3 pl-3 border-l-2 border-white/15">
+          {report.priorReadings.data.matchConclusion}
+          <span class="block text-white/35 font-mono text-[0.7rem] mt-1">Stored reading, not re-run &middot; {report.priorReadings.data.matchComputedAt}</span>
+        </p>
+      )}
+      {hasPriorDecisions && (
+        <ul class="space-y-2">
+          {priorDecisions.map((d) => (
+            <li class="text-[0.78rem] text-white/70">
+              <strong class="text-white/85">{d.decisionLabel}</strong>
+              <span class="text-white/45"> &mdash; {d.decidedByName || 'somebody'}</span>
+              <span class="block text-white/55 leading-relaxed">{d.reason}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+
+    <section class="rounded-xl border border-white/10 bg-white/5 p-5">
+      <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/50 mb-2">Funnel history</p>
+      <p class="text-[0.82rem] text-white/65 leading-relaxed mb-3">{report.stageHistory.sentence}</p>
+      {hasStageEvents && (
+        <ul class="space-y-1.5">
+          {stageEvents.map((s) => (
+            <li class="text-[0.78rem] text-white/70">
+              <span class="font-mono text-[0.72rem] text-white/40">{s.at ? s.at.slice(0, 10) : ''}</span>
+              <span> {s.from || 'start'} &rarr; <strong class="text-white/85">{s.to}</strong></span>
+              {s.actor && <span class="text-white/45"> &middot; {s.actor}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  </div>
+
+  <!-- ============================================================================================
+       THE DECISIONS ALREADY RECORDED
+       ============================================================================================ -->
+  {hasDecisions && (
+    <section class="rounded-xl border border-white/10 bg-white/5 p-5 mb-5">
+      <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-white/50 mb-3">Decisions recorded on this application</p>
+      <div class="space-y-3">
+        {report.decisions.map((d) => (
+          <div class={'rounded-lg border p-3.5 ' + (d.isCurrent ? 'border-leaf-border/40 bg-leaf-bg/10' : 'border-white/10 bg-white/4 opacity-70')}>
+            <div class="flex flex-wrap items-baseline justify-between gap-2 mb-1.5">
+              <p class="text-[0.9rem] font-semibold text-white">
+                {d.decisionLabel}
+                {!d.isCurrent && <span class="text-white/40 font-normal text-[0.76rem]"> &middot; superseded</span>}
+              </p>
+              <p class="text-[0.72rem] font-mono text-white/45">{d.decidedAt}</p>
+            </div>
+            <p class="text-[0.78rem] text-white/60 mb-2">
+              Decided by <strong class="text-white/85">{d.decidedByName || 'a named account'}</strong>
+              {d.supportStateLabel && <span> &middot; the report showed <em class="text-white/70">{d.supportStateLabel}</em></span>}
+            </p>
+            <p class="text-[0.82rem] text-white/80 leading-relaxed">{d.reasoning}</p>
+            {d.candidateFeedback && (
+              <p class="text-[0.78rem] text-white/60 leading-relaxed mt-2 pt-2 border-t border-white/10">
+                <span class="text-white/40">Sent to the candidate:</span> {d.candidateFeedback}
+              </p>
+            )}
+            {d.stageMovedTo && <p class="text-[0.74rem] text-white/40 mt-2">Funnel moved to: {d.stageMovedTo}</p>}
+          </div>
+        ))}
+      </div>
+    </section>
+  )}
+
+  <!-- ============================================================================================
+       THE FINAL HUMAN DECISION
+       ============================================================================================ -->
+  <section class="rounded-xl border border-burn-dim/50 bg-burn-pale/10 p-5 mb-8">
+    <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold text-burn mb-2">Final human decision</p>
+
+    {!report.schema.ok && (
+      <div class="bg-amber-500/10 border border-amber-500/30 text-amber-200 rounded-lg p-3 mb-4 text-[0.82rem]">
+        {report.schema.sentence} The first decision recorded here will create it; if that fails you
+        will be told the exact reason and nothing will have been written.
+      </div>
+    )}
+
+    {!mayDecide && (
+      <p class="text-[0.82rem] text-white/60 leading-relaxed">
+        You can read this report but not record the decision. Recording it needs the
+        <span class="font-mono text-white/80"> selection.decide </span>
+        capability, which is held by the hiring desk. That split is deliberate: reading the evidence
+        and exercising the authority are two acts.
+      </p>
+    )}
+
+    {canRecord && (
+      <form method="POST" class="space-y-4">
+        <input type="hidden" name="action" value="record_decision" />
+
+        <div>
+          <p class="text-[0.8rem] text-white/70 mb-2">What is decided</p>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {FINAL_DECISIONS.map((d) => (
+              <label class="flex items-start gap-2.5 rounded-lg border border-white/12 bg-white/5 p-3 cursor-pointer hover:border-white/25">
+                <input type="radio" name="decision" value={d} required class="mt-0.5" />
+                <span>
+                  <span class="block text-[0.88rem] font-semibold text-white">{FINAL_DECISION_LABELS[d]}</span>
+                  <span class="block text-[0.72rem] text-white/45 mt-0.5">
+                    {stageForDecision(d) ? 'Proposes funnel stage: ' + stageForDecision(d) : 'Proposes no funnel movement'}
+                  </span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-[0.8rem] text-white/70 mb-1.5" for="reasoning">
+            Why. Required, and kept permanently against your name.
+          </label>
+          <textarea
+            id="reasoning"
+            name="reasoning"
+            required
+            rows="4"
+            placeholder="What in the evidence above led to this, and what you weighed where the sources disagreed."
+            class="w-full bg-[#1c2128] border border-white/12 text-white rounded-lg p-3 text-[0.84rem] leading-relaxed"
+          ></textarea>
+          <p class="text-[0.72rem] text-white/40 mt-1.5 leading-relaxed">
+            A recorded decision with no reason is an opaque decision with a timestamp on it. This is
+            the record somebody may be asked to explain in six months.
+          </p>
+        </div>
+
+        <div>
+          <label class="block text-[0.8rem] text-white/70 mb-1.5" for="candidate_feedback">
+            What the candidate is told. Optional.
+          </label>
+          <textarea
+            id="candidate_feedback"
+            name="candidate_feedback"
+            rows="3"
+            placeholder="What the role asked for and what this candidate demonstrated. Nothing else."
+            class="w-full bg-[#1c2128] border border-white/12 text-white rounded-lg p-3 text-[0.84rem] leading-relaxed"
+          ></textarea>
+          <p class="text-[0.72rem] text-white/40 mt-1.5 leading-relaxed">
+            This is screened before it is saved. Feedback that names a protected attribute, a trait
+            proxy such as culture fit, or any birth-derived term is refused with the reason, and
+            nothing is sent. Leave it blank rather than writing a sentence you would not defend &mdash;
+            a later sentence beats a wrong one.
+          </p>
+        </div>
+
+        <div>
+          <label class="block text-[0.8rem] text-white/70 mb-1.5" for="move_stage">
+            Move the candidate's tracker. Optional.
+          </label>
+          <select
+            id="move_stage"
+            name="move_stage"
+            class="w-full bg-[#1c2128] border border-white/12 text-white rounded-lg p-2.5 text-[0.84rem]"
+          >
+            <option value="">Leave the tracker where it is</option>
+            {STAGE_OPTIONS.map((s) => <option value={s[0]}>{s[1]}</option>)}
+          </select>
+          <p class="text-[0.72rem] text-white/40 mt-1.5 leading-relaxed">
+            The move is made by the funnel engine, which owns the stage column, its history, the
+            notification the candidate receives and the event that goes with it. If you leave this
+            blank, Hire proposes Decision and Reject proposes Closed; Hold and Move to Next Stage
+            propose nothing, because only you know which stage is next.
+          </p>
+        </div>
+
+        <div class="pt-2 border-t border-white/10">
+          <p class="text-[0.76rem] text-white/50 leading-relaxed mb-3">
+            The reading above is what the record supports. It is not a recommendation that has been
+            acted on, and nothing in this system can record a decision without an account attached to
+            it. What you pick here is the decision.
+          </p>
+          <button
+            type="submit"
+            class="bg-burn/20 hover:bg-burn/30 border border-burn-dim/60 text-burn font-semibold py-2.5 px-5 rounded-lg text-[0.85rem]"
+          >Record this decision</button>
+        </div>
+      </form>
+    )}
+  </section>
+
+</AdminLayout>

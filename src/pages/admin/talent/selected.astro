@@ -1,0 +1,331 @@
+---
+// /admin/talent/selected — THE SELECTED CANDIDATES CONSOLE.
+//
+// Spec: docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md section 6B.
+//
+// This is the queue between "we said yes" and "they are in the system". Until this page existed the
+// candidate-facing onboarding portal at /onboarding was unreachable in practice: it asks for a code,
+// and nothing in the product could mint one.
+//
+// TWO ACTS, TWO BUTTONS, TWO CAPABILITIES. Approving a selected candidate for onboarding and issuing
+// the code that lets them in are separate on purpose (spec 6B rule 1), and the separation is enforced
+// in src/lib/talent/selection.ts, not here — a second page would forget it.
+//
+// THE SECRET IS SHOWN ONCE. issueCode() returns the plaintext exactly once and stores only a hash.
+// It is rendered in the banner below and is unrecoverable afterwards by anybody, including a super
+// admin reading the database. That is deliberate and the copy says so, because an operator who
+// assumes they can look it up again later will close the tab.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { logAudit } from '@/lib/audit';
+import { selectedCandidatesBoard, approveForOnboarding, withdrawSelection, type SelectedRow } from '@/lib/talent/selection';
+import { issueCode, revokeCode, listCodes } from '@/lib/talent/codes';
+
+// EVERY const IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted, and a handler reaching a
+// later declaration threw on its first line every time while the page reported success — that is a
+// real outage on this project, not a style preference.
+const user = Astro.locals.user!;
+
+// Server-side gate, before any query runs. The middleware section gate ('talent_onboarding') stands
+// in front of this path too; this is the page's own lock and the one that actually decides.
+const mayApprove = can(user, 'selection.approve_onboarding');
+const mayIssue = can(user, 'onboarding.code.issue');
+const mayView = can(user, 'talent.view') || mayApprove || mayIssue;
+if (!mayView) return Astro.redirect('/admin');
+
+const fmtDate = (iso: string | null): string => {
+  if (!iso) return '';
+  try { return new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }); }
+  catch { return ''; }
+};
+
+let msg = '';
+let err = '';
+let issuedSecret = '';
+let issuedFor = '';
+let issuedUntil = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+  const selectionId = String(fd.get('selectionId') || '');
+  try {
+    if (action === 'approve') {
+      if (!mayApprove) {
+        err = 'You do not hold the approval desk for onboarding.';
+      } else {
+        const r = await approveForOnboarding(selectionId, user.id);
+        if (r.ok) { msg = 'Approved for onboarding. A code can now be issued.'; }
+        else { err = r.error || 'Could not approve.'; }
+      }
+    } else if (action === 'issue') {
+      if (!mayIssue) {
+        err = 'You do not hold the authority to issue onboarding codes.';
+      } else {
+        const days = parseInt(String(fd.get('validityDays') || '14'), 10) || 14;
+        const r = await issueCode({ selectionId, issuedByUserId: user.id, validityDays: days });
+        if (r.ok && r.secret) {
+          issuedSecret = r.secret;
+          issuedFor = String(fd.get('personName') || '');
+          issuedUntil = r.code ? fmtDate(r.code.validUntil) : '';
+          msg = 'Code issued. It is shown once, below.';
+          await logAudit({
+            userId: user.id, action: 'onboarding.code.issued_from_console',
+            entity: 'tal_onboarding_code', entityId: r.code ? r.code.id : '',
+            ipAddress: Astro.clientAddress,
+          });
+        } else {
+          err = r.error || 'Could not issue a code.';
+        }
+      }
+    } else if (action === 'revoke') {
+      if (!mayIssue) {
+        err = 'You do not hold the authority to revoke onboarding codes.';
+      } else {
+        const codeRowId = String(fd.get('codeRowId') || '');
+        const reason = String(fd.get('reason') || '').trim();
+        if (!reason) {
+          err = 'A revocation needs a written reason.';
+        } else {
+          const r = await revokeCode(codeRowId, user.id, reason);
+          if (r.ok) { msg = r.changed ? 'Code revoked.' : 'That code was already inactive.'; }
+          else { err = r.error || 'Could not revoke the code.'; }
+        }
+      }
+    } else if (action === 'withdraw') {
+      if (!mayApprove) {
+        err = 'You do not hold the authority to withdraw a selection.';
+      } else {
+        const reason = String(fd.get('reason') || '').trim();
+        const r = await withdrawSelection(selectionId, user.id, reason);
+        if (r.ok) { msg = 'Selection withdrawn. Any live code was revoked with it.'; }
+        else { err = r.error || 'Could not withdraw the selection.'; }
+      }
+    }
+  } catch (e: any) {
+    // The REAL Postgres reason lives on e.cause; e.message is just the failed statement.
+    err = e?.cause?.message || e?.message || 'Something went wrong.';
+  }
+}
+
+// The board is loaded AFTER the POST so the screen reflects what just happened.
+//
+// A THROW HERE IS NOT AN EMPTY QUEUE. selectedCandidatesBoard() rethrows rather than returning [],
+// because "nobody is waiting" and "we cannot read who is waiting" look identical on screen and are
+// opposite facts. The distinction is kept all the way to the render.
+let board: SelectedRow[] = [];
+let boardFailed = false;
+try {
+  board = await selectedCandidatesBoard(200);
+} catch (e: any) {
+  boardFailed = true;
+  err = err || ('The selected-candidate queue could not be read: ' + (e?.cause?.message || e?.message || 'unknown error'));
+}
+
+// Live codes, keyed for the revoke button. Read separately so a code failure cannot blank the board.
+const liveCodes = new Map<string, { id: string; codeId: string }>();
+try {
+  // 200 is listCodes()'s own hard cap, stated here rather than asking for more and being silently
+  // truncated. Past that, a row may offer "Issue code" to somebody who already has one; issueCode()
+  // re-reads and refuses, so the failure mode is a refusal message and never a second live code.
+  const codes = await listCodes({ status: 'active', limit: 200 });
+  for (const c of codes) liveCodes.set(c.selectionId, { id: c.id, codeId: c.codeId });
+} catch { /* the board still renders; the row simply offers no revoke button */ }
+
+// Counts computed in the frontmatter. `<` and comparisons inside JSX expressions break .astro
+// parsing on this project, so every number the template needs is finished here.
+const awaitingApproval = board.filter((r) => !r.approvedForOnboardingAt).length;
+const awaitingCode = board.filter((r) => r.approvedForOnboardingAt && !r.codeStatus).length;
+const inOnboarding = board.filter((r) => r.onboardingStatus && r.onboardingStatus !== 'approved').length;
+const done = board.filter((r) => r.identityCode).length;
+
+// Per-row display is precomputed for the same reason.
+const rows = board.map((r) => {
+  const code = liveCodes.get(r.selectionId) || null;
+  let stage = 'Awaiting approval';
+  if (r.identityCode) stage = 'Identity issued';
+  else if (r.onboardingStatus === 'submitted') stage = 'Onboarding submitted';
+  else if (r.onboardingStatus === 'in_progress') stage = 'Onboarding started';
+  else if (r.onboardingStatus === 'changes_requested') stage = 'Changes requested';
+  else if (r.codeStatus === 'active') stage = 'Code issued, not yet used';
+  else if (r.approvedForOnboardingAt) stage = 'Approved, no code yet';
+  return {
+    ...r,
+    stage,
+    codeRowId: code ? code.id : '',
+    decidedOn: fmtDate(r.decidedAt),
+    joiningOn: r.proposedJoiningDate ? fmtDate(r.proposedJoiningDate) : '',
+    validUntil: r.codeValidUntil ? fmtDate(r.codeValidUntil) : '',
+    canApprove: mayApprove && !r.approvedForOnboardingAt,
+    canIssue: mayIssue && !!r.approvedForOnboardingAt && r.codeStatus !== 'active',
+    canRevoke: mayIssue && r.codeStatus === 'active' && !!code,
+  };
+});
+---
+
+<AdminLayout title="Selected candidates" activeNav="talent-selected">
+  <div class="wrap">
+    <header class="head">
+      <h1>Selected candidates</h1>
+      <p class="sub">
+        Everyone who has been selected, and exactly how far they have got. Approving a candidate for
+        onboarding and issuing their code are two separate acts.
+      </p>
+    </header>
+
+    {msg && <div class="note note--ok">{msg}</div>}
+    {err && <div class="note note--err">{err}</div>}
+
+    {issuedSecret && (
+      <div class="secret">
+        <p class="secret__eyebrow">Onboarding code issued{issuedFor ? ' for ' + issuedFor : ''}</p>
+        <p class="secret__code">{issuedSecret}</p>
+        <p class="secret__note">
+          Shown once. It is stored only as a hash, so nobody can read it back later, including from
+          the database. Send it to the candidate now, through the official channel, and never in the
+          same message as their offer letter. Valid until {issuedUntil}.
+        </p>
+      </div>
+    )}
+
+    {!boardFailed && (
+      <div class="tiles">
+        <div class="tile"><span class="tile__n">{awaitingApproval}</span><span class="tile__l">Awaiting approval</span></div>
+        <div class="tile"><span class="tile__n">{awaitingCode}</span><span class="tile__l">Approved, no code</span></div>
+        <div class="tile"><span class="tile__n">{inOnboarding}</span><span class="tile__l">In onboarding</span></div>
+        <div class="tile"><span class="tile__n">{done}</span><span class="tile__l">Identity issued</span></div>
+      </div>
+    )}
+
+    {boardFailed && (
+      <p class="empty">
+        The queue could not be read just now. This is not the same as nobody waiting, and nothing has
+        been changed. Reload; if it persists, the reason is in the message above.
+      </p>
+    )}
+
+    {!boardFailed && rows.length === 0 && (
+      <p class="empty">
+        No selected candidates yet. A candidate appears here once a selection decision of "selected"
+        is recorded against their application.
+      </p>
+    )}
+
+    {rows.length > 0 && (
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Candidate</th>
+              <th>Opportunity</th>
+              <th>Stage</th>
+              <th>Decided</th>
+              <th>Joining</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr>
+                <td>
+                  <strong>{r.personName || 'Unnamed'}</strong>
+                  <span class="mono">{r.personCode}</span>
+                  <span class="mono">{r.selectionCode}</span>
+                </td>
+                <td>
+                  {r.opportunityTitle}
+                  {r.employmentType && <span class="mono">{r.employmentType}</span>}
+                  {r.departmentId && <span class="mono">{r.departmentId}</span>}
+                </td>
+                <td>
+                  <span class="stage">{r.stage}</span>
+                  {r.codeId && <span class="mono">{r.codeId}</span>}
+                  {r.validUntil && <span class="mono">valid to {r.validUntil}</span>}
+                  {r.identityCode && <span class="mono">{r.identityCode}</span>}
+                </td>
+                <td>{r.decidedOn}</td>
+                <td>{r.joiningOn}</td>
+                <td class="acts">
+                  {r.canApprove && (
+                    <form method="POST">
+                      <input type="hidden" name="_action" value="approve" />
+                      <input type="hidden" name="selectionId" value={r.selectionId} />
+                      <button type="submit" class="btn btn--go">Approve for onboarding</button>
+                    </form>
+                  )}
+                  {r.canIssue && (
+                    <form method="POST" class="issue">
+                      <input type="hidden" name="_action" value="issue" />
+                      <input type="hidden" name="selectionId" value={r.selectionId} />
+                      <input type="hidden" name="personName" value={r.personName} />
+                      <label class="days">
+                        Valid
+                        <input type="number" name="validityDays" value="14" min="1" max="60" />
+                        days
+                      </label>
+                      <button type="submit" class="btn btn--go">Issue code</button>
+                    </form>
+                  )}
+                  {r.canRevoke && (
+                    <form method="POST" class="revoke">
+                      <input type="hidden" name="_action" value="revoke" />
+                      <input type="hidden" name="codeRowId" value={r.codeRowId} />
+                      <input type="text" name="reason" placeholder="Reason" required />
+                      <button type="submit" class="btn btn--warn">Revoke code</button>
+                    </form>
+                  )}
+                  {!r.canApprove && !r.canIssue && !r.canRevoke && (
+                    <span class="muted">
+                      {r.identityCode ? 'Complete' : 'No action available to you'}
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+  </div>
+</AdminLayout>
+
+<style>
+  .wrap { padding: 20px; max-width: 1400px; }
+  .head h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #9aa0aa; font-size: 13px; margin: 0 0 18px; max-width: 70ch; }
+  .note { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; }
+  .note--ok { background: rgba(46,160,90,0.12); border: 1px solid rgba(46,160,90,0.4); }
+  .note--err { background: rgba(200,60,60,0.12); border: 1px solid rgba(200,60,60,0.4); }
+  .secret {
+    border: 1px solid rgba(255,190,80,0.5); background: rgba(255,190,80,0.08);
+    border-radius: 8px; padding: 14px 16px; margin-bottom: 18px;
+  }
+  .secret__eyebrow { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 6px; color: #d9b169; }
+  .secret__code {
+    font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 22px; letter-spacing: 0.06em;
+    margin: 0 0 8px; user-select: all;
+  }
+  .secret__note { font-size: 12px; color: #b9bec7; margin: 0; max-width: 80ch; line-height: 1.5; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .tile { border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .tile__n { font-size: 22px; font-weight: 600; }
+  .tile__l { font-size: 11px; color: #9aa0aa; text-transform: uppercase; letter-spacing: 0.06em; }
+  .tablewrap { overflow-x: auto; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 900px; }
+  th { text-align: left; padding: 10px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; border-bottom: 1px solid rgba(255,255,255,0.1); }
+  td { padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.06); vertical-align: top; }
+  td strong { display: block; }
+  .mono { display: block; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #8b919b; }
+  .stage { display: inline-block; font-size: 12px; }
+  .acts { display: flex; flex-direction: column; gap: 8px; min-width: 220px; }
+  .acts form { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .btn { border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.06); color: inherit; padding: 6px 10px; border-radius: 5px; font-size: 12px; cursor: pointer; }
+  .btn--go { border-color: rgba(46,160,90,0.5); }
+  .btn--warn { border-color: rgba(200,60,60,0.5); }
+  .days { font-size: 11px; color: #9aa0aa; display: flex; align-items: center; gap: 4px; }
+  .days input { width: 54px; }
+  input[type=text], input[type=number] { background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.14); color: inherit; padding: 5px 7px; border-radius: 4px; font-size: 12px; }
+  .revoke input[type=text] { width: 140px; }
+  .muted { color: #6f757e; font-size: 12px; }
+  .empty { color: #9aa0aa; font-size: 13px; max-width: 70ch; line-height: 1.6; }
+</style>
