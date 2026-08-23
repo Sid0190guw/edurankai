@@ -61,6 +61,38 @@ const draft = safeDraft(draftRow?.data);
 const profileCommon = await getProfileCommon(user.id);
 const s1 = { ...profileCommon, ...(draft.step1 || {}) };
 
+// -------------------------------------------------------------------------------------------------
+// HORIZON PATCH 01 — the optional, authorised personal profile section.
+//
+// EVERY `const` HERE IS DECLARED BEFORE THE POST HANDLER BELOW. `const` is not hoisted, and a handler
+// reaching a later declaration has taken pages down on this project more than once.
+//
+// The section is ADDITIVE. The recruitment fields above it — date of birth, birth time, birth place —
+// are unchanged, still validated the same way, and still written into the draft and onward to
+// `applications` exactly as before. What this adds is: how precisely the time is known, which time
+// zone the place was on, optional coordinates, and the authorisation that decides whether any of it
+// is kept in the consent-controlled store at all.
+//
+// IT IS NOT OFFERED WHEN IT CANNOT BE HONOURED. If this deployment has no encryption key, the section
+// does not render and nobody types their details into a field that was never going to keep them.
+// -------------------------------------------------------------------------------------------------
+const { INTAKE_LABELS, CURRENT_NOTICE, TIME_PRECISIONS, TIME_PRECISION_LABELS } = await import('@/lib/horizon/intake');
+const { encryptionAvailable, currentConsent, subjectForUser } = await import('@/lib/horizon/intake');
+const { supportedTimezones } = await import('@/lib/horizon/intake');
+
+const foundationAvailable = encryptionAvailable();
+const foundationConsentState = foundationAvailable ? await currentConsent(subjectForUser(user.id)) : null;
+// Checked by default when a live authorisation is already on file, so re-walking the form to fix a
+// typo cannot silently read as "I withdraw". Unticking it stays a deliberate act.
+const foundationTicked = s1.foundationConsent !== undefined
+  ? s1.foundationConsent === true || s1.foundationConsent === 'yes'
+  : !!foundationConsentState?.granted;
+const tzOptions = foundationAvailable ? supportedTimezones() : [];
+const precisionOptions = TIME_PRECISIONS.filter((p) => p !== 'unknown')
+  .map((p) => ({ value: p, label: TIME_PRECISION_LABELS[p] }));
+let foundationNotice = '';
+let foundationIssues: { field: string; message: string }[] = [];
+
 let errorMsg = '';
 
 if (Astro.request.method === 'POST') {
@@ -82,6 +114,16 @@ if (Astro.request.method === 'POST') {
     dateOfBirth: (fd.get('dateOfBirth') as string || '').trim(),
     birthTime: (fd.get('birthTime') as string || '').trim(),
     birthPlace: (fd.get('birthPlace') as string || '').trim(),
+    // HORIZON Patch 01. Kept in the draft alongside everything else so the step re-renders with what
+    // the person typed; the values that are actually KEPT go through the consent-gated,
+    // encrypted store below, never through the application row.
+    birthTimePrecision: (fd.get('birthTimePrecision') as string || '').trim(),
+    birthTimezone: (fd.get('birthTimezone') as string || '').trim(),
+    birthTimezoneSource: (fd.get('birthTimezoneSource') as string || '').trim(),
+    birthLatitude: (fd.get('birthLatitude') as string || '').trim(),
+    birthLongitude: (fd.get('birthLongitude') as string || '').trim(),
+    birthCoordinatesSource: (fd.get('birthCoordinatesSource') as string || '').trim(),
+    foundationConsent: fd.get('foundationConsent') === 'yes',
     photoUrl: photoValue,
     familyAnnualIncome: (fd.get('familyAnnualIncome') as string || '').trim(),
     instagram: (fd.get('instagram') as string || '').trim(),
@@ -123,13 +165,60 @@ if (Astro.request.method === 'POST') {
   if (missing.length > 0) {
     errorMsg = 'Please fill in: ' + missing.join(', ');
   } else {
-    const newDraft = { ...draft, step1: data };
+    // The draft is an untyped JSON blob (safeDraft returns Record<string, any>) and carries
+    // top-level keys beside the per-step objects - roleSlug is one of them, read back by
+    // level.astro and step-2. Spreading drops the index signature, so it is declared here.
+    const newDraft: Record<string, any> = { ...draft, step1: data };
     if (roleSlug && !newDraft.roleSlug) newDraft.roleSlug = roleSlug;
     await saveDraft(user.id, user.email, newDraft, 2);
     // Persist the common info to the applicant's profile so their NEXT
     // application pre-fills automatically (survives draft deletion on submit).
     await saveCommonFromStep1(user.id, user.email, data);
-    return Astro.redirect('/apply/level' + (roleSlug ? '?role=' + roleSlug : ''));
+
+    // HORIZON PATCH 01. Runs AFTER the draft is saved, so nothing the person typed can be lost by
+    // anything that happens here. `applyFoundationDecision` never throws: it returns an outcome.
+    //
+    // The ONLY outcome that holds the person on this step is `invalid` — a correctable mistake in
+    // the optional section, where continuing would silently discard what they asked us to keep. The
+    // message says plainly that the rest of the application is already saved. Every other failure
+    // (no key, a write that would not land) lets them continue and tells them what did not happen.
+    let holdHere = false;
+    if (foundationAvailable) {
+      const { applyFoundationDecision } = await import('@/lib/horizon/intake');
+      const decision = await applyFoundationDecision({
+        userId: user.id,
+        displayName: user.name || null,
+        consented: data.foundationConsent,
+        form: {
+          dateOfBirth: data.dateOfBirth,
+          timeOfBirth: data.birthTime,
+          timePrecision: data.birthTimePrecision,
+          birthPlace: data.birthPlace,
+          latitude: data.birthLatitude,
+          longitude: data.birthLongitude,
+          coordinatesSource: data.birthCoordinatesSource,
+          timezoneId: data.birthTimezone,
+          timezoneSource: data.birthTimezoneSource,
+        },
+        source: 'apply/step-1',
+        ipAddress: (Astro.request.headers.get('x-forwarded-for') || Astro.clientAddress || '').split(',')[0].trim(),
+        userAgent: Astro.request.headers.get('user-agent'),
+      });
+      if (decision.outcome === 'invalid') {
+        holdHere = true;
+        foundationIssues = decision.errors;
+        errorMsg = decision.message;
+      } else if (decision.outcome === 'unavailable' || decision.outcome === 'failed') {
+        foundationNotice = decision.message;
+        // TOLD ONCE, NEVER TRAPPED. The person stays on this step so they actually see that the
+        // optional section was not saved; the hidden `foundationRetried` field means their next
+        // Continue goes through regardless of whether the fault has cleared. An infrastructure
+        // problem must not become a person who cannot finish an application.
+        if (fd.get('foundationRetried') !== '1') holdHere = true;
+      }
+    }
+
+    if (!holdHere) return Astro.redirect('/apply/level' + (roleSlug ? '?role=' + roleSlug : ''));
   }
 }
 
@@ -192,7 +281,20 @@ const roleSecurity = await getRoleSecurity(preselectedRole?.id);
     </div>
   )}
 
+  {foundationIssues.length > 0 && (
+    <ul style="background:rgba(220,38,38,0.04);border:1px solid rgba(220,38,38,0.2);color:#b91c1c;font-size:0.82rem;padding:11px 14px 11px 30px;border-radius:8px;margin-bottom:18px;line-height:1.6;list-style:disc;">
+      {foundationIssues.map((i) => <li>{i.message}</li>)}
+    </ul>
+  )}
+
+  {foundationNotice && (
+    <div style="background:rgba(180,120,20,0.06);border:1px solid rgba(180,120,20,0.25);color:#92600e;font-size:0.85rem;padding:11px 14px;border-radius:8px;margin-bottom:18px;line-height:1.6;">
+      {foundationNotice}
+    </div>
+  )}
+
   <form method="POST" class="flex flex-col gap-5">
+    {foundationNotice && <input type="hidden" name="foundationRetried" value="1" />}
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
       <div>
@@ -267,6 +369,81 @@ const roleSecurity = await getRoleSecurity(preselectedRole?.id);
         <input type="text" name="birthPlace" required value={s1.birthPlace || ''} placeholder="City and country where you were born" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2 transition-colors" />
       </div>
     </div>
+
+    {foundationAvailable && (
+      <div class="border-t border-ink/8 pt-5" id="foundationSection">
+        <p class="text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">{INTAKE_LABELS.sectionTitle}</p>
+        <p class="text-[0.82rem] text-ink-2 leading-relaxed mb-4">{INTAKE_LABELS.sectionLead}</p>
+
+        <div class="bg-cream-2/60 border border-ink/10 rounded-xl p-4 mb-4 text-[0.8rem] text-ink-2 leading-relaxed">
+          <p class="font-semibold text-ink mb-2">What we would hold</p>
+          <ul class="list-disc pl-5 space-y-1">
+            {CURRENT_NOTICE.dataCollected.map((line) => <li>{line}</li>)}
+          </ul>
+          <p class="font-semibold text-ink mt-3 mb-2">What it is used for</p>
+          <ul class="list-disc pl-5 space-y-1">
+            {CURRENT_NOTICE.purposes.map((line) => <li>{line}</li>)}
+          </ul>
+          <p class="font-semibold text-ink mt-3 mb-2">What it is never used for</p>
+          <ul class="list-disc pl-5 space-y-1">
+            {CURRENT_NOTICE.limits.map((line) => <li>{line}</li>)}
+          </ul>
+          <p class="font-semibold text-ink mt-3 mb-2">Who can see it, and for how long</p>
+          <ul class="list-disc pl-5 space-y-1">
+            {CURRENT_NOTICE.access.map((line) => <li>{line}</li>)}
+            {CURRENT_NOTICE.retention.map((line) => <li>{line}</li>)}
+          </ul>
+          <p class="text-[0.72rem] text-ink-soft mt-3">Notice version {CURRENT_NOTICE.version}. You can withdraw at any time at <a href={CURRENT_NOTICE.withdrawalUrl} class="text-sky hover:underline">{CURRENT_NOTICE.withdrawalUrl}</a>.</p>
+        </div>
+
+        <label class="flex items-start gap-3 bg-white border border-ink/15 rounded-lg p-3.5 cursor-pointer mb-4">
+          <input type="checkbox" name="foundationConsent" value="yes" checked={foundationTicked} class="mt-1" />
+          <span>
+            <span class="block text-[0.85rem] font-semibold text-ink">{INTAKE_LABELS.consentCheckbox}</span>
+            <span class="block text-[0.78rem] text-ink-2 leading-relaxed mt-1">{CURRENT_NOTICE.affirmation}</span>
+            <span class="block text-[0.72rem] text-ink-soft italic mt-1.5">{INTAKE_LABELS.declineNote}</span>
+          </span>
+        </label>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">{INTAKE_LABELS.timePrecision}</label>
+            <select name="birthTimePrecision" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2 transition-colors">
+              <option value="">Not sure</option>
+              {precisionOptions.map((p) => <option value={p.value} selected={s1.birthTimePrecision === p.value}>{p.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">{INTAKE_LABELS.timezone}</label>
+            <select id="birthTimezone" name="birthTimezone" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2 transition-colors">
+              <option value="">Not sure</option>
+              {tzOptions.map((z) => <option value={z} selected={s1.birthTimezone === z}>{z}</option>)}
+            </select>
+            <input type="hidden" id="birthTimezoneSource" name="birthTimezoneSource" value={s1.birthTimezoneSource || ''} />
+            <p class="text-[0.7rem] text-ink-soft mt-1 italic">{INTAKE_LABELS.timezoneHelp}</p>
+          </div>
+        </div>
+
+        <details class="mt-4">
+          <summary class="text-[0.78rem] font-semibold text-ink-2 cursor-pointer">{INTAKE_LABELS.coordinates}</summary>
+          <p class="text-[0.72rem] text-ink-soft mt-1.5 mb-3 italic">{INTAKE_LABELS.coordinatesHelp}</p>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div>
+              <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">{INTAKE_LABELS.latitude}</label>
+              <input type="text" name="birthLatitude" inputmode="decimal" value={s1.birthLatitude || ''} placeholder="21.1458" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2 transition-colors" />
+            </div>
+            <div>
+              <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">{INTAKE_LABELS.longitude}</label>
+              <input type="text" name="birthLongitude" inputmode="decimal" value={s1.birthLongitude || ''} placeholder="79.0882" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2 transition-colors" />
+            </div>
+            <div>
+              <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">{INTAKE_LABELS.coordinatesSource}</label>
+              <input type="text" name="birthCoordinatesSource" value={s1.birthCoordinatesSource || ''} placeholder="Birth certificate" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2 transition-colors" />
+            </div>
+          </div>
+        </details>
+      </div>
+    )}
 
     <div class="border-t border-ink/8 pt-5">
       <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Your photo <span class="text-ink-soft/60 font-normal normal-case tracking-normal">(optional)</span></label>
@@ -547,6 +724,51 @@ const roleSecurity = await getRoleSecurity(preselectedRole?.id);
         say('Location received and recorded. You can continue.', 'text-green-400');
       });
     });
+  })();
+</script>
+
+<script is:inline>
+  /* HORIZON Patch 01 — offer the browser's own time zone as the default.
+   *
+   * WHY THIS IS NOT JUST `select.value = tz`. The server renders its option list from
+   * Intl.supportedValuesOf('timeZone'), and on the Node build this runs on that list holds the
+   * LEGACY names: Asia/Calcutta, Europe/Kiev, Asia/Rangoon. Browsers report the modern ones —
+   * Asia/Kolkata, Europe/Kyiv, Asia/Yangon — so a plain assignment silently matches nothing and
+   * leaves the field blank for a large part of the world, India included.
+   *
+   * So: try the exact value; if no option has it, ADD one. The server accepts either spelling
+   * (canonicalTimezone in birth-input.ts resolves both through Intl), so the added option is a real
+   * answer and not a workaround with a hole in it.
+   *
+   * A DEFAULT, NOT A DECISION. It is only applied when the field is empty, the source is recorded as
+   * `device` rather than `declared`, and the person can change it or clear it. Nothing here guesses
+   * a zone from a place name — that is exactly what the server refuses to do.
+   */
+  (function () {
+    var sel = document.getElementById('birthTimezone');
+    var src = document.getElementById('birthTimezoneSource');
+    if (!sel || !src) return;
+    if (sel.value) { if (!src.value) src.value = 'declared'; return; }
+
+    var tz = '';
+    try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { tz = ''; }
+    if (!tz) return;
+
+    var found = false;
+    for (var i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === tz) { found = true; break; }
+    }
+    if (!found) {
+      var opt = document.createElement('option');
+      opt.value = tz;
+      opt.textContent = tz;
+      sel.insertBefore(opt, sel.options[1] || null);
+    }
+    sel.value = tz;
+    src.value = 'device';
+
+    /* Once the person touches it, it is their declaration and not the device's. */
+    sel.addEventListener('change', function () { src.value = sel.value ? 'declared' : ''; });
   })();
 </script>
 
