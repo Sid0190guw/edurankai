@@ -4,20 +4,22 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { guardInterviewSession } from '@/lib/aquin/interview-session';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 
-// EXAMINED AND NOT CONVERTED — NO CAPABILITY APPLIES; THE MISSING TEST IS SESSION OWNERSHIP.
-// No authorization at all, and /api/ has no structural gate. Anyone holding a sessionId can end
-// someone else's in-progress interview and push an "interview completed" notification naming that
-// candidate to admins. See the fuller note in enroll-face.ts.
-export const POST: APIRoute = async ({ request }) => {
+// SESSION OWNERSHIP IS THE TEST, AND IT IS NOW MADE — see src/lib/aquin/interview-session.ts.
+// Before the guard below, anyone holding a sessionId could end someone else's in-progress interview
+// and push an "interview completed" notification naming that candidate to admins.
+export const POST: APIRoute = async ({ request, cookies }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
   const sessionId = (body?.sessionId || '').toString();
   if (!sessionId) return json({ ok: false, error: 'sessionId required' }, 400);
+  const gate = guardInterviewSession(cookies, sessionId);
+  if (!gate.ok) return json({ ok: false, error: gate.error }, gate.status);
 
   try {
     await db.execute(sql`

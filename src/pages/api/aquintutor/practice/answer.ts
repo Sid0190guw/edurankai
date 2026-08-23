@@ -27,14 +27,39 @@ export const POST: APIRoute = async ({ request, locals }) => {
     // question_text / category / the CURRENT empirical difficulty come along for the AquinTutor Mind
     // event below — read here so the capture costs no extra query, and read BEFORE the stats update
     // so the difficulty recorded is the one this learner actually faced.
+    // =============================================================================================
+    // THE SAME GATE ITS OWN SIBLING ALREADY APPLIES, AND WITHOUT IT THIS WAS THE ANSWER KEY
+    // =============================================================================================
+    //
+    // test_questions is not a practice bank. It is THE question table — /admin/tests/[id] writes
+    // into it, attempts are marked from it, and q.correct_answer is the mark scheme. This lookup
+    // used to match on the question id ALONE, and the route has no authentication of any kind
+    // (`user` below is only used to award XP and record events, never to authorise). So an
+    // unauthenticated POST of any question id came back with correct_answer, accepted_answers and
+    // explanation — for a live, proctored, unpublished assessment as readily as for a practice set.
+    // A candidate sitting a test in another tab could read the mark scheme one question at a time.
+    //
+    // practice/start.ts, which hands OUT the questions, has always required the parent test to be
+    // `is_published = true` AND practice-enabled, and it strips correct_answer before replying. The
+    // door that gives feedback simply never asked. The rule is not new and is not widened here — it
+    // is the same rule, applied at the second door. A question the practice runner may legitimately
+    // serve still grades exactly as before; a question belonging to a live or unpublished test is
+    // no longer gradeable at this URL.
     const q = rows(await db.execute(sql`
       SELECT q.id, q.question_type, q.options, q.correct_answer, q.accepted_answers, q.answer_tolerance,
              q.explanation, q.marks, q.question_text, q.category,
              COALESCE(s.empirical_difficulty, 0.5)::float8 AS emp_diff
       FROM test_questions q
+      JOIN tests t ON t.id = q.test_id
       LEFT JOIN question_stats s ON s.question_id = q.id
-      WHERE q.id = ${questionId} LIMIT 1
+      WHERE q.id = ${questionId}
+        AND q.is_active = true
+        AND t.is_published = true
+        AND COALESCE(t.practice_enabled, true) = true
+      LIMIT 1
     `))[0] as any;
+    // Deliberately the SAME answer for "no such question" and "that question is not practisable":
+    // telling the two apart is how somebody maps which ids belong to a live assessment.
     if (!q) return json({ ok: false, error: 'Question not found' }, 404);
 
     const u = body.answer;

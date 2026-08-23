@@ -6,6 +6,7 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { askFollowUp, isLlmConfigured } from '@/lib/llm';
+import { guardInterviewSession } from '@/lib/aquin/interview-session';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -14,11 +15,12 @@ function json(d: any, s = 200) {
 const VAGUE_THRESHOLD_CHARS = 50;
 const MAX_FOLLOWUPS_PER_SEED = 1; // single follow-up per seed keeps interviews snappy
 
-// EXAMINED AND NOT CONVERTED — NO CAPABILITY APPLIES; THE MISSING TEST IS SESSION OWNERSHIP.
-// No authorization at all, and /api/ has no structural gate. Anyone holding a sessionId can append
-// transcript turns to a named candidate's interview record and drive the follow-up logic. See the
-// fuller note in enroll-face.ts; the whole folder needs one ownership fix, not a capability.
-export const POST: APIRoute = async ({ request }) => {
+// SESSION OWNERSHIP IS THE TEST, AND IT IS NOW MADE — see src/lib/aquin/interview-session.ts.
+// Before the guard below, anyone holding a sessionId could append transcript turns to a named
+// candidate's interview record and drive the follow-up logic — which also spends LLM tokens on
+// somebody else's account. The whole folder needed one ownership fix, not a capability, and this is
+// it; no sign-in was added.
+export const POST: APIRoute = async ({ request, cookies }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
 
@@ -29,6 +31,8 @@ export const POST: APIRoute = async ({ request }) => {
   const justAnsweredFollowUp = !!body?.justAnsweredFollowUp;
 
   if (!sessionId) return json({ ok: false, error: 'sessionId required' }, 400);
+  const gate = guardInterviewSession(cookies, sessionId);
+  if (!gate.ok) return json({ ok: false, error: gate.error }, gate.status);
   if (!transcript) return json({ ok: false, error: 'transcript required' }, 400);
 
   try {

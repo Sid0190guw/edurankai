@@ -10,34 +10,37 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ALLOWED_PROCTOR_EVENT_TYPES, VALID_SEVERITIES } from '@/lib/proctor-events';
 import { eventWeight, strikesFor } from '@/lib/sentinel';
+import { guardInterviewSession } from '@/lib/aquin/interview-session';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
-// EXAMINED AND NOT CONVERTED — NO CAPABILITY APPLIES, AND THE MISSING TEST IS SESSION OWNERSHIP.
+// SESSION OWNERSHIP IS THE TEST, AND IT IS NOW MADE — see src/lib/aquin/interview-session.ts.
 //
-// There is no authorization here at all: possession of a sessionId string is the only requirement,
-// and /api/ has no structural gate (src/middleware.ts isExempt() returns true for it). So an
-// unauthenticated caller who learns a session id can drive another person's risk_score, strikes_count
-// and tab_switches, and trip the auto-termination below in their name.
+// What this route did before: possession of a sessionId string was the only requirement, and /api/
+// has no structural gate (src/middleware.ts isExempt() returns true for it). An unauthenticated
+// caller who learned a session id could drive another person's risk_score, strikes_count and
+// tab_switches, and trip the auto-termination below in their name.
 //
 // CLAUDE.md is explicit that automated proctoring is ADVISORY ONLY and a human decides. An
-// unauthenticated writer into the advisory pipeline is the sharp edge of that rule: the strikes are
+// unauthenticated writer into the advisory pipeline was the sharp edge of that rule: the strikes are
 // stamped on a named candidate's record and a reviewer reads them as evidence.
 //
-// A capability is the wrong instrument — the question is not "may this person log proctoring events"
-// but "is this caller the candidate whose session this is". That needs the session bound to the
-// signed-in user (or to a one-time token issued when it starts), which changes who can call the
-// route, so it is reported for a human rather than shipped in a mechanism-only pass.
-export const POST: APIRoute = async ({ request, clientAddress }) => {
+// A capability was the wrong instrument — the question is not "may this person log proctoring
+// events" but "is this caller the candidate whose session this is". That is the one-time binding
+// /start now mints, which is the second option the earlier note named. Nobody new can call this
+// route; people who are not the candidate no longer can.
+export const POST: APIRoute = async ({ request, clientAddress, cookies }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
 
   const sessionId = (body?.sessionId || '').toString();
   const events = Array.isArray(body?.events) ? body.events : [];
   if (!sessionId) return json({ ok: false, error: 'sessionId required' }, 400);
+  const gate = guardInterviewSession(cookies, sessionId);
+  if (!gate.ok) return json({ ok: false, error: gate.error }, gate.status);
   if (events.length === 0) return json({ ok: true, inserted: 0 });
   if (events.length > 200) return json({ ok: false, error: 'too many events (max 200)' }, 400);
 

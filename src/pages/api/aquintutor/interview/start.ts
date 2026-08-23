@@ -2,15 +2,23 @@
 // Body: { templateSlug, candidateName?, candidateEmail?, language? }
 // Creates a session and returns the first seed question.
 // Auth optional; if signed in, candidate_id is linked.
+//
+// THIS IS WHERE THE SESSION IS BOUND TO THE BROWSER THAT ASKED FOR IT. bindSession() sets an
+// HttpOnly signature over the new session id, and the five writers under this folder require it
+// back — without it, possession of a sessionId string was the whole credential for overwriting a
+// candidate's face reference, their ID document and their proctoring record. See
+// src/lib/aquin/interview-session.ts. Sign-in is still not required and candidate_id is still
+// optional: the binding is to the browser, not to an account.
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { bindSession } from '@/lib/aquin/interview-session';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 
-export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
+export const POST: APIRoute = async ({ request, locals, clientAddress, cookies }) => {
   const user = (locals as any)?.user;
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
@@ -64,6 +72,16 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
     `);
     const insRows = Array.isArray(ins) ? ins : (ins?.rows || []);
     const session = insRows[0] as any;
+
+    // Bound BEFORE the first turn is written, so there is no window in which a session exists that
+    // nothing can prove ownership of. A deployment with no SESSION_SECRET cannot sign, and the
+    // writers refuse rather than accept an unsigned caller — so the interview is stopped here, with
+    // a sentence, instead of at the first upload.
+    if (!bindSession(cookies, session.id)) {
+      console.error('[interview/start] could not bind session', session.id, '- SESSION_SECRET is missing or the cookie could not be set');
+      await db.execute(sql`UPDATE ai_interview_sessions SET status = 'abandoned', ended_at = NOW() WHERE id = ${session.id}`).catch(() => {});
+      return json({ ok: false, error: 'This deployment cannot start an interview right now. Nothing was recorded.' }, 503);
+    }
 
     // First AI turn = first seed
     const firstSeed = seeds[0] as any;

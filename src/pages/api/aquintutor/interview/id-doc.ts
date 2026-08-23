@@ -5,24 +5,31 @@ import type { APIRoute } from 'astro';
 import { put } from '@vercel/blob';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { guardInterviewSession } from '@/lib/aquin/interview-session';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
 const MAX_BYTES = 12 * 1024 * 1024;
 const ALLOWED: { [e: string]: string } = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', pdf: 'application/pdf' };
 
-// EXAMINED AND NOT CONVERTED — NO CAPABILITY APPLIES; THE MISSING TEST IS SESSION OWNERSHIP.
+// SESSION OWNERSHIP IS THE TEST, AND IT IS NOW MADE — see src/lib/aquin/interview-session.ts.
 //
-// No authorization at all, and /api/ has no structural gate. This is two problems at once: an
-// unauthenticated 12 MB upload into the PUBLIC blob store, and an UPDATE that can replace the ID
-// document a reviewer will look at on any session id the caller names. See the fuller note in
-// enroll-face.ts — the fix is binding the session to its candidate, which no role grant can express.
-export const POST: APIRoute = async ({ request }) => {
+// This was two problems at once: an unauthenticated 12 MB upload into the PUBLIC blob store, and an
+// UPDATE that could replace the ID document a reviewer will look at on any session id the caller
+// names. The guard below closes both, because neither can be reached without the cookie /start
+// minted for this session.
+//
+// STILL TRUE AND NOT FIXED HERE: the blob itself is written with `access: 'public'`, so the URL —
+// once known — is readable by anyone. It is unguessable (addRandomSuffix) rather than protected, and
+// making it private is a separate change that has to move the reviewer's read path with it.
+export const POST: APIRoute = async ({ request, cookies }) => {
   let form: FormData;
   try { form = await request.formData(); } catch { return json({ ok: false, error: 'Expected form data' }, 400); }
   const sessionId = (form.get('sessionId') as string || '').trim();
   const file = form.get('file');
   if (!sessionId) return json({ ok: false, error: 'sessionId required' }, 400);
+  const gate = guardInterviewSession(cookies, sessionId);
+  if (!gate.ok) return json({ ok: false, error: gate.error }, gate.status);
   if (!(file instanceof File) || file.size === 0) return json({ ok: false, error: 'No file' }, 400);
   if (file.size > MAX_BYTES) return json({ ok: false, error: 'File too large (max 12 MB)' }, 400);
   const ext = (file.name || '').toLowerCase().split('.').pop() || '';

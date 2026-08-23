@@ -17,32 +17,77 @@ Largest families: `labs` (63 routes), `admin` (24), `campus` (11).
 
 ## Finding 1 — laboratory discoverability
 
-**Verified, and it is not what the first scan said.**
+**CORRECTED. Both of this finding's original headline numbers were wrong, and the corrections run in
+opposite directions: the estate is in better shape than reported, and it contained one real problem
+that the reachability question was never going to surface.**
 
-| | |
+What the first version of this section said:
+
+> Genuinely unreachable: 1 page — `/aquintutor/labs/cad-bench`.
+> A learner browsing `/aquintutor/labs` is offered 20 of 61 laboratories.
+
+Both are false, and for the same root cause: the detector read `src/data/labs-catalog.ts`, whose own
+header describes it as the **licensable** catalogue for the partner-facing page. The learner-facing
+`labs/index.astro` carries its own arrays and does not import that file. Two different lists were
+being treated as one. `cad-bench` is on the learner index at line 24 with `live: true` and always was.
+
+Measured against the right file:
+
+| | count |
 |---|---|
-| Lab pages on disk | 61 |
-| Slugs in `src/data/labs-catalog.ts` (the learner-facing index) | 20 |
+| Lab pages on disk | **60** |
+| Slugs listed on the learner index | **50** |
+| Slugs in the licensing catalogue (a different list, for a different page) | 20 |
 | Catalogued slugs with no page (broken links) | **0** |
-| Pages not in the catalogue | 41 |
+| **Genuinely unreachable** | **0** |
 
-Splitting those 41 by whether anything else reaches them:
+The ten not on the index are reachable by design rather than by accident:
 
-- **31** appear in `src/lib/aquintutor-authoring.ts`, so a teacher can embed them in a lesson.
-- **9** appear in neither.
-- Of those 9, **8 are linked from a parent lab page** — a hub-and-spoke pattern:
-  `ai-ml` → `attention`, `cybersecurity` → `ecc-workbench` + `rsa-attacks`,
-  `dsp` → `filter-designer`, `vlsi` → `cpu-pipeline`, `quantum-lab` → `quantum-vqe`,
-  `control-systems` → `control-lab`, and `xr` from the labs index.
+- **8 are hub-linked from a parent laboratory** — `ai-ml` → `attention`, `cybersecurity` →
+  `ecc-workbench` + `rsa-attacks`, `dsp` → `filter-designer`, `vlsi` → `cpu-pipeline`,
+  `quantum-lab` → `quantum-vqe`, `control-systems` → `control-lab`, and `xr`, linked from the index
+  itself by href rather than by slug — which is exactly why a slug-only scan missed it.
+- **`animator`** is embedded from the lesson player, the authoring tool and the home data.
+- **`train`** is not a laboratory at all. See below.
 
-**Genuinely unreachable: 1 page — `/aquintutor/labs/cad-bench`.**
+**Gap classification: none.** The discoverability crisis this section originally reported does not
+exist. `src/lib/aquin-surface.test.ts` now pins the distinction between the two lists, because the
+failure mode worth guarding is somebody later pointing the learner index at the licensing catalogue
+and silently cutting the estate to a third.
 
-**The real gap is discoverability, not breakage.** A learner browsing `/aquintutor/labs` is offered
-20 of 61 laboratories. The other 41 exist, work, and are reachable only by already being inside a
-lesson or a parent lab that happens to link them. Nothing 404s; two thirds of the estate is simply
-not on the map.
+## Finding 1a — `/aquintutor/labs/train` accepted writes from anybody  ·  P1, FIXED
 
-**Gap classification:** `UX` + `INTEGRATION`, not `BROKEN` or `ORPHAN`.
+Found while verifying the reachability numbers above, and unrelated to them. Recorded separately
+because it is the more serious item and would be lost inside a discoverability finding.
+
+`labs/train` is a 695-line **LLM fine-tuning console** — base model, dataset URL, custom weights URL,
+hyperparameters — sitting in the public `/aquintutor/labs/` namespace where every neighbouring page is
+a learner-facing laboratory. Nothing links to it. It answered **HTTP 200 to an anonymous request on
+the live site**.
+
+Line 6 read `const user = Astro.locals.user` and never consulted it again. The POST handler inserted
+into `training_jobs` with `user_id = ${user?.id || null}`; the null branch is the tell, since it says
+an anonymous writer was expected to work — and it did.
+
+**Severity, stated accurately rather than dramatically.** Grep found no worker and no cron consuming
+`training_jobs`. Nothing ever fetched the `dataset_url` or the custom weights URL, so there was no
+server-side fetch to abuse and no code execution: **not SSRF, not RCE.** What a stranger could
+actually do was insert unbounded rows carrying chosen job names and URLs into a production table —
+and those rows render on the AquinTutor admin dashboard, so text an administrator reads was writable
+by anybody. That is a P1, not a P0.
+
+**Fixed**: signed-out visitors are redirected to sign in, and the page now admits the same roles as
+its only consumer, `/aquintutor/admin/index.astro`, so the two cannot drift apart. A regression test
+asserts both the specific gate and the general rule.
+
+**The general rule is the durable part.** `aquin-surface.test.ts` now requires every page under
+`/aquintutor` that accepts a POST and writes to the database to *decide* who may — reading
+`locals.user` does not count. Running it immediately surfaced five more ungated writers: hall
+bookings, placement requests, study-abroad enquiries, EIR applications and partnership applications.
+Those were traced individually and are **public application forms** — requiring an account before
+somebody may apply to a partnership programme would defeat the purpose — so they are exempted by an
+**explicit written list**, not by an inferred pattern. A rule like "the table name ends in `_requests`
+so it is probably fine" would have quietly exempted `training_jobs` too.
 
 ## Finding 2 — dead interactions: effectively none
 
