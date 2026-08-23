@@ -1,4 +1,4 @@
----
+﻿---
 import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
@@ -39,34 +39,54 @@ try {
   featuredCourses = Array.isArray(r) ? r : (r?.rows || []);
 } catch (_) {}
 
+// SEVEN COUNTS, ONE ROUND TRIP.
+//
+// These were seven separate `await db.execute(...)` calls. Each await is a network round trip, and
+// a round trip to this database measures ~139ms, so this block alone cost about a second before the
+// page rendered anything. They cannot overlap either: the pool is max:1 per instance (see
+// src/lib/db/index.ts), so issuing them concurrently would still run them one at a time on the one
+// connection. Scalar subqueries in a single SELECT is the shape that actually removes the cost.
+//
+// The per-count try/catch is preserved in effect, not in form. Each count previously tolerated its
+// own table being absent while the others still rendered; combining them means one missing table
+// would zero all seven. So the fallback below re-runs them individually on failure — the fast path
+// is one round trip, and the degraded path behaves exactly as before.
 try {
-  const r = await db.execute(sql`SELECT COUNT(*)::int as n FROM training_courses WHERE is_published = true AND access_type IN ('public', 'both')`);
-  courseCount = ((Array.isArray(r) ? r : (r?.rows || []))[0] as any)?.n || 0;
-} catch (_) {}
-try {
-  const r = await db.execute(sql`SELECT COUNT(*)::int as n FROM training_lessons l JOIN training_courses c ON l.course_id = c.id WHERE c.is_published = true`);
-  lessonCount = ((Array.isArray(r) ? r : (r?.rows || []))[0] as any)?.n || 0;
-} catch (_) {}
-try {
-  const r = await db.execute(sql`SELECT COUNT(*)::int as n FROM training_certificates`);
-  certCount = ((Array.isArray(r) ? r : (r?.rows || []))[0] as any)?.n || 0;
-} catch (_) {}
-try {
-  const r = await db.execute(sql`SELECT COUNT(DISTINCT user_id)::int as n FROM training_enrollments`);
-  enrolledCount = ((Array.isArray(r) ? r : (r?.rows || []))[0] as any)?.n || 0;
-} catch (_) {}
-try {
-  const r = await db.execute(sql`SELECT COUNT(*)::int as n FROM academic_departments`);
-  deptCount = ((Array.isArray(r) ? r : (r?.rows || []))[0] as any)?.n || 0;
-} catch (_) {}
-try {
-  const r = await db.execute(sql`SELECT COUNT(*)::int as n FROM training_instructors`);
-  facultyCount = ((Array.isArray(r) ? r : (r?.rows || []))[0] as any)?.n || 0;
-} catch (_) {}
-try {
-  const r = await db.execute(sql`SELECT COUNT(*)::int as n FROM test_attempts WHERE status = 'in_progress' AND started_at > NOW() - INTERVAL '4 hours'`);
-  liveAttempts = ((Array.isArray(r) ? r : (r?.rows || []))[0] as any)?.n || 0;
-} catch (_) {}
+  const r = await db.execute(sql`SELECT
+    (SELECT COUNT(*)::int FROM training_courses WHERE is_published = true AND access_type IN ('public', 'both')) AS courses,
+    (SELECT COUNT(*)::int FROM training_lessons l JOIN training_courses c ON l.course_id = c.id WHERE c.is_published = true) AS lessons,
+    (SELECT COUNT(*)::int FROM training_certificates) AS certs,
+    (SELECT COUNT(DISTINCT user_id)::int FROM training_enrollments) AS enrolled,
+    (SELECT COUNT(*)::int FROM academic_departments) AS depts,
+    (SELECT COUNT(*)::int FROM training_instructors) AS faculty,
+    (SELECT COUNT(*)::int FROM test_attempts WHERE status = 'in_progress' AND started_at > NOW() - INTERVAL '4 hours') AS live`);
+  const row = ((Array.isArray(r) ? r : (r?.rows || []))[0] as any) || {};
+  courseCount = row.courses || 0;
+  lessonCount = row.lessons || 0;
+  certCount = row.certs || 0;
+  enrolledCount = row.enrolled || 0;
+  deptCount = row.depts || 0;
+  facultyCount = row.faculty || 0;
+  liveAttempts = row.live || 0;
+} catch (e: any) {
+  // The real Postgres reason is on e.cause; e.message is only the failed SQL. Logged rather than
+  // swallowed, because a silent fallback here means the page quietly costs seven round trips again
+  // and nobody finds out why it got slow.
+  console.error('[aquintutor] combined counts failed, falling back to individual queries:', e?.cause?.message || e?.message);
+  const one = async (q: any): Promise<number> => {
+    try {
+      const r = await db.execute(q);
+      return ((Array.isArray(r) ? r : (r?.rows || []))[0] as any)?.n || 0;
+    } catch (_) { return 0; }
+  };
+  courseCount = await one(sql`SELECT COUNT(*)::int as n FROM training_courses WHERE is_published = true AND access_type IN ('public', 'both')`);
+  lessonCount = await one(sql`SELECT COUNT(*)::int as n FROM training_lessons l JOIN training_courses c ON l.course_id = c.id WHERE c.is_published = true`);
+  certCount = await one(sql`SELECT COUNT(*)::int as n FROM training_certificates`);
+  enrolledCount = await one(sql`SELECT COUNT(DISTINCT user_id)::int as n FROM training_enrollments`);
+  deptCount = await one(sql`SELECT COUNT(*)::int as n FROM academic_departments`);
+  facultyCount = await one(sql`SELECT COUNT(*)::int as n FROM training_instructors`);
+  liveAttempts = await one(sql`SELECT COUNT(*)::int as n FROM test_attempts WHERE status = 'in_progress' AND started_at > NOW() - INTERVAL '4 hours'`);
+}
 
 try {
   const r = await db.execute(sql`
@@ -162,7 +182,7 @@ const principles = [
   { n: 'IV', title: 'Named faculty', body: 'Every course is authored by a real person with their name attached. We do not hide behind institutional anonymity.' },
 ];
 ---
-<AquintutorLayout title="AquinTutor - A virtual unEuropean MOOC consortium" description={pageDesc}>
+<AquintutorLayout title="AquinTutor - A virtual university" description={pageDesc}>
   <script slot="head" is:inline type="application/ld+json" set:html={JSON.stringify(orgSchema)} />
 
   <!-- LIVE TICKER -->
@@ -205,13 +225,13 @@ const principles = [
       <div style="position:relative;">
         <p style="font-family:'Inter Tight',sans-serif; font-size:13px; color:var(--rust); font-weight:600; letter-spacing:0.04em; margin:0 0 18px;">Open enrolment &middot; Autumn {yr}</p>
         <h1 class="font-display" style="font-size:clamp(2.6rem, 7vw, 5.75rem); line-height:0.96; letter-spacing:-0.028em; font-weight:500; margin:0; color:var(--ink);">
-          A virtual unEuropean MOOC consortium<br/>
+          A virtual university<br/>
           <span style="font-style:italic; font-weight:300; color:var(--ink-500);">for the students the</span><br/>
           existing system never<br/>
           <span style="font-style:italic; font-weight:300; color:var(--ink-500);">had room for.</span>
         </h1>
         <p class="font-serif" style="font-family:'Cormorant Garamond',serif; font-size:clamp(1.15rem, 1.5vw, 1.4rem); line-height:1.5; font-style:italic; color:var(--ink-500); margin:30px 0 0; max-width:38rem;">
-          AquinTutor is a frontier research unEuropean MOOC consortium working in Vedic sciences, artificial super-intelligence, quantum technology and advanced computing. {schools.length} schools, {deptCount} departments, named faculty-written curriculum, proctored examinations, and a private AI co-pilot in every enrolment.
+          AquinTutor is a frontier research university working in Vedic sciences, artificial super-intelligence, quantum technology and advanced computing. {schools.length} schools, {deptCount} departments, named faculty-written curriculum, proctored examinations, and a private AI co-pilot in every enrolment.
         </p>
         <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:32px;">
           <a href="/aquintutor/signup" style="background:var(--ink); color:var(--sand-50); padding:14px 26px; border-radius:6px; font-family:'Inter Tight',sans-serif; font-size:14px; font-weight:600; text-decoration:none;">Apply for admission</a>
@@ -390,7 +410,7 @@ const principles = [
     <div style="max-width:1200px; margin:0 auto; padding:80px 28px; position:relative;">
       <div style="position:absolute; top:60px; left:28px; font-family:'Fraunces',serif; font-size:9rem; line-height:1; color:var(--ink); opacity:0.08; font-weight:500;" aria-hidden="true">&ldquo;</div>
       <blockquote class="font-display" style="font-style:italic; font-weight:300; font-size:clamp(1.6rem, 3vw, 2.5rem); line-height:1.25; letter-spacing:-0.015em; color:var(--ink); max-width:54rem; margin:0; position:relative; z-index:1;">
-        The unEuropean MOOC consortium is no longer a place. It is a contract: open enrolment, named faculty, faithful teaching, proctored assessment, and a credential that someone outside the institution can verify in fifteen seconds.
+        The university is no longer a place. It is a contract: open enrolment, named faculty, faithful teaching, proctored assessment, and a credential that someone outside the institution can verify in fifteen seconds.
       </blockquote>
       <footer style="display:flex; align-items:center; gap:14px; margin-top:32px;">
         <span style="display:inline-flex; align-items:center; justify-content:center; width:42px; height:42px; border-radius:50%; background:var(--ink); color:var(--sand-50); font-family:'Fraunces',serif; font-weight:500; font-size:18px;">A</span>
