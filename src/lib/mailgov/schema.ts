@@ -34,6 +34,7 @@
 // screen rather than assumed. A reported success and an observable result are not the same thing.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { textIn } from '@/lib/pg-array';
 import { ensureOnce } from '@/lib/ensure-once';
 
 /** Normalize a postgres-js result. It returns a plain array, never `{ rows }`. */
@@ -469,7 +470,7 @@ export async function tablesExisting(tables: string[]): Promise<Set<string>> {
       SELECT c.relname AS name
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
        WHERE n.nspname = 'public' AND c.relkind = 'r'
-         AND c.relname = ANY(${tables})`));
+         AND c.relname::text IN ${textIn(tables)}`));
     for (const row of r) out.add(String(row.name));
   } catch {
     /* An unreadable catalogue is reported by health, not guessed at here. */

@@ -166,8 +166,13 @@ export async function contactContext(viewer: any, email: string): Promise<Contac
     const { ensureContactSchema } = await import('@/lib/mail-contacts');
     await ensureContactSchema();
 
+    // `tags` is selected with the row, not joined. Tags are a text[] COLUMN on mail_contacts (see
+    // the core DDL in mail-product/schema.ts and the writer at mail-contacts.ts setTags) — there is
+    // no mail_contact_tags table and never was. Reading one cost this card everything below it: the
+    // failed query threw from the MIDDLE of this try block, so the lists read and the suppression
+    // read beneath it never ran, and a contact who was on a list or suppressed showed as neither.
     const c = rowsOf(await db.execute(sql`
-      SELECT id, first_name, last_name, organization, role_title, status, consent_source, consent_at
+      SELECT id, first_name, last_name, organization, role_title, status, consent_source, consent_at, tags
       FROM mail_contacts WHERE email = ${addr} LIMIT 1`))[0];
     if (c) {
       const full = [c.first_name, c.last_name].filter(Boolean).join(' ').trim();
@@ -180,9 +185,11 @@ export async function contactContext(viewer: any, email: string): Promise<Contac
         at: c.consent_at ? new Date(c.consent_at).toISOString() : null,
       };
 
-      const tags = rowsOf(await db.execute(sql`
-        SELECT tag FROM mail_contact_tags WHERE contact_id = ${String(c.id)}::uuid ORDER BY tag ASC LIMIT 40`));
-      ctx.tags = tags.map((t) => String(t.tag));
+      // Defensive about the shape for the same reason mail-contacts.ts is: postgres-js hands back a
+      // JS array for text[], but a driver change or a NULL from a pre-DEFAULT row would otherwise
+      // turn a card into a crash. Sorted and capped here rather than in SQL, since the row is
+      // already in hand.
+      ctx.tags = (Array.isArray(c.tags) ? c.tags.map(String) : []).sort().slice(0, 40);
 
       const lists = rowsOf(await db.execute(sql`
         SELECT l.name FROM mail_list_members lm JOIN mail_lists l ON l.id = lm.list_id

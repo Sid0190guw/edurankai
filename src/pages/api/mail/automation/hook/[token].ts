@@ -2,23 +2,24 @@
 //
 // THREE THINGS ARE CHECKED, AND A TOKEN ON ITS OWN IS NOT ENOUGH.
 //
-//   1. The token identifies WHICH workflow. Nothing more. A URL token leaks the way URLs leak — a
+//   1. The token identifies WHICH automation. Nothing more. A URL token leaks the way URLs leak — a
 //      proxy log, a browser history, a screenshot in a support ticket — and on its own it would let
-//      anybody who has ever seen it start real workflows that send real mail to real candidates.
-//   2. X-Automation-Signature is an HMAC-SHA256 of "<timestamp>.<body>" under the workflow's secret.
+//      anybody who has ever seen it start real automations that mail real candidates.
+//   2. X-Automation-Signature is an HMAC-SHA256 of "<timestamp>.<body>" under the automation's secret.
 //      That is what proves the sender holds the secret and that the body was not altered on the way.
 //   3. X-Automation-Timestamp must be within five minutes, so a captured request cannot be replayed
 //      for ever.
 //
-// It fails CLOSED everywhere, including when the workflow has no secret configured. src/middleware.ts
+// It fails CLOSED everywhere, including when the automation has no secret configured. src/middleware.ts
 // exempts everything under /api/, so nothing stands in front of this URL but this file.
 //
-// The organisation comes from the WORKFLOW ROW, never from the request. A sender does not choose
+// The organisation comes from the AUTOMATION ROW, never from the request. A sender does not choose
 // which tenant their events land in.
 import type { APIRoute } from 'astro';
 import { pgStore, webhookSecretFor } from '@/lib/mailplatform/pg-store';
 import { emit } from '@/lib/mailplatform/router';
-import { isUsableEventType } from '@/lib/mailplatform/triggers';
+import { canonicalEventType, isUsableEventType } from '@/lib/mailplatform/triggers';
+import { triggerNode } from '@/lib/mailplatform/graph';
 import { MAX_WEBHOOK_BODY, safeId, verifyWebhook } from '@/lib/mailplatform/security';
 import { reasonOf } from '@/lib/mailplatform/errors';
 
@@ -32,13 +33,13 @@ export const POST: APIRoute = async ({ request, params }) => {
   const raw = await request.text().catch(() => '');
   if (raw.length > MAX_WEBHOOK_BODY) return json({ ok: false, error: 'The body is larger than 64 KB.' }, 413);
 
-  const workflow = token ? await pgStore.getWorkflowByWebhookToken(token) : null;
+  const automation = token ? await pgStore.getAutomationByWebhookToken(token) : null;
   // The same 404 for "no such token" and "token disabled": a caller probing tokens learns nothing
   // from the difference, and there is nothing useful to tell a legitimate sender either.
-  if (!workflow) return json({ ok: false, error: 'No workflow accepts events at this address.' }, 404);
+  if (!automation) return json({ ok: false, error: 'No automation accepts events at this address.' }, 404);
 
   const verdict = verifyWebhook({
-    secret: await webhookSecretFor(workflow.orgId, workflow.id),
+    secret: await webhookSecretFor(automation.orgId, automation.id),
     body: raw,
     signature: request.headers.get('x-automation-signature'),
     timestamp: request.headers.get('x-automation-timestamp'),
@@ -49,13 +50,15 @@ export const POST: APIRoute = async ({ request, params }) => {
   let body: any = {};
   try { body = JSON.parse(raw || '{}'); } catch { return json({ ok: false, error: 'The body is not JSON.' }, 400); }
 
-  // THE EVENT TYPE IS PINNED TO THIS WORKFLOW'S TRIGGER. Without this line, a signed sender could
-  // post ANY event type and start every other workflow in the organisation — the signature would
+  // THE EVENT TYPE IS PINNED TO THIS AUTOMATION'S OWN TRIGGER. Without this, a signed sender could
+  // post ANY event type and start every other automation in the organisation — the signature would
   // prove only that they were allowed to feed this one.
-  const type = String(body.type || workflow.triggerEvent || '').trim();
+  const listensFor = canonicalEventType(String((triggerNode(automation.graph)?.config || {}).event || ''));
+  const type = canonicalEventType(String(body.type || listensFor || '').trim());
   if (!isUsableEventType(type)) return json({ ok: false, error: '"' + type.slice(0, 80) + '" is not a usable event type.' }, 400);
-  if (type !== workflow.triggerEvent) {
-    return json({ ok: false, error: 'This address accepts "' + workflow.triggerEvent + '" events only; it was sent "' + type + '".' }, 400);
+  if (!listensFor) return json({ ok: false, error: 'That automation has no trigger, so it accepts nothing.' }, 400);
+  if (type !== listensFor) {
+    return json({ ok: false, error: 'This address accepts "' + listensFor + '" events only; it was sent "' + type + '".' }, 400);
   }
 
   if (!body.contact_email && !body.contact_id) {
@@ -65,7 +68,7 @@ export const POST: APIRoute = async ({ request, params }) => {
   try {
     const r = await emit(pgStore, {
       type,
-      orgId: workflow.orgId,
+      orgId: automation.orgId,
       contactEmail: body.contact_email ? String(body.contact_email) : null,
       contactId: body.contact_id ? safeId(body.contact_id) : null,
       contact: body.contact || undefined,

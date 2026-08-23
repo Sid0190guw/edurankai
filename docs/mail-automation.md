@@ -1,97 +1,117 @@
-# Mail automation — the event-driven workflow engine
+# Mail automation — the execution engine
 
-`src/lib/mailplatform/` · admin at **/admin/mail/automation** · API under `/api/mail/automation/`
+`src/lib/mailplatform/` · ops console at **/admin/mail/automation** · API under `/api/mail/automation/`
 
-A workflow is: something happened → check something → do something → wait → check again → do
-something else. It is event-driven and persistent. Nothing about a running workflow lives in a
+An automation is: something happened → check something → do something → wait → check again → do
+something else. It is event-driven and persistent. Nothing about a running automation lives in a
 process, so a delay outlives the worker, the deploy and the database restart that happen during it.
 
-This does **not** replace the campaign engine (`src/lib/mail.ts`, `src/lib/mail-advanced.ts`). A
-campaign is one message to many people; an automation is one person moving through steps over days,
-which is why it can carry per-person merge fields and a condition that is re-checked tomorrow.
+## Where this sits
+
+The **builder** already existed: `src/lib/mail-product/automations.ts` owns the graph shape
+(`AutomationGraph`), `validateGraph()`, the node catalogue and the CRUD, and `/mail/automations` is
+the canvas. What it did not have was an **executor** — nothing in the codebase ever inserted a row
+into `mail_automation_runs` or advanced one, so a published automation sat there, correct and inert.
+
+This folder is that executor. It adds no second graph shape, no second validator and no second
+writer:
+
+| Concern | Owner |
+| --- | --- |
+| Graph shape, node catalogue, `validateGraph()`, create/save/delete, Publish gate | `mail-product/automations.ts` |
+| Event routing, run state, delays, idempotency, retries, lifecycle, scheduler | `mailplatform/` |
+
+It also does **not** touch the campaign engine (`mail.ts`, `mail-advanced.ts`, `mail-campaigns.ts`).
+A campaign is one message to many people; an automation is one person moving through steps over
+days, which is why it can carry per-person merge fields and re-check a condition tomorrow.
 
 ---
 
-## The shape of it
+## The files
 
 | File | What it is |
 | --- | --- |
-| `graph.ts` | Nodes, edges, the validator. Pure. **The contract a visual builder draws against.** |
+| `graph.ts` | The **adapter** onto the canvas's graph: next-node, condition/delay translation, platform checks. Pure. |
 | `conditions.ts` | The condition evaluator. Pure, total, never throws. |
 | `delay.ts` | Delay arithmetic. Turns "wait 24 hours" into an absolute instant. Pure. |
-| `triggers.ts` | The event vocabulary and the trigger matcher. |
+| `triggers.ts` | The event vocabulary, the canvas-key aliases, the trigger matcher. |
 | `errors.ts` | Temporary / permanent / business failure, backoff, the retry decision. Pure. |
 | `store.ts` | The persistence **port**: types and one interface. No SQL. |
 | `pg-store.ts` | That port against Postgres. Three atomic statements carry every guarantee. |
-| `memory-store.ts` | The same port in one process. Tests and dry runs. |
-| `actions.ts` | What a workflow can do, and which of those cannot be undone. |
+| `memory-store.ts` | The same port in one process. Tests. |
+| `actions.ts` | What each node kind does, and which of those cannot be undone. |
 | `adapters/` | Channels. Email is built; SMS, push, WhatsApp and Slack are declared and refuse. |
 | `engine.ts` | The state machine: one run, moved forward as far as it will go. |
 | `router.ts` | Events in, runs out. The **only** way anything starts. |
 | `worker.ts` | The tick (scheduler + due runs) and the run lifecycle controls. |
-| `service.ts` | Save, validate, activate, install an example, webhook credentials. |
-| `examples.ts` | The two recruitment workflows, as data. |
+| `service.ts` | Version snapshots, webhook credentials, readiness, example installer. |
+| `examples.ts` | The two recruitment automations, as graphs. |
 | `security.ts` | The four doors, the HMAC, the outbound-URL guard. |
 
-`src/lib/workflow.ts` is a **different thing** — HR approvals routed through the org graph. The two
-share a word and nothing else.
+`src/lib/workflow.ts` is a **different thing** — HR approvals routed through the org graph.
 
 ---
 
-## The guarantees, and how each one is actually enforced
+## The guarantees, and how each is actually enforced
 
 ### 1. A delay is a row, not a timer
 
 Reaching a delay resolves it **once** into an absolute instant, writes it to
-`mail_workflow_runs.wait_until` and sets the state `WAITING`. Waking up is a query. There is no
-`setTimeout` anywhere in this engine — on Vercel the process that started a 24-hour wait is long
-dead before it ends.
+`mail_automation_runs.wait_until` and sets the state `waiting`. Waking up is a query. There is no
+`setTimeout` anywhere — on Vercel the process that started a 24-hour wait is long dead before it ends.
 
-`current_node` while waiting points at the step the wait is **for**, so the runs list reads "waiting
-to send the stage-3 reminder".
+`node_id` while waiting points at the step the wait is **for**, so the runs list reads "waiting to
+send the reminder".
 
 ### 2. An effect happens at most once per (run, node)
 
-`mail_workflow_steps` has `PRIMARY KEY (run_id, node_id)`. Before an action runs, the engine
-**claims** that row with one statement. Whoever gets it performs the effect; anybody else sees
-`already_done` and skips it, replaying the recorded result.
+`mail_automation_steps` has `PRIMARY KEY (run_id, node_id)`. Before an action runs the engine
+**claims** that row in one statement. Whoever gets it performs the effect; anybody else sees
+`already_done` and replays the recorded result.
 
 The one genuinely ambiguous state is a worker that died between claiming and finishing. It is
 resolved by asking the action whether repeating it is visible outside this platform:
 
-- **reversible** (`add_tag`, `remove_tag`, `add_to_list`, `update_contact`, `create_event`) — the
-  step is re-claimed after 10 minutes and simply runs again.
-- **irreversible** (`send_email`, `send_template`, `webhook`) — it is **never** repeated
-  automatically. The step goes to `needs_review`, the run is `FAILED` + dead-lettered, and a person
-  decides on `/admin/mail/automation`. Mail cannot be recalled, so "possibly not sent, and said so"
-  beats "possibly sent twice, and said nothing".
+- **reversible** (`add_tag`, `remove_tag`, `update_contact`) — re-claimed after 10 minutes and re-run.
+- **irreversible** (`send_email`, `webhook`) — **never** repeated automatically. The step goes to
+  `needs_review`, the run is `failed` + dead-lettered, and a person decides on
+  /admin/mail/automation. Mail cannot be recalled, so "possibly not sent, and said so" beats
+  "possibly sent twice, and said nothing".
 
 ### 3. One event starts at most one run
 
-`mail_workflow_events.event_id` is the primary key, so a re-delivered event is discarded at the
-door. `mail_workflow_runs` additionally has `UNIQUE (workflow_id, trigger_event_id)`.
+`mail_automation_events.event_id` is the primary key, so a re-delivered event is discarded at the
+door. `mail_automation_runs` additionally has `UNIQUE (automation_id, trigger_event_id)`.
 
 **Send your own `event_id`.** It is the idempotency key. A sender that generates a fresh one per
-retry has no idempotency, and two "identical" deliveries become two letters to one candidate.
+retry has none, and two "identical" deliveries become two letters to one candidate.
 
 ### 4. A run never changes shape mid-flight
 
-Every definition edit bumps the version and writes a snapshot to `mail_workflow_versions`. A run
-records the version it started on and follows that snapshot to the end. Without this, deleting a
-node re-points every parked run at whatever now occupies that position.
+Every graph change bumps `mail_automations.version` and writes a snapshot to
+`mail_automation_versions`. A run records the version it started on and follows that snapshot to the
+end. Without this, deleting a node re-points every parked run at whatever now occupies that position.
+
+The snapshot is taken by `snapshotGraph()` (or `POST /api/mail/automation/catalogue`
+`{action:"snapshot"}`) after the builder saves. A graph saved without it gets no snapshot, and the
+engine says so on the run (`no snapshot of version N was kept`) rather than pretending.
 
 ---
 
 ## States
 
-`RUNNING` · `WAITING` · `COMPLETED` · `FAILED` · `CANCELLED` · `PAUSED`
+`running` · `waiting` · `completed` · `failed` · `cancelled` · `paused`
 
-A run carries `workflow_id`, `contact_id`, `run_id`, `current_node`, `state`, `started_at`,
-`updated_at`, `completed_at`, `error`, `retry_count` — plus `error_kind`, `dead_letter`,
-`wait_until` and `trigger_event_id`.
+Lower case, because `mail_automation_runs.status` already defaults to `'running'` and every other
+queue here uses lower case. A column whose DEFAULT disagrees with every value written into it is a
+trap for the next reader.
 
-**`COMPLETED` with `error_kind = 'business'` is not a failure.** "This candidate had unsubscribed"
-is the system working; counting it red trains operators to ignore red.
+A run carries `automation_id`, `contact_id`, `id` (the run id), `node_id`, `status`, `started_at`,
+`updated_at`, `completed_at`, `last_error`, `retry_count` — plus `error_kind`, `dead_letter`,
+`wait_until`, `graph_version` and `trigger_event_id`.
+
+**`completed` with `error_kind = 'business'` is not a failure.** "This candidate had unsubscribed" is
+the system working; counting it red trains operators to ignore red.
 
 ---
 
@@ -100,8 +120,8 @@ is the system working; counting it red trains operators to ignore red.
 | Kind | Example | What happens |
 | --- | --- | --- |
 | temporary | `421 4.7.0 try again`, connection reset, 503 | retry with backoff: 1m, 2m, 4m, 8m, 16m, capped at 1h, up to 5 attempts, then dead-letter |
-| permanent | `550 5.1.1 no such user`, missing template, unknown action | dead-letter immediately — five more identical failures, delayed, help nobody |
-| business | unsubscribed, no deadline on the event, no contact | end the run, record why, **count nothing as an error** |
+| permanent | `550 5.1.1 no such user`, missing template, unknown step kind | dead-letter immediately — five more identical failures, delayed, help nobody |
+| business | not subscribed, suppressed, no deadline on the event, no contact | end the run, record why, **count nothing as an error** |
 
 `retry_count` resets per step, not per run: five retries are five retries of *this* step, not a
 budget the whole run exhausts on its third node.
@@ -110,16 +130,27 @@ budget the whole run exhausts on its third node.
 
 ## Triggers
 
-Contact created / updated / added to list · tag added / removed · campaign sent · email delivered /
-opened / clicked / bounced / unsubscribed · API event · webhook event · scheduled date / time.
+The canvas offers its six original keys plus the fifteen the engine added. The six are **aliased**,
+never renamed — automations already drawn against them keep working, and both spellings resolve to
+one canonical dotted name:
 
-Recruitment events, first-class through the same router: `application.submitted`,
-`application.stage.changed`, `assessment.assigned`, `assessment.completed`, `interview.scheduled`,
+| Canvas key | Canonical event |
+| --- | --- |
+| `application_stage_changed` | `application.stage.changed` |
+| `contact_created` | `contact.created` |
+| `tag_added` | `contact.tag.added` |
+| `list_joined` | `contact.list.added` |
+| `campaign_opened` | `email.opened` |
+| `campaign_clicked` | `email.clicked` |
+
+Added: `contact.updated`, `contact.tag.removed`, `campaign.sent`, `email.delivered`,
+`email.bounced`, `email.unsubscribed`, `api.event`, `webhook.event`, `schedule.date`,
+`application.submitted`, `assessment.assigned`, `assessment.completed`, `interview.scheduled`,
 `internship.selected`, `internship.rejected`.
 
-Any well-formed dotted lower-case name works, declared or not — that is what "custom application
-event" means here. Free text (`"Stage Changed!!"`) is refused, because the log is queried by type
-and two spellings would be two silently different triggers.
+Any well-formed dotted lower-case name routes, declared or not — that is what "custom application
+event" means. Free text (`"Stage Changed!!"`) is refused, because the log is queried by type and two
+spellings would be two silently different triggers.
 
 ---
 
@@ -128,11 +159,25 @@ and two spellings would be two silently different triggers.
 `equals` · `not_equals` · `contains` · `starts_with` · `ends_with` · `greater_than` · `less_than` ·
 `exists` · `does_not_exist`, combined with `{and:[…]}`, `{or:[…]}`, `{not:…}`.
 
+The canvas writes `{field, value}` over five familiar fields; the engine maps each onto a real path:
+
+| Canvas field | Evaluated as |
+| --- | --- |
+| stage | `stage` — the event's value if it carries one, else the contact's |
+| tag | `contact.tags`, by membership |
+| status | `contact.status` |
+| assessment completed | `contact.fields.assessment_completed` |
+| custom field | `contact.fields.<key>` |
+
+Two additions the canvas does not draw yet, accepted by both validators so nothing breaks:
+`config.operator` (any of the nine) and `config.condition` (a whole AND/OR/NOT tree).
+
 Decisions worth knowing:
 
-- **False is the safe answer.** The `true` branch usually sends something; a broken comparison
+- **False is the safe answer.** The `yes` branch usually sends something; a broken comparison
   therefore sends nothing rather than mailing people on the strength of a typo.
-- A **missing field** is `false` for everything except `not_equals`, where it is genuinely `true`.
+- A **missing field** is `false` for everything except `not_equals`, where it is genuinely `true` —
+  that is what makes "assessment_completed is not true" match the candidate who never started.
 - **Case-insensitive by default** (`caseSensitive: true` to opt out).
 - `greater_than` compares numbers as numbers, then dates as dates, then text — so 9 is not greater
   than 10.
@@ -142,34 +187,42 @@ Decisions worth knowing:
 
 ---
 
-## Actions
+## Steps
 
-`send_email` · `send_template` · `add_tag` · `remove_tag` · `add_to_list` · `remove_from_list` ·
-`update_contact` · `wait` · `webhook` · `create_event` · `end_workflow`.
+`send_email` · `add_tag` · `remove_tag` · `update_contact` · `webhook`, plus the structural
+`trigger` · `condition` · `delay` · `end`. These are the canvas's own kinds; the engine adds none,
+because a kind the canvas cannot place is a step nobody can author.
 
-`send_template` reads `email_templates` — the catalogue `/admin/mail/templates` already writes — and
-fills `{{first_name}}` style fields through `src/lib/mail-personalize.ts`. Use
-`{{name|default:fallback}}`; a bare `{{name|fallback}}` is not a token and goes out literally.
+`send_email` reads `email_templates` — the catalogue `/admin/mail/templates` and the campaign builder
+already write — and fills `{{first_name}}` style fields per contact through `mail-personalize.ts`.
+Use `{{name|default:fallback}}`; a bare `{{name|fallback}}` is not a token and goes out literally.
 
-**Unsubscribe is enforced in the send path, not in the builder.** A person who asked not to be
-mailed asked the platform, not one workflow.
+**Suppression and subscription status are enforced in the send path, not in the builder.** A person
+who asked not to be mailed asked the platform, not one automation. `mail_suppression` is read through
+`mailsec/sending.ts`, the one suppression reader the whole platform uses, and it **fails closed**.
+
+**Not yet drawable:** "add to list" and "remove from list" are in the specification and the store
+implements both against `mail_lists` / `mail_list_members`. They are not registered as node kinds
+because the canvas cannot place a kind its own catalogue does not know — adding them is one entry in
+`NODE_CATALOGUE` plus one handler. Stated rather than half-built.
 
 ### Channels
 
-Email is built. SMS, push, WhatsApp and Slack are declared in `adapters/` and **refuse to send**
-with a sentence naming the channel. Wiring one up is implementing `send()` and flipping
-`available()`; nothing in the engine, the actions or the builder changes.
+Email is built. SMS, push, WhatsApp and Slack are declared in `adapters/` and **refuse to send** with
+a sentence naming the channel. Wiring one up is implementing `send()` and flipping `available()`;
+nothing in the engine, the actions or the builder changes.
 
 ---
 
 ## Delays
 
-`minutes` · `hours` · `days` · `until` (absolute) · `until_field` (a date from the event, plus or
-minus an offset — this is how "wait until the deadline minus 24 hours" is written).
+`minutes` (what the canvas draws) · `until` (an absolute date) · `untilField` (a date carried by the
+event, plus or minus an offset — this is how "wait until the deadline minus 24 hours" is written).
+`mail-product/automations.ts` accepts all three, so Publish does not refuse the latter two.
 
 A target already in the past resolves to **now** and fires immediately: a replayed or backfilled
-event must finish, not strand a run in `WAITING` for ever. A missing `until_field` value is a
-business failure — the engine does not invent a deadline and mail somebody about it.
+event must finish, not strand a run in `waiting` for ever. A missing `untilField` value is a business
+failure — the engine does not invent a deadline and mail somebody about it.
 
 ---
 
@@ -178,18 +231,22 @@ business failure — the engine does not invent a deadline and mail somebody abo
 Four doors, all in `security.ts`:
 
 1. **Admin API** — `denyMailApi()`, the same gate as `/api/mail/send`, then scoped to the
-   organisation. Every store method takes `orgId` and every query filters on it.
+   organisation. Every automation and run query filters on `org_id`.
 2. **Internal emit** — same gate; source recorded as `internal`.
-3. **Webhook** — a per-workflow token in the URL says *which workflow*, an HMAC-SHA256 signature over
-   `"<timestamp>.<body>"` proves the sender holds the secret, and a five-minute window stops replay.
-   Fails closed, including when no secret is configured. The event type is **pinned to that
-   workflow's trigger**, so a signed sender cannot start every other workflow in the organisation.
-   Body capped at 64 KB. The organisation comes from the workflow row, never from the request.
-4. **Outbound webhook** — https only, no credentials in the URL, no localhost / `.internal` /
-   private ranges. Without it, anyone who can author a workflow could make the server fetch an
-   internal address and read the answer off the run page.
+3. **Webhook** — a per-automation token in the URL says *which automation*, an HMAC-SHA256 signature
+   over `"<timestamp>.<body>"` proves the sender holds the secret, and a five-minute window stops
+   replay. Fails closed, including when no secret is configured. The event type is **pinned to that
+   automation's own trigger**, so a signed sender cannot start every other automation. Body capped at
+   64 KB. The organisation comes from the automation row, never from the request.
+4. **Outbound webhook** — https only, no credentials in the URL, no localhost / `.internal` / private
+   ranges. Without it, anyone who can author an automation could make the server fetch an internal
+   address and read the answer off the run page.
 
-A chain of workflows triggering one another is bounded at **5** links deep.
+A chain of automations triggering one another is bounded at **5** links deep.
+
+**Contacts are not org-scoped.** `mail_contacts` is mail-product's table and has no tenant column;
+this platform runs one mail workspace. The automation and run tables do carry `org_id` so a second
+workspace cannot read the first's automations.
 
 ### Verifying a webhook, from the sending side
 
@@ -219,7 +276,7 @@ await emit(pgStore, {
   type: 'application.stage.changed',
   orgId: ORG_ID,
   contactEmail: applicant.email,
-  contact: { firstName: applicant.first_name, applicationNumber: applicant.number },
+  contact: { firstName: applicant.first_name },
   payload: { stage: '3', previous_stage: '2' },
   eventId: 'stage:' + applicant.id + ':3',   // stable = safe to retry
 });
@@ -233,9 +290,9 @@ ledger, or decide whether a send is a duplicate.
 
 ## Running it
 
-`/api/mail/automation/tick` is the worker: it emits due scheduled events, claims every run whose
-wait has ended, and advances each one. Protected by `CRON_SECRET`, **failing closed** — with no
-secret set nothing runs, visibly, rather than the URL standing open as an anonymous send button.
+`/api/mail/automation/tick` is the worker: it emits due scheduled events, claims every run whose wait
+has ended, and advances each one. Protected by `CRON_SECRET`, **failing closed** — with no secret set
+nothing runs, visibly, rather than the URL standing open as an anonymous send button.
 
 `vercel.json` calls it once a day (Hobby crons are daily-only on this project). **A 24-hour delay
 resolved at 09:00 therefore fires on the next daily pass, not at 09:00 sharp.** For minute-level
@@ -245,35 +302,42 @@ timing, call the URL from any scheduler with the secret:
 curl -H "Authorization: Bearer $CRON_SECRET" https://www.edurankai.in/api/mail/automation/tick
 ```
 
-A tick is bounded and reports `more_due` when it hit its limit. It never implies it drained the
-queue.
+A tick is bounded and reports `more_due` when it hit its limit. It never implies it drained the queue.
 
 ---
 
 ## The tables
 
-`db/mail-automation-schema.sql` — **run it yourself**; CLAUDE.md forbids this repository's agents
-from opening a database connection, so these tables have not been created. `ensureAutomationSchema()`
-runs the identical statements on first use if you would rather.
+`db/mail-automation-schema.sql` — **run it yourself**; CLAUDE.md forbids this repository's agents from
+opening a database connection. `ensureAutomationSchema()` runs the identical statements on first use
+if you would rather. **Run `db/mail-platform-schema.sql` first.**
 
 ```
 psql "$DATABASE_URL" -f db/mail-automation-schema.sql
 ```
 
-`mail_workflows` · `mail_workflow_versions` · `mail_workflow_events` · `mail_workflow_runs` ·
-`mail_workflow_steps` · `mail_contacts` · `mail_contact_lists` · `mail_contact_list_members`
+Owned by this engine: `mail_automation_events` · `mail_automation_steps` ·
+`mail_automation_versions`.
+
+Extended additively: `mail_automations` (+`org_id`, `version`, `webhook_token`, `webhook_secret`),
+`mail_automation_runs` (+`org_id`, `graph_version`, `error_kind`, `retry_count`, `dead_letter`,
+`completed_at`, `trigger_event_id`).
+
+Visited, never redefined: `mail_contacts` · `mail_lists` · `mail_list_members` · `email_templates` ·
+`mail_suppression`.
 
 ---
 
 ## The visual builder
 
-The server side of one is finished: stable node ids, an edge model with labelled branches, a
-validator that explains every problem against a node id, and `GET /api/mail/automation/workflows`
-returning the trigger, operator, action and channel catalogues. **No page hard-codes a workflow
-shape** — `/admin/mail/automation/[id]` renders its whole palette from those catalogues, and edits
-the same JSON structure a canvas would post, through the same validation.
+`/mail/automations` is the canvas and stays the canvas. `GET /api/mail/automation/catalogue` adds
+what only the runtime knows: every event type it can route, every operator it can evaluate, every
+step it can perform, which channels actually work on this deployment, and — with `?id=` — one
+automation's graph resolved with **both** validations plus its runs. No page hard-codes a shape.
 
-The drag-and-drop canvas itself is not built. It can be added without the engine changing.
+`POST` there does the four things only the engine owns: install an example, snapshot a version,
+check readiness, and turn the inbound webhook on or off. Creating, saving and publishing remain
+`/api/mail/product/automations`.
 
 ---
 
@@ -283,12 +347,15 @@ The drag-and-drop canvas itself is not built. It can be added without the engine
 npx vitest run src/lib/mailplatform
 ```
 
-`pure.test.ts` covers the validator, the evaluator, the delay arithmetic, the classifier and the
-HMAC. `engine.test.ts` covers the things that only appear over time and across processes: a delay
-that outlives its worker, a **worker restart** (new engine objects over the same store), a
-**database restart** (the whole store serialised to JSON and read back), a duplicate event, a crash
-between the send and the record of it, retry-to-dead-letter, business-rule endings, cancellation,
-pause/resume, chained workflows, and an edit while runs are in flight.
+`pure.test.ts` covers the graph adapter, the evaluator, the delay arithmetic, the classifier, the
+canvas-key aliases and the HMAC — and asserts both shipped examples pass the **canvas's own**
+validator, so they are graphs an operator could publish.
+
+`engine.test.ts` covers what only appears over time and across processes: a delay that outlives its
+worker, a **worker restart** (new engine objects over the same store), a **database restart** (the
+whole store serialised to JSON and read back), a duplicate event, a crash between the send and the
+record of it, retry-to-dead-letter, business-rule endings, suppression, a missing template,
+cancellation, pause/resume, chained automations, and an edit while runs are in flight.
 
 Both run against `MemoryStore`, which enforces the same atomicity rules as the Postgres store — the
 behaviours being tested are about **ordering**, and ordering is what it reproduces. It is not a mock.
@@ -298,12 +365,16 @@ behaviours being tested are about **ordering**, and ordering is what it reproduc
 ## Known limits, stated
 
 - **A follow-on event can be lost.** If the process dies between recording a step and publishing the
-  event that step emitted (`tag added`, `create_event`), the announcement is gone — a workflow
-  chained off it will not start. It is logged as an error with the run id, and the events that
-  *should* have been emitted are recorded on the step, so the run page shows them.
+  event that step emitted (`tag added`), the announcement is gone — an automation chained off it will
+  not start. It is logged as an error with the run id, and the events that *should* have been emitted
+  are recorded on the step.
+- **A graph saved without a snapshot** (any writer that does not call `snapshotGraph`) leaves runs
+  following the live graph. The engine says so on the run rather than guessing.
 - **DNS is not resolved** by the outbound-URL guard, so a hostname that resolves to a private address
   at request time gets through. The remaining protection is that only operators holding `mail.manage`
-  can author a workflow, and every call is recorded on the step.
-- **Cycles between two workflows** are only caught by the depth limit at runtime, not at authoring
-  time. Cycles *within* one definition are refused outright.
+  can author an automation, and every call is recorded on the step.
+- **Cycles between two automations** are only caught by the depth limit at runtime. Cycles *within*
+  one graph are refused by `validateGraph()` when they contain no delay.
 - **Timing is as coarse as the tick.** See "Running it".
+- **Scheduled triggers fan out 500 contacts per tick.** The rest follow on the next tick; the event
+  ids are deterministic, so nobody is mailed twice and nobody is skipped.

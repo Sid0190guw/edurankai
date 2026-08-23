@@ -304,7 +304,10 @@ const DDL: string[] = [
  *
  * An earlier draft of this file created `mail_contacts` additively so the import/export surface had
  * somewhere to write. It does not any more: src/lib/mail-contacts.ts owns that table and creates it
- * with `email VARCHAR(320) UNIQUE` and `mail_contact_tags` keyed `(contact_id, tag)`. A second
+ * with `email VARCHAR(320) UNIQUE` and tags as a `text[]` COLUMN on the contact row — there is no
+ * `mail_contact_tags` table, and this comment used to say there was. That belief cost mail-context.ts
+ * a working contact card: it queried the table this sentence promised, threw, and took the lists and
+ * suppression reads below it down too. A second
  * bootstrap adding a unique index on `lower(email)` would either fail on real data or silently
  * impose a different uniqueness rule than the module that does the writing — two answers to "is this
  * the same contact?", which is exactly the class of split-brain this codebase keeps paying for.

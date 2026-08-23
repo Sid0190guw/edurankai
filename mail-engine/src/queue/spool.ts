@@ -19,11 +19,15 @@
 //     <spool>/sent/      delivered. Kept for a retention window so "what happened" stays answerable.
 //     <spool>/failed/    dead-lettered. Never auto-deleted — a human decides.
 //
-// CLAIMING IS A RENAME, NOT A FLAG. Two workers racing for the same entry both call rename();
-// exactly one succeeds and the other gets ENOENT. No lock file, no advisory lock, and no window in
-// which both believe they own it. That is what makes the Phase-3 "several workers over one spool"
-// line in the HA document true rather than aspirational — the semantics are already right, so
-// nothing has to be redesigned when a second worker starts.
+// CLAIMING IS A link(), NOT A FLAG AND NOT A rename(). Two workers racing for the same entry both
+// call link() into sending/; exactly one succeeds and the other gets EEXIST. No lock file, no
+// advisory lock, and no window in which both believe they own it. That is what makes the Phase-3
+// "several workers over one spool" line in the HA document true rather than aspirational — the
+// semantics are already right, so nothing has to be redesigned when a second worker starts.
+//
+// It was rename() first, which is the conventional answer and is correct on POSIX. It is NOT correct
+// on Windows: two concurrent renames of one source both resolve successfully there, so both workers
+// claim the entry and the message goes out twice. See the long note above claim().
 //
 // A CRASH LOSES A LEASE, NOT A MESSAGE. A worker that dies mid-delivery leaves its entry in sending/
 // with a lease timestamp; reclaim() returns anything past its lease to queued/. The cost of a crash

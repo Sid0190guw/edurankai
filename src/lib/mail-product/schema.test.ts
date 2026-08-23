@@ -4,6 +4,8 @@
 // interesting cases are the ones where a UI and a database could come to disagree about the same
 // campaign.
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { canTransition, CAMPAIGN_STATUSES, CAMPAIGN_TRANSITIONS, CONTACT_STATUSES, EVENT_TYPES } from './schema';
 
 describe('campaign state machine', () => {
@@ -69,6 +71,43 @@ describe('campaign state machine', () => {
     for (const s of CAMPAIGN_STATUSES) {
       expect(CAMPAIGN_TRANSITIONS[s]).not.toContain(s);
     }
+  });
+});
+
+describe('the mail_suppression mirror', () => {
+  // audienceSql() filters campaigns against mail_suppression, so the table has to exist wherever
+  // this module runs — and ensureMailProductSchema() cannot call ensureContactSchema() to guarantee
+  // it, because mail-contacts.ts already imports ensureMailProductSchema() and the two ensureOnce()
+  // caches would wait on each other. So the declaration is mirrored, and THIS test is what stops the
+  // mirror rotting: it reads both files and compares the columns they actually declare.
+  const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
+
+  /** The column lines of the first `CREATE TABLE … mail_suppression (…)` in a file, normalised. */
+  function declaredColumns(src: string): string[] {
+    const m = src.match(/CREATE TABLE IF NOT EXISTS mail_suppression\s*\(([\s\S]*?)\)`/);
+    if (!m) return [];
+    return m[1]
+      .split('\n')
+      .map((l) => l.trim().replace(/,$/, ''))
+      .filter(Boolean);
+  }
+
+  const mine = declaredColumns(read('./schema.ts'));
+  const theirs = declaredColumns(read('../mail-contacts.ts'));
+
+  it('is declared in both files', () => {
+    expect(mine.length).toBeGreaterThan(0);
+    expect(theirs.length).toBeGreaterThan(0);
+  });
+
+  it('declares exactly the same columns as its owner in src/lib/mail-contacts.ts', () => {
+    // If this fails, mail-contacts.ts changed the table and this mirror was not updated with it.
+    // Fix the mirror in schema.ts — do not weaken this test.
+    expect(mine).toEqual(theirs);
+  });
+
+  it('still keys on email, which is what audienceSql() joins against', () => {
+    expect(mine[0]).toMatch(/^email text PRIMARY KEY$/);
   });
 });
 

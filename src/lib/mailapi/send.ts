@@ -42,6 +42,8 @@
 import crypto from 'node:crypto';
 import { SITE } from '@/lib/site';
 import { sendExternal } from '@/lib/mail-transport';
+// Renders link attachments into the body instead of having the server fetch them. See below.
+import { appendLinkAttachments } from '@/lib/mailsec/link-attachments';
 import { getMailConfig } from '@/lib/mail';
 import { ApiError } from './errors';
 import type { AuthContext } from './keys';
@@ -132,13 +134,28 @@ export function verifiedSendingDomains(domainRows: any[]): string[] {
  * sends the mail: relaying for a domain we cannot confirm we own is the failure that costs us the
  * reputation of every other domain we sign.
  */
-async function assertSenderIdentity(auth: AuthContext, fromEmail: string, platform: string[], configError: string): Promise<void> {
+async function assertSenderIdentity(auth: AuthContext, fromEmail: string, platform: string[], configError: string,
+                                   callerSuppliedFrom: boolean): Promise<void> {
   // A malformed address is answered before any query: a bad address must not cost a round trip, and
   // it certainly must not reach the allowance counter further down.
   if (!isValidAddress(fromEmail)) {
     throw new ApiError('invalid_request', 'The `from` address is not a valid email address, so nothing was sent.', { param: 'from' });
   }
-  if (checkEnvelopeSender(fromEmail, platform).allowed) return;
+  // ═══ THE PLATFORM ALLOWANCE IS FOR ADDRESSES WE CHOSE, NOT ADDRESSES A TENANT ASKED FOR ═══
+  //
+  // `platform` is the deployment's own sending identity — the configured mailbox,
+  // MAILAPI_DEFAULT_FROM, and noreply@ on the site domain. It has to be allowed, or our own default
+  // From stops working the moment the domain table cannot be read.
+  //
+  // But allowing it UNCONDITIONALLY made it a tenant-spoofing lane: any organization holding any
+  // live key could put `security@<our own domain>` in `from` and have us sign it. That is worse
+  // than sending as an unverified third-party domain, because mail from our own domain is the mail
+  // our own people trust.
+  //
+  // So the allowance applies only when WE chose the address — the caller supplied no `from` and we
+  // filled in the default. A tenant that explicitly names an address on the platform domain has to
+  // verify it like any other domain.
+  if (!callerSuppliedFrom && checkEnvelopeSender(fromEmail, platform).allowed) return;
 
   let verified: string[];
   try {
@@ -158,16 +175,21 @@ async function assertSenderIdentity(auth: AuthContext, fromEmail: string, platfo
 
   // checkEnvelopeSender() owns the domain arithmetic, including the "ends with ours" trap: a
   // sender at `notedurankai.in` must not pass because the string ends with `edurankai.in`.
-  if (checkEnvelopeSender(fromEmail, [...platform, ...verified]).allowed) return;
+  // Same rule on the second pass: the platform list is only in play when we chose the address.
+  const allowed = callerSuppliedFrom ? verified : [...platform, ...verified];
+  if (checkEnvelopeSender(fromEmail, allowed).allowed) return;
 
   const domain = addressDomain(fromEmail);
+  // The list is trimmed for the message: an organization with two hundred verified domains should
+  // get a readable error, not its own inventory pasted into a sentence.
+  const shown = verified.slice(0, 10);
   throw new ApiError('invalid_request',
     'This organization is not verified to send as ' + (domain || 'that address') + ' in the ' + auth.environment + ' environment, so the message was refused rather than signed by us. '
     + (verified.length
-      ? 'Verified sending domains for this organization: ' + verified.join(', ') + '.'
+      ? 'Verified sending domains for this organization: ' + shown.join(', ') + (verified.length > shown.length ? ', and ' + (verified.length - shown.length) + ' more' : '') + '.'
       : 'No sending domain has been verified for this organization yet. Add the domain and publish its SPF and DKIM records, then verify it.')
     + (configError ? ' (The configured platform mailbox could not be read on this request: ' + configError + '.)' : ''),
-    { param: 'from', extra: { from_domain: domain, verified_domains: verified, environment: auth.environment } });
+    { param: 'from', extra: { from_domain: domain, verified_domains: shown, environment: auth.environment } });
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +323,7 @@ export async function prepareMessage(auth: AuthContext, body: any, headers: { id
   });
   const fromEmail = input.from?.email || config.fromAddress || process.env.MAILAPI_DEFAULT_FROM || 'noreply@' + String(SITE.domain);
   const fromName = input.from?.name || config.fromName || auth.orgName;
-  await assertSenderIdentity(auth, bareAddress(fromEmail), platformSendingDomains(config.fromAddress), configError);
+  await assertSenderIdentity(auth, bareAddress(fromEmail), platformSendingDomains(config.fromAddress), configError, !!input.from?.email);
   if (config.fromAddress && fromEmail.toLowerCase() !== String(config.fromAddress).toLowerCase()) {
     // The tail of this warning used to read "Verify <domain> as a sending identity to send From it
     // directly". It cannot say that any more: by the time execution reaches this line the identity
@@ -317,6 +339,8 @@ export async function prepareMessage(auth: AuthContext, body: any, headers: { id
   let templateKey: string | null = null;
   let templateVersion: number | null = null;
   let templateState: string | null = null;
+  /** True when the plain-text part was derived from the html rather than supplied — see below. */
+  let textDerivedFromHtml = false;
 
   if (input.templateRef) {
     const resolved = await resolveForSend({
@@ -357,7 +381,10 @@ export async function prepareMessage(auth: AuthContext, body: any, headers: { id
     subject = s.output;
     html = h.output || '';
     text = t.output || (html ? htmlToText(html) : '');
-    if (!html && text) html = '<pre style="font-family:inherit;white-space:pre-wrap;">' + text.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' } as any)[c]) + '</pre>';
+    // The two derived parts — a text part taken from the html, and the <pre> wrapper for a body that
+    // is only text — are now built AFTER sanitisation instead of here. See the block below: built
+    // here, the wrapper would be stripped by the sanitiser as if the caller had written it.
+    textDerivedFromHtml = !t.output && !!html;
   }
 
   // ---- sanitise the body BEFORE it is stored -----------------------------
@@ -378,6 +405,23 @@ export async function prepareMessage(auth: AuthContext, body: any, headers: { id
   if (!sanitized.clean) {
     warnings.push('Part of the HTML body was removed before sending: ' + summarizeRemovals(sanitized.removed) + '. The message was sent without it rather than with markup we will not put our signature on.');
   }
+
+  // THE TEXT PART HAS TO AGREE WITH THE HTML PART. When the caller sent html and no text, the plain
+  // text was taken from the body they sent — so the contents of a `<script>` we had just removed
+  // would still have travelled, as text, in the same message. Regenerated from the sanitised html,
+  // the two alternatives of one multipart message say the same thing. A text part the CALLER wrote,
+  // or one that came from a template, is never rewritten: it is theirs.
+  if (textDerivedFromHtml && !sanitized.clean) text = html.trim() ? htmlToText(html) : '';
+
+  // Our own wrapper for a body that is only text, built here rather than before the sanitiser
+  // because `pre` is not on the email allow-list: sanitising it would strip the wrapper we had just
+  // added and then report our own markup to the caller as something removed from theirs. What goes
+  // inside it is escaped on the way in, so it never needed sanitising. Inline bodies only — a
+  // template that ships a text part and no html has always sent exactly that.
+  if (!input.templateRef && !html.trim() && text.trim()) {
+    html = '<pre style="font-family:inherit;white-space:pre-wrap;">' + text.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' } as any)[c]) + '</pre>';
+  }
+
   if (!html.trim() && !text.trim() && !sanitized.clean) {
     // Distinct from the generic empty-body error below, which would be a confusing answer to a body
     // that was not empty when it arrived.
@@ -575,17 +619,32 @@ export async function deliverMessage(message: MessageRecord, orgSlug: string): P
   }
 
   const rfcId = '<' + message.id + '@' + String(SITE.domain) + '>';
+
+  // ATTACHMENT LINKS GO INTO THE MESSAGE. THEY ARE NOT FETCHED BY US.
+  //
+  // This used to be `attachments: message.attachments.map(a => ({ filename: a.filename, href: a.url }))`.
+  // nodemailer's `href` does not mean "link to this" — it means FETCH THAT URL and embed the
+  // response, and neither transport in this repository set `disableUrlAccess`. The URL comes from
+  // the body of POST /api/v1/email/send (validate.ts accepts any absolute http(s) address), so any
+  // API key holder could name an address inside the deployment's own network — the cloud metadata
+  // endpoint, an internal service — and have the response delivered to a mailbox of their choosing.
+  // A full-response SSRF with exfiltration by email, on a route documented as never fetching
+  // anything.
+  //
+  // appendLinkAttachments() puts the links in the body instead, where the RECIPIENT's browser
+  // fetches them under the recipient's own authority. The server opens no connection at all.
+  const withLinks = appendLinkAttachments(String(row.body_html || ''), String(row.body_text || ''), message.attachments);
+
   const result = await sendExternal({
     from: (message.fromName ? message.fromName + ' ' : '') + '<' + message.from + '>',
     to: message.to,
     cc: message.cc.length ? message.cc : undefined,
     bcc: message.bcc.length ? message.bcc : undefined,
     subject: message.subject,
-    html: String(row.body_html || ''),
-    text: String(row.body_text || ''),
+    html: withLinks.html,
+    text: withLinks.text,
     replyTo: message.replyTo || undefined,
     messageId: rfcId,
-    attachments: message.attachments.map((a: any) => ({ filename: a.filename, href: a.url })),
     // Custom X- headers from the caller, plus List-Unsubscribe when an unsubscribe link was added.
     headers: Object.keys(extraHeaders).length ? extraHeaders : undefined,
     // The transactional platform keeps its own event log; a second row per send in email_logs would

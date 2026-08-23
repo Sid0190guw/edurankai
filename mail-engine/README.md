@@ -80,8 +80,19 @@ Start-Process node -ArgumentList '--import','tsx','mail-engine/src/index.ts' -Wi
 ### The whole stack
 
 **Needs Docker Desktop, which is not installed on the ZBook** (WSL2 is). `docker compose` will
-report `docker: command not found` until it is. The container configuration in `docker/` has been
-written and reviewed but never executed — see the honesty note at the bottom of this file.
+report `docker: command not found` until it is.
+
+The container configuration in `docker/` has never been executed. It has been through an adversarial
+review — five independent reviewers against Postfix, Dovecot, Rspamd/OpenDKIM, the compose wiring and
+the documentation, each finding checked by a second reviewer whose brief was to refute it — and the
+blockers it found are fixed: a read-only certificate mount that crash-looped Postfix and Dovecot on
+first boot, a `smtpd_sender_login_maps` pointing at a map of maildir paths that refused 100% of
+authenticated submission, a missing `users` file that Docker turns into a directory and silently
+kills all authentication, six environment variables the compose file never passed through, a global
+`header_checks` that stripped the `Authentication-Results` header the engine reads, and a DKIM
+private key being baked into an image layer for want of a `.dockerignore`.
+
+Reviewed is not run. Expect to find more on the first real `up`.
 
 ```bash
 cp mail-engine/.env.example mail-engine/.env         # then fill in the secrets
@@ -152,7 +163,7 @@ domain needs.
 npx vitest run mail-engine/
 ```
 
-219 tests, no Docker and no network required. `test/smtp-integration.test.ts` runs a real SMTP server
+225 tests, no Docker and no network required. `test/smtp-integration.test.ts` runs a real SMTP server
 on loopback (`test/helpers/fake-smtp.ts`) and drives real deliveries through it — signed messages,
 partial rejections, dropped connections, 421s — because a mail transport tested against a mock is a
 mock that has been tested.

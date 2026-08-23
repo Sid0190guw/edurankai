@@ -1007,21 +1007,62 @@ export async function promoteWinner(id: string, opts: { variant?: string; overri
 export interface UnsubscribeResult { ok: boolean; email?: string; error?: string; already?: boolean }
 
 /**
- * One-click unsubscribe.
+ * THE ONE PLACE AN OPT-OUT IS PROCESSED. Every unsubscribe path — the public page, the RFC 8058
+ * one-click POST, an admin setting the status by hand — comes through here, because an opt-out that
+ * takes a shortcut is an opt-out that half works.
  *
- * The token is the contact's own `unsub_token` — a random uuid stored on the row, checked against
- * the contact id. It carries no signature because it needs none: it is unguessable, scoped to one
- * person, and grants exactly one power (stop mailing me). A link that fails to unsubscribe somebody
- * is a compliance failure, so this path is deliberately the simplest one in the system.
+ * FOUR THINGS HAVE TO HAPPEN, AND MISSING ANY ONE OF THEM IS A REAL FAILURE:
+ *
+ *   1. `mail_suppression` gets the ADDRESS. This is the one that is easy to skip and expensive to
+ *      skip. Setting `mail_contacts.status` alone looks correct and behaves correctly right up until
+ *      somebody deletes the contact and re-imports the spreadsheet — at which point a person who
+ *      asked us to stop is mailable again, because the refusal lived on a row that no longer exists.
+ *      The transactional API (/api/mail/send) reads this table too, so skipping it also lets
+ *      transactional bulk through.
+ *   2. The contact's own status changes, so every screen agrees with the suppression list.
+ *   3. The campaign that prompted it records the event, so its report shows the unsubscribe it caused.
+ *   4. Every OTHER campaign holding this address in a pending queue drops it NOW, not at the end of
+ *      the current batch. That happens inside suppress(), because a bounce and a complaint mean the
+ *      same thing about queued mail as an unsubscribe does.
+ *
+ * THE TOKEN IS CHECKED WHEN THERE IS ONE, AND NOT REQUIRED WHEN THERE IS NOT. Links minted here
+ * carry `unsub_token` (a random uuid on the contact row) and it is verified. Links minted by the
+ * core campaign engine carry only the contact id — refusing those would break every unsubscribe in
+ * mail that has already been sent, which is a far worse outcome than the weaker check. The worst a
+ * guessed contact id can do is unsubscribe somebody, which a human can reverse; a link that does not
+ * work cannot be reversed by the recipient at all.
  */
-export async function unsubscribeByToken(contactId: string, token: string, campaignId?: string | null, meta: { ip?: string; userAgent?: string } = {}): Promise<UnsubscribeResult> {
+export async function unsubscribeContact(
+  contactId: string,
+  token: string | null,
+  campaignId?: string | null,
+  meta: { ip?: string; userAgent?: string; source?: string } = {},
+): Promise<UnsubscribeResult> {
   await ensureContactSchema();
-  if (!isUuid(contactId) || !isUuid(token)) return { ok: false, error: 'That unsubscribe link is not valid. Reply to any message and we will remove you by hand.' };
-  const c = rows(await db.execute(sql`SELECT id, email, status FROM mail_contacts WHERE id = ${contactId} AND unsub_token = ${token} LIMIT 1`))[0];
+  if (!isUuid(contactId)) {
+    return { ok: false, error: 'That unsubscribe link is not valid. Reply to any message and we will remove you by hand.' };
+  }
+  // A token that is present but malformed is a refusal; an absent token falls back to id-only.
+  if (token !== null && token !== '' && !isUuid(token)) {
+    return { ok: false, error: 'That unsubscribe link is not valid. Reply to any message and we will remove you by hand.' };
+  }
+  const where = token
+    ? sql`id = ${contactId} AND unsub_token = ${token}`
+    : sql`id = ${contactId}`;
+  const c = rows(await db.execute(sql`SELECT id, email, status FROM mail_contacts WHERE ${where} LIMIT 1`))[0];
   if (!c) return { ok: false, error: 'That unsubscribe link is not valid. Reply to any message and we will remove you by hand.' };
-  if (c.status === 'unsubscribed') return { ok: true, email: c.email, already: true };
 
-  await suppress(c.email, 'unsubscribed', 'One-click unsubscribe' + (campaignId ? ' from a campaign' : ''), campaignId || null);
+  const already = c.status === 'unsubscribed';
+  // Runs even when the contact already reads as unsubscribed: the status may have been set by a
+  // path that never wrote the suppression row, and this is the repair for exactly that case.
+  await suppress(
+    c.email,
+    'unsubscribed',
+    (meta.source || 'One-click unsubscribe') + (campaignId ? ' from a campaign' : ''),
+    campaignId || null,
+  );
+  if (already) return { ok: true, email: c.email, already: true };
+
   if (campaignId && isUuid(campaignId)) {
     const rec = rows(await db.execute(sql`SELECT id, variant FROM mail_campaign_recipients WHERE campaign_id = ${campaignId} AND contact_id = ${contactId} LIMIT 1`))[0];
     await recordCampaignEvent({
@@ -1029,12 +1070,16 @@ export async function unsubscribeByToken(contactId: string, token: string, campa
       kind: 'unsubscribed', variant: rec?.variant || null, ip: meta.ip, userAgent: meta.userAgent,
     });
   }
-  // Every other campaign that has this person queued must stop now, not at the end of the batch.
-  await db.execute(sql`
-    UPDATE mail_campaign_recipients SET status = 'skipped', skip_reason = 'unsubscribed', updated_at = now()
-    WHERE contact_id = ${contactId} AND status = 'pending'
-  `).catch((e: any) => console.error('[mail-campaigns] could not clear queued sends after unsubscribe:', dbReason(e)));
+  // Clearing this person out of every other campaign's queue is done by suppress() above, keyed by
+  // address — it belongs there because a bounce and a complaint mean the same thing about queued
+  // mail as an unsubscribe does, and only doing it here left those two cases sending.
   return { ok: true, email: c.email };
+}
+
+/** The token-required form, for the RFC 8058 one-click endpoint whose links always carry one. */
+export async function unsubscribeByToken(contactId: string, token: string, campaignId?: string | null, meta: { ip?: string; userAgent?: string } = {}): Promise<UnsubscribeResult> {
+  if (!isUuid(token)) return { ok: false, error: 'That unsubscribe link is not valid. Reply to any message and we will remove you by hand.' };
+  return unsubscribeContact(contactId, token, campaignId, meta);
 }
 
 /** Resolve a click token to its campaign, recipient and destination. Never trusts a URL parameter. */

@@ -160,10 +160,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
       }
 
       case 'dispatch': {
-        const res = await dispatchBatch(id, clampInt(body.batchSize, 1, 100, 25));
-        // A refusal is reported as a refusal WITH its reason, not as a zero-progress success.
-        if (!res.ok) return json({ ok: false, error: res.error, ...res }, 200);
-        return json({ ok: true, ...res });
+        const { ok, error, ...progress } = await dispatchBatch(id, clampInt(body.batchSize, 1, 100, 25));
+        // A refusal is reported as a refusal WITH its reason, not as a zero-progress success — and
+        // the progress figures travel with it either way, so the screen can show where the send
+        // actually stopped. 200 rather than 4xx because the loop in campaign.js reads the body: this
+        // is a well-formed answer about a campaign, not a malformed request.
+        return json({ ok, error: error ?? null, ...progress }, 200);
       }
 
       default:
@@ -175,7 +177,14 @@ export const POST: APIRoute = async ({ request, locals }) => {
   }
 };
 
-/** A service result becomes a response in one place, so every action answers in the same shape. */
+/**
+ * A service result becomes a response in one place, so every action answers in the same shape.
+ *
+ * `ok` and `error` are destructured OUT rather than spread over: `{ ...r, ok: true }` sets the key
+ * twice, and while the last one wins, a reader cannot tell that from the source and TypeScript is
+ * right to flag it.
+ */
 function respond(r: { ok: boolean; error?: string; [k: string]: unknown }): Response {
-  return r.ok ? json({ ...r, ok: true }) : fail(r.error || 'That did not go through.');
+  const { ok, error, ...rest } = r;
+  return ok ? json({ ok: true, ...rest }) : fail(error || 'That did not go through.');
 }

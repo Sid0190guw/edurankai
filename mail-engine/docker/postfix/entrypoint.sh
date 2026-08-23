@@ -50,20 +50,38 @@ cp /etc/postfix/master.cf.template /etc/postfix/master.cf
 # ---------------------------------------------------------------------------
 : > /etc/postfix/virtual_mailbox
 : > /etc/postfix/virtual_alias
+# THE SENDER-IDENTITY MAP IS A SEPARATE FILE, AND IT HAS TO BE.
+#
+# main.cf pointed smtpd_sender_login_maps at virtual_mailbox, which looks reasonable — it lists every
+# address we host — but the two maps answer different QUESTIONS. virtual_mailbox answers "where does
+# mail for this address get written" and its value is a maildir path (`edurankai.in/noreply/`).
+# smtpd_sender_login_maps answers "which SASL login owns this address", and master.cf runs
+# reject_sender_login_mismatch on submission. So Postfix looked up noreply@edurankai.in, got
+# `edurankai.in/noreply/`, compared it to the login `noreply@edurankai.in`, found them different, and
+# answered `553 5.7.1 Sender address rejected: not owned by user`. EVERY authenticated submission on
+# 587 and 465 was refused, while port 25 and the healthcheck stayed green.
+#
+# Here the value is the login itself, which is what Dovecot authenticates as (dovecot.conf uses
+# username_format=%u, so the login IS the full address).
+: > /etc/postfix/sender_login
+
+add_mailbox() {
+  # $1 = address, $2 = domain, $3 = localpart
+  echo "$1  $2/$3/" >> /etc/postfix/virtual_mailbox
+  echo "$1  $1" >> /etc/postfix/sender_login
+}
 
 for domain in $MAIL_DOMAINS_SPACED; do
   for local in postmaster abuse hostmaster webmaster noreply connect; do
-    echo "$local@$domain  $domain/$local/" >> /etc/postfix/virtual_mailbox
+    add_mailbox "$local@$domain" "$domain" "$local"
   done
 done
 
 # MAIL_EXTRA_MAILBOXES="one@edurankai.in,two@edurankai.in"
 if [ -n "${MAIL_EXTRA_MAILBOXES:-}" ]; then
-  echo "$MAIL_EXTRA_MAILBOXES" | tr ',' '\n' | while read -r addr; do
+  for addr in $(echo "$MAIL_EXTRA_MAILBOXES" | tr ',' ' '); do
     [ -z "$addr" ] && continue
-    domain="${addr#*@}"
-    local="${addr%@*}"
-    echo "$addr  $domain/$local/" >> /etc/postfix/virtual_mailbox
+    add_mailbox "$addr" "${addr#*@}" "${addr%@*}"
   done
 fi
 
@@ -85,22 +103,65 @@ if [ "${MAIL_CATCH_ALL:-false}" = "true" ]; then
 fi
 
 postmap /etc/postfix/virtual_mailbox
+postmap /etc/postfix/sender_login
 postmap /etc/postfix/virtual_alias
+
+# WHO DECIDES WHETHER A MAILBOX EXISTS DEPENDS ON WHERE THE MAIL IS GOING, and getting this wrong
+# rejects every real user's mail at RCPT time.
+#
+# With the default lmtp:dovecot transport the mailbox list above IS the authority: an address not in
+# it has nowhere to be delivered, so rejecting at RCPT is correct and tells the sender immediately.
+#
+# With VIRTUAL_TRANSPORT=engine the authority is the APPLICATION — it holds the user table and
+# resolveAddress() answers the question. Postfix has only the six seeded addresses, so leaving strict
+# validation on means mail to every actual learner and staff member is refused with "User unknown in
+# virtual mailbox table" while the engine sits behind it, perfectly able to deliver. So in that mode
+# Postfix accepts anything at a hosted domain and the engine's own 550 (mapped to a bounce by
+# pipe-to-engine.sh) becomes the rejection instead — later in the conversation, but from the party
+# that actually knows.
+case "$VIRTUAL_TRANSPORT" in
+  engine*)
+    echo "[postfix] transport=engine: recipient existence is the application's decision, not Postfix's"
+    postconf -e "virtual_mailbox_maps = static:all" "smtpd_reject_unlisted_recipient = no"
+    ;;
+esac
 
 # ---------------------------------------------------------------------------
 # TLS certificate.
 # ---------------------------------------------------------------------------
-if [ ! -f /etc/mail/certs/fullchain.pem ] || [ ! -f /etc/mail/certs/privkey.pem ]; then
-  echo "[postfix] no certificate at /etc/mail/certs — generating a SELF-SIGNED one."
-  echo "[postfix] This is fine for local development and WRONG for production: other mail servers"
-  echo "[postfix] will fall back to cleartext. See docs/production-migration.md for Let's Encrypt."
-  mkdir -p /etc/mail/certs
+# THIS BLOCK USED TO CRASH-LOOP THE CONTAINER ON A FRESH CHECKOUT, and the reason is worth keeping
+# written down: docker-compose mounted ./docker/certs READ-ONLY, and this code writes a self-signed
+# pair into it when none is present. Under `set -eu` the failed mkdir killed the entrypoint, Postfix
+# never started, and `docker compose up` produced a container that restarted forever with an error
+# most people would read as a TLS problem rather than a permissions one.
+#
+# Two changes. The compose mount is no longer read-only, so the normal path works. And an unwritable
+# certificate directory is now a legitimate production posture — certificates managed outside the
+# stack, mounted read-only on purpose — so instead of dying, the entrypoint falls back to a
+# container-local directory and points Postfix at it.
+CERT_DIR=/etc/mail/certs
+if [ ! -f "$CERT_DIR/fullchain.pem" ] || [ ! -f "$CERT_DIR/privkey.pem" ]; then
+  if ! mkdir -p "$CERT_DIR" 2>/dev/null || [ ! -w "$CERT_DIR" ]; then
+    CERT_DIR=/var/lib/postfix-certs
+    mkdir -p "$CERT_DIR"
+    echo "[postfix] /etc/mail/certs holds no certificate and cannot be written to."
+    echo "[postfix] Falling back to a self-signed certificate in $CERT_DIR (NOT persisted)."
+    echo "[postfix] If you meant to supply your own, put fullchain.pem and privkey.pem in the"
+    echo "[postfix] mounted directory — see mail-engine/docker/certs/README.md."
+  else
+    echo "[postfix] no certificate at $CERT_DIR — generating a SELF-SIGNED one."
+  fi
+  echo "[postfix] Self-signed is fine for local development and WRONG for production: other mail"
+  echo "[postfix] servers fall back to cleartext. See docs/production-migration.md for Let's Encrypt."
   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
     -subj "/CN=$MAIL_HOSTNAME" \
-    -keyout /etc/mail/certs/privkey.pem \
-    -out /etc/mail/certs/fullchain.pem 2>/dev/null
-  chmod 600 /etc/mail/certs/privkey.pem
+    -keyout "$CERT_DIR/privkey.pem" \
+    -out "$CERT_DIR/fullchain.pem" 2>/dev/null
+  # A bind mount from a Windows host does not carry Unix permissions; failing to tighten them must
+  # not be fatal, because the alternative is a mail server that will not start on a developer laptop.
+  chmod 600 "$CERT_DIR/privkey.pem" 2>/dev/null || true
 fi
+postconf -e "smtpd_tls_cert_file = $CERT_DIR/fullchain.pem" "smtpd_tls_key_file = $CERT_DIR/privkey.pem"
 
 # A relayhost is how this works from a laptop, where outbound 25 is blocked.
 if [ -n "${RELAYHOST:-}" ]; then

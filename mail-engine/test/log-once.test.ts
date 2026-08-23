@@ -81,5 +81,11 @@ describe('the publisher does not flood the log', () => {
     } finally {
       await removeDir(dir);
     }
-  });
+  // The 5-second default is a statement about THIS MACHINE, not about the code. The throttling
+  // itself runs on an injected clock and costs nothing; the wall-clock here is 151 real spool writes
+  // into a temp directory, and on a loaded Windows box inside the full suite that crossed five
+  // seconds and failed a test that passes every time on its own. A gate that goes red for being
+  // busy is a gate people learn to re-run instead of read, so the budget is stated rather than
+  // inherited. Nothing about what is asserted changes.
+  }, 30_000);
 });

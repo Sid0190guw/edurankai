@@ -256,8 +256,44 @@ clients and security scanners pre-fetch links, and a GET that opted people out w
 people who never clicked. The page is self-contained — no layout, no fonts, no framework — so a
 change to the site shell cannot break an opt-out.
 
-Unsubscribing also clears that person from **every other campaign's pending queue** immediately, not
-at the end of the current batch.
+### One opt-out path, four steps
+
+Both the page and the one-click endpoint call `unsubscribeContact()`. Nothing does its own UPDATE,
+because an opt-out that takes a shortcut is an opt-out that half works. All four of these must
+happen:
+
+1. **`mail_suppression` gets the address.** This is the step that is easy to skip and expensive to
+   skip. Setting `mail_contacts.status` alone looks correct right up until somebody deletes the
+   contact and re-imports the spreadsheet — at which point a person who asked us to stop is mailable
+   again, because the refusal lived on a row that no longer exists. `/api/mail/send` reads the same
+   table, so skipping it lets transactional bulk through too. An earlier revision of the page did
+   exactly this and it is why the single-path rule exists.
+2. The contact's own status changes, so every screen agrees with the suppression list.
+3. The campaign that prompted it records the event, so its report shows the unsubscribe it caused.
+4. Every other campaign holding that **address** in a pending queue drops it immediately — both
+   `pending` (this engine) and `queued` (the core dispatcher), because the person unsubscribing does
+   not know or care which engine has them.
+
+Step 4 lives inside `suppress()`, not in the unsubscribe handler, because suppression has four
+causes and all four mean the same thing about mail already sitting in a queue: an unsubscribe, a hard
+bounce, a spam complaint, and an admin adding an address by hand. Putting it only on the unsubscribe
+path left the other three — an address that hard-bounced mid-campaign kept being handed to the sender
+for every remaining batch, and an admin marking somebody unsubscribed on the contact screen still had
+them go out that evening.
+
+Step 1 runs even when the contact already reads as unsubscribed, which repairs anyone opted out by a
+path that never wrote the suppression row.
+
+**The token is checked when there is one and not required when there is not.** Links minted here
+carry `unsub_token`; links minted by the core campaign engine carry only the contact id. Refusing
+those would break every unsubscribe in mail that has already been sent — a far worse outcome than
+the weaker check, since the worst a guessed contact id can do is unsubscribe somebody, which a human
+can reverse, while a link that does not work cannot be reversed by the recipient at all.
+
+The page answers identically for an unknown id, an invalid token and a successful opt-out, so it
+cannot be used to test whether an address is in the system. A genuine **write failure** is a
+different thing and is never hidden: it says so and offers a retry, because telling somebody they
+have been unsubscribed when the write threw is the worst thing this page could do.
 
 ---
 

@@ -20,7 +20,7 @@
 // described where they are declared below.
 import type { APIRoute } from 'astro';
 import { ApiError, apiError, apiJson, handleApiError, newRequestId, preflight, type ErrorCode } from './errors';
-import { authenticate, requireScope, type AuthContext, type Scope } from './keys';
+import { authenticate, extractKey, keyPrefix, requireScope, type AuthContext, type Scope } from './keys';
 import { DEFAULT_LIMITS, checkRateLimits, clientIp, consume, rateLimitHeaders, type Limit, type RateDecision } from './ratelimit';
 
 // ---------------------------------------------------------------------------
@@ -134,9 +134,18 @@ async function chargePreAuth(ip: string): Promise<RateDecision | null> {
  * precisely the moment we are least able to see it happening. Bounding abuse is the one place this
  * codebase fails closed, and this is that place.
  */
-async function chargeAuthFailure(ip: string): Promise<RateDecision> {
+async function chargeAuthFailure(ip: string, presentedKey: string): Promise<RateDecision> {
   try {
-    return await consume('authfail_ip', ip, AUTH_FAILURE_LIMIT);
+    // KEYED ON IP **AND** THE PRESENTED KEY PREFIX, not the IP alone.
+    //
+    // Our own products call this API from a small pool of serverless egress addresses, so a bucket
+    // keyed on IP alone means one integration that has pasted a stale key throttles every unrelated
+    // integration sharing that address. The prefix identifies which credential is failing without
+    // revealing anything: it is the public half of the key, already stored in mailapi_keys and
+    // already shown in the admin console. A caller with no key at all falls back to the IP, which is
+    // the only identity it has offered.
+    const who = presentedKey ? ip + '|' + keyPrefix(presentedKey) : ip;
+    return await consume('authfail_ip', who, AUTH_FAILURE_LIMIT);
   } catch (e: any) {
     console.error('[mailapi] auth-failure limiter unavailable, throttling this refusal anyway:', e?.cause?.message || e?.message);
     return { allowed: false, limit: AUTH_FAILURE_LIMIT.limit, remaining: 0, resetSec: Math.max(1, AUTH_FAILURE_LIMIT.windowSec) };
@@ -193,7 +202,22 @@ export function apiRoute(opts: RouteOptions, handler: (ctx: ApiContext) => Promi
         auth = await authenticate(request);
       } catch (e) {
         if (!isCredentialFailure(e)) throw e;
-        const failed = await chargeAuthFailure(ip);
+        const failed = await chargeAuthFailure(ip, extractKey(request));
+        // ═══ COUNTED IS NOT ENFORCED ═══
+        //
+        // This bucket was charged and its decision used only to decorate the response with
+        // Retry-After. A header is advice; an attacker guessing keys does not read it. So the
+        // "unmetered guessing oracle" the comment above describes was still unmetered — the counter
+        // moved and nothing ever acted on it.
+        //
+        // Once the failure budget is spent the refusal becomes a refusal to keep answering. It is
+        // deliberately a DIFFERENT code from the 401: being throttled tells a caller only that they
+        // have failed too many times, which they already know, whereas the 401 must stay identical
+        // for every reason so that "unknown key" and "revoked key" remain indistinguishable.
+        if (!failed.allowed) {
+          return apiError('rate_limit_exceeded', retryMessage(failed.resetSec),
+            { requestId, headers: { ...rateLimitHeaders(failed), 'X-Request-Id': requestId } });
+        }
         const err = e as ApiError;
         // The SAME code, message and status as before this bucket existed, for every reason. Being
         // throttled must not be a new signal: if a spent budget answered differently from a fresh

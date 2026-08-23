@@ -16,6 +16,18 @@ import { mailCsp, reportUriRefusal, serializeCsp, DOCUMENT_CSP, API_CSP } from '
 import { secureHeaders, secureJson } from '@/lib/http-guard';
 
 describe('report-uri refusals', () => {
+  // THE BYPASS A REVIEW FOUND IN THE FIRST VERSION OF THIS GUARD. Browsers normalise a backslash to
+  // a slash inside a URL, so `/` + `\` + `evil.example/collect` is protocol-relative by the time it
+  // is fetched: it starts with a single slash, so the `//` test misses it, and it points at somebody
+  // else's server. The repair stopped enumerating shapes and let the URL parser answer instead.
+  // Written with String.fromCharCode so the byte is visible to a reader rather than lost in escaping,
+  // which is the same house rule this file's header cites.
+  it('refuses a slash-backslash, which a browser reads as protocol-relative', () => {
+    const BACKSLASH = String.fromCharCode(92);
+    expect(reportUriRefusal('/' + BACKSLASH + 'evil.example/collect')).toBe('resolves to another origin');
+    expect(reportUriRefusal('/' + BACKSLASH + BACKSLASH + 'evil.example')).toBe('resolves to another origin');
+  });
+
   const REFUSED = [
     ['', 'empty'],
     ['/csp\r\nX-Injected: 1', 'contains a line break or control character'],

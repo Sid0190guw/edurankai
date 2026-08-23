@@ -14,46 +14,55 @@
  * IT REVEALS NOTHING. The contact id is a uuid supplied in the link. The page never displays the
  * address, never confirms whether the id exists, and answers the same way either way — otherwise it
  * is an oracle for testing whether an address is in this system.
+ *
+ * IT DOES NOT DO THE WORK ITSELF. An earlier version of this page ran its own UPDATE on
+ * `mail_contacts.status`, which looks right and is half an opt-out: it never wrote
+ * `mail_suppression`, so deleting the contact and re-importing the spreadsheet made a person who had
+ * asked us to stop mailable again, and the transactional API — which reads that same table — kept
+ * sending. It also left the person sitting in other campaigns' pending queues. All four steps live
+ * in unsubscribeContact(); this page collects the click and reports the outcome.
  */
-import { db } from '@/lib/db';
-import { sql } from 'drizzle-orm';
-import { ensureMailProductSchema } from '@/lib/mail-product/schema';
-import { isUuid, reasonOf, rowsOf } from '@/lib/mail-product/common';
+import { unsubscribeContact } from '@/lib/mail-campaigns';
+import { dbReason } from '@/lib/mail-contacts';
 
 const url = new URL(Astro.request.url);
 const contactId = url.searchParams.get('c') || '';
 const campaignId = url.searchParams.get('k') || '';
+// Links minted by this engine carry the contact's own unsub_token; links minted by the core
+// campaign engine do not. unsubscribeContact() verifies one when it is there and accepts the
+// id alone when it is not, so mail already in people's inboxes keeps working.
+const token = url.searchParams.get('t') || '';
 
 let done = false;
 let failed = false;
 
+// Astro.clientAddress THROWS on an adapter that does not provide it, and an unsubscribe page that
+// 500s because it wanted an IP for a log line would be an absurd way to fail. It is optional data.
+let clientIp: string | undefined;
+try {
+  clientIp = Astro.clientAddress || undefined;
+} catch {
+  clientIp = Astro.request.headers.get('x-forwarded-for') || undefined;
+}
+
 if (Astro.request.method === 'POST') {
   try {
-    await ensureMailProductSchema();
-    if (isUuid(contactId)) {
-      const r = await db.execute(sql`
-        UPDATE mail_contacts
-        SET status = 'unsubscribed', unsubscribed_at = now(), updated_at = now()
-        WHERE id = ${contactId} AND status <> 'unsubscribed'
-        RETURNING id, email`);
-      const row = rowsOf(r)[0];
-      if (row) {
-        // Recorded against the campaign so its report can show the unsubscribe it caused. Best
-        // effort: a failed event write must not stop somebody opting out.
-        await db.execute(sql`
-          INSERT INTO mail_campaign_events (campaign_id, contact_id, email, type)
-          VALUES (${isUuid(campaignId) ? campaignId : null}, ${row.id}, ${row.email}, 'unsubscribed')
-        `).catch((e: any) => console.error('[mail/unsubscribe] event write failed:', reasonOf(e)));
-      }
-    }
-    // `done` regardless of whether a row matched — an unknown id and an already-unsubscribed contact
-    // must be indistinguishable from a successful one, or this page enumerates the audience.
+    const res = await unsubscribeContact(contactId, token || null, campaignId || null, {
+      ip: clientIp,
+      userAgent: Astro.request.headers.get('user-agent') || undefined,
+      source: 'Unsubscribe page',
+    });
+    // `done` regardless of whether a row matched — an unknown id, an invalid token and an
+    // already-unsubscribed contact must all be indistinguishable from a successful one, or this
+    // page enumerates the audience. A genuine WRITE failure is a different thing and is not hidden:
+    // unsubscribeContact() throws for those, and the catch below reports them.
     done = true;
+    if (!res.ok) console.warn('[mail/unsubscribe] refused for ' + contactId + ': ' + res.error);
   } catch (e: any) {
     // A failure is reported HONESTLY. Telling somebody they have been unsubscribed when the write
     // threw is the single worst thing this page could do: they stop trying, and keep receiving mail.
     failed = true;
-    console.error('[mail/unsubscribe] failed:', reasonOf(e));
+    console.error('[mail/unsubscribe] failed:', dbReason(e));
   }
 }
 ---

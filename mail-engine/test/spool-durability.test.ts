@@ -115,6 +115,37 @@ describe('claiming', () => {
     expect(total).toBe(1);
   });
 
+  it('gives every entry to exactly one of three racing workers', async () => {
+    // THE TWO-WORKER TEST ABOVE IS TRUE BUT NOT SHARP, and that cost real time. With one entry and
+    // two workers it only fails when the race lands the wrong way, so the underlying bug — claiming
+    // with rename(), which on Windows lets BOTH renames of one source resolve successfully — showed
+    // up as an occasional flake in a full-suite run rather than as a failing test. An intermittent
+    // red invites a re-run; a deterministic red gets fixed.
+    //
+    // Measured against the rename() version: a single entry duplicates roughly 5% of the time, so
+    // sixty entries across two rounds catch it about 95% of the time and one entry catches it
+    // almost never. The generous timeout is because enqueue() fsyncs, which on a Windows host costs
+    // around 100ms per message — this test is IO-bound, not slow logic.
+    const workers = [spool({ workerId: 'w-a' }), spool({ workerId: 'w-b' }), spool({ workerId: 'w-c' })];
+    const PER_ROUND = 30;
+
+    for (let round = 0; round < 2; round++) {
+      for (let i = 0; i < PER_ROUND; i++) {
+        await workers[0].enqueue(newQueueEntry(message(`r${round}-m${i}`), [`r${round}i${i}@example.test`], 1000));
+      }
+
+      const claimed = (await Promise.all(workers.map((w) => w.claim(PER_ROUND)))).flat();
+      const ids = claimed.map((c) => c.id);
+
+      expect(new Set(ids).size, `round ${round}: an entry was claimed by more than one worker`).toBe(ids.length);
+      expect(ids, `round ${round}: an entry was lost`).toHaveLength(PER_ROUND);
+      expect(await workers[0].list('queued')).toHaveLength(0);
+
+      // Clear sending/ so the next round starts from a known state.
+      for (const entry of claimed) await workers[0].complete(entry.id).catch(() => {});
+    }
+  }, 60_000);
+
   it('does not claim an entry that is not due yet', async () => {
     const now = 10_000;
     const s = spool({ now: () => now });

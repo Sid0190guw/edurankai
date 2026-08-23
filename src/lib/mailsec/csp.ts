@@ -285,11 +285,38 @@ export function reportUriRefusal(raw: unknown): string | null {
   if (s.includes(',')) return 'contains a comma, which would start a new policy';
   if (/\s/.test(s)) return 'contains whitespace, which would split the directive';
 
-  // Same-origin only. Anything with a scheme or a protocol-relative prefix is a third-party
-  // collector receiving page URLs and inline-script samples. See the doc comment on reportUri.
+  // ═══ SAME-ORIGIN ONLY, AND THE PARSER DECIDES, NOT A PATTERN ═══
+  //
+  // Anything off-origin is a third-party collector receiving page URLs and inline-script samples —
+  // exactly the data a CSP report carries. The first version of this check pattern-matched the
+  // shapes it could think of (`//host`, `scheme:`) and a review found the one it could not: a
+  // slash followed by a BACKSLASH. Browsers normalise `\` to `/` in a URL, so `/\evil.example/c`
+  // is `//evil.example/c` by the time it is fetched — it passes `startsWith('/')`, fails
+  // `startsWith('//')`, and points at somebody else's server.
+  //
+  // Enumerating shapes is how that happens. So the URL parser answers instead: resolve against a
+  // sentinel origin and require the result to have stayed on it. Anything that escapes — a scheme,
+  // a protocol-relative prefix, a backslash, or a form nobody has thought of yet — changes the
+  // origin and is refused by construction.
+  //
+  // The header-shape rules above still run FIRST, and must: a CR, a semicolon or a space is not a
+  // bad URL, it is an attempt to write a second header or a second directive, and the URL parser
+  // would quietly normalise several of them away before we ever saw them.
+  // The two shapes that have their own names, kept ahead of the parser so the refusal SAYS which
+  // mistake was made. "resolves to another origin" is correct but unhelpful to somebody who typed a
+  // full URL into a field that wanted a path.
   if (s.startsWith('//')) return 'is protocol-relative, which points off-origin';
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s)) return 'is an absolute URL, which points off-origin';
   if (!s.startsWith('/')) return 'is not an absolute path';
+
+  const SENTINEL = 'https://csp-origin.invalid';
+  let resolved: URL;
+  try {
+    resolved = new URL(s, SENTINEL);
+  } catch {
+    return 'is not a resolvable path';
+  }
+  if (resolved.origin !== SENTINEL) return 'resolves to another origin';
 
   return null;
 }

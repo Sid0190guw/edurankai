@@ -68,6 +68,28 @@ export type EventType = (typeof EVENT_TYPES)[number];
 
 export function ensureMailProductSchema(): Promise<void> {
   return ensureOnce('mail-product.schema', async () => {
+    // ---- Shared suppression --------------------------------------------------------------------
+    //
+    // THIS TABLE IS NOT OURS. src/lib/mail-contacts.ts owns it — suppress(), isSuppressed() and the
+    // one-click unsubscribe endpoint all write it, keyed by EMAIL rather than by contact id, so an
+    // address can be suppressed with no contact row at all.
+    //
+    // It is declared here as well because audienceSql() filters on it, and this module CANNOT call
+    // ensureContactSchema() to guarantee it exists: mail-contacts.ts already imports
+    // ensureMailProductSchema(), so awaiting theirs from here would have two ensureOnce() caches
+    // waiting on each other's in-flight promise — a deadlock, not a slow start.
+    //
+    // The two declarations must stay byte-identical in their columns. schema.test.ts reads both
+    // files and fails if they drift, which is the guard that makes this mirror safe to keep.
+    await db.execute(sql`CREATE TABLE IF NOT EXISTS mail_suppression (
+      email text PRIMARY KEY,
+      reason text NOT NULL DEFAULT 'unsubscribed',
+      detail text,
+      campaign_id uuid,
+      created_by uuid,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )`);
+
     // ---- Audience ----------------------------------------------------------------------------
     // email is CITEXT-less on purpose (the extension may not be installed): the column is stored
     // lower-cased by the service layer and the unique index is on the raw column, so a duplicate

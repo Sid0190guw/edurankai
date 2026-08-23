@@ -38,8 +38,29 @@ for domain in $(echo "$MAIL_DOMAINS" | tr ',' ' '); do
   fi
   echo "$SELECTOR._domainkey.$domain $domain:$SELECTOR:$key" >> /etc/opendkim/KeyTable
   echo "*@$domain $SELECTOR._domainkey.$domain" >> /etc/opendkim/SigningTable
-  echo "$domain" >> /etc/opendkim/TrustedHosts
+  # LEADING DOT. opendkim matches a peer entry against the client's reverse-DNS name by walking
+  # suffixes that include the dot — "mail.edurankai.in", then ".edurankai.in". A bare
+  # "edurankai.in" matches only a client whose PTR is exactly that, i.e. nothing. The CIDR entries
+  # above are what actually classify the compose network as internal; this makes the intent real
+  # rather than decorative.
+  echo ".$domain" >> /etc/opendkim/TrustedHosts
   signable=$((signable + 1))
+done
+
+# EVERY OPENDKIM DIAGNOSTIC WAS BEING DISCARDED. opendkim.conf sets `Syslog yes` and writes nothing
+# to stderr, but an alpine image has no syslogd and no /dev/log — so "key data is not secure",
+# "can't load key" and "no signing table match" all went to a socket that does not exist. `docker
+# logs opendkim` showed two echo lines from this script and nothing else, and the success line was
+# computed from a file-existence test. A signing milter that silently signs nothing is exactly the
+# failure this stack cannot afford, because the mail still goes out — unsigned.
+busybox syslogd -n -O /proc/1/fd/1 &
+
+# Assert something real. `[ -f ]` proves a file exists; opendkim-testkey proves opendkim can parse
+# the key and that it matches what is published in DNS. A DNS failure here is expected before the
+# record is published, so it is reported, not fatal.
+for domain in $(echo "$MAIL_DOMAINS" | tr ',' ' '); do
+  [ -f "$KEYDIR/$domain.private" ] || continue
+  if opendkim-testkey -d "$domain" -s "$SELECTOR" -k "$KEYDIR/$domain.private" 2>&1 | head -2; then :; fi
 done
 
 echo "[opendkim] signing $signable domain(s) with selector $SELECTOR"

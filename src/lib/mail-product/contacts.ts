@@ -374,12 +374,25 @@ export async function listCustomFields(): Promise<{ id: string; key: string; lab
 /**
  * Who a campaign would actually go to.
  *
- * The union of its lists and its segment, minus everybody who is not 'subscribed'. That last clause
- * is not a filter the operator can turn off, and it is applied HERE rather than at send time so the
- * number on the confirmation screen is the number of messages that will leave.
+ * The union of its lists and its segment, minus everybody who is not 'subscribed', minus everybody
+ * on the shared suppression list. Neither exclusion is a filter the operator can turn off, and both
+ * are applied HERE rather than at send time so the number on the confirmation screen is the number
+ * of messages that will leave.
+ *
+ * WHY TWO CHECKS AND NOT ONE. `mail_contacts.status` is this product's own view of a person.
+ * `mail_suppression` (owned by src/lib/mail-contacts.ts, keyed by EMAIL rather than by contact id)
+ * is the whole system's — it is what a bounce webhook, the transactional API and the one-click
+ * unsubscribe endpoint all write, and an address can land in it with no contact row at all or while
+ * a contact row still reads 'subscribed'. Filtering on status alone would mail somebody who had
+ * asked another part of this platform to stop, which is the precise failure that produces a spam
+ * complaint rather than an unsubscribe.
+ *
+ * The NOT EXISTS is an index lookup per row against a primary key, so it costs effectively nothing
+ * even over a large audience.
  */
 export function audienceSql(listIds: string[], segmentRules: SegmentRules | null): SQL {
-  let where: SQL = sql`c.status = 'subscribed'`;
+  let where: SQL = sql`c.status = 'subscribed'
+    AND NOT EXISTS (SELECT 1 FROM mail_suppression s WHERE s.email = lower(c.email))`;
   const ids = listIds.filter(isUuid);
   const parts: SQL[] = [];
   if (ids.length) {

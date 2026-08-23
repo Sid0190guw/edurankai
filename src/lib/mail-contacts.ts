@@ -205,6 +205,33 @@ export async function suppress(email: string, reason: SuppressionReason, detail?
     UPDATE mail_contacts SET status = ${status}, unsubscribed_at = coalesce(unsubscribed_at, now()), updated_at = now()
     WHERE lower(email) = ${e} RETURNING id
   `));
+
+  /**
+   * STOP EVERYTHING ALREADY QUEUED TO THIS ADDRESS, NOW.
+   *
+   * It lives here rather than in the unsubscribe handler because suppression has four causes and all
+   * four mean the same thing about mail that is already sitting in a queue: an unsubscribe, a hard
+   * bounce, a spam complaint and an admin adding an address by hand. Putting it only on the
+   * unsubscribe path left the other three — an address that hard-bounced mid-campaign would keep
+   * being handed to the sender for every remaining batch, and an admin marking somebody unsubscribed
+   * on the contact screen still had them go out that evening.
+   *
+   * Keyed by ADDRESS, matching the suppression row itself, so it works for an address with no
+   * contact record. Both engines' pending states: 'pending' is this one's, 'queued' is the core
+   * dispatcher's.
+   */
+  try {
+    await db.execute(sql`
+      UPDATE mail_campaign_recipients SET status = 'skipped', skip_reason = ${reason}, updated_at = now()
+      WHERE lower(email) = ${e} AND status IN ('pending', 'queued')
+    `);
+  } catch (err: any) {
+    // Never take the suppression write down with it — the refusal to mail is recorded either way,
+    // and the resolver re-checks suppression on every send. But say so: a queue that silently keeps
+    // a suppressed address is exactly what this statement exists to prevent.
+    console.error('[mail-contacts] could not clear queued sends for a suppressed address:', dbReason(err));
+  }
+
   await logContactEvent({ contactId: hit[0]?.id || null, email: e, kind: 'suppressed', campaignId, actor, detail: { reason, detail } });
 }
 

@@ -66,7 +66,12 @@ Logs are one JSON object per line, and secrets are scrubbed before writing (`src
 `AUTH PLAIN` lines, `password=`, and PEM blocks).
 
 ```bash
-docker compose -f mail-engine/docker-compose.yml logs engine | jq -c 'select(.kind=="deferred")'
+# --no-log-prefix matters: without it every line arrives as `engine  | {"ts":...}` and jq answers
+# "parse error: Invalid numeric literal" for each one, which during an incident reads as a broken
+# log rather than a broken command. The filter is on .msg, not .kind — `kind` is a field of a
+# DeliveryEvent, never of a log line.
+docker compose -f mail-engine/docker-compose.yml logs --no-log-prefix engine \
+  | jq -c 'select(.msg=="message deferred")'
 ```
 
 ---
@@ -78,7 +83,7 @@ docker compose -f mail-engine/docker-compose.yml logs engine | jq -c 'select(.ki
    flat means the worker is not running, or every message is deferred. The logs say which.
 3. **What is the far end saying?**
    ```bash
-   docker compose -f mail-engine/docker-compose.yml logs engine \
+   docker compose -f mail-engine/docker-compose.yml logs --no-log-prefix engine \
      | jq -c 'select(.msg=="message deferred") | {messageId, reason, retryIn}'
    ```
 4. **Is it port 25?** From the mail host:
