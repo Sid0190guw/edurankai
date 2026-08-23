@@ -1078,7 +1078,39 @@ export interface PunchResult extends WriteResult {
  */
 /** Today's punches for one employee, oldest first. */
 export async function punchesOn(employeeId: string, dateIso: string): Promise<PunchEvent[]> {
-  if (!isUuid(employeeId) || !isDateIso(dateIso)) return [];
+  const r = await punchesOnRead(employeeId, dateIso);
+  return r.ok ? r.punches : [];
+}
+
+/**
+ * The same read, with the failure kept.
+ *
+ * =================================================================================================
+ * WHY THIS EXISTS: A FAILED READ USED TO ERASE THE DAY
+ * =================================================================================================
+ *
+ * punchesOn() returns [] both when nobody has punched and when the query did not run — the ordinary
+ * fail-closed shape, and correct for every screen that only DISPLAYS the day.
+ *
+ * It is not correct for punch(). That function inserts the clock event, then recomputes the whole
+ * day with `computeDay(await punchesOn(...))` and UPSERTS the result over hr_attendance.clock_in,
+ * clock_out and work_hours. Recomputing rather than incrementing is deliberate and right: a
+ * double-fire cannot then double-count. But it means the write is only ever as good as the read,
+ * and on a read that failed the recomputation is an empty day — so a transient pooler hiccup in the
+ * window between the INSERT and the recompute would overwrite a full day's recorded hours with
+ * zero, and return ok:true with zero totals to a person who had just worked eight hours.
+ *
+ * Nothing would have looked wrong. The punch is in hr_clock_events, so the log is intact and the
+ * next punch repairs the day — but the day in between is what payroll and the timesheet read.
+ *
+ * So the writer asks for the failure and refuses to write on one. Every display caller keeps the
+ * old signature and the old behaviour.
+ */
+async function punchesOnRead(
+  employeeId: string,
+  dateIso: string,
+): Promise<{ ok: true; punches: PunchEvent[] } | { ok: false; error: string }> {
+  if (!isUuid(employeeId) || !isDateIso(dateIso)) return { ok: true, punches: [] };
   try {
     await ensureAttendanceSchema();
     const r = await db.execute(sql`
@@ -1089,13 +1121,16 @@ export async function punchesOn(employeeId: string, dateIso: string): Promise<Pu
          AND event_time < ((${dateIso}::timestamp + INTERVAL '1 day') AT TIME ZONE ${ATTENDANCE_TIME_ZONE})
        ORDER BY event_time ASC
        LIMIT ${LIST_LIMIT}`);
-    return rows(r).map((row: any) => ({
-      kind: String(row?.event_type || ''),
-      at: row?.event_time ? new Date(row.event_time).toISOString() : '',
-    }));
+    return {
+      ok: true,
+      punches: rows(r).map((row: any) => ({
+        kind: String(row?.event_type || ''),
+        at: row?.event_time ? new Date(row.event_time).toISOString() : '',
+      })),
+    };
   } catch (e: any) {
     logFail('punchesOn', e);
-    return [];
+    return { ok: false, error: errText(e, 'The day could not be read back.') };
   }
 }
 
@@ -1286,7 +1321,29 @@ export async function punch(
     return { ok: false, error: errText(e, 'The punch could not be recorded.'), totals: before };
   }
 
-  const after = computeDay(await punchesOn(employeeId, day));
+  // THE PUNCH IS ALREADY SAVED. Everything below recomputes the DAY from it, and a recomputation
+  // built on a read that did not run is not a smaller version of the day — it is a different day,
+  // an empty one, and writing it would erase the hours this person has actually worked. So a failed
+  // read stops the write and says so, rather than being silently treated as "no punches today".
+  //
+  // `changed: true` and `ok: false` together, deliberately: the event IS in hr_clock_events, the log
+  // on screen will show it, and the next punch recomputes the day correctly. What failed is the
+  // rollup, and the sentence says exactly that instead of implying the punch was lost.
+  const read = await punchesOnRead(employeeId, day);
+  if (!read.ok) {
+    return {
+      ok: false,
+      changed: true,
+      totals: before,
+      advisory,
+      verification,
+      error: 'Your punch was recorded, but the day could not be added up just now, so the hours on '
+        + 'this screen may be behind. Nothing is lost — reload in a moment, and the next punch '
+        + 'recalculates the day.',
+    };
+  }
+
+  const after = computeDay(read.punches);
   const written = await writeDayFromPunches(employeeId, day, after, workMode);
   if (!written.ok) return { ...written, totals: after, advisory, verification };
 
@@ -1396,6 +1453,16 @@ export interface Timesheet {
   recordedDays: number;
   /** True when no shift is rostered for any day in the week — so "expected" means nothing yet. */
   noRoster: boolean;
+  /**
+   * True when the hr_attendance read did not run.
+   *
+   * A week with nothing recorded and a week that could not be READ produce byte-identical
+   * timesheets: seven empty days, zero minutes, zero recorded days. Without this flag the screen
+   * has no way to tell them apart, so it printed the first meaning — a definite claim that somebody
+   * did no work all week — over a query that had simply failed. Every caller must say so rather
+   * than render the empty week as fact.
+   */
+  unreadable: boolean;
 }
 
 /**
@@ -1414,6 +1481,8 @@ export async function weeklyTimesheet(employeeId: string, anyDayInWeek: string):
   const now = await today();
 
   let attendanceRows: any[] = [];
+  // Declared beside the rows it describes and above every use: `const`/`let` is not hoisted here.
+  let attendanceUnreadable = false;
   try {
     await ensureAttendanceSchema();
     const r = await db.execute(sql`
@@ -1426,6 +1495,7 @@ export async function weeklyTimesheet(employeeId: string, anyDayInWeek: string):
     attendanceRows = rows(r);
   } catch (e: any) {
     logFail('weeklyTimesheet.attendance', e);
+    attendanceUnreadable = true;
   }
 
   const byDate = new Map<string, any>();
@@ -1501,6 +1571,7 @@ export async function weeklyTimesheet(employeeId: string, anyDayInWeek: string):
     expectedMinutes,
     recordedDays,
     noRoster: !anyShift,
+    unreadable: attendanceUnreadable,
   };
 }
 
