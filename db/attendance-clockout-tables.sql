@@ -32,9 +32,36 @@
 --       table here does degrade gracefully — the page says the certificates could not be loaded —
 --       but it says that to every person, on every open, forever.
 --
+-- THREE TABLES WERE NOT THE WHOLE OF IT. A second reading of this file found that the same two
+-- statements also name SIXTEEN COLUMNS that no db/*.sql declares, so creating the tables alone
+-- still left both halves of a working day broken on a database built from db/:
+--
+--   hr_clock_events   is in db/hr-schema.sql, but WITHOUT qr_station_id, qr_code_raw, source,
+--                     face_verified, face_verify_method, face_verify_outcome or face_verified_at —
+--                     and punch() names all seven in its INSERT. So CLOCK-IN fails there too. The
+--                     first draft of this file claimed clock-in was unaffected; it was wrong.
+--
+--   hr_daily_reports  is in db/hr-schema.sql with work_done, progress and blockers, and the
+--                     clock-out INSERT names nine more: report_url, sharing_ack, revision_count,
+--                     last_revised_at, submitted_by_user_id, work_source, form_response_url,
+--                     form_service, filed_at_clock_out.
+--
+-- A parent table that exists while the columns written to it do not is the shape that hid all of
+-- this: every "does the table exist" check passed.
+--
 -- AFTER RUNNING THIS: open /api/health and confirm schemas.missingCount is 0. Those three tables
 -- are now in BOOTSTRAP_MODULES (src/lib/observability-health.ts), so that endpoint reports on them
--- instead of staying silent about them.
+-- instead of staying silent about them. Note that BOOTSTRAP_MODULES tests for TABLES, not columns,
+-- so it cannot see the sixteen above — running this file is what covers them.
+--
+-- WHETHER ANY OF THIS IS BROKEN ON THE LIVE DATABASE TODAY IS NOT KNOWN, AND THIS FILE DOES NOT
+-- CLAIM IT IS. The production kill switch in ensure-once.ts landed on 2026-08-23 at 14:48
+-- (effb474b); the revisions DDL landed on 2026-08-06 (d7d43f3f). For the seventeen days between
+-- them the bootstrap ran freely on the request path, so the live database has most likely had all
+-- of this created already. What changed today is that it will never happen again — and ensureOnce
+-- SWALLOWS a failed DDL run, so "it had seventeen days" is not evidence that it worked. This file
+-- is what makes a restored, rebuilt or newly provisioned database correct, and it is idempotent on
+-- one where the bootstrap already did the work.
 --
 -- Every statement is IF NOT EXISTS and none of them drops, alters or deletes anything. Running it
 -- twice is safe. The DDL is copied from the modules that own it, so it must stay identical to:
@@ -125,3 +152,52 @@ ALTER TABLE training_certificates ADD COLUMN IF NOT EXISTS ledger_cert_number VA
 
 CREATE INDEX IF NOT EXISTS training_certificates_user_idx
   ON training_certificates (user_id, issued_at DESC);
+
+-- -------------------------------------------------------------------------------------------------
+-- 4. THE COLUMNS punch() WRITES THAT db/hr-schema.sql DOES NOT DECLARE.
+--
+-- Without these, CLOCK-IN fails as surely as clock-out: punch() names all seven in one INSERT, and
+-- Postgres rejects the statement on the first column it does not recognise. Owned by
+-- src/lib/attendance-schema.ts (the first three) and src/lib/attendance-verify.ts (the four face
+-- columns).
+--
+-- The face columns are a LABEL on a punch and never a verdict: nothing refuses a punch because a
+-- face check did not pass, and no screen filters on them. Automated checks here are advisory and a
+-- human decides — see the header of src/pages/portal/employee/attendance/index.astro.
+-- -------------------------------------------------------------------------------------------------
+ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS qr_station_id UUID;
+ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS qr_code_raw TEXT;
+ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS face_verified BOOLEAN;
+ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS face_verify_method TEXT;
+ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS face_verify_outcome TEXT;
+ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS face_verified_at TIMESTAMPTZ;
+
+-- -------------------------------------------------------------------------------------------------
+-- 5. THE COLUMNS THE CLOCK-OUT REPORT WRITES THAT db/hr-schema.sql DOES NOT DECLARE.
+--
+-- hr_daily_reports exists there with work_done, progress and blockers. The clock-out INSERT names
+-- nine more, and the revision snapshot in section 1 reads report_url and revision_count off the
+-- same row. Owned by src/lib/daily-report.ts and src/lib/attendance-verify-clockout.ts.
+--
+-- report_url and form_response_url are kept SEPARATE on purpose: a Drive link and a form response
+-- can both be present on one day's report and neither may overwrite the other.
+-- -------------------------------------------------------------------------------------------------
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS report_url TEXT;
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS sharing_ack BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS revision_count INT NOT NULL DEFAULT 0;
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS last_revised_at TIMESTAMPTZ;
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS submitted_by_user_id UUID;
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS work_source TEXT;
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS form_response_url TEXT;
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS form_service TEXT;
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS filed_at_clock_out BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- The reviewer's half of the same table, from the same module. Included because a report that can
+-- be filed and not reviewed is only half a feature, and these are ALTERs on a table this file has
+-- already touched — cheaper to apply in the same pass than to discover separately.
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS reviewed_by_user_id UUID;
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS reviewed_by_employee_id UUID;
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS reviewed_revision INT;
+ALTER TABLE hr_daily_reports ADD COLUMN IF NOT EXISTS review_comment TEXT;

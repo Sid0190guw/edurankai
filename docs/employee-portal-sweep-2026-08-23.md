@@ -54,6 +54,29 @@ table was not.
 `training_certificates`, and all three are now in `BOOTSTRAP_MODULES` so `/api/health` reports on
 them instead of staying silent. **That file has to be run by hand against production.**
 
+### Two corrections to the paragraph above, from re-reading it
+
+**It is not only three tables — it is also sixteen columns.** The same two statements name
+`qr_station_id`, `qr_code_raw`, `source`, `face_verified`, `face_verify_method`,
+`face_verify_outcome` and `face_verified_at` on `hr_clock_events`, and nine more on
+`hr_daily_reports` (`report_url`, `sharing_ack`, `revision_count`, `last_revised_at`,
+`submitted_by_user_id`, `work_source`, `form_response_url`, `form_service`,
+`filed_at_clock_out`). None of the sixteen is declared in any `db/*.sql`. So on a database built
+from `db/` alone, **clock-IN fails too** — the first draft of this document said it was unaffected,
+and that was wrong. `BOOTSTRAP_MODULES` tests for tables, not columns, so it cannot see any of them;
+running the SQL file is what covers it.
+
+**And this is probably not broken on the live database today.** The production kill switch in
+`ensure-once.ts` landed 2026-08-23 at 14:48 (`effb474b`); the revisions DDL landed 2026-08-06
+(`d7d43f3f`). For the seventeen days between, the bootstrap ran freely on the request path, so the
+live database has most likely had all of this created already. What changed is that it will never
+happen again — and `ensureOnce` swallows a failed DDL run, so "it had seventeen days" is not
+evidence that it worked. The file is what makes a restored, rebuilt or newly provisioned database
+correct; on one where the bootstrap already ran, it is a no-op.
+
+A parent table that exists while the columns written to it do not is the shape that hid all of
+this: every "does the table exist" check passed.
+
 ## The pattern underneath most of the rest
 
 Thirty-four of the fifty are one shape: a read fails, the helper catches it and returns `[]` or
