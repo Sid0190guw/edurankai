@@ -12,20 +12,24 @@
 import { db } from '@/lib/db';
 import { textArray } from '@/lib/pg-array';
 import { sql } from 'drizzle-orm';
-import { ensureOnce } from '@/lib/ensure-once';
+import { ensureBatch } from '@/lib/ensure-once';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 const clean = (slugs: string[]): string[] =>
   Array.from(new Set((slugs || []).map((s) => (s || '').trim()).filter(Boolean)));
 
+// One round trip, not five — same reasoning as ROLES_AICTE_DDL in role-aicte.ts. All five are
+// idempotent and none is individually tolerated, so batching changes nothing but the cost.
+const ROLES_PRODUCT_DDL = `
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS product VARCHAR(80);
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS products TEXT[];
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS openings INT;
+  CREATE INDEX IF NOT EXISTS roles_product_idx ON roles (product);
+  CREATE INDEX IF NOT EXISTS roles_products_gin ON roles USING GIN (products);
+`;
+
 export function ensureRoleProductColumn(): Promise<void> {
-  return ensureOnce('roles_product_cols_v2', async () => {
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS product VARCHAR(80)`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS products TEXT[]`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS openings INT`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS roles_product_idx ON roles (product)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS roles_products_gin ON roles USING GIN (products)`);
-  });
+  return ensureBatch('roles_product_cols_v2', ROLES_PRODUCT_DDL);
 }
 
 /** Open roles that build a given product (matches the array OR legacy single). */

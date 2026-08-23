@@ -9,27 +9,33 @@
 // products/openings pattern in role-products.ts.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { ensureOnce } from '@/lib/ensure-once';
+import { ensureBatch } from '@/lib/ensure-once';
 import { textArray } from '@/lib/pg-array';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
+// One round trip, not thirteen. Every statement is an idempotent ADD COLUMN IF NOT EXISTS and none
+// is allowed to fail on its own, so the batch shape is safe here — see ensureBatch for when it is
+// not. This ran on the public /careers path, where thirteen sequential round trips to a database on
+// another continent cost ~2.3s before the page could read its first role.
+const ROLES_AICTE_DDL = `
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS keywords TEXT[];
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS learning_outcomes TEXT[];
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS qualification_type VARCHAR(40);
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS qualifications TEXT[];
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS specialisations TEXT[];
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS no_of_interns INT;
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS perks TEXT[];
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS internship_mode VARCHAR(20) DEFAULT 'Full-Time';
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS working_days_per_week INT;
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS hours_per_week NUMERIC(5,2);
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS project_hours_per_day NUMERIC(4,2);
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS wellbeing_hours_per_day NUMERIC(4,2);
+  ALTER TABLE roles ADD COLUMN IF NOT EXISTS engagement_notes TEXT[];
+`;
+
 export function ensureRoleAicteColumns(): Promise<void> {
-  return ensureOnce('roles_aicte_cols_v1', async () => {
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS keywords TEXT[]`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS learning_outcomes TEXT[]`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS qualification_type VARCHAR(40)`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS qualifications TEXT[]`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS specialisations TEXT[]`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS no_of_interns INT`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS perks TEXT[]`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS internship_mode VARCHAR(20) DEFAULT 'Full-Time'`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS working_days_per_week INT`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS hours_per_week NUMERIC(5,2)`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS project_hours_per_day NUMERIC(4,2)`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS wellbeing_hours_per_day NUMERIC(4,2)`);
-    await db.execute(sql`ALTER TABLE roles ADD COLUMN IF NOT EXISTS engagement_notes TEXT[]`);
-  });
+  return ensureBatch('roles_aicte_cols_v1', ROLES_AICTE_DDL);
 }
 
 export interface RoleAicte {

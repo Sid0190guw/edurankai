@@ -31,3 +31,30 @@ export function ensureOnce(key: string, fn: () => Promise<void>): Promise<void> 
     console.error('[ensure-once] ' + key + ' failed:', e?.cause?.message || e?.message || e);
   });
 }
+
+/**
+ * Run a block of idempotent DDL in ONE round trip instead of one per statement.
+ *
+ * WHY. These bootstraps are written as a sequence of `await db.execute(...)` calls, and each one is
+ * a separate round trip to the database. That is invisible when the database is next door and
+ * expensive when it is not: measured from the deployed function, a round trip costs ~177ms, so a
+ * 21-statement bootstrap spends ~3.7s before the page runs its first real query. /careers paid
+ * exactly that on every cold instance — its floor was 5s and its worst was 32s, on a public page
+ * that job applicants land on.
+ *
+ * The statements are joined and sent over the SIMPLE protocol, which is what allows more than one
+ * statement per message. postgres-js only accepts that through `unsafe()`, so the text is never
+ * built from user input — every caller passes a string literal of `... IF NOT EXISTS` DDL.
+ *
+ * ONE IMPLICIT TRANSACTION. A batch sent this way succeeds or rolls back as a whole. For idempotent
+ * DDL that is an improvement — a failure leaves nothing half-made, and ensureOnce drops the cache
+ * entry so the next call retries the whole thing. But it means a batch is the WRONG shape wherever
+ * a statement is deliberately allowed to fail on its own: some bootstraps here wrap an index in its
+ * own try/catch precisely so a failure does not abort the rest. Keep those as separate calls.
+ */
+export function ensureBatch(key: string, ddl: string): Promise<void> {
+  return ensureOnce(key, async () => {
+    const { sqlClient } = await import('@/lib/db');
+    await sqlClient().unsafe(ddl).simple();
+  });
+}
