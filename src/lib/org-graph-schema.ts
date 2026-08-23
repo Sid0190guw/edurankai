@@ -82,7 +82,8 @@
 //    A `::uuid` cast here throws `invalid input syntax for type uuid` the moment a slug arrives.
 //    scope_id is TEXT for exactly that reason and for no other.
 
-import { db } from './db';
+
+import { db, sqlClient } from './db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from './ensure-once';
 
@@ -90,6 +91,224 @@ import { ensureOnce } from './ensure-once';
 // under its first use has taken pages down on this project.
 const logFail = (tag: string, e: any) =>
   console.error('[org-graph-schema] ' + tag, e?.cause?.message || e?.message);
+
+// =================================================================================================
+// THE DDL, AND WHY IT IS TWO BATCHES PLUS FOUR SEPARATE STATEMENTS
+// =================================================================================================
+//
+// Every `await db.execute(...)` is one network round trip, and this bootstrap was 52 of them. It
+// runs on the first request into every cold serverless instance, before the page reads its first
+// row: at the ~139ms round trip measured against this database that is ~7s of pure latency on an
+// authenticated page, which is enough on its own to reach the gateway timeout. The statements below
+// are grouped into strings and sent over the simple protocol — the same send ensureBatch() makes,
+// src/lib/ensure-once.ts — so a group costs ONE round trip instead of one per statement.
+//
+// WHAT is created did not change. Same statements, same order, same ensureOnce key.
+//
+// WHAT IS DELIBERATELY LEFT OUT OF THE BATCHES. A batch is ONE IMPLICIT TRANSACTION: if any
+// statement in it fails, the whole block rolls back. The four UNIQUE indexes further down each sit
+// in their own try/catch precisely so that existing data violating one of them fails THAT index and
+// leaves the rest of the schema standing — the comment above them says why. Batching them would
+// turn a survivable index failure into a bootstrap that creates no tables at all, so they stay four
+// separate db.execute() calls. 16 + 3 + 32 + 1 statements becomes 1 + 3 + 1 + 1 = 6 round trips.
+
+// -----------------------------------------------------------------------------------------
+// org_relationships — THE EDGE TABLE. One row per relationship per lifetime.
+//
+// DIRECTION, stated once and never re-derived. Read a row as this sentence:
+//
+//     <subject> is the <type> of <object>, within <scope>, from <effective_from> to <effective_to>
+//
+//   subject_employee_id  the person who HOLDS the responsibility  (the manager, the head,
+//                        the mentor, the reviewer, the delegate)
+//   object_employee_id   the person the responsibility is ABOUT   (the report, the mentee)
+//                        NULL when the responsibility is to a SCOPE rather than to a person —
+//                        a department head is the head of a department, not of one named person.
+//
+// Getting this backwards inverts the org chart, so both indexes below are named for the
+// direction they serve and org-graph.ts states the direction at every query.
+// -----------------------------------------------------------------------------------------
+const ORG_RELATIONSHIPS_TABLE_DDL = `
+  CREATE TABLE IF NOT EXISTS org_relationships (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    type                TEXT NOT NULL,
+    subject_employee_id UUID NOT NULL,
+    object_employee_id  UUID,
+    scope_type          TEXT,
+    scope_id            TEXT,
+    effective_from      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    effective_to        TIMESTAMPTZ,
+    status              TEXT NOT NULL DEFAULT 'active',
+    created_by          UUID,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    note                TEXT,
+    CONSTRAINT org_relationships_not_self CHECK (
+      object_employee_id IS NULL OR subject_employee_id <> object_employee_id
+    ),
+    CONSTRAINT org_relationships_range CHECK (
+      effective_to IS NULL OR effective_to > effective_from
+    )
+  );
+`;
+
+// CREATE TABLE IF NOT EXISTS IS A NO-OP ON AN EXISTING TABLE, INCLUDING ONE MISSING COLUMNS. That
+// is how hr_employees.work_email came to be declared in db/hr-schema.sql and absent from the live
+// table, which locked every administrator out of /admin. So every column past the primary key is
+// asserted again. On a fresh database these are no-ops; on a database carrying an earlier
+// revision they are the difference between working and a 500.
+const ORG_RELATIONSHIPS_COLUMN_DDL = `
+  ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS object_employee_id UUID;
+  ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS scope_type TEXT;
+  ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS scope_id TEXT;
+  ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS effective_from TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS effective_to TIMESTAMPTZ;
+  ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+  ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS created_by UUID;
+  ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS note TEXT;
+`;
+
+// NO FOREIGN KEY TO hr_employees, and this is deliberate rather than an omission. An employee row
+// being deleted must not take the history of who they reported to with it — that history is the
+// evidence behind past approvals. The hr_* tables already work this way (hr_task_log,
+// hr_time_logs). Orphan detection is db/org-graph-validate.sql's job, not the planner's.
+//
+// NO CHECK CONSTRAINT ON `type`, either. A CHECK would have to be dropped and recreated to add a
+// relationship type, and this project has no migration runner — every DDL change here is
+// CREATE/ADD IF NOT EXISTS, which cannot alter an existing CHECK. The vocabulary is enforced in
+// TypeScript (ORG_RELATIONSHIP_TYPES in src/lib/org-graph.ts) and audited by validation SQL, which
+// reports any type outside the list. Same reasoning for `status` and `scope_type`.
+
+// Indexes. Every column any resolver filters on is covered; nothing in org-graph.ts does a
+// sequential scan of this table.
+//
+const ORG_RELATIONSHIPS_INDEX_DDL = `
+  -- ...OF is the lookup "who is X's manager / mentor / reviewer" — filter on the OBJECT.
+  CREATE INDEX IF NOT EXISTS org_relationships_object_idx
+    ON org_relationships (object_employee_id, type, status, effective_from DESC);
+  -- ...HOLDS is the lookup "who reports to X" / "what does X hold" — filter on the SUBJECT.
+  CREATE INDEX IF NOT EXISTS org_relationships_subject_idx
+    ON org_relationships (subject_employee_id, type, status, effective_from DESC);
+  -- Scope lookups: "who heads department D", "who owns approvals for domain X".
+  CREATE INDEX IF NOT EXISTS org_relationships_scope_idx
+    ON org_relationships (type, scope_type, scope_id, status);
+  -- isInitialized() and the open-edge sweeps: the currently-in-force rows.
+  CREATE INDEX IF NOT EXISTS org_relationships_open_idx
+    ON org_relationships (status, effective_to, type);
+  -- The audit question — every edge in force on a given date.
+  CREATE INDEX IF NOT EXISTS org_relationships_effective_idx
+    ON org_relationships (effective_from, effective_to);
+  -- "Who recorded this edge, and when" — the accountability read.
+  CREATE INDEX IF NOT EXISTS org_relationships_created_by_idx
+    ON org_relationships (created_by, created_at DESC);
+`;
+
+// Three constants, one batch. The split exists only so each block keeps the comment that explains
+// it; they are concatenated and sent together, so this is still a single round trip. The six
+// per-index notes moved into the string as SQL comments to stay next to the index they describe.
+const ORG_RELATIONSHIPS_DDL =
+  ORG_RELATIONSHIPS_TABLE_DDL + ORG_RELATIONSHIPS_COLUMN_DDL + ORG_RELATIONSHIPS_INDEX_DDL;
+
+// Teams. `department_id` is TEXT — see ID-SPACE TRAP 2 at the top of this file. Never ::uuid.
+const ORG_TEAMS_DDL = `
+  CREATE TABLE IF NOT EXISTS org_teams (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name           TEXT NOT NULL,
+    slug           TEXT,
+    department_id  TEXT,
+    parent_team_id UUID,
+    is_active      BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by     UUID,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  ALTER TABLE org_teams ADD COLUMN IF NOT EXISTS slug TEXT;
+  ALTER TABLE org_teams ADD COLUMN IF NOT EXISTS department_id TEXT;
+  ALTER TABLE org_teams ADD COLUMN IF NOT EXISTS parent_team_id UUID;
+  ALTER TABLE org_teams ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+  ALTER TABLE org_teams ADD COLUMN IF NOT EXISTS created_by UUID;
+  CREATE INDEX IF NOT EXISTS org_teams_dept_idx ON org_teams (department_id, is_active);
+  CREATE INDEX IF NOT EXISTS org_teams_parent_idx ON org_teams (parent_team_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS org_teams_slug_uq ON org_teams (slug) WHERE slug IS NOT NULL;
+`;
+
+// Positions — the SEAT, not the person and not the role name. A position is "Backend Engineer II
+// in Engineering"; who occupies it is an assignment row below. `title` is descriptive text and
+// is never compared to users.role or to a capability.
+const ORG_POSITIONS_DDL = `
+  CREATE TABLE IF NOT EXISTS org_positions (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title         TEXT NOT NULL,
+    code          TEXT,
+    department_id TEXT,
+    team_id       UUID,
+    grade         TEXT,
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by    UUID,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS code TEXT;
+  ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS department_id TEXT;
+  ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS team_id UUID;
+  ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS grade TEXT;
+  ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+  ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS created_by UUID;
+  CREATE INDEX IF NOT EXISTS org_positions_dept_idx ON org_positions (department_id, is_active);
+  CREATE INDEX IF NOT EXISTS org_positions_team_idx ON org_positions (team_id, is_active);
+  CREATE UNIQUE INDEX IF NOT EXISTS org_positions_code_uq ON org_positions (code) WHERE code IS NOT NULL;
+`;
+
+// Assignments — WHO SITS WHERE, AND WHEN. Append-only on exactly the same terms as
+// org_relationships: moving someone CLOSES the old row and INSERTS a new one, status stays
+// 'active' on the closed row so "which team was she in in March" still answers.
+const ORG_ASSIGNMENTS_DDL = `
+  CREATE TABLE IF NOT EXISTS org_employee_assignments (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    employee_id    UUID NOT NULL,
+    position_id    UUID,
+    team_id        UUID,
+    department_id  TEXT,
+    allocation_pct INT,
+    is_primary     BOOLEAN NOT NULL DEFAULT TRUE,
+    effective_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    effective_to   TIMESTAMPTZ,
+    status         TEXT NOT NULL DEFAULT 'active',
+    created_by     UUID,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT org_employee_assignments_range CHECK (
+      effective_to IS NULL OR effective_to > effective_from
+    )
+  );
+  ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS position_id UUID;
+  ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS team_id UUID;
+  ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS department_id TEXT;
+  ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS allocation_pct INT;
+  ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT TRUE;
+  ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS effective_to TIMESTAMPTZ;
+  ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+  ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS created_by UUID;
+  CREATE INDEX IF NOT EXISTS org_assignments_employee_idx
+    ON org_employee_assignments (employee_id, status, effective_from DESC);
+  CREATE INDEX IF NOT EXISTS org_assignments_team_idx
+    ON org_employee_assignments (team_id, status, effective_to);
+  CREATE INDEX IF NOT EXISTS org_assignments_dept_idx
+    ON org_employee_assignments (department_id, status, effective_to);
+  CREATE INDEX IF NOT EXISTS org_assignments_position_idx
+    ON org_employee_assignments (position_id, status, effective_to);
+`;
+
+// The whole second pass as one batch, split into three constants for the same reason as above.
+const ORG_STRUCTURES_DDL = ORG_TEAMS_DDL + ORG_POSITIONS_DDL + ORG_ASSIGNMENTS_DDL;
+
+// The one-round-trip send ensureBatch() performs, WITHOUT its per-key memoisation, because this
+// module already has one: everything below runs inside ensureOnce('org_graph_v1', ...). Nesting a
+// second cache entry under a second key would break the retry this file depends on — ensureOnce
+// swallows the rejection for its caller, so a failed inner batch would return as if it had worked,
+// the outer key would be cached as done, and the outer catch that exists to delete that key and
+// force a retry would never fire. The send itself is identical to ensureBatch's: one simple-protocol
+// message, one implicit transaction, and only string literals declared above — never user input.
+async function sendDdlBatch(ddl: string): Promise<void> {
+  await sqlClient().unsafe(ddl).simple();
+}
 
 /**
  * Create the Layer 1 tables if they are absent. Idempotent, safe to call on every request.
@@ -116,90 +335,9 @@ export function ensureOrgGraphSchema(): Promise<void> {
 }
 
 async function createOrgGraphTables(): Promise<void> {
-  // -----------------------------------------------------------------------------------------
-  // org_relationships — THE EDGE TABLE. One row per relationship per lifetime.
-  //
-  // DIRECTION, stated once and never re-derived. Read a row as this sentence:
-  //
-  //     <subject> is the <type> of <object>, within <scope>, from <effective_from> to <effective_to>
-  //
-  //   subject_employee_id  the person who HOLDS the responsibility  (the manager, the head,
-  //                        the mentor, the reviewer, the delegate)
-  //   object_employee_id   the person the responsibility is ABOUT   (the report, the mentee)
-  //                        NULL when the responsibility is to a SCOPE rather than to a person —
-  //                        a department head is the head of a department, not of one named person.
-  //
-  // Getting this backwards inverts the org chart, so both indexes below are named for the
-  // direction they serve and org-graph.ts states the direction at every query.
-  // -----------------------------------------------------------------------------------------
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS org_relationships (
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    type                TEXT NOT NULL,
-    subject_employee_id UUID NOT NULL,
-    object_employee_id  UUID,
-    scope_type          TEXT,
-    scope_id            TEXT,
-    effective_from      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    effective_to        TIMESTAMPTZ,
-    status              TEXT NOT NULL DEFAULT 'active',
-    created_by          UUID,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    note                TEXT,
-    CONSTRAINT org_relationships_not_self CHECK (
-      object_employee_id IS NULL OR subject_employee_id <> object_employee_id
-    ),
-    CONSTRAINT org_relationships_range CHECK (
-      effective_to IS NULL OR effective_to > effective_from
-    )
-  )`);
-
-  // CREATE TABLE IF NOT EXISTS IS A NO-OP ON AN EXISTING TABLE, INCLUDING ONE MISSING COLUMNS. That
-  // is how hr_employees.work_email came to be declared in db/hr-schema.sql and absent from the live
-  // table, which locked every administrator out of /admin. So every column past the primary key is
-  // asserted again. On a fresh database these are no-ops; on a database carrying an earlier
-  // revision they are the difference between working and a 500.
-  await db.execute(sql`ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS object_employee_id UUID`);
-  await db.execute(sql`ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS scope_type TEXT`);
-  await db.execute(sql`ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS scope_id TEXT`);
-  await db.execute(sql`ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS effective_from TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
-  await db.execute(sql`ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS effective_to TIMESTAMPTZ`);
-  await db.execute(sql`ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'`);
-  await db.execute(sql`ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS created_by UUID`);
-  await db.execute(sql`ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
-  await db.execute(sql`ALTER TABLE org_relationships ADD COLUMN IF NOT EXISTS note TEXT`);
-
-  // NO FOREIGN KEY TO hr_employees, and this is deliberate rather than an omission. An employee row
-  // being deleted must not take the history of who they reported to with it — that history is the
-  // evidence behind past approvals. The hr_* tables already work this way (hr_task_log,
-  // hr_time_logs). Orphan detection is db/org-graph-validate.sql's job, not the planner's.
-  //
-  // NO CHECK CONSTRAINT ON `type`, either. A CHECK would have to be dropped and recreated to add a
-  // relationship type, and this project has no migration runner — every DDL change here is
-  // CREATE/ADD IF NOT EXISTS, which cannot alter an existing CHECK. The vocabulary is enforced in
-  // TypeScript (ORG_RELATIONSHIP_TYPES in src/lib/org-graph.ts) and audited by validation SQL, which
-  // reports any type outside the list. Same reasoning for `status` and `scope_type`.
-
-  // Indexes. Every column any resolver filters on is covered; nothing in org-graph.ts does a
-  // sequential scan of this table.
-  //
-  // ...OF is the lookup "who is X's manager / mentor / reviewer" — filter on the OBJECT.
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS org_relationships_object_idx
-    ON org_relationships (object_employee_id, type, status, effective_from DESC)`);
-  // ...HOLDS is the lookup "who reports to X" / "what does X hold" — filter on the SUBJECT.
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS org_relationships_subject_idx
-    ON org_relationships (subject_employee_id, type, status, effective_from DESC)`);
-  // Scope lookups: "who heads department D", "who owns approvals for domain X".
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS org_relationships_scope_idx
-    ON org_relationships (type, scope_type, scope_id, status)`);
-  // isInitialized() and the open-edge sweeps: the currently-in-force rows.
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS org_relationships_open_idx
-    ON org_relationships (status, effective_to, type)`);
-  // The audit question — every edge in force on a given date.
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS org_relationships_effective_idx
-    ON org_relationships (effective_from, effective_to)`);
-  // "Who recorded this edge, and when" — the accountability read.
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS org_relationships_created_by_idx
-    ON org_relationships (created_by, created_at DESC)`);
+  // The edge table, its nine re-asserted columns and its six indexes: 16 statements, one round trip.
+  // The comments that used to sit between them are with the DDL above, in the same order.
+  await sendDdlBatch(ORG_RELATIONSHIPS_DDL);
 
   // -----------------------------------------------------------------------------------------
   // THE OVERLAP INVARIANTS. These are what EXCLUDE constraints would have given us, expressed as
@@ -263,86 +401,13 @@ async function createOrgGraphTables(): Promise<void> {
   // chart that cannot answer who approves anything is an outage.
   // -----------------------------------------------------------------------------------------
   try {
-    // Teams. `department_id` is TEXT — see ID-SPACE TRAP 2 at the top of this file. Never ::uuid.
-    await db.execute(sql`CREATE TABLE IF NOT EXISTS org_teams (
-      id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      name           TEXT NOT NULL,
-      slug           TEXT,
-      department_id  TEXT,
-      parent_team_id UUID,
-      is_active      BOOLEAN NOT NULL DEFAULT TRUE,
-      created_by     UUID,
-      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )`);
-    await db.execute(sql`ALTER TABLE org_teams ADD COLUMN IF NOT EXISTS slug TEXT`);
-    await db.execute(sql`ALTER TABLE org_teams ADD COLUMN IF NOT EXISTS department_id TEXT`);
-    await db.execute(sql`ALTER TABLE org_teams ADD COLUMN IF NOT EXISTS parent_team_id UUID`);
-    await db.execute(sql`ALTER TABLE org_teams ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE`);
-    await db.execute(sql`ALTER TABLE org_teams ADD COLUMN IF NOT EXISTS created_by UUID`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS org_teams_dept_idx ON org_teams (department_id, is_active)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS org_teams_parent_idx ON org_teams (parent_team_id)`);
-    await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS org_teams_slug_uq ON org_teams (slug) WHERE slug IS NOT NULL`);
-
-    // Positions — the SEAT, not the person and not the role name. A position is "Backend Engineer II
-    // in Engineering"; who occupies it is an assignment row below. `title` is descriptive text and
-    // is never compared to users.role or to a capability.
-    await db.execute(sql`CREATE TABLE IF NOT EXISTS org_positions (
-      id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      title         TEXT NOT NULL,
-      code          TEXT,
-      department_id TEXT,
-      team_id       UUID,
-      grade         TEXT,
-      is_active     BOOLEAN NOT NULL DEFAULT TRUE,
-      created_by    UUID,
-      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )`);
-    await db.execute(sql`ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS code TEXT`);
-    await db.execute(sql`ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS department_id TEXT`);
-    await db.execute(sql`ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS team_id UUID`);
-    await db.execute(sql`ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS grade TEXT`);
-    await db.execute(sql`ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE`);
-    await db.execute(sql`ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS created_by UUID`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS org_positions_dept_idx ON org_positions (department_id, is_active)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS org_positions_team_idx ON org_positions (team_id, is_active)`);
-    await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS org_positions_code_uq ON org_positions (code) WHERE code IS NOT NULL`);
-
-    // Assignments — WHO SITS WHERE, AND WHEN. Append-only on exactly the same terms as
-    // org_relationships: moving someone CLOSES the old row and INSERTS a new one, status stays
-    // 'active' on the closed row so "which team was she in in March" still answers.
-    await db.execute(sql`CREATE TABLE IF NOT EXISTS org_employee_assignments (
-      id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      employee_id    UUID NOT NULL,
-      position_id    UUID,
-      team_id        UUID,
-      department_id  TEXT,
-      allocation_pct INT,
-      is_primary     BOOLEAN NOT NULL DEFAULT TRUE,
-      effective_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      effective_to   TIMESTAMPTZ,
-      status         TEXT NOT NULL DEFAULT 'active',
-      created_by     UUID,
-      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      CONSTRAINT org_employee_assignments_range CHECK (
-        effective_to IS NULL OR effective_to > effective_from
-      )
-    )`);
-    await db.execute(sql`ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS position_id UUID`);
-    await db.execute(sql`ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS team_id UUID`);
-    await db.execute(sql`ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS department_id TEXT`);
-    await db.execute(sql`ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS allocation_pct INT`);
-    await db.execute(sql`ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT TRUE`);
-    await db.execute(sql`ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS effective_to TIMESTAMPTZ`);
-    await db.execute(sql`ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'`);
-    await db.execute(sql`ALTER TABLE org_employee_assignments ADD COLUMN IF NOT EXISTS created_by UUID`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS org_assignments_employee_idx
-      ON org_employee_assignments (employee_id, status, effective_from DESC)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS org_assignments_team_idx
-      ON org_employee_assignments (team_id, status, effective_to)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS org_assignments_dept_idx
-      ON org_employee_assignments (department_id, status, effective_to)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS org_assignments_position_idx
-      ON org_employee_assignments (position_id, status, effective_to)`);
+    // The three structure tables, their columns and their indexes: 32 statements, one round trip.
+    // Still non-fatal as a block, under this same try/catch, and the comments are with the DDL
+    // above. One difference worth stating rather than assuming away: a batch rolls back as a unit,
+    // so a failure here now leaves none of these three tables instead of the first few. Every
+    // statement is IF NOT EXISTS, so the next process retries the whole group and lands in the
+    // same place — and a clean rollback is the outcome the comment above already argues for.
+    await sendDdlBatch(ORG_STRUCTURES_DDL);
   } catch (e: any) {
     logFail('ensureOrgGraphSchema structures', e);
   }

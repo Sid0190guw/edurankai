@@ -1,4 +1,4 @@
----
+﻿---
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { roles, departments } from '@/lib/db/schema';
@@ -18,6 +18,20 @@ const productFilter = url.searchParams.get('product') || '';
 await ensureRoleProductColumn().catch(() => {});
 // `keywords` is also a runtime column (src/lib/role-aicte.ts) and is searched below.
 await ensureRoleAicteColumns().catch(() => {});
+
+// Departments are loaded FIRST, because the search below needs them. They used to be fetched after
+// the roles query, which forced "match a department by name" to be written as a correlated subquery
+// evaluated once per row of `roles`. There are a few dozen departments; matching them in memory is
+// free and removes a per-row scan from the hottest query on this page.
+let allDepts: any[] = [];
+try { allDepts = await db.select().from(departments).orderBy(asc(departments.sortOrder)); }
+catch (e: any) { console.error('[careers] departments query failed:', e?.cause?.message || e?.message); Astro.response.headers.set('x-era-degraded', '1'); }
+
+// Department ids whose NAME matches the search term, resolved once.
+const qLower = q.trim().toLowerCase();
+const matchedDeptIds: string[] = qLower
+  ? allDepts.filter((d) => String(d.name || '').toLowerCase().includes(qLower)).map((d) => String(d.id))
+  : [];
 
 // Search predicate, built as a factory so the query below can retry with a narrower version.
 // A search that silently returns nothing for EVERY term is far worse than one matching fewer
@@ -41,9 +55,15 @@ const searchClause = (includeKeywords: boolean) => {
         CASE WHEN jsonb_typeof(${roles.skills}) = 'array' THEN ${roles.skills} ELSE '[]'::jsonb END
       ) AS skill WHERE skill ILIKE ${like}
     )`,
-    // Let people search by department name ("Cybersecurity", "FinTech") and not just role text.
-    sql`EXISTS (SELECT 1 FROM departments d WHERE d.id = ${roles.departmentId} AND d.name ILIKE ${like})`,
   ];
+  // Let people search by department name ("Cybersecurity", "FinTech") and not just role text.
+  // Resolved above from allDepts rather than as EXISTS (SELECT ... FROM departments WHERE d.id =
+  // roles.department_id AND d.name ILIKE ...), which Postgres had to evaluate for every candidate
+  // row. Same results, no subquery. When nothing matches by name the term is simply not added,
+  // rather than adding a predicate that can never be true.
+  if (matchedDeptIds.length) {
+    parts.push(sql`${roles.departmentId} IN (${sql.join(matchedDeptIds.map((id) => sql`${id}`), sql`, `)})`);
+  }
   if (includeKeywords) {
     // Every catalogue role carries keyword tags ("GovTech", "LegalTech", "Space Systems") that
     // appear in NO other column, so without this those searches return nothing at all.
@@ -70,6 +90,10 @@ const hasFilters = !!(q || deptFilter || levelFilter || productFilter);
 
 // Guarded so a DB hiccup degrades to an empty state instead of a 500 on a public marketing page.
 let openRoles: any[] = [];
+// Nothing bounded this query, so every view read every open role. Far above any real catalogue
+// size, so it changes no page anyone sees — it is a ceiling on a public, unauthenticated read, not
+// a page size.
+const ROLE_LIST_CAP = 500;
 const runRolesQuery = (where: any) => db.select({
   id: roles.id,
   title: roles.title,
@@ -82,7 +106,7 @@ const runRolesQuery = (where: any) => db.select({
   salary: roles.salary,
   skills: roles.skills,
   isFeatured: roles.isFeatured
-}).from(roles).where(where).orderBy(desc(roles.isFeatured), asc(roles.sortOrder), asc(roles.title));
+}).from(roles).where(where).orderBy(desc(roles.isFeatured), asc(roles.sortOrder), asc(roles.title)).limit(ROLE_LIST_CAP);
 
 try {
   openRoles = await runRolesQuery(and(...conditions, ...(q ? [searchClause(true)] : [])));
@@ -105,9 +129,6 @@ try {
   }
 }
 
-let allDepts: any[] = [];
-try { allDepts = await db.select().from(departments).orderBy(asc(departments.sortOrder)); }
-catch (e: any) { console.error('[careers] departments query failed:', e?.cause?.message || e?.message); Astro.response.headers.set('x-era-degraded', '1'); }
 const deptMap: Record<string, string> = Object.fromEntries(allDepts.map((d) => [d.id, d.name]));
 const deptByName: Record<string, any> = Object.fromEntries(allDepts.map((d) => [d.name, d]));
 
@@ -126,25 +147,10 @@ const LEVELS = ['C-Level', 'Lead', 'Senior', 'Mid', 'Junior', 'Intern', 'Apprent
 // Both inline forms now live on dedicated pages: /careers/fee-waiver and
 // /careers/hr-support. This page just lists roles + fee policy.
 
-// Open departments + fee range for the metrics strip. Fee columns aren't in
-// the Drizzle schema (runtime ALTER) so query raw.
+// Open departments for the metrics strip. The fee-range query that used to sit here went
+// with the fee itself (applications are free — src/lib/application-fee.ts): nothing ever
+// rendered feeRange, so it was one wasted database round trip per careers page view.
 const openDeptCount = Object.keys(groupedRoles).length;
-let feeRange = { min: 1, max: 100, currency: 'CHF' };
-try {
-  const fr = await db.execute(sql`
-    SELECT MIN(application_fee_amount) AS min, MAX(application_fee_amount) AS max,
-      MAX(application_fee_currency) AS currency
-    FROM roles WHERE is_open = true AND application_fee_amount IS NOT NULL
-  `);
-  const frs = (Array.isArray(fr) ? fr : ((fr as any)?.rows || [])) as any[];
-  if (frs[0]) {
-    feeRange = {
-      min: frs[0].min != null ? Number(frs[0].min) : 1,
-      max: frs[0].max != null ? Number(frs[0].max) : 100,
-      currency: frs[0].currency || 'CHF',
-    };
-  }
-} catch (_) {}
 
 const levelDot: Record<string, string> = {
   'C-Level': '#6d28d9', 'Lead': '#15803d', 'Senior': '#1045BB', 'Mid': '#FF4F00',

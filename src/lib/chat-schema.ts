@@ -57,7 +57,7 @@
 // archive must keep rendering, and because `chat_channels.is_dm` and `chat_messages.message_code`
 // are written by code and appear in no CREATE TABLE in the repository (only in the manually-run
 // scripts/setup-chat-audit.mjs, which a fresh database would never have had run against it).
-import { db } from '@/lib/db';
+import { db, sqlClient } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 import { logEvent } from '@/lib/logger';
@@ -117,120 +117,201 @@ async function detectShape(): Promise<{ present: Set<string>; notNull: Set<strin
   return { present, notNull, exists: present.size > 0 };
 }
 
+// ---- HOW THIS DDL IS SENT: one message per block, not one message per statement.
+//
+// ensureOnce memoises per PROCESS, so every cold serverless instance pays this whole bootstrap again
+// before the messenger reads its first row. A round trip to this database measures ~139ms, and the
+// thirty-four statements that now travel as three messages were thirty-four sequential round trips —
+// roughly 4.7s in front of a page somebody is waiting on. The statements below are the same
+// statements in the same order; only the number of round trips they take is different. Nothing here
+// creates, drops or renames anything it did not before.
+//
+// WHAT IS DELIBERATELY LEFT OUT OF A BLOCK. A block is ONE implicit transaction, so anything that may
+// legitimately be skipped or that decides what runs next cannot join one:
+//   * detectShape() — a SELECT, and the branch below is decided by its answer.
+//   * the fresh-database CREATE TABLE chat_messages — one statement alone in its branch, with
+//     nothing to batch it with.
+//   * the ALTER ... DROP NOT NULL statements — each runs only if the probe found that column
+//     constrained, so which of them exist at all is not known until run time.
+// Those three stay exactly as they were, one db.execute() each.
+//
+// Failure behaviour is unchanged. A block that fails rejects as a whole and leaves nothing half-made,
+// the catch at the bottom of run() logs the real Postgres reason, and the rethrow makes ensureOnce
+// drop its cache entry so the next request retries the lot.
+async function batch(ddl: string): Promise<void> {
+  // The mechanism of ensureBatch() in src/lib/ensure-once.ts without its per-key memoisation: run()
+  // is already memoised once, by ensureChatSchema below, and a second ensureOnce inside it would
+  // also SWALLOW the failure. This file must not swallow — an index that silently fails to exist is
+  // how the original shape mismatch stayed hidden for eight weeks — so the rejection is left to
+  // propagate. Every string passed here is a literal of idempotent DDL, never built from input,
+  // which is what makes the simple protocol safe to use.
+  await sqlClient().unsafe(ddl).simple();
+}
+
+const CHAT_CHANNELS_DDL = `
+  -- ---- channel side of the house, so the archive renders on a database that never had the
+  -- manually-run setup scripts. Same shape as src/lib/db/schema.ts:711-741, is_dm included.
+  CREATE TABLE IF NOT EXISTS chat_channels (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug VARCHAR(60) NOT NULL UNIQUE,
+    name VARCHAR(120) NOT NULL,
+    description TEXT,
+    is_private BOOLEAN NOT NULL DEFAULT false,
+    is_dm BOOLEAN NOT NULL DEFAULT false,
+    created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  -- Declared in Drizzle and written by start-dm.ts:49, created by no CREATE TABLE in the repo.
+  ALTER TABLE chat_channels ADD COLUMN IF NOT EXISTS is_dm BOOLEAN NOT NULL DEFAULT false;
+  CREATE TABLE IF NOT EXISTS chat_memberships (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    channel_id UUID NOT NULL REFERENCES chat_channels(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (channel_id, user_id)
+  );
+`;
+
+// ---- thread side of the house (the canonical messenger).
+//
+// `kind` is the only distinction between a direct message and a group: 'direct' | 'group'.
+// There is no second thread table and no second membership table — a group is a thread with a
+// name and more than two rows in chat_thread_members. See GROUP KEYS below for what the extra
+// columns on the membership table carry.
+//
+// (This is the one comment kept in TypeScript rather than moved into the DDL string alongside the
+// statements it describes: it contains backticks, which would end the template literal.)
+const CHAT_THREADS_DDL = `
+  CREATE TABLE IF NOT EXISTS chat_threads (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind VARCHAR(20) NOT NULL DEFAULT 'direct',
+    title VARCHAR(200),
+    description TEXT,
+    cover_url TEXT,
+    last_message_preview TEXT,
+    last_message_at TIMESTAMPTZ,
+    disappearing_seconds INT,
+    created_by_user_id UUID,
+    source_kind VARCHAR(20),
+    source_group_id UUID,
+    key_epoch INT NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS chat_thread_members (
+    thread_id UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL,
+    role VARCHAR(20) NOT NULL DEFAULT 'member',
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_read_at TIMESTAMPTZ,
+    notifications_muted BOOLEAN NOT NULL DEFAULT false,
+    public_key_pem TEXT,
+    wrapped_key TEXT,
+    wrapped_key_iv TEXT,
+    wrapped_by_user_id UUID,
+    wrapped_by_public_key_pem TEXT,
+    wrapped_key_epoch INT NOT NULL DEFAULT 1,
+    PRIMARY KEY (thread_id, user_id)
+  );
+  -- CREATE TABLE IF NOT EXISTS IS A NO-OP ON AN EXISTING TABLE, INCLUDING ONE MISSING COLUMNS —
+  -- and both tables above already exist on the live database (portal/messages.astro created them
+  -- inline from 2026-06-09; only chat_messages collided with the channel shape). So every column
+  -- added after that date is asserted again here, or the queries that name it throw. Same reason
+  -- the same block exists in work-groups.ts. On a fresh database these are no-ops.
+  ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS description TEXT;
+  ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS created_by_user_id UUID;
+  -- Where a group's membership came from, so a department channel derives from the work group
+  -- instead of being a second, immediately-stale copy of it. No FOREIGN KEY to work_groups: that
+  -- table is ensured by a different module (work-groups.ts) and may not exist yet when this runs,
+  -- and a constraint that can fail the whole ensure would take the messenger down to gain nothing
+  -- chat-groups.ts does not already check.
+  ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS source_kind VARCHAR(20);
+  ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS source_group_id UUID;
+  ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS key_epoch INT NOT NULL DEFAULT 1;
+  -- ---- GROUP KEYS. WHY THESE COLUMNS EXIST, AND WHAT THEY DO NOT CONTAIN.
+  --
+  -- A direct thread needs no stored key: both ends derive the same AES-GCM key from ECDH between
+  -- their two published public keys. That construction does NOT extend to three people — with
+  -- members A, B, C, A derives ECDH(A,B) and C derives ECDH(C,A), which are different keys, and a
+  -- group built on it would simply not decrypt. So a group has ONE random AES-GCM-256 key,
+  -- generated in the creator's browser, and each member gets their own copy of it WRAPPED:
+  --
+  --   wrapped_key                = the 32-byte group key, AES-GCM encrypted under a key-encryption
+  --                                key derived by ECDH between the wrapper's private key and this
+  --                                member's published public key
+  --   wrapped_key_iv             = the IV for that wrap
+  --   wrapped_by_user_id         = who wrapped it (for display and audit)
+  --   wrapped_by_public_key_pem  = the wrapper's public key AT THE TIME OF WRAPPING. Stored rather
+  --                                than looked up, because the wrapper may later leave the group
+  --                                or regenerate their device key, and either would otherwise make
+  --                                every copy they wrapped permanently unopenable.
+  --   wrapped_key_epoch          = which generation of the group key this copy holds. Nothing
+  --                                rotates keys today; the column is what lets a client say "your
+  --                                copy is stale" later instead of silently decrypting to noise.
+  --
+  -- THE SERVER STILL CANNOT READ ANYTHING. Every value here is ciphertext or a PUBLIC key. Opening
+  -- a wrapped_key needs an ECDH private key, and private keys are generated in the browser and
+  -- live only in that browser's localStorage — there is no column for one anywhere in this file,
+  -- and there must never be. This is what keeps src/lib/legal-hold.ts truthful for group threads
+  -- as well as direct ones.
+  ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_key TEXT;
+  ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_key_iv TEXT;
+  ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_by_user_id UUID;
+  ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_by_public_key_pem TEXT;
+  ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_key_epoch INT NOT NULL DEFAULT 1;
+`;
+
+// Whichever half is missing is added. No foreign key is attached to a column added here: the
+// live table may already hold rows a new constraint would reject, and a failed ensure would
+// take both surfaces down to gain nothing the application does not already check.
+//
+// Only reached when chat_messages already exists, so this block is one round trip in the branch
+// that the live database actually takes.
+const CHAT_MESSAGES_MERGE_DDL = `
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS thread_id UUID;
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS channel_id UUID;
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS sender_name VARCHAR(120);
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS body TEXT;
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS message_code VARCHAR(20);
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS ciphertext TEXT;
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS iv TEXT;
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS envelope JSONB DEFAULT '{}'::jsonb;
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS attachment_url TEXT;
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS attachment_meta JSONB;
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reply_to_message_id UUID;
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
+  ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+`;
+
+// The receipts table and the indexes, after the chat_messages branch either way. Both index
+// statements name columns the branch above has just guaranteed, so nothing in here is allowed to
+// fail on its own and the whole tail travels as one message.
+const CHAT_TAIL_DDL = `
+  CREATE TABLE IF NOT EXISTS chat_message_receipts (
+    message_id UUID NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL,
+    delivered_at TIMESTAMPTZ,
+    read_at TIMESTAMPTZ,
+    PRIMARY KEY (message_id, user_id)
+  );
+  -- Indexes last: after the ALTERs above, both of these name columns that exist under either
+  -- starting shape. They are NOT swallowed — an index that silently fails to exist is how the
+  -- original mismatch stayed hidden for eight weeks.
+  CREATE INDEX IF NOT EXISTS chat_messages_thread_idx ON chat_messages (thread_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS chat_messages_channel_idx ON chat_messages (channel_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS chat_members_user_idx ON chat_thread_members (user_id);
+  -- The group list is "my threads WHERE kind = 'group'", and the department-channel top-up asks
+  -- "which thread was seeded from this work group".
+  CREATE INDEX IF NOT EXISTS chat_threads_kind_idx ON chat_threads (kind);
+  CREATE INDEX IF NOT EXISTS chat_threads_source_group_idx ON chat_threads (source_group_id);
+`;
+
 async function run(): Promise<void> {
   try {
-    // ---- channel side of the house, so the archive renders on a database that never had the
-    // manually-run setup scripts. Same shape as src/lib/db/schema.ts:711-741, is_dm included.
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS chat_channels (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        slug VARCHAR(60) NOT NULL UNIQUE,
-        name VARCHAR(120) NOT NULL,
-        description TEXT,
-        is_private BOOLEAN NOT NULL DEFAULT false,
-        is_dm BOOLEAN NOT NULL DEFAULT false,
-        created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-        sort_order INTEGER NOT NULL DEFAULT 0,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`);
-    // Declared in Drizzle and written by start-dm.ts:49, created by no CREATE TABLE in the repo.
-    await db.execute(sql`ALTER TABLE chat_channels ADD COLUMN IF NOT EXISTS is_dm BOOLEAN NOT NULL DEFAULT false`);
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS chat_memberships (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        channel_id UUID NOT NULL REFERENCES chat_channels(id) ON DELETE CASCADE,
-        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        last_read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (channel_id, user_id)
-      )`);
-
-    // ---- thread side of the house (the canonical messenger).
-    //
-    // `kind` is the only distinction between a direct message and a group: 'direct' | 'group'.
-    // There is no second thread table and no second membership table — a group is a thread with a
-    // name and more than two rows in chat_thread_members. See GROUP KEYS below for what the extra
-    // columns on the membership table carry.
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS chat_threads (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        kind VARCHAR(20) NOT NULL DEFAULT 'direct',
-        title VARCHAR(200),
-        description TEXT,
-        cover_url TEXT,
-        last_message_preview TEXT,
-        last_message_at TIMESTAMPTZ,
-        disappearing_seconds INT,
-        created_by_user_id UUID,
-        source_kind VARCHAR(20),
-        source_group_id UUID,
-        key_epoch INT NOT NULL DEFAULT 1,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`);
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS chat_thread_members (
-        thread_id UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
-        user_id UUID NOT NULL,
-        role VARCHAR(20) NOT NULL DEFAULT 'member',
-        joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        last_read_at TIMESTAMPTZ,
-        notifications_muted BOOLEAN NOT NULL DEFAULT false,
-        public_key_pem TEXT,
-        wrapped_key TEXT,
-        wrapped_key_iv TEXT,
-        wrapped_by_user_id UUID,
-        wrapped_by_public_key_pem TEXT,
-        wrapped_key_epoch INT NOT NULL DEFAULT 1,
-        PRIMARY KEY (thread_id, user_id)
-      )`);
-
-    // CREATE TABLE IF NOT EXISTS IS A NO-OP ON AN EXISTING TABLE, INCLUDING ONE MISSING COLUMNS —
-    // and both tables above already exist on the live database (portal/messages.astro created them
-    // inline from 2026-06-09; only chat_messages collided with the channel shape). So every column
-    // added after that date is asserted again here, or the queries that name it throw. Same reason
-    // the same block exists in work-groups.ts. On a fresh database these are no-ops.
-    await db.execute(sql`ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS description TEXT`);
-    await db.execute(sql`ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS created_by_user_id UUID`);
-    // Where a group's membership came from, so a department channel derives from the work group
-    // instead of being a second, immediately-stale copy of it. No FOREIGN KEY to work_groups: that
-    // table is ensured by a different module (work-groups.ts) and may not exist yet when this runs,
-    // and a constraint that can fail the whole ensure would take the messenger down to gain nothing
-    // chat-groups.ts does not already check.
-    await db.execute(sql`ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS source_kind VARCHAR(20)`);
-    await db.execute(sql`ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS source_group_id UUID`);
-    await db.execute(sql`ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS key_epoch INT NOT NULL DEFAULT 1`);
-
-    // ---- GROUP KEYS. WHY THESE COLUMNS EXIST, AND WHAT THEY DO NOT CONTAIN.
-    //
-    // A direct thread needs no stored key: both ends derive the same AES-GCM key from ECDH between
-    // their two published public keys. That construction does NOT extend to three people — with
-    // members A, B, C, A derives ECDH(A,B) and C derives ECDH(C,A), which are different keys, and a
-    // group built on it would simply not decrypt. So a group has ONE random AES-GCM-256 key,
-    // generated in the creator's browser, and each member gets their own copy of it WRAPPED:
-    //
-    //   wrapped_key                = the 32-byte group key, AES-GCM encrypted under a key-encryption
-    //                                key derived by ECDH between the wrapper's private key and this
-    //                                member's published public key
-    //   wrapped_key_iv             = the IV for that wrap
-    //   wrapped_by_user_id         = who wrapped it (for display and audit)
-    //   wrapped_by_public_key_pem  = the wrapper's public key AT THE TIME OF WRAPPING. Stored rather
-    //                                than looked up, because the wrapper may later leave the group
-    //                                or regenerate their device key, and either would otherwise make
-    //                                every copy they wrapped permanently unopenable.
-    //   wrapped_key_epoch          = which generation of the group key this copy holds. Nothing
-    //                                rotates keys today; the column is what lets a client say "your
-    //                                copy is stale" later instead of silently decrypting to noise.
-    //
-    // THE SERVER STILL CANNOT READ ANYTHING. Every value here is ciphertext or a PUBLIC key. Opening
-    // a wrapped_key needs an ECDH private key, and private keys are generated in the browser and
-    // live only in that browser's localStorage — there is no column for one anywhere in this file,
-    // and there must never be. This is what keeps src/lib/legal-hold.ts truthful for group threads
-    // as well as direct ones.
-    await db.execute(sql`ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_key TEXT`);
-    await db.execute(sql`ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_key_iv TEXT`);
-    await db.execute(sql`ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_by_user_id UUID`);
-    await db.execute(sql`ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_by_public_key_pem TEXT`);
-    await db.execute(sql`ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_key_epoch INT NOT NULL DEFAULT 1`);
+    // Fifteen statements, one message. The two constants are separate only so each keeps the comment
+    // that explains it; concatenating them preserves the order they were awaited in.
+    await batch(CHAT_CHANNELS_DDL + CHAT_THREADS_DDL);
 
     // ---- the table both systems collided on. Created UNIFIED when it is absent, so a fresh
     // database can never reproduce the split; reconciled additively when it is present.
@@ -256,22 +337,9 @@ async function run(): Promise<void> {
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )`);
     } else {
-      // Whichever half is missing is added. No foreign key is attached to a column added here: the
-      // live table may already hold rows a new constraint would reject, and a failed ensure would
-      // take both surfaces down to gain nothing the application does not already check.
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS thread_id UUID`);
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS channel_id UUID`);
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS sender_name VARCHAR(120)`);
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS body TEXT`);
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS message_code VARCHAR(20)`);
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS ciphertext TEXT`);
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS iv TEXT`);
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS envelope JSONB DEFAULT '{}'::jsonb`);
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS attachment_url TEXT`);
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS attachment_meta JSONB`);
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reply_to_message_id UUID`);
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ`);
-      await db.execute(sql`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`);
+      // Thirteen ADD COLUMN IF NOT EXISTS, one message — see CHAT_MESSAGES_MERGE_DDL for why none of
+      // them may fail on its own.
+      await batch(CHAT_MESSAGES_MERGE_DDL);
 
       // A column that is NOT NULL for the OTHER shape's rows makes this table impossible to write.
       // Dropping a NOT NULL constraint removes no column and rewrites no row; it is the one change
@@ -295,25 +363,8 @@ async function run(): Promise<void> {
       });
     }
 
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS chat_message_receipts (
-        message_id UUID NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
-        user_id UUID NOT NULL,
-        delivered_at TIMESTAMPTZ,
-        read_at TIMESTAMPTZ,
-        PRIMARY KEY (message_id, user_id)
-      )`);
-
-    // Indexes last: after the ALTERs above, both of these name columns that exist under either
-    // starting shape. They are NOT swallowed — an index that silently fails to exist is how the
-    // original mismatch stayed hidden for eight weeks.
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_messages_thread_idx ON chat_messages (thread_id, created_at DESC)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_messages_channel_idx ON chat_messages (channel_id, created_at DESC)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_members_user_idx ON chat_thread_members (user_id)`);
-    // The group list is "my threads WHERE kind = 'group'", and the department-channel top-up asks
-    // "which thread was seeded from this work group".
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_threads_kind_idx ON chat_threads (kind)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_threads_source_group_idx ON chat_threads (source_group_id)`);
+    // The receipts table and the five indexes, one message.
+    await batch(CHAT_TAIL_DDL);
   } catch (e: any) {
     // Logged before it is rethrown. ensureOnce drops a failed run from its cache so the next request
     // retries; without this line that retry would be the only trace that anything went wrong.

@@ -53,7 +53,7 @@
 // people typing the SAME code each got their OWN empty room and never met. `room_code` is the
 // additive column that fixes it: it is the handle in the URL, it is UNIQUE, and it exists under
 // either id type. Look a room up with roomLookupSql(); never compare the URL segment to `id` alone.
-import { db } from '@/lib/db';
+import { db, sqlClient } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 import { logEvent } from '@/lib/logger';
@@ -129,6 +129,148 @@ async function detectRooms(): Promise<{ present: Map<string, string>; notNull: S
   return { present, notNull };
 }
 
+// ---- the DDL, as two blocks that each cost ONE round trip instead of one per statement.
+//
+// WHY. Every `await db.execute(...)` below used to be its own round trip, and this whole bootstrap
+// runs before the first real query on every cold serverless instance. On an existing database that
+// was 26 ALTERs plus 13 statements for the indexes and children — 39 round trips at a measured
+// ~139ms each, ~5.4s of pure latency before /portal/meet reads a single row. Joined and sent over
+// the simple protocol, each block costs one.
+//
+// SAFE HERE, and rule-3 checked statement by statement: nothing in run() is individually tolerated.
+// The entire body sits in ONE try that rethrows, so a failure at statement 20 already aborted the
+// other 19 and took the ensure down with it. There is no `try { CREATE INDEX } catch {}` anywhere in
+// this file. What the batch adds is that the failed block also ROLLS BACK — an improvement, not a
+// loss: every statement is IF NOT EXISTS-idempotent, ensureOnce drops the failed run from its cache,
+// and the next request retries the whole block from a clean state rather than from a half-applied
+// one. The unique index on room_code can legitimately fail (duplicate codes); it could before too,
+// and it aborted the ensure then exactly as it does now.
+//
+// DELIBERATELY LEFT OUT OF THE BATCHES:
+//   * the CREATE TABLE for a fresh database. It is a single statement — already one round trip — and
+//     moving it would only take it further from the comment that explains why it is unified.
+//   * the two `ALTER COLUMN ... DROP NOT NULL` statements. They fire only when detectRooms() found
+//     the column actually set NOT NULL, so they are not part of a fixed literal block; they stay
+//     separate calls and cost nothing at all on a database that does not have the constraint.
+//   * detectRooms()'s SELECT, which is not DDL and whose answer the branch below depends on.
+//
+// The text is never built from input — these are string literals, which is the only shape
+// sqlClient().unsafe() may ever be handed.
+//
+// NOT ensureBatch(), and this is the one thing to keep straight if you touch it. ensureBatch() wraps
+// ensureOnce(), whose returned promise NEVER REJECTS — it logs and swallows (src/lib/ensure-once.ts).
+// Nested inside run() that would report a failed block as a success: run() would carry straight on,
+// ensureFailed would stay false, meetBlockReason() would tell every surface the store is fine, and
+// the outer ensureOnce would cache that verdict for the life of the process while the columns were
+// missing. That is the exact "ok: true, ran: 8, failed: 0 while ten tables were missing" failure
+// ensure-once.ts was commented to prevent. So this uses the same one-round-trip mechanism directly
+// and leaves the error to propagate into run()'s catch, where the flag, the log and the rethrow are.
+const batch = async (ddl: string): Promise<void> => {
+  await sqlClient().unsafe(ddl).simple();
+};
+
+// Whichever half is missing is added. No column is dropped, no type is altered and no row is
+// touched: a room already stored keeps every value it has and simply gains NULL columns.
+const MEET_ROOMS_ALTER_DDL = `
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS room_code TEXT;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS host_name TEXT;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS host_email TEXT;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS title TEXT;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS description TEXT;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS kind VARCHAR(20) DEFAULT 'huddle';
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS duration_min INTEGER DEFAULT 30;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS duration_minutes INT DEFAULT 60;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS passcode VARCHAR(40);
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS waiting_room BOOLEAN DEFAULT true;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS record_on_default BOOLEAN DEFAULT false;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS breakouts_enabled BOOLEAN DEFAULT false;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS attendee_mute_default BOOLEAN DEFAULT false;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS raise_hand_enabled BOOLEAN DEFAULT true;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS recurrence TEXT DEFAULT 'none';
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS invitees JSONB DEFAULT '[]'::jsonb;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS is_locked BOOLEAN DEFAULT false;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS recording_enabled BOOLEAN DEFAULT false;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS recording_url TEXT;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS max_participants INT DEFAULT 250;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS features JSONB DEFAULT '{}'::jsonb;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'scheduled';
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;
+  ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+`;
+
+// The indexes and the child tables, which run on BOTH branches — a fresh database and an existing
+// one need exactly the same set. The comments that travelled with these statements are kept here,
+// as SQL comments, next to the statements they are about.
+const MEET_CHILDREN_DDL = `
+  -- room_code is the handle in the URL. UNIQUE so a code resolves to exactly one room — the whole
+  -- point of the column. Partial, because rooms created before this build have no code and NULL is
+  -- not unique-constrained anyway; naming the predicate keeps the index small.
+  CREATE UNIQUE INDEX IF NOT EXISTS meet_rooms_room_code_idx
+    ON meet_rooms (room_code) WHERE room_code IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_meet_rooms_host ON meet_rooms (host_user_id);
+  CREATE INDEX IF NOT EXISTS idx_meet_rooms_scheduled ON meet_rooms (scheduled_at);
+  CREATE INDEX IF NOT EXISTS idx_meet_rooms_status ON meet_rooms (status);
+
+  -- ---- the children. Each is created in ONE place — here — and in the canonical types. No FK is
+  -- attached to meet_rooms(id): on a legacy-shaped parent the types would not match and a failed
+  -- ensure would take the whole meeting platform down to gain nothing the surfaces do not check.
+  CREATE TABLE IF NOT EXISTS meet_participants (
+    room_id UUID,
+    user_id UUID,
+    display_name VARCHAR(200),
+    email TEXT,
+    role VARCHAR(20) DEFAULT 'attendee',
+    joined_at TIMESTAMPTZ DEFAULT NOW(),
+    left_at TIMESTAMPTZ,
+    in_lobby BOOLEAN DEFAULT false,
+    PRIMARY KEY (room_id, user_id)
+  );
+  ALTER TABLE meet_participants ADD COLUMN IF NOT EXISTS email TEXT;
+  ALTER TABLE meet_participants ADD COLUMN IF NOT EXISTS in_lobby BOOLEAN DEFAULT false;
+  ALTER TABLE meet_participants ADD COLUMN IF NOT EXISTS left_at TIMESTAMPTZ;
+
+  CREATE TABLE IF NOT EXISTS meet_recordings (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL,
+    title TEXT,
+    duration_sec INTEGER DEFAULT 0,
+    attendees_count INTEGER DEFAULT 0,
+    transcript_available BOOLEAN DEFAULT false,
+    blob_url TEXT,
+    thumbnail_url TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_meet_recordings_room ON meet_recordings (room_id);
+
+  CREATE TABLE IF NOT EXISTS meet_chat (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    room_id UUID,
+    user_id UUID,
+    body TEXT,
+    is_private_to UUID,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS meet_polls (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    room_id UUID,
+    question TEXT,
+    options JSONB DEFAULT '[]'::jsonb,
+    votes JSONB DEFAULT '{}'::jsonb,
+    status VARCHAR(20) DEFAULT 'live',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS meet_breakouts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    room_id UUID,
+    label VARCHAR(120),
+    participants JSONB DEFAULT '[]'::jsonb,
+    ends_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+`;
+
 async function run(): Promise<void> {
   ensureFailed = false;
   try {
@@ -172,34 +314,10 @@ async function run(): Promise<void> {
         )`);
       detected = { existed: false, roomIdIsUuid: true, hostIsUuid: true, writable: true };
     } else {
-      // Whichever half is missing is added. No column is dropped, no type is altered and no row is
-      // touched: a room already stored keeps every value it has and simply gains NULL columns.
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS room_code TEXT`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS host_name TEXT`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS host_email TEXT`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS title TEXT`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS description TEXT`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS kind VARCHAR(20) DEFAULT 'huddle'`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS duration_min INTEGER DEFAULT 30`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS duration_minutes INT DEFAULT 60`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS passcode VARCHAR(40)`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS waiting_room BOOLEAN DEFAULT true`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS record_on_default BOOLEAN DEFAULT false`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS breakouts_enabled BOOLEAN DEFAULT false`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS attendee_mute_default BOOLEAN DEFAULT false`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS raise_hand_enabled BOOLEAN DEFAULT true`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS recurrence TEXT DEFAULT 'none'`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS invitees JSONB DEFAULT '[]'::jsonb`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS is_locked BOOLEAN DEFAULT false`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS recording_enabled BOOLEAN DEFAULT false`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS recording_url TEXT`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS max_participants INT DEFAULT 250`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS features JSONB DEFAULT '{}'::jsonb`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'scheduled'`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ`);
-      await db.execute(sql`ALTER TABLE meet_rooms ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+      // Whichever half is missing is added — the 26 ALTERs of MEET_ROOMS_ALTER_DDL, in one round
+      // trip. No column is dropped, no type is altered and no row is touched: a room already stored
+      // keeps every value it has and simply gains NULL columns.
+      await batch(MEET_ROOMS_ALTER_DDL);
 
       // `title TEXT NOT NULL` belongs to the scheduler shape only, and a room opened ad hoc has no
       // title until somebody types one. Dropping a NOT NULL removes no column and rewrites no row;
@@ -226,77 +344,9 @@ async function run(): Promise<void> {
       });
     }
 
-    // room_code is the handle in the URL. UNIQUE so a code resolves to exactly one room — the whole
-    // point of the column. Partial, because rooms created before this build have no code and NULL is
-    // not unique-constrained anyway; naming the predicate keeps the index small.
-    await db.execute(sql`
-      CREATE UNIQUE INDEX IF NOT EXISTS meet_rooms_room_code_idx
-        ON meet_rooms (room_code) WHERE room_code IS NOT NULL`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_meet_rooms_host ON meet_rooms (host_user_id)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_meet_rooms_scheduled ON meet_rooms (scheduled_at)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_meet_rooms_status ON meet_rooms (status)`);
-
-    // ---- the children. Each is created in ONE place — here — and in the canonical types. No FK is
-    // attached to meet_rooms(id): on a legacy-shaped parent the types would not match and a failed
-    // ensure would take the whole meeting platform down to gain nothing the surfaces do not check.
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS meet_participants (
-        room_id UUID,
-        user_id UUID,
-        display_name VARCHAR(200),
-        email TEXT,
-        role VARCHAR(20) DEFAULT 'attendee',
-        joined_at TIMESTAMPTZ DEFAULT NOW(),
-        left_at TIMESTAMPTZ,
-        in_lobby BOOLEAN DEFAULT false,
-        PRIMARY KEY (room_id, user_id)
-      )`);
-    await db.execute(sql`ALTER TABLE meet_participants ADD COLUMN IF NOT EXISTS email TEXT`);
-    await db.execute(sql`ALTER TABLE meet_participants ADD COLUMN IF NOT EXISTS in_lobby BOOLEAN DEFAULT false`);
-    await db.execute(sql`ALTER TABLE meet_participants ADD COLUMN IF NOT EXISTS left_at TIMESTAMPTZ`);
-
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS meet_recordings (
-        id TEXT PRIMARY KEY,
-        room_id TEXT NOT NULL,
-        title TEXT,
-        duration_sec INTEGER DEFAULT 0,
-        attendees_count INTEGER DEFAULT 0,
-        transcript_available BOOLEAN DEFAULT false,
-        blob_url TEXT,
-        thumbnail_url TEXT,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      )`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_meet_recordings_room ON meet_recordings (room_id)`);
-
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS meet_chat (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        room_id UUID,
-        user_id UUID,
-        body TEXT,
-        is_private_to UUID,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      )`);
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS meet_polls (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        room_id UUID,
-        question TEXT,
-        options JSONB DEFAULT '[]'::jsonb,
-        votes JSONB DEFAULT '{}'::jsonb,
-        status VARCHAR(20) DEFAULT 'live',
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      )`);
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS meet_breakouts (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        room_id UUID,
-        label VARCHAR(120),
-        participants JSONB DEFAULT '[]'::jsonb,
-        ends_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      )`);
+    // The indexes on meet_rooms and every child table, in one round trip. The reasoning that used to
+    // sit against these statements now sits with them, inside MEET_CHILDREN_DDL.
+    await batch(MEET_CHILDREN_DDL);
   } catch (e: any) {
     // Recorded, logged, and THEN rethrown. ensureOnce drops a failed run from its cache so the next
     // request retries; without these two lines that retry would be the only trace that anything went

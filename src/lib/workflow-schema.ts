@@ -68,7 +68,7 @@
 //    varchar(50) in src/lib/db/schema.ts and UUID in db/hr-schema.sql. It does not appear here at
 //    all, which is the safest form of that rule.
 
-import { db } from './db';
+import { db, sqlClient } from './db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from './ensure-once';
 
@@ -77,6 +77,178 @@ import { ensureOnce } from './ensure-once';
 // down on this project twice.
 const logFail = (tag: string, e: any) =>
   console.error('[workflow-schema] ' + tag, e?.cause?.message || e?.message);
+
+// =================================================================================================
+// FOUR ROUND TRIPS, NOT THIRTY-SEVEN
+// =================================================================================================
+//
+// Four, not two: the two batched blocks are one message each, and the two individually-tolerated
+// unique indexes below are still a round trip apiece. That is the whole cost of this bootstrap now.
+//
+// This bootstrap was 37 separate `await db.execute(...)` calls. Each one is its own round trip, and
+// a measured round trip to this database is ~139ms, so a cold instance spent ~5s in here before the
+// page could read its first row. ensureOnce() caches per PROCESS, not per database, so every cold
+// serverless instance paid the whole bill again — a large part of why
+// /portal/employee/attendance/clock-out was reaching the gateway timeout. The unguarded statements
+// are now two blocks sent over the simple protocol, one message each, carrying exactly the same
+// statements in exactly the order they were written.
+//
+// THE TWO GUARDED UNIQUE INDEXES ARE NOT IN THE BLOCKS. A block is ONE IMPLICIT TRANSACTION: if any
+// statement in it fails, the whole block rolls back. Both unique indexes can legitimately fail
+// against existing data that violates them, and both are individually tolerated for exactly that
+// reason (the comment at each says so). Batching them would turn "the index is missing, and the log
+// names why" into "the tables do not exist". They stay as their own db.execute() calls, in their
+// original positions, each still wrapped in its own try/catch.
+//
+// sqlClient().unsafe(ddl).simple() is the mechanism ensureBatch() uses in src/lib/ensure-once.ts.
+// It is called directly here rather than through ensureBatch because ensureBatch is ensureOnce plus
+// ONE block, and this bootstrap is four ordered steps under the single 'workflow_v1' key — and
+// because ensureBatch carries its OWN ensureOnce, so a failed block would be logged and swallowed
+// inside it and the catch/re-throw below would never see it. (The cache entry is still dropped on
+// failure either way, so a transient failure retries; what is lost is this file's own error path.)
+// The strings are literals in this file; nothing user-supplied reaches unsafe().
+// =================================================================================================
+
+// -----------------------------------------------------------------------------------------
+// workflow_instances — ONE ROW PER REQUEST MOVING THROUGH AN APPROVAL.
+//
+//   domain       'leave' | 'attendance' | 'expenses' | 'procurement' | 'recruitment' | 'travel'
+//   record_id    the id of the row in that domain's own table. TEXT — see trap 2 above.
+//   state        THE EXPLICIT STATE. draft | pending | approved | rejected | cancelled | halted.
+//                'halted' is the one that matters most: it is what the engine writes when the org
+//                graph cannot name an approver. It is NOT 'approved' and it is NOT 'pending'
+//                waiting on nobody — a request that auto-approved because routing failed is the
+//                worst outcome this system can produce, and a state that means exactly "stopped,
+//                and here is the sentence explaining why" is how that is made impossible.
+//   halt_reason  the sentence. Rendered to a person verbatim.
+//   current_step which step_no is live. Sequential steps advance it; parallel steps share it.
+// -----------------------------------------------------------------------------------------
+const WORKFLOW_INSTANCES_DDL = `
+  CREATE TABLE IF NOT EXISTS workflow_instances (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    domain               TEXT NOT NULL,
+    record_id            TEXT NOT NULL,
+    subject_employee_id  UUID,
+    requested_by_user_id UUID,
+    state                TEXT NOT NULL DEFAULT 'draft',
+    current_step         INT NOT NULL DEFAULT 1,
+    halt_reason          TEXT,
+    summary              TEXT,
+    amount               NUMERIC(14,2),
+    currency             TEXT,
+    created_by           UUID,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    settled_at           TIMESTAMPTZ
+  );
+
+  -- CREATE TABLE IF NOT EXISTS IS A NO-OP ON AN EXISTING TABLE, INCLUDING ONE MISSING COLUMNS. That
+  -- is how hr_employees.work_email came to be declared in db/hr-schema.sql and absent from the live
+  -- table, which locked every administrator out of /admin for a day. Every column past the primary
+  -- key is therefore asserted again. On a fresh database these are no-ops; on a database carrying an
+  -- earlier revision of this file they are the difference between working and a 500.
+  ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS subject_employee_id UUID;
+  ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS requested_by_user_id UUID;
+  ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'draft';
+  ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS current_step INT NOT NULL DEFAULT 1;
+  ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS halt_reason TEXT;
+  ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS summary TEXT;
+  ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS amount NUMERIC(14,2);
+  ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS currency TEXT;
+  ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS created_by UUID;
+  ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;
+`;
+
+// The read paths workflow_instances actually serves. These come AFTER the record_uq unique index in
+// the original order and are kept there — they are sent in the same message as the workflow_steps
+// block below, which is the next unguarded run.
+const WORKFLOW_INSTANCE_INDEXES_DDL = `
+  -- "What is waiting, across the company" — the queue view, newest first.
+  CREATE INDEX IF NOT EXISTS workflow_instances_state_idx
+    ON workflow_instances (state, domain, created_at DESC);
+  -- "Everything raised by this person" — their own history.
+  CREATE INDEX IF NOT EXISTS workflow_instances_subject_idx
+    ON workflow_instances (subject_employee_id, created_at DESC);
+  -- The halt sweep: every request stopped because routing could not name anybody.
+  CREATE INDEX IF NOT EXISTS workflow_instances_halted_idx
+    ON workflow_instances (state, updated_at DESC);
+`;
+
+// -----------------------------------------------------------------------------------------
+// workflow_steps — ONE ROW PER APPROVAL DECISION THAT IS OWED.
+//
+//   step_no      the position in the chain. SEQUENTIAL steps have one row each and run in
+//                ascending order. PARALLEL approval is several rows SHARING one step_no — all of
+//                them must approve before current_step advances. That is the entire mechanism;
+//                there is no separate parallel flag to get out of step with the rows.
+//   mode         'sequential' | 'parallel' | 'executive'. Descriptive, for rendering and audit.
+//                The BEHAVIOUR comes from how many rows share step_no, never from this string.
+//   via          WHICH ORG RELATIONSHIP RESOLVED THIS APPROVER — 'reporting_manager',
+//                'department_head', 'approval_owner', 'executive_sponsor'. This is a value of
+//                org_relationships.type, recorded so a screen can say "waiting on her manager"
+//                and an auditor can see which edge was walked. IT IS NOT A ROLE NAME AND IT IS
+//                NOT A CAPABILITY. Nothing compares it to users.role, and nothing grants anything
+//                from it.
+//   acted_via    HOW THE PERSON WHO ACTUALLY DECIDED WAS ENTITLED TO: 'routed' (they are the
+//                resolved approver), 'delegate' (they are standing in for the resolved approver
+//                under an in-force temporary_delegate edge) or 'capability' (they hold the
+//                domain's approval capability from Layer 2). Written by the engine AFTER the
+//                check, never read to make one.
+//   due_at       when this step becomes escalatable. NULL means it never escalates on its own.
+//   escalated_from_step_id  set on a step created BECAUSE another one went unanswered. The
+//                original row is left pending, so either person can still act and the record
+//                shows the escalation happened rather than replacing the history with its result.
+// -----------------------------------------------------------------------------------------
+const WORKFLOW_STEPS_DDL = `
+  CREATE TABLE IF NOT EXISTS workflow_steps (
+    id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    instance_id            UUID NOT NULL,
+    step_no                INT NOT NULL DEFAULT 1,
+    mode                   TEXT NOT NULL DEFAULT 'sequential',
+    via                    TEXT,
+    approver_employee_id   UUID,
+    approver_user_id       UUID,
+    decision               TEXT NOT NULL DEFAULT 'pending',
+    decided_by_user_id     UUID,
+    decided_at             TIMESTAMPTZ,
+    acted_via              TEXT,
+    note                   TEXT,
+    due_at                 TIMESTAMPTZ,
+    escalated_from_step_id UUID,
+    notified_at            TIMESTAMPTZ,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS step_no INT NOT NULL DEFAULT 1;
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'sequential';
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS via TEXT;
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS approver_employee_id UUID;
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS approver_user_id UUID;
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS decision TEXT NOT NULL DEFAULT 'pending';
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS decided_by_user_id UUID;
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS acted_via TEXT;
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS note TEXT;
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ;
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS escalated_from_step_id UUID;
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;
+  ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+  -- The step list for one instance, in order. Every read of an instance uses this.
+  CREATE INDEX IF NOT EXISTS workflow_steps_instance_idx
+    ON workflow_steps (instance_id, step_no, created_at);
+  -- "What is waiting on ME" — the only query an approver's phone actually runs.
+  CREATE INDEX IF NOT EXISTS workflow_steps_approver_idx
+    ON workflow_steps (approver_user_id, decision, due_at);
+  -- The same question in employee-id space, for the delegate lookup.
+  CREATE INDEX IF NOT EXISTS workflow_steps_approver_emp_idx
+    ON workflow_steps (approver_employee_id, decision);
+  -- The escalation sweep: pending steps that are past due.
+  CREATE INDEX IF NOT EXISTS workflow_steps_due_idx
+    ON workflow_steps (decision, due_at);
+`;
 
 /**
  * Create the Layer 3 tables if they are absent. Idempotent, safe to call on every request.
@@ -104,55 +276,8 @@ export function ensureWorkflowSchema(): Promise<void> {
 }
 
 async function createWorkflowTables(): Promise<void> {
-  // -----------------------------------------------------------------------------------------
-  // workflow_instances — ONE ROW PER REQUEST MOVING THROUGH AN APPROVAL.
-  //
-  //   domain       'leave' | 'attendance' | 'expenses' | 'procurement' | 'recruitment' | 'travel'
-  //   record_id    the id of the row in that domain's own table. TEXT — see trap 2 above.
-  //   state        THE EXPLICIT STATE. draft | pending | approved | rejected | cancelled | halted.
-  //                'halted' is the one that matters most: it is what the engine writes when the org
-  //                graph cannot name an approver. It is NOT 'approved' and it is NOT 'pending'
-  //                waiting on nobody — a request that auto-approved because routing failed is the
-  //                worst outcome this system can produce, and a state that means exactly "stopped,
-  //                and here is the sentence explaining why" is how that is made impossible.
-  //   halt_reason  the sentence. Rendered to a person verbatim.
-  //   current_step which step_no is live. Sequential steps advance it; parallel steps share it.
-  // -----------------------------------------------------------------------------------------
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS workflow_instances (
-    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    domain               TEXT NOT NULL,
-    record_id            TEXT NOT NULL,
-    subject_employee_id  UUID,
-    requested_by_user_id UUID,
-    state                TEXT NOT NULL DEFAULT 'draft',
-    current_step         INT NOT NULL DEFAULT 1,
-    halt_reason          TEXT,
-    summary              TEXT,
-    amount               NUMERIC(14,2),
-    currency             TEXT,
-    created_by           UUID,
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    settled_at           TIMESTAMPTZ
-  )`);
-
-  // CREATE TABLE IF NOT EXISTS IS A NO-OP ON AN EXISTING TABLE, INCLUDING ONE MISSING COLUMNS. That
-  // is how hr_employees.work_email came to be declared in db/hr-schema.sql and absent from the live
-  // table, which locked every administrator out of /admin for a day. Every column past the primary
-  // key is therefore asserted again. On a fresh database these are no-ops; on a database carrying an
-  // earlier revision of this file they are the difference between working and a 500.
-  await db.execute(sql`ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS subject_employee_id UUID`);
-  await db.execute(sql`ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS requested_by_user_id UUID`);
-  await db.execute(sql`ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'draft'`);
-  await db.execute(sql`ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS current_step INT NOT NULL DEFAULT 1`);
-  await db.execute(sql`ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS halt_reason TEXT`);
-  await db.execute(sql`ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS summary TEXT`);
-  await db.execute(sql`ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS amount NUMERIC(14,2)`);
-  await db.execute(sql`ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS currency TEXT`);
-  await db.execute(sql`ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS created_by UUID`);
-  await db.execute(sql`ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
-  await db.execute(sql`ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
-  await db.execute(sql`ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ`);
+  // workflow_instances and its twelve column assertions, in one message.
+  await sqlClient().unsafe(WORKFLOW_INSTANCES_DDL).simple();
 
   // NO CHECK CONSTRAINT ON `state` OR `domain`, and no foreign key to the domain tables. Same three
   // reasons as org_relationships:
@@ -177,6 +302,9 @@ async function createWorkflowTables(): Promise<void> {
   // DELIBERATELY NOT PARTIAL. A rejected leave request that is re-submitted becomes a NEW row in
   // hr_leave_request with a new id, so it gets a new instance naturally. Allowing a second instance
   // against the SAME record_id would mean one request could be approved and rejected at once.
+  //
+  // NOT IN EITHER BLOCK ABOVE, for the reason its catch describes: a block is one implicit
+  // transaction, so folding this in would let a duplicate row in existing data roll the tables back.
   try {
     await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS workflow_instances_record_uq
       ON workflow_instances (domain, record_id)`);
@@ -188,87 +316,10 @@ async function createWorkflowTables(): Promise<void> {
     logFail('workflow_instances_record_uq', e);
   }
 
-  // "What is waiting, across the company" — the queue view, newest first.
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS workflow_instances_state_idx
-    ON workflow_instances (state, domain, created_at DESC)`);
-  // "Everything raised by this person" — their own history.
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS workflow_instances_subject_idx
-    ON workflow_instances (subject_employee_id, created_at DESC)`);
-  // The halt sweep: every request stopped because routing could not name anybody.
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS workflow_instances_halted_idx
-    ON workflow_instances (state, updated_at DESC)`);
-
-  // -----------------------------------------------------------------------------------------
-  // workflow_steps — ONE ROW PER APPROVAL DECISION THAT IS OWED.
-  //
-  //   step_no      the position in the chain. SEQUENTIAL steps have one row each and run in
-  //                ascending order. PARALLEL approval is several rows SHARING one step_no — all of
-  //                them must approve before current_step advances. That is the entire mechanism;
-  //                there is no separate parallel flag to get out of step with the rows.
-  //   mode         'sequential' | 'parallel' | 'executive'. Descriptive, for rendering and audit.
-  //                The BEHAVIOUR comes from how many rows share step_no, never from this string.
-  //   via          WHICH ORG RELATIONSHIP RESOLVED THIS APPROVER — 'reporting_manager',
-  //                'department_head', 'approval_owner', 'executive_sponsor'. This is a value of
-  //                org_relationships.type, recorded so a screen can say "waiting on her manager"
-  //                and an auditor can see which edge was walked. IT IS NOT A ROLE NAME AND IT IS
-  //                NOT A CAPABILITY. Nothing compares it to users.role, and nothing grants anything
-  //                from it.
-  //   acted_via    HOW THE PERSON WHO ACTUALLY DECIDED WAS ENTITLED TO: 'routed' (they are the
-  //                resolved approver), 'delegate' (they are standing in for the resolved approver
-  //                under an in-force temporary_delegate edge) or 'capability' (they hold the
-  //                domain's approval capability from Layer 2). Written by the engine AFTER the
-  //                check, never read to make one.
-  //   due_at       when this step becomes escalatable. NULL means it never escalates on its own.
-  //   escalated_from_step_id  set on a step created BECAUSE another one went unanswered. The
-  //                original row is left pending, so either person can still act and the record
-  //                shows the escalation happened rather than replacing the history with its result.
-  // -----------------------------------------------------------------------------------------
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS workflow_steps (
-    id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    instance_id            UUID NOT NULL,
-    step_no                INT NOT NULL DEFAULT 1,
-    mode                   TEXT NOT NULL DEFAULT 'sequential',
-    via                    TEXT,
-    approver_employee_id   UUID,
-    approver_user_id       UUID,
-    decision               TEXT NOT NULL DEFAULT 'pending',
-    decided_by_user_id     UUID,
-    decided_at             TIMESTAMPTZ,
-    acted_via              TEXT,
-    note                   TEXT,
-    due_at                 TIMESTAMPTZ,
-    escalated_from_step_id UUID,
-    notified_at            TIMESTAMPTZ,
-    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )`);
-
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS step_no INT NOT NULL DEFAULT 1`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'sequential'`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS via TEXT`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS approver_employee_id UUID`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS approver_user_id UUID`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS decision TEXT NOT NULL DEFAULT 'pending'`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS decided_by_user_id UUID`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS acted_via TEXT`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS note TEXT`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS escalated_from_step_id UUID`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ`);
-  await db.execute(sql`ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
-
-  // The step list for one instance, in order. Every read of an instance uses this.
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS workflow_steps_instance_idx
-    ON workflow_steps (instance_id, step_no, created_at)`);
-  // "What is waiting on ME" — the only query an approver's phone actually runs.
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS workflow_steps_approver_idx
-    ON workflow_steps (approver_user_id, decision, due_at)`);
-  // The same question in employee-id space, for the delegate lookup.
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS workflow_steps_approver_emp_idx
-    ON workflow_steps (approver_employee_id, decision)`);
-  // The escalation sweep: pending steps that are past due.
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS workflow_steps_due_idx
-    ON workflow_steps (decision, due_at)`);
+  // The three workflow_instances indexes and the whole of workflow_steps — the next unguarded run,
+  // in its original order. Concatenated so it travels as ONE message while each block keeps the
+  // comments that belong above it.
+  await sqlClient().unsafe(WORKFLOW_INSTANCE_INDEXES_DDL + WORKFLOW_STEPS_DDL).simple();
 
   try {
     // ONE PENDING DECISION PER PERSON PER STEP. Without this, two routing passes over the same
@@ -279,6 +330,10 @@ async function createWorkflowTables(): Promise<void> {
     //
     // Scoped to PENDING rows only, deliberately: a person may legitimately appear twice in the
     // history of one instance (approve, the instance is reopened, approve again).
+    //
+    // Left out of the block above for the same reason as workflow_instances_record_uq: it is
+    // tolerated individually, and a block that included it would roll the whole of workflow_steps
+    // back the first time existing data owed one person two pending decisions.
     await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS workflow_steps_one_pending_per_approver_uq
       ON workflow_steps (
         instance_id,
