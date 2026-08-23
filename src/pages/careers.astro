@@ -5,6 +5,7 @@ import { roles, departments } from '@/lib/db/schema';
 import { eq, asc, desc, and, or, ilike, sql } from 'drizzle-orm';
 import { ensureRoleProductColumn } from '@/lib/role-products';
 import { ensureRoleAicteColumns } from '@/lib/role-aicte';
+import { displayLocation } from '@/lib/work-mode';
 
 const url = new URL(Astro.request.url);
 const q = url.searchParams.get('q') || '';
@@ -90,10 +91,14 @@ const hasFilters = !!(q || deptFilter || levelFilter || productFilter);
 
 // Guarded so a DB hiccup degrades to an empty state instead of a 500 on a public marketing page.
 let openRoles: any[] = [];
-// Nothing bounded this query, so every view read every open role. Far above any real catalogue
-// size, so it changes no page anyone sees — it is a ceiling on a public, unauthenticated read, not
-// a page size.
-const ROLE_LIST_CAP = 500;
+// A ceiling on a public, unauthenticated read — not a page size, and not a statement about how
+// many roles exist. It was set to 500 on the assumption that the catalogue would never reach it.
+// The catalogue passed it, and because `totalCount` was measured off THIS array, the page then
+// reported the cap as the catalogue size: it said "500 open roles" and listed 500, while the team
+// sidebar beside it — which counts in SQL and is not capped — already added up to more than that.
+// Two consequences, both fixed below: every role after the 500th was invisible, and the number was
+// wrong. Raised to a ceiling the catalogue is nowhere near, and the count now comes from SQL.
+const ROLE_LIST_CAP = 5000;
 const runRolesQuery = (where: any) => db.select({
   id: roles.id,
   title: roles.title,
@@ -108,8 +113,15 @@ const runRolesQuery = (where: any) => db.select({
   isFeatured: roles.isFeatured
 }).from(roles).where(where).orderBy(desc(roles.isFeatured), asc(roles.sortOrder), asc(roles.title)).limit(ROLE_LIST_CAP);
 
+// Built as a factory so the COUNT below can be run against the SAME predicate the list actually
+// used. The retry path narrows the search, and counting with the wide predicate after the narrow
+// one succeeded would print a total the list could never reach.
+const listWhere = (includeKeywords: boolean) =>
+  and(...conditions, ...(q ? [searchClause(includeKeywords)] : []));
+
+let usedWhere: any = listWhere(true);
 try {
-  openRoles = await runRolesQuery(and(...conditions, ...(q ? [searchClause(true)] : [])));
+  openRoles = await runRolesQuery(usedWhere);
 } catch (e: any) {
   const reason = e?.cause?.message || e?.message;
   console.error('[careers] roles query failed:', reason);
@@ -118,7 +130,8 @@ try {
     // database. Retry without it rather than reporting "no roles match", which is what a bare
     // catch here would do and is indistinguishable from a genuinely empty result.
     try {
-      openRoles = await runRolesQuery(and(...conditions, searchClause(false)));
+      usedWhere = listWhere(false);
+      openRoles = await runRolesQuery(usedWhere);
       console.error('[careers] retried search without keywords and succeeded');
     } catch (e2: any) {
       console.error('[careers] narrowed search also failed:', e2?.cause?.message || e2?.message);
@@ -141,7 +154,23 @@ for (const r of openRoles) {
 }
 const deptOrder = allDepts.map((d) => d.name).filter((n) => groupedRoles[n]);
 
-const totalCount = openRoles.length;
+// How many roles match the current filters — counted in SQL, not measured off the capped array.
+// The extra round trip is spent ONLY when the cap was actually reached, so the ordinary view
+// (which is every view until the catalogue grows past ROLE_LIST_CAP) still costs exactly what it
+// did before. `listedCount` stays the number of cards actually on the page, so the two can be
+// shown honestly against each other rather than one silently standing in for the other.
+const listedCount = openRoles.length;
+let totalCount = listedCount;
+if (listedCount >= ROLE_LIST_CAP) {
+  try {
+    const tc = await db.select({ n: sql<number>`COUNT(*)::int` }).from(roles).where(usedWhere);
+    const tcr = (Array.isArray(tc) ? tc : ((tc as any)?.rows || [])) as any[];
+    totalCount = Number(tcr[0]?.n ?? listedCount) || listedCount;
+  } catch (e: any) {
+    console.error('[careers] total count failed:', e?.cause?.message || e?.message);
+  }
+}
+const isTruncated = totalCount > listedCount;
 const LEVELS = ['C-Level', 'Lead', 'Senior', 'Mid', 'Junior', 'Intern', 'Apprentice'];
 
 // Both inline forms now live on dedicated pages: /careers/fee-waiver and
@@ -266,7 +295,7 @@ const teamsWithRoles = allDepts
 
     <div class="mb-5 flex items-center justify-between">
       <p class="text-[0.85rem] text-ink-soft">
-        <strong class="text-ink font-semibold">{totalCount}</strong> {totalCount === 1 ? 'open role' : 'open roles'}{hasFilters ? ' match your filters' : ''}
+        <strong class="text-ink font-semibold">{totalCount}</strong> {totalCount === 1 ? 'open role' : 'open roles'}{hasFilters ? ' match your filters' : ''}{isTruncated && <span class="text-ink-soft/70"> &middot; showing the first {listedCount} &mdash; filter by team or level to reach the rest</span>}
       </p>
       <span class="text-[0.75rem] font-mono text-ink-soft/60">Updated {updated}</span>
     </div>
@@ -383,7 +412,7 @@ const teamsWithRoles = allDepts
                   <div class="relative z-[1] pointer-events-none flex items-center justify-between gap-2 pt-3 border-t border-ink/8">
                     <div class="flex items-center gap-1.5 min-w-0">
                       <span class="text-[0.66rem] font-semibold text-ink-soft bg-cream-2 border border-ink/10 px-2 py-0.5 rounded-md whitespace-nowrap">{r.engagementType}</span>
-                      {r.location && <span class="text-[0.66rem] text-ink-soft inline-flex items-center gap-1 truncate"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" class="flex-shrink-0"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg><span class="truncate">{r.location}</span></span>}
+                      {r.location && <span class="text-[0.66rem] text-ink-soft inline-flex items-center gap-1 truncate"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" class="flex-shrink-0"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg><span class="truncate">{displayLocation(r.engagementType, r.level, r.location)}</span></span>}
                     </div>
                     <span class="text-[0.8rem] font-semibold text-burn inline-flex items-center gap-1 group-hover:gap-2 transition-all whitespace-nowrap">View role &rarr;</span>
                   </div>
