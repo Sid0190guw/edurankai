@@ -1,0 +1,289 @@
+---
+// /portal/manager — THE TEAM A MANAGER IS AUTHORISED TO SEE, AND NOBODY ELSE.
+//
+// =================================================================================================
+// WHY THIS IS A THIRD SCREEN AND NOT A FOURTH TAB
+// =================================================================================================
+//
+// Two manager-shaped surfaces already exist and neither is this one:
+//
+//   /portal/team                          capacity and attendance for a DEPARTMENT lead, scoped from
+//                                         users.assigned_department_id. Who is working today, who is
+//                                         on leave, whose hours are drifting.
+//   /portal/employee/performance (Team)   the appraisal cycle: reports' goals, reviews owed, 360
+//                                         feedback requested.
+//
+// This is the day-to-day one: what the people I manage are working on, how delivery is going, and
+// what I might do about it — with the controls to actually do it. It duplicates neither, links to
+// both, and writes to neither's tables.
+//
+// =================================================================================================
+// WHO APPEARS HERE
+// =================================================================================================
+//
+// Only people the ORGANIZATION GRAPH records a relationship to: a direct report, or somebody this
+// person is a named reviewer for. Not a department string comparison, not users.role, and not
+// "everybody" for a capability holder — holding performance.manage does not make the whole company
+// somebody's team, and this screen says so rather than listing four hundred people.
+//
+// AN EMPTY GRAPH AND AN EMPTY TEAM ARE DIFFERENT SENTENCES, and teamRoster() is what tells them
+// apart. Printing "nobody reports to you" on a database whose graph has never been backfilled would
+// tell every manager in the company the same false thing.
+//
+// MOBILE FIRST. Around nine in ten of the people using this are on a phone: one column at 360px,
+// every target clears 44px, nothing scrolls sideways. No client JavaScript at all.
+import EmployeeShell from '@/components/workforce/EmployeeShell.astro';
+import { composeWorkspace } from '@/lib/workforce/composer';
+import { resolvePerfViewer, PERF_MANAGE } from '@/lib/performance-scope';
+import { teamRoster, type RosterEntry } from '@/lib/manager-intelligence/read';
+import { schemaState } from '@/lib/manager-intelligence/schema';
+import { outboxHealth } from '@/lib/manager-intelligence/record-port';
+
+const PATH = '/portal/manager';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+// ---- Everything the markup reads, declared before it. `const` is not hoisted. --------------------
+const NOW = new Date();
+
+const initialsOf = (name: string): string => String(name || '')
+  .trim().split(/\s+/).slice(0, 2).map((p: string) => p.charAt(0).toUpperCase()).join('') || '?';
+
+const basisLabel = (basis: string): string => {
+  const k = String(basis || '');
+  if (k === 'direct_report') return 'Reports to you';
+  if (k === 'review_subject') return 'You review their work';
+  if (k === 'responsible_via_org_graph') return 'You answer for their work';
+  if (k === 'capability:performance.manage') return 'Organization-wide access';
+  return 'Recorded relationship';
+};
+
+let composed: any = null;
+try {
+  composed = await composeWorkspace(user as any, { locals: Astro.locals, next: PATH });
+} catch (e: any) {
+  // A composition that cannot be built is not guessed at. holds() then answers false for everything,
+  // which lands the viewer on the narrowest scope — the safe direction.
+  console.error('[portal/manager] compose', e?.cause?.message || e?.message);
+}
+const holds = (key: string): boolean => {
+  try {
+    return composed?.context?.holds ? composed.context.holds(key) === true : false;
+  } catch {
+    return false;
+  }
+};
+
+const viewer = await resolvePerfViewer(String(user.id), holds);
+const roster = await teamRoster(viewer, NOW);
+const schema = await schemaState();
+const outbox = holds(PERF_MANAGE) ? await outboxHealth() : null;
+
+// Shaped for the markup, so nothing in JSX does arithmetic or comparison — `<` and `<=` inside an
+// Astro expression are a known parse hazard on this project.
+interface Card {
+  employeeId: string;
+  name: string;
+  initials: string;
+  designation: string;
+  basis: string;
+  openTasks: number;
+  overdue: number;
+  dueWithin7: number;
+  blocked: number;
+  reportsLine: string;
+  reportsBehind: boolean;
+  developmentLine: string;
+  needsAttention: boolean;
+  href: string;
+}
+
+const cards: Card[] = roster.entries.map((e: RosterEntry) => {
+  const behind = e.reportsExpected >= 3 && e.reportsFiled * 10 < e.reportsExpected * 6;
+  return {
+    employeeId: e.employeeId,
+    name: e.fullName,
+    initials: initialsOf(e.fullName),
+    designation: e.designation || '',
+    basis: basisLabel(e.authorityBasis),
+    openTasks: e.openTasks,
+    overdue: e.overdue,
+    dueWithin7: e.dueWithin7,
+    blocked: e.blocked,
+    reportsLine: e.reportsExpected > 0
+      ? String(e.reportsFiled) + ' of ' + String(e.reportsExpected) + ' daily reports filed'
+      : 'No recorded working days in the last four weeks',
+    reportsBehind: behind,
+    developmentLine: e.openDevelopmentActions > 0
+      ? String(e.openDevelopmentActions) + ' development action' + (e.openDevelopmentActions === 1 ? '' : 's') + ' open'
+      : '',
+    needsAttention: e.overdue > 0 || e.blocked > 0 || behind,
+    href: PATH + '/' + e.employeeId,
+  };
+});
+
+const attentionCount = cards.filter((c) => c.needsAttention).length;
+const headline = cards.length === 0
+  ? ''
+  : String(cards.length) + (cards.length === 1 ? ' person' : ' people')
+    + (attentionCount > 0
+      ? ', ' + String(attentionCount) + ' with something worth a look'
+      : '. Nothing on any of them needs attention right now.');
+---
+<EmployeeShell title="My team" back="/portal/employee" person={viewer.fullName || ''} width={760} bare>
+  <main class="wrap">
+
+    <p class="scope">{viewer.explanation}</p>
+
+    {schema.ok ? null : (
+      <div class="note warn">
+        <p>{schema.sentence}</p>
+        <p class="quiet">Reading works without it. Recording feedback, acknowledgements, interventions and
+          development actions does not, and those controls will say so.</p>
+      </div>
+    )}
+
+    {schema.ok && !schema.appendOnlyEnforced ? (
+      <div class="note">
+        <p>The append-only guarantee on the manager action log is not installed on this database, so the
+          log is protected by convention rather than by the database itself. Re-running
+          db/manager-intelligence-schema.sql installs it.</p>
+      </div>
+    ) : null}
+
+    {outbox && outbox.pending > 0 ? (
+      <div class="note">
+        <p>{outbox.sentence}</p>
+      </div>
+    ) : null}
+
+    {cards.length === 0 ? (
+      <div class="empty">
+        <p>{roster.sentence}</p>
+        <p class="quiet">Reporting lines are recorded in the Organization Graph. If somebody is missing
+          from this list, that relationship has not been recorded yet — ask HR to add it rather than
+          working around it.</p>
+      </div>
+    ) : (
+      <>
+        <p class="headline">{headline}</p>
+        {roster.truncated ? <p class="quiet">{roster.sentence}</p> : null}
+
+        <ul class="people">
+          {cards.map((c) => (
+            <li class={c.needsAttention ? 'person attn' : 'person'}>
+              <a class="open" href={c.href}>
+                <span class="avatar" aria-hidden="true">{c.initials}</span>
+                <span class="who">
+                  <span class="name">{c.name}</span>
+                  {c.designation ? <span class="role">{c.designation}</span> : null}
+                  <span class="basis">{c.basis}</span>
+                </span>
+                <svg class="chev" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+              </a>
+              <div class="stats">
+                <span class="stat"><b>{c.openTasks}</b> open</span>
+                {c.overdue > 0 ? <span class="stat bad"><b>{c.overdue}</b> overdue</span> : null}
+                {c.dueWithin7 > 0 ? <span class="stat"><b>{c.dueWithin7}</b> due this week</span> : null}
+                {c.blocked > 0 ? <span class="stat warn"><b>{c.blocked}</b> blocked</span> : null}
+              </div>
+              <p class={c.reportsBehind ? 'sub bad-text' : 'sub'}>{c.reportsLine}</p>
+              {c.developmentLine ? <p class="sub">{c.developmentLine}</p> : null}
+            </li>
+          ))}
+        </ul>
+      </>
+    )}
+
+    <section class="elsewhere">
+      <h2>The other two team screens</h2>
+      <p class="quiet">This one is the day-to-day view. It does not replace either of these and does not
+        write to what they own.</p>
+      <ul class="links">
+        <li><a href="/portal/team">Team capacity and attendance</a><span>Who is working, who is away, and cover.</span></li>
+        <li><a href="/portal/employee/performance?view=team">Appraisal and goals</a><span>Review cycles, objectives, 360 feedback.</span></li>
+      </ul>
+    </section>
+
+    <p class="foot">Everything on the pages behind this list is drawn from ordinary work records that the
+      person can already see on their own portal. There is no monitoring here: no screen capture, no
+      keystroke log, no location, and no health or wellbeing data of any kind.</p>
+
+  </main>
+</EmployeeShell>
+
+<style is:global>
+  .wrap { width: 100%; max-width: var(--emp-width, 760px); margin: 0 auto; padding: 16px; }
+
+  .scope { margin: 0 0 14px; color: var(--emp-muted); font-size: 14px; line-height: 1.5; }
+  .headline { margin: 0 0 12px; font-size: 15px; color: var(--emp-ink); font-weight: 600; }
+  .quiet { color: var(--emp-dim); font-size: 13px; line-height: 1.55; margin: 6px 0 0; }
+
+  .note {
+    border: 1px solid var(--emp-line); background: var(--emp-surface-2);
+    border-radius: 10px; padding: 12px 14px; margin: 0 0 14px;
+  }
+  .note p { margin: 0; font-size: 14px; line-height: 1.55; color: var(--emp-ink); }
+  .note.warn { background: var(--emp-warn-bg); border-color: var(--emp-warn-line); }
+  .note.warn p { color: var(--emp-warn-ink); }
+
+  .empty {
+    border: 1px solid var(--emp-line); background: var(--emp-surface);
+    border-radius: 12px; padding: 18px;
+  }
+  .empty p { margin: 0; font-size: 15px; line-height: 1.6; color: var(--emp-ink); }
+
+  .people { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+  .person {
+    border: 1px solid var(--emp-line); background: var(--emp-surface);
+    border-radius: 12px; padding: 12px 14px 14px;
+  }
+  .person.attn { border-color: var(--emp-warn-line); }
+
+  .open {
+    display: flex; align-items: center; gap: 12px; min-height: 44px;
+    text-decoration: none; color: inherit;
+  }
+  .avatar {
+    flex: 0 0 auto; width: 38px; height: 38px; border-radius: 50%;
+    display: grid; place-items: center; font-size: 13px; font-weight: 700;
+    background: var(--emp-surface-2); border: 1px solid var(--emp-line-2); color: var(--emp-muted);
+  }
+  .who { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
+  .name { font-size: 16px; font-weight: 600; color: var(--emp-ink); }
+  .role { font-size: 13px; color: var(--emp-muted); }
+  .basis { font-size: 12px; color: var(--emp-dim); }
+  .chev { flex: 0 0 auto; color: var(--emp-dim); }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 0; }
+  .stat {
+    font-size: 12px; padding: 3px 8px; border-radius: 999px;
+    background: var(--emp-surface-2); border: 1px solid var(--emp-line); color: var(--emp-muted);
+  }
+  .stat b { color: var(--emp-ink); font-weight: 700; }
+  .stat.bad { background: var(--emp-bad-bg); border-color: var(--emp-bad-line); color: var(--emp-bad-ink); }
+  .stat.bad b { color: var(--emp-bad-ink); }
+  .stat.warn { background: var(--emp-warn-bg); border-color: var(--emp-warn-line); color: var(--emp-warn-ink); }
+  .stat.warn b { color: var(--emp-warn-ink); }
+
+  .sub { margin: 8px 0 0; font-size: 13px; color: var(--emp-muted); line-height: 1.5; }
+  .bad-text { color: var(--emp-warn-ink); }
+
+  .elsewhere { margin: 22px 0 0; padding: 16px 0 0; border-top: 1px solid var(--emp-line); }
+  .elsewhere h2 { margin: 0 0 4px; font-size: 15px; color: var(--emp-ink); }
+  .links { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 10px; }
+  .links li { display: flex; flex-direction: column; gap: 2px; }
+  .links a { color: var(--emp-accent); font-size: 15px; min-height: 24px; }
+  .links span { font-size: 13px; color: var(--emp-dim); }
+
+  .foot {
+    margin: 22px 0 0; padding: 14px; border-radius: 10px;
+    background: var(--emp-surface-2); border: 1px solid var(--emp-line);
+    font-size: 13px; line-height: 1.6; color: var(--emp-muted);
+  }
+
+  @media (min-width: 600px) {
+    .wrap { padding: 24px 20px 40px; }
+  }
+</style>

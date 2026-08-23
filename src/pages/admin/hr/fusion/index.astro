@@ -1,0 +1,365 @@
+---
+// /admin/hr/fusion — THE FUSION DESK (PATCH 06).
+//
+// WHAT IT IS. The way in to one person's Employee Intelligence Profile, plus the two things that
+// belong to the desk rather than to any one person: what is connected, and the weighting every
+// reading is produced under.
+//
+// THE GATE. `performance.manage` reads across the organisation; the organisation graph opens a
+// manager's own team. NO NEW CAPABILITY KEY WAS MINTED — see the header of src/lib/fusion/access.ts
+// for why, and for what a distinct key would take.
+//
+// WHAT THIS PAGE IS NOT. There is no ranking, no league table, no sort by reading and no export of
+// people by score. The list is alphabetical, it carries no number, and every number in this system
+// lives on the individual's own page beside the sentence that explains it. A list of humans ordered
+// by a computed figure is a different screen with different consequences for the people on it.
+//
+// CLIENT JAVASCRIPT: NONE. Forms are forms, disclosure is native <details>.
+//
+// Every `const` is declared ABOVE the POST handler that reads it. `const` is not hoisted, and a
+// handler reaching a later declaration throws on its first line while the page reports success.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { flashFailed } from '@/lib/flash-tone';
+import { can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { visibleEmployeeIds, uuidList } from '@/lib/performance-scope';
+import {
+  resolveViewer,
+  connectionReport,
+  getWeightProfile,
+  saveWeightProfile,
+  verifyFusionSchema,
+  validateSourceWeights,
+  weightingSentence,
+  notConnectedSentence,
+  foundationNotice,
+  SOURCE_CLASSES,
+  SOURCE_CLASS_LABELS,
+  SOURCE_CLASS_SPECS,
+  DIMENSION_SPECS,
+  INFERRED_CEILING,
+  DEMONSTRATED_MULTIPLE,
+  INTELLIGENCE_VIEW_ALL,
+  INTELLIGENCE_WEIGHTS,
+  FUSION_CSS,
+  GLYPH_ADVISORY,
+  type SourceClass,
+} from '@/lib/fusion';
+
+const PATH = '/admin/hr/fusion';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=' + encodeURIComponent(PATH));
+if (!can(user as any, 'admin.access')) return Astro.redirect('/admin');
+
+const viewer = await resolveViewer(user as any);
+const mayWeight = !!viewer?.mayWeight;
+
+const back = (msg: string) =>
+  Astro.redirect(PATH + '?msg=' + encodeURIComponent(msg.slice(0, 300)));
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+
+  if (action === 'save_weights') {
+    if (!mayWeight) {
+      return back('Changing the weighting needs ' + INTELLIGENCE_WEIGHTS + '. Nothing was saved.');
+    }
+    const weights: Record<string, number> = {};
+    for (const c of SOURCE_CLASSES) weights[c] = Number(fd.get('w_' + c) || 0);
+    const r = await saveWeightProfile({
+      key: 'default',
+      label: String(fd.get('label') || 'Organisation weighting'),
+      weights,
+      note: String(fd.get('note') || ''),
+      ownerUserId: String(user.id),
+    });
+    return back(r.ok
+      ? 'Weighting saved, with your name on it. Every reading computed from now on uses it.'
+      : (r.error || 'That weighting could not be saved.'));
+  }
+
+  return back('That action is not one this page performs.');
+}
+
+const params = Astro.url.searchParams;
+const msg = String(params.get('msg') || '').slice(0, 300);
+const q = String(params.get('q') || '').trim().slice(0, 80);
+
+// -------------------------------------------------------------------------------------------------
+// READS
+// -------------------------------------------------------------------------------------------------
+
+const connections = connectionReport();
+const [schema, weighting] = await Promise.all([verifyFusionSchema(), getWeightProfile('default')]);
+
+const allowedIds = viewer?.scope ? visibleEmployeeIds(viewer.scope) : [];
+const orgWide = allowedIds === null;
+const scopeEmpty = Array.isArray(allowedIds) && allowedIds.length === 0;
+
+let people: { id: string; fullName: string; designation: string | null; lastAt: string | null; snapshots: number }[] = [];
+let peopleUnreadable: string | null = null;
+
+if (!scopeEmpty) {
+  try {
+    // ONE QUERY, and the snapshot counts come with it rather than as N follow-ups. Round-trip COUNT
+    // is the lever on this deployment, not query cleverness.
+    const scopeClause = orgWide ? sql`TRUE` : sql`e.id IN (${uuidList(allowedIds as string[])})`;
+    const search = q ? sql`AND e.full_name ILIKE ${'%' + q + '%'}` : sql``;
+    const rows = await db.execute(sql`
+      SELECT e.id, e.full_name, e.designation,
+             s.n AS snapshots, s.last_at
+        FROM hr_employees e
+        LEFT JOIN (
+          SELECT employee_id, COUNT(*)::int AS n, MAX(computed_at) AS last_at
+            FROM hif_snapshots GROUP BY employee_id
+        ) s ON s.employee_id = e.id
+       WHERE e.is_active = TRUE AND ${scopeClause} ${search}
+       ORDER BY e.full_name ASC
+       LIMIT 200`);
+    const list = Array.isArray(rows) ? rows : ((rows as any)?.rows || []);
+    people = list.map((r: any) => ({
+      id: String(r.id),
+      fullName: r.full_name ? String(r.full_name) : 'Unnamed record',
+      designation: r.designation ? String(r.designation) : null,
+      snapshots: Number(r.snapshots) || 0,
+      lastAt: r.last_at ? new Date(r.last_at).toISOString().slice(0, 10) : null,
+    }));
+  } catch (e: any) {
+    // Named, never rendered as an empty list. An empty list and a failed query look identical
+    // otherwise, and this project has already paid for that ambiguity.
+    peopleUnreadable = e?.cause?.message || e?.message || 'no reason was given';
+  }
+}
+
+const canReachAnyone = orgWide || people.length > 0;
+
+// Declared above the template. Hoisted out of JSX because `<` inside a JSX expression breaks .astro
+// parsing, and because a template should not be doing arithmetic.
+const demonstratedNow = SOURCE_CLASSES
+  .filter((c) => c !== 'inferred_foundation')
+  .reduce((s, c) => s + (weighting.weights[c as SourceClass] || 0), 0);
+const inferredNow = weighting.weights.inferred_foundation || 0;
+const ratioSentence = inferredNow === 0
+  ? 'The inferred foundation is switched off entirely, so it contributes nothing to any reading.'
+  : 'Demonstrated evidence is worth ' + demonstratedNow + ' against ' + inferredNow + ' for the inferred foundation.';
+---
+
+<AdminLayout title="Intelligence" activeNav="hr">
+  <style set:html={FUSION_CSS}></style>
+
+  <div class="fu">
+    <h1>Employee intelligence</h1>
+    <p class="lede">
+      One record per person, read ten ways, from five kinds of evidence, each carrying where it came
+      from and how sure it is. Nothing here decides anything: every reading is a prompt for a
+      conversation with the person it is about, and every one of them can be disagreed with on the
+      record.
+    </p>
+
+    {msg && <p class={flashFailed(msg) ? 'flash warn' : 'flash'} role={flashFailed(msg) ? 'alert' : 'status'}>{msg}</p>}
+
+    {!schema.ok && (
+      <div class="deny">
+        <p><b>The intelligence tables are not fully present.</b></p>
+        <p style="margin-top:8px">{schema.sentence}</p>
+        <p style="margin-top:8px" class="muted">
+          Run <code>db/hif-fusion-schema.sql</code>. Readings can still be computed without the tables
+          — what is lost is the history that makes evolution over time possible.
+        </p>
+      </div>
+    )}
+
+    <div class="card">
+      <h2>What is connected</h2>
+      <p class="muted">{connections.sentence}</p>
+      {connections.missing.length > 0 && (
+        <ul class="chain">
+          {connections.missing.map((m) => (<li>{notConnectedSentence(m)}</li>))}
+        </ul>
+      )}
+      <p class="muted" style="margin-top:10px">
+        {connections.firstParty} provider{connections.firstParty === 1 ? '' : 's'} in this patch are
+        reading the skill matrix, appraisal history, assigned learning, graded assessments, the
+        employment record and the organisation graph.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>The weighting in force</h2>
+      <p class="muted">{weighting.sentence}</p>
+      <p class="muted" style="margin-top:6px">{ratioSentence}</p>
+
+      {weighting.isBuiltInDefault && (
+        <p class="muted" style="margin-top:8px">
+          <b>Nobody owns this weighting.</b> It is the built-in default. Saving one puts a name on the
+          policy that decides how every person here is read.
+        </p>
+      )}
+
+      <details>
+        <summary>What the five kinds of evidence are, and what each one is allowed to mean</summary>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Kind</th><th>What it is</th><th>Stands on</th><th>Owner</th></tr></thead>
+            <tbody>
+              {SOURCE_CLASS_SPECS.map((s) => (
+                <tr>
+                  <td><b>{s.label}</b></td>
+                  <td>{s.meaning}</td>
+                  <td>{s.standsOn}</td>
+                  <td class="muted">{s.ownerPatch}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </details>
+
+      <details>
+        <summary>Why the inferred foundation can never dominate a reading</summary>
+        <p class="muted" style="margin-top:6px">
+          <span set:html={GLYPH_ADVISORY} /> {foundationNotice()}
+        </p>
+        <ul class="chain">
+          <li>No weighting may give it more than <b>{INFERRED_CEILING}</b> of 100. A profile that tries
+            is refused with the number it tried, not quietly clamped.</li>
+          <li>The four demonstrated kinds together must be worth at least <b>{DEMONSTRATED_MULTIPLE}
+            times</b> whatever it is worth.</li>
+          <li>On the three dimensions that ask what somebody has actually done — role alignment,
+            current capability and development requirements — it is not admitted at all, at any
+            weight. It is still shown, marked as not admitted, because a hidden refusal is not one
+            anybody can check.</li>
+          <li>Where demonstrated evidence contradicts it, it drops to zero for that dimension and the
+            contradiction is stated in words. Evidence displaces inference rather than averaging with it.</li>
+          <li>A dimension whose only signals are inferred produces <b>no reading at all</b>.</li>
+        </ul>
+      </details>
+
+      {mayWeight ? (
+        <form method="post" style="margin-top:12px">
+          <input type="hidden" name="action" value="save_weights" />
+          <label for="w-label">Name this weighting</label>
+          <input id="w-label" name="label" maxlength="120" value={weighting.label} required />
+          <div class="row2">
+            {SOURCE_CLASSES.map((c) => (
+              <div>
+                <label for={'w-' + c}>{SOURCE_CLASS_LABELS[c]}{c === 'inferred_foundation' ? ' (max ' + INFERRED_CEILING + ')' : ''}</label>
+                <input id={'w-' + c} name={'w_' + c} type="number" min="0" max="100" step="1"
+                  value={String(weighting.weights[c] ?? 0)} />
+              </div>
+            ))}
+          </div>
+          <label for="w-note">Why this weighting</label>
+          <textarea id="w-note" name="note" maxlength="600"
+            placeholder="Optional. The reason a later reader will want."></textarea>
+          <button class="btn" type="submit">Save weighting</button>
+          <p class="muted" style="margin-top:8px">
+            This is a policy about people, not a setting. It changes how everybody is read from now
+            on, it is saved with your name on it, and the change goes to the audit log.
+          </p>
+        </form>
+      ) : (
+        <p class="muted" style="margin-top:10px">
+          Changing the weighting needs <code>{INTELLIGENCE_WEIGHTS}</code>, which you do not hold.
+          The numbers above are shown so you know what produced any reading you are looking at.
+        </p>
+      )}
+    </div>
+
+    <div class="card">
+      <h2>Open somebody’s profile</h2>
+
+      {orgWide && (
+        <p class="muted">
+          You hold <code>{INTELLIGENCE_VIEW_ALL}</code>, so this lists everybody. Opening a profile is
+          written to the access log with your name on it.
+        </p>
+      )}
+      {!orgWide && !scopeEmpty && (
+        <p class="muted">
+          This lists the people the organisation graph records you as responsible for, and yourself.
+        </p>
+      )}
+
+      {scopeEmpty && (
+        <div class="deny">
+          <p><b>There is nobody here for you to open.</b></p>
+          <p style="margin-top:8px">
+            You do not hold the capability that reads across the organisation, and the organisation
+            graph records no reporting or review relationship for you. If the graph has not been set
+            up yet, that is what this means — not that nobody reports to you.
+          </p>
+          <p style="margin-top:8px">Your own record is on your workspace at
+            <a href="/portal/employee/fusion"> /portal/employee/fusion</a>.</p>
+        </div>
+      )}
+
+      {peopleUnreadable && (
+        <p class="flash warn" role="alert">
+          The people list could not be read just now: {peopleUnreadable}. This is a failed query, not
+          an empty organisation.
+        </p>
+      )}
+
+      {canReachAnyone && !peopleUnreadable && (
+        <>
+          <form method="get" style="margin-top:6px">
+            <label for="q">Find a person</label>
+            <input id="q" name="q" value={q} maxlength="80" placeholder="Name" />
+            <button class="btn ghost" type="submit">Search</button>
+          </form>
+
+          <div class="tablewrap">
+            <table>
+              <thead>
+                <tr><th>Person</th><th>Role</th><th>Readings stored</th><th>Last computed</th><th></th></tr>
+              </thead>
+              <tbody>
+                {people.map((p) => (
+                  <tr>
+                    <td><b>{p.fullName}</b></td>
+                    <td class="muted">{p.designation || '—'}</td>
+                    <td class="muted">{p.snapshots || 'none yet'}</td>
+                    <td class="muted">{p.lastAt || '—'}</td>
+                    <td><a class="btn ghost slim" href={PATH + '/' + p.id}>Open</a></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <p class="muted" style="margin-top:10px">
+            This list is alphabetical and carries no reading. There is deliberately no way to sort
+            people by a computed figure here: a number is what people act on, and a column of them
+            beside a column of names is a ranking of humans however it is labelled.
+          </p>
+        </>
+      )}
+    </div>
+
+    <div class="card">
+      <h2>The ten dimensions</h2>
+      <p class="muted">
+        Every profile reports all ten, in this order, whether or not there is anything on record for
+        them. A dimension with nothing behind it says so rather than being left out.
+      </p>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Dimension</th><th>The question it answers</th><th>Inference admitted</th></tr></thead>
+          <tbody>
+            {DIMENSION_SPECS.map((d) => (
+              <tr>
+                <td><b>{d.label}</b></td>
+                <td>{d.question}<br /><span class="muted">High means: {d.highMeans}</span></td>
+                <td class="muted">{d.inferenceAdmissible ? 'Capped, advisory' : 'Not admitted'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</AdminLayout>

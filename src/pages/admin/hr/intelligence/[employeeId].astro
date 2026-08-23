@@ -1,0 +1,720 @@
+---
+// /admin/hr/intelligence/[employeeId] — PATCH 13. ONE PERSON, WHAT THEY NEED, AND WHAT YOU CAN DO.
+//
+// THE ORDER OF OPERATIONS ON THIS PAGE IS THE POINT, AND IT IS NOT NEGOTIABLE:
+//
+//   1. resolve who the viewer is;
+//   2. resolve WHAT THEY MAY SEE, before any of it is read;
+//   3. WRITE THE ACCESS ROW, and stop here if it fails;
+//   4. only then assemble the record, and only the granted sections.
+//
+// Step 3 failing means the page shows a refusal rather than the record. An unlogged read of
+// somebody's development record is not offered as a fallback, and the cost of that trade is stated
+// on the screen rather than hidden in a comment.
+//
+// EVERY FIGURE ON THIS PAGE CARRIES ITS OWN JUSTIFICATION. There is no drill-down fetch: the
+// evidence, the inputs, the confidence and the timestamp are part of the signal object, computed
+// once, together. A second round trip would be a second chance to disagree with the number above it.
+//
+// `const` IS NOT HOISTED. Every constant the POST handler reads is declared above it.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { hasPermission } from '@/lib/auth/registry';
+import { resolvePerfViewer } from '@/lib/performance-scope';
+import {
+  resolveHrIntelAccess,
+  recordAccess,
+  accessHistory,
+  HR_DESK,
+  PERSON_360,
+  PERF_MANAGE,
+  SKILLS_MANAGE,
+  LEARNING_ASSIGN,
+  ROLES_VIEW,
+  FOUNDATIONAL,
+} from '@/lib/hr-intelligence/access';
+import { buildHrIntelligence } from '@/lib/hr-intelligence/signals';
+import {
+  requestFeedback,
+  initiateDevelopmentPlan,
+  assignTraining,
+  scheduleReview,
+  recordIntervention,
+  recordInterventionOutcome,
+  initiateMobilityReview,
+  concludeMobilityReview,
+  setPlanItemStatus,
+  closePlan,
+  INTERVENTION_KINDS,
+  interventionKindLabel,
+} from '@/lib/hr-intelligence/actions';
+import {
+  actionLabel,
+  actionEffect,
+  assertionLabel,
+  evidenceStrengthLabel,
+  decisionUseSentence,
+  depthLabel,
+  ACTIONS_DECIDE_NOTHING,
+  FOUNDATIONAL_WITHHELD_SENTENCE,
+} from '@/lib/hr-intelligence/types';
+
+const employeeId = String(Astro.params.employeeId || '');
+const BASE = '/admin/hr/intelligence';
+const PATH = BASE + '/' + employeeId;
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=' + encodeURIComponent(PATH));
+if (!can(user as any, 'admin.access')) return Astro.redirect('/admin');
+
+const params = Astro.url.searchParams;
+const purpose = String(params.get('purpose') || '').trim().slice(0, 300);
+const msg = String(params.get('msg') || '').slice(0, 400);
+const err = String(params.get('err') || '').slice(0, 400);
+const wantsDeep = params.get('depth') === 'foundational';
+
+// -------------------------------------------------------------------------------------------------
+// THE CAPABILITY TEST
+//
+// can() for the built-in keys — PERMS_BY_ROLE only, no database, and the same question the sibling
+// HR consoles ask. The registry is consulted for exactly ONE key: the foundational tier, which is
+// granted to no built-in role and therefore has nowhere else to come from. Asking the registry for
+// the others would admit a hand-typed custom-role row to a screen nobody deliberately opened.
+// -------------------------------------------------------------------------------------------------
+const builtIn = new Set<string>();
+for (const key of [HR_DESK, PERSON_360, PERF_MANAGE, SKILLS_MANAGE, LEARNING_ASSIGN, ROLES_VIEW]) {
+  if (can(user as any, key as any)) builtIn.add(key);
+}
+const holdsDeep = await hasPermission(String(user.id), FOUNDATIONAL, { locals: Astro.locals });
+const holds = (key: string): boolean => (key === FOUNDATIONAL ? holdsDeep : builtIn.has(key));
+
+const viewer = await resolvePerfViewer(String(user.id), holds);
+
+// Resolved BEFORE anything is read, and reused by the POST handler below so an action cannot be
+// taken through a decision the reader never saw.
+const access = await resolveHrIntelAccess({
+  viewer,
+  subjectEmployeeId: employeeId,
+  holds,
+  purpose,
+  requestFoundational: wantsDeep,
+});
+
+const actorName = viewer.fullName || String((user as any).name || (user as any).email || '');
+
+const back = (kind: 'msg' | 'err', text: string) =>
+  Astro.redirect(PATH + '?purpose=' + encodeURIComponent(purpose)
+    + '&' + kind + '=' + encodeURIComponent(text.slice(0, 400)));
+
+// -------------------------------------------------------------------------------------------------
+// ACTIONS
+//
+// Every branch below hands the RESOLVED access decision to the action, which re-asks it. The page
+// does not re-implement the gate and the action does not trust the page.
+// -------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  if (!access.mayOpen) return Astro.redirect(BASE + '?notice=' + encodeURIComponent(access.sentence));
+
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const str = (k: string) => String(fd.get(k) || '');
+  const common = { access, actorUserId: String(user.id), actorName };
+
+  if (action === 'request_feedback') {
+    const r = await requestFeedback({
+      ...common,
+      employeeId,
+      requestedOfUserId: str('requested_of_user_id') || null,
+      requestedOfName: str('requested_of_name'),
+      theme: str('theme'),
+      reason: str('reason'),
+    });
+    return back(r.ok ? 'msg' : 'err', r.ok ? (r.message || 'Recorded.') : (r.error || 'That did not work.'));
+  }
+
+  if (action === 'initiate_development_plan') {
+    const titles = fd.getAll('item_title').map((v) => String(v)).filter((v) => v.trim());
+    const r = await initiateDevelopmentPlan({
+      ...common,
+      employeeId,
+      title: str('title'),
+      reason: str('reason'),
+      targetOn: str('target_on') || null,
+      items: titles.map((t) => ({ title: t, kind: 'skill_gap', detail: null })),
+    });
+    return back(r.ok ? 'msg' : 'err', r.ok ? (r.message || 'Opened.') : (r.error || 'That did not work.'));
+  }
+
+  if (action === 'assign_training') {
+    const r = await assignTraining({
+      access,
+      viewer,
+      employeeId,
+      courseId: str('course_id'),
+      dueOn: str('due_on') || null,
+      required: str('required') === 'on',
+      reason: str('reason'),
+      actorUserId: String(user.id),
+    });
+    return back(r.ok ? 'msg' : 'err', r.ok ? (r.message || 'Assigned.') : (r.error || 'That did not work.'));
+  }
+
+  if (action === 'schedule_review') {
+    const r = await scheduleReview({
+      access,
+      employeeId,
+      employeeName: str('employee_name'),
+      startsAt: str('starts_at'),
+      endsAt: str('ends_at') || null,
+      location: str('location') || null,
+      mode: str('mode') || 'online',
+      reason: str('reason'),
+      departmentId: str('department_id') || null,
+      actorUserId: String(user.id),
+    });
+    return back(r.ok ? 'msg' : 'err', r.ok ? (r.message || 'Scheduled.') : (r.error || 'That did not work.'));
+  }
+
+  if (action === 'record_intervention') {
+    const r = await recordIntervention({
+      ...common,
+      employeeId,
+      kind: str('kind'),
+      summary: str('summary'),
+      promptedBy: str('prompted_by'),
+      occurredOn: str('occurred_on'),
+    });
+    return back(r.ok ? 'msg' : 'err', r.ok ? (r.message || 'Recorded.') : (r.error || 'That did not work.'));
+  }
+
+  if (action === 'intervention_outcome') {
+    const r = await recordInterventionOutcome({
+      access,
+      interventionId: str('intervention_id'),
+      outcome: str('outcome'),
+      actorUserId: String(user.id),
+    });
+    return back(r.ok ? 'msg' : 'err', r.ok ? (r.message || 'Recorded.') : (r.error || 'That did not work.'));
+  }
+
+  if (action === 'initiate_mobility_review') {
+    const r = await initiateMobilityReview({
+      ...common,
+      employeeId,
+      roleId: str('role_id'),
+      reason: str('reason'),
+      coverage: null,
+    });
+    return back(r.ok ? 'msg' : 'err', r.ok ? (r.message || 'Opened.') : (r.error || 'That did not work.'));
+  }
+
+  if (action === 'conclude_mobility_review') {
+    const r = await concludeMobilityReview({
+      ...common,
+      reviewId: str('review_id'),
+      conclusion: str('conclusion'),
+    });
+    return back(r.ok ? 'msg' : 'err', r.ok ? (r.message || 'Recorded.') : (r.error || 'That did not work.'));
+  }
+
+  if (action === 'plan_item_status') {
+    const r = await setPlanItemStatus({
+      access, itemId: str('item_id'), status: str('status'), actorUserId: String(user.id),
+    });
+    return back(r.ok ? 'msg' : 'err', r.ok ? (r.message || 'Updated.') : (r.error || 'That did not work.'));
+  }
+
+  if (action === 'close_plan') {
+    const r = await closePlan({
+      access, planId: str('plan_id'), status: str('status'), note: str('note'), actorUserId: String(user.id),
+    });
+    return back(r.ok ? 'msg' : 'err', r.ok ? (r.message || 'Closed.') : (r.error || 'That did not work.'));
+  }
+
+  return back('err', 'That action is not one this page performs.');
+}
+
+// -------------------------------------------------------------------------------------------------
+// THE READ
+// -------------------------------------------------------------------------------------------------
+let view: any = null;
+let blocked = '';
+let history: any[] = [];
+
+if (!access.mayOpen) {
+  blocked = access.sentence;
+} else if (!purpose) {
+  blocked = 'Opening this record needs a reason, which is written down beside the read. Go back to '
+    + 'the people list and say why you are opening it. This is not a formality: the person whose '
+    + 'record it is can be shown who opened it and what they said they were doing.';
+} else {
+  const logged = await recordAccess({
+    viewerUserId: String(user.id),
+    viewerName: actorName,
+    subjectEmployeeId: employeeId,
+    depth: access.depth,
+    purpose,
+    sectionsGranted: access.granted,
+    sectionsWithheld: access.withheld.map((w) => w.section),
+    capabilityUsed: access.capabilityUsed,
+  });
+
+  if (!logged.ok) {
+    blocked = logged.error || 'The access could not be recorded, so the record was not opened.';
+  } else {
+    try {
+      view = await buildHrIntelligence({
+        employeeId,
+        access,
+        accessRecordId: String(logged.id),
+        purpose,
+      });
+    } catch (e: any) {
+      blocked = 'The record could not be assembled: ' + String(e?.cause?.message || e?.message || e);
+    }
+    if (view && access.granted.indexOf('interventions') >= 0) {
+      const h = await accessHistory(employeeId, 20);
+      history = h.ok ? h.rows : [];
+    }
+  }
+}
+
+// Hoisted out of the template: `<` and `<=` inside a JSX expression is a known parse hazard here.
+const sections = view ? view.sections : [];
+const withheldCount = access.withheld.length;
+const grantedCount = access.granted.length;
+const deepOffered = holdsDeep && !wantsDeep && access.mayOpen;
+const deepHref = PATH + '?purpose=' + encodeURIComponent(purpose) + '&depth=foundational';
+const interventionKinds = INTERVENTION_KINDS.map((k) => ({ value: k, label: interventionKindLabel(k) }));
+const canAct = (k: string) => access.grantedActions.indexOf(k as any) >= 0;
+---
+
+<AdminLayout title={view ? ('HR intelligence — ' + (view.displayName || 'person')) : 'HR intelligence'} activeNav="hr">
+  <div class="hri-wrap">
+    <p class="hri-back"><a href={BASE}>Back to the people list</a></p>
+
+    {blocked ? (
+      <section class="hri-card hri-refusal">
+        <h1>Not opened</h1>
+        <p>{blocked}</p>
+        <p class="hri-muted">
+          Nothing about this person was read. This is a refusal, not an empty record.
+        </p>
+      </section>
+    ) : (
+      <>
+        <header class="hri-head">
+          <p class="hri-eyebrow">People desk</p>
+          <h1>{view.displayName || 'This person'}</h1>
+          <p class="hri-sub">{view.designation || 'No designation recorded'}</p>
+          <p class="hri-lede">{access.sentence}</p>
+        </header>
+
+        {msg ? <p class="hri-notice">{msg}</p> : null}
+        {err ? <p class="hri-error">{err}</p> : null}
+
+        <section class="hri-card hri-provenance">
+          <h2>How this reading was made</h2>
+          <dl class="hri-kv">
+            <dt>Depth</dt>
+            <dd>{depthLabel(access.depth)}. {access.depthReason}</dd>
+            <dt>Opened for</dt>
+            <dd>{purpose}</dd>
+            <dt>Recorded as</dt>
+            <dd>Access row {view.accessRecordId}, written before anything was read.</dd>
+            <dt>Sections</dt>
+            <dd>{grantedCount} assembled, {withheldCount} withheld and never queried.</dd>
+            <dt>Assembled</dt>
+            <dd>{view.assembledAt}</dd>
+          </dl>
+          {view.unreadable.length ? (
+            <p class="hri-warnline">
+              Could not be read: {view.unreadable.join('; ')}. Those are failures, not empty records.
+            </p>
+          ) : null}
+        </section>
+
+        <section class="hri-card hri-boundary">
+          <h2>Foundational computation detail</h2>
+          {access.depth === 'foundational' ? (
+            <>
+              <p>{view.foundational.state === 'ready'
+                ? 'A registered provider returned a reading. The computation and the interpretation of it are kept apart, and neither outranks demonstrated work.'
+                : view.foundational.sentence}</p>
+            </>
+          ) : (
+            <>
+              <p>{FOUNDATIONAL_WITHHELD_SENTENCE}</p>
+              {deepOffered ? (
+                <p class="hri-muted">
+                  You hold {FOUNDATIONAL}. <a href={deepHref}>Request the deeper tier</a> — it will
+                  still be refused unless this person's consent is on record for the purpose you
+                  stated, and no consent registry exists on this platform yet.
+                </p>
+              ) : null}
+            </>
+          )}
+        </section>
+
+        {sections.map((s: any) => (
+          <section class={'hri-card hri-section hri-state-' + s.state}>
+            <h2>{s.label}</h2>
+            <p class="hri-sub2">{s.subtitle}</p>
+            <p class={s.state === 'ready' ? 'hri-muted' : 'hri-statement'}>{s.sentence}</p>
+
+            {s.signals.map((sig: any) => (
+              <article class="hri-signal">
+                <div class="hri-signal-head">
+                  <h3>{sig.label}</h3>
+                  <span class={'hri-chip hri-strength-' + sig.strength}>{evidenceStrengthLabel(sig.strength)}</span>
+                  <span class={'hri-chip hri-conf-' + sig.confidence.level}>Confidence: {sig.confidence.level}</span>
+                </div>
+                <p class={sig.value.kind === 'absent' ? 'hri-absent' : 'hri-value'}>{sig.value.display}</p>
+                <p class="hri-use">{decisionUseSentence(sig.decisionUse)}</p>
+
+                <details class="hri-why">
+                  <summary>Why this says what it says</summary>
+                  <div class="hri-why-body">
+                    <h4>How it was worked out</h4>
+                    <p>{sig.processing}</p>
+
+                    <h4>Confidence</h4>
+                    <p>{sig.confidence.why}</p>
+
+                    <h4>Sources read</h4>
+                    {sig.inputs.length ? (
+                      <ul>
+                        {sig.inputs.map((i: any) => (
+                          <li>
+                            <code>{i.table}</code>, owned by {i.ownerModule} — {i.rowsRead} row(s) read
+                            {i.unreadable ? '. COULD NOT BE READ: ' + i.unreadable : '.'}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : <p class="hri-muted">No source was recorded as having been read.</p>}
+
+                    <h4>Records behind it</h4>
+                    {sig.evidence.length ? (
+                      <ul class="hri-evidence">
+                        {sig.evidence.map((e: any) => (
+                          <li>
+                            <span class="hri-ev-summary">{e.summary}</span>
+                            <span class="hri-ev-meta">
+                              {assertionLabel(e.assertion)} — {e.providedBy}
+                              {e.occurredAt ? ', ' + String(e.occurredAt).slice(0, 10) : ''}
+                              {' ('}<code>{e.recordId}</code>{')'}
+                            </span>
+                            {e.href ? <a href={e.href}>Open the record that owns this</a> : null}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p class="hri-muted">
+                        Nothing on record supports this. That is a complete answer, and inventing a
+                        plausible one is what this page exists to prevent.
+                      </p>
+                    )}
+
+                    <h4>Computed</h4>
+                    <p class="hri-muted">{sig.computedAt}</p>
+                  </div>
+                </details>
+              </article>
+            ))}
+          </section>
+        ))}
+
+        <section class="hri-card hri-actions">
+          <h2>What you can do</h2>
+          <p class="hri-statement">{ACTIONS_DECIDE_NOTHING}</p>
+
+          {access.actions.filter((a: any) => !a.granted).length ? (
+            <p class="hri-muted">
+              Not available to you: {access.actions.filter((a: any) => !a.granted).map((a: any) => actionLabel(a.kind)).join(', ')}.
+            </p>
+          ) : null}
+
+          {canAct('request_feedback') ? (
+            <details class="hri-action">
+              <summary>{actionLabel('request_feedback')}</summary>
+              <p class="hri-muted">{actionEffect('request_feedback')}</p>
+              <form method="POST">
+                <input type="hidden" name="action" value="request_feedback" />
+                <label>Who are you asking?
+                  <input type="text" name="requested_of_name" required maxlength="200" />
+                </label>
+                <label>Their user id, if you have it
+                  <input type="text" name="requested_of_user_id" maxlength="40" />
+                </label>
+                <label>About what?
+                  <select name="theme">
+                    <option value="general">General</option>
+                    <option value="strength">A strength</option>
+                    <option value="improvement">An area to improve</option>
+                  </select>
+                </label>
+                <label>Why are you asking?
+                  <textarea name="reason" required rows="3" maxlength="1000"></textarea>
+                </label>
+                <button type="submit">Record the request</button>
+              </form>
+            </details>
+          ) : null}
+
+          {canAct('initiate_development_plan') ? (
+            <details class="hri-action">
+              <summary>{actionLabel('initiate_development_plan')}</summary>
+              <p class="hri-muted">{actionEffect('initiate_development_plan')}</p>
+              <form method="POST">
+                <input type="hidden" name="action" value="initiate_development_plan" />
+                <label>Title
+                  <input type="text" name="title" required maxlength="300" />
+                </label>
+                <label>Why is this plan being opened?
+                  <textarea name="reason" required rows="3" maxlength="2000"></textarea>
+                </label>
+                <label>Target date
+                  <input type="date" name="target_on" />
+                </label>
+                <label>First item
+                  <input type="text" name="item_title" required maxlength="300" />
+                </label>
+                <label>Another item
+                  <input type="text" name="item_title" maxlength="300" />
+                </label>
+                <label>Another item
+                  <input type="text" name="item_title" maxlength="300" />
+                </label>
+                <p class="hri-muted">A plan needs at least one item. A plan with nothing under it is an intention.</p>
+                <button type="submit">Open the plan</button>
+              </form>
+            </details>
+          ) : null}
+
+          {canAct('assign_training') ? (
+            <details class="hri-action">
+              <summary>{actionLabel('assign_training')}</summary>
+              <p class="hri-muted">{actionEffect('assign_training')}</p>
+              <form method="POST">
+                <input type="hidden" name="action" value="assign_training" />
+                <label>Course id
+                  <input type="text" name="course_id" required maxlength="40" />
+                </label>
+                <label>Due date
+                  <input type="date" name="due_on" />
+                </label>
+                <label class="hri-inline">
+                  <input type="checkbox" name="required" /> Mark it required
+                </label>
+                <label>What is it for?
+                  <textarea name="reason" required rows="3" maxlength="1000"></textarea>
+                </label>
+                <button type="submit">Assign through the learning module</button>
+              </form>
+            </details>
+          ) : null}
+
+          {canAct('schedule_review') ? (
+            <details class="hri-action">
+              <summary>{actionLabel('schedule_review')}</summary>
+              <p class="hri-muted">{actionEffect('schedule_review')}</p>
+              <form method="POST">
+                <input type="hidden" name="action" value="schedule_review" />
+                <input type="hidden" name="employee_name" value={view.displayName || ''} />
+                <input type="hidden" name="department_id" value={view.departmentId || ''} />
+                <label>Starts
+                  <input type="datetime-local" name="starts_at" required />
+                </label>
+                <label>Ends
+                  <input type="datetime-local" name="ends_at" />
+                </label>
+                <label>Where
+                  <input type="text" name="location" maxlength="200" />
+                </label>
+                <label>Mode
+                  <select name="mode">
+                    <option value="online">Online</option>
+                    <option value="in_person">In person</option>
+                  </select>
+                </label>
+                <label>What is the review for?
+                  <textarea name="reason" required rows="3" maxlength="1000"></textarea>
+                </label>
+                <button type="submit">Put it on the calendar</button>
+              </form>
+            </details>
+          ) : null}
+
+          {canAct('record_intervention') ? (
+            <details class="hri-action">
+              <summary>{actionLabel('record_intervention')}</summary>
+              <p class="hri-muted">{actionEffect('record_intervention')}</p>
+              <form method="POST">
+                <input type="hidden" name="action" value="record_intervention" />
+                <label>What kind of support step?
+                  <select name="kind" required>
+                    {interventionKinds.map((k) => <option value={k.value}>{k.label}</option>)}
+                  </select>
+                </label>
+                <label>What did you do?
+                  <textarea name="summary" required rows="3" maxlength="4000"></textarea>
+                </label>
+                <label>What prompted it?
+                  <textarea name="prompted_by" required rows="2" maxlength="2000"></textarea>
+                </label>
+                <label>When did it happen?
+                  <input type="date" name="occurred_on" required />
+                </label>
+                <p class="hri-muted">
+                  This list holds no disciplinary step. Those are recorded in the flags module,
+                  which has an appeal path this record does not.
+                </p>
+                <button type="submit">Record it</button>
+              </form>
+            </details>
+          ) : null}
+
+          {canAct('initiate_mobility_review') ? (
+            <details class="hri-action">
+              <summary>{actionLabel('initiate_mobility_review')}</summary>
+              <p class="hri-muted">{actionEffect('initiate_mobility_review')}</p>
+              <form method="POST">
+                <input type="hidden" name="action" value="initiate_mobility_review" />
+                <label>Role id
+                  <input type="text" name="role_id" required maxlength="40" />
+                </label>
+                <label>Why open this review?
+                  <textarea name="reason" required rows="3" maxlength="2000"></textarea>
+                </label>
+                <button type="submit">Open the review</button>
+              </form>
+            </details>
+          ) : null}
+        </section>
+
+        {history.length ? (
+          <section class="hri-card">
+            <h2>Who has opened this record</h2>
+            <p class="hri-muted hri-tight">
+              Every read, including this one, with the reason its reader gave. The person this
+              record is about can be shown the same list.
+            </p>
+            <ul class="hri-log">
+              {history.map((h: any) => (
+                <li>
+                  <span class="hri-log-name">{h.viewerName || 'A reader'}</span>
+                  <span class="hri-log-at">{h.accessedAt ? String(h.accessedAt).slice(0, 16).replace('T', ' ') : ''}</span>
+                  <span class="hri-log-why">{h.depth} — {h.purpose}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
+      </>
+    )}
+  </div>
+</AdminLayout>
+
+<style>
+  .hri-wrap { max-width: 980px; margin: 0 auto; padding: 24px 20px 100px; }
+  .hri-back { font-size: 13px; margin: 0 0 16px; }
+  .hri-head { margin-bottom: 22px; }
+  .hri-eyebrow {
+    text-transform: uppercase; letter-spacing: 0.12em; font-size: 11px;
+    color: var(--muted, #6b7280); margin: 0 0 6px;
+  }
+  .hri-head h1 { font-size: 28px; margin: 0 0 4px; line-height: 1.15; }
+  .hri-sub { margin: 0 0 10px; color: var(--muted, #4b5563); font-size: 15px; }
+  .hri-sub2 { margin: 0 0 8px; color: var(--muted, #6b7280); font-size: 13px; }
+  .hri-lede { max-width: 64ch; color: var(--muted, #4b5563); margin: 0; line-height: 1.6; font-size: 14px; }
+
+  .hri-card {
+    border: 1px solid var(--border, #e5e7eb); border-radius: 12px;
+    padding: 20px; margin-bottom: 16px; background: var(--surface, #fff);
+  }
+  .hri-card h2 { font-size: 16px; margin: 0 0 8px; }
+  .hri-muted { color: var(--muted, #6b7280); font-size: 13px; line-height: 1.6; }
+  .hri-tight { margin-top: 0; }
+  .hri-statement {
+    color: var(--muted, #4b5563); font-size: 13px; line-height: 1.6;
+    border-left: 3px solid var(--border, #d1d5db); padding-left: 12px; margin: 8px 0;
+  }
+  .hri-refusal { border-color: #d1d5db; }
+  .hri-warnline { color: #b45309; font-size: 13px; margin: 10px 0 0; }
+  .hri-notice {
+    border: 1px solid #10b981; background: rgba(16, 185, 129, 0.08);
+    padding: 12px 14px; border-radius: 10px; margin-bottom: 16px; font-size: 14px;
+  }
+  .hri-error {
+    border: 1px solid #ef4444; background: rgba(239, 68, 68, 0.07);
+    padding: 12px 14px; border-radius: 10px; margin-bottom: 16px; font-size: 14px;
+  }
+
+  .hri-provenance { background: var(--surface-2, #fafafa); }
+  .hri-boundary { border-style: dashed; }
+  .hri-kv { display: grid; grid-template-columns: 130px 1fr; gap: 6px 14px; margin: 0; font-size: 13px; }
+  .hri-kv dt { font-weight: 600; color: var(--muted, #4b5563); }
+  .hri-kv dd { margin: 0; color: var(--muted, #4b5563); line-height: 1.55; }
+
+  .hri-state-not_permitted, .hri-state-unreadable { background: var(--surface-2, #fafafa); }
+
+  .hri-signal { border-top: 1px solid var(--border, #f0f0f0); padding: 14px 0 4px; }
+  .hri-signal-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .hri-signal h3 { font-size: 14px; margin: 0; }
+  .hri-value { font-size: 15px; margin: 6px 0; line-height: 1.5; }
+  .hri-absent { font-size: 14px; margin: 6px 0; color: var(--muted, #6b7280); font-style: italic; line-height: 1.55; }
+  .hri-use { font-size: 12px; color: var(--muted, #6b7280); margin: 0 0 6px; }
+
+  .hri-chip {
+    font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--border, #d1d5db); color: var(--muted, #4b5563);
+  }
+  .hri-strength-demonstrated { border-color: #059669; color: #047857; }
+  .hri-strength-stated { border-color: #d97706; color: #b45309; }
+  .hri-strength-derived { border-color: #9ca3af; }
+  .hri-conf-high { border-color: #059669; color: #047857; }
+  .hri-conf-none { border-color: #ef4444; color: #b91c1c; }
+
+  .hri-why summary { cursor: pointer; font-size: 12px; color: var(--muted, #4b5563); }
+  .hri-why-body { padding: 8px 0 4px 12px; border-left: 2px solid var(--border, #e5e7eb); margin-top: 8px; }
+  .hri-why-body h4 { font-size: 12px; margin: 10px 0 4px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted, #6b7280); }
+  .hri-why-body p { font-size: 13px; margin: 0; line-height: 1.6; color: var(--muted, #4b5563); }
+  .hri-why-body ul { font-size: 13px; margin: 0; padding-left: 18px; line-height: 1.6; color: var(--muted, #4b5563); }
+  .hri-evidence li { margin-bottom: 8px; }
+  .hri-ev-summary { display: block; }
+  .hri-ev-meta { display: block; font-size: 12px; color: var(--muted, #6b7280); }
+  code { font-size: 12px; background: var(--surface-2, #f3f4f6); padding: 1px 5px; border-radius: 4px; }
+
+  .hri-action { border-top: 1px solid var(--border, #f0f0f0); padding: 12px 0; }
+  .hri-action summary { cursor: pointer; font-weight: 600; font-size: 14px; }
+  .hri-action form { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; max-width: 560px; }
+  .hri-action label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; font-weight: 600; }
+  .hri-action label.hri-inline { flex-direction: row; align-items: center; gap: 8px; font-weight: 400; }
+  .hri-action input[type="text"], .hri-action input[type="date"], .hri-action input[type="datetime-local"],
+  .hri-action select, .hri-action textarea {
+    padding: 8px 11px; border: 1px solid var(--border, #d1d5db); border-radius: 8px;
+    font: inherit; font-weight: 400; background: var(--surface, #fff); color: inherit;
+  }
+  .hri-action button {
+    align-self: flex-start; padding: 9px 16px; border-radius: 8px;
+    border: 1px solid var(--border, #d1d5db); background: var(--surface-2, #f9fafb);
+    font: inherit; cursor: pointer;
+  }
+  .hri-action button:hover { background: var(--surface-3, #f3f4f6); }
+
+  .hri-log { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+  .hri-log li {
+    display: grid; grid-template-columns: 170px 130px 1fr; gap: 10px;
+    padding: 7px 0; border-top: 1px solid var(--border, #f0f0f0);
+  }
+  .hri-log li:first-child { border-top: 0; }
+  .hri-log-name { font-weight: 600; }
+  .hri-log-at { color: var(--muted, #6b7280); font-variant-numeric: tabular-nums; }
+  .hri-log-why { color: var(--muted, #4b5563); }
+
+  @media (max-width: 640px) {
+    .hri-kv { grid-template-columns: 1fr; gap: 2px 0; }
+    .hri-kv dd { margin-bottom: 8px; }
+    .hri-log li { grid-template-columns: 1fr; gap: 2px; }
+  }
+</style>

@@ -1,0 +1,415 @@
+---
+// /admin/hr/fusion/[employeeId] — ONE PERSON'S EMPLOYEE INTELLIGENCE PROFILE (PATCH 06).
+//
+// THE ORDER OF OPERATIONS IS THE POINT:
+//
+//   1. resolve who is looking;
+//   2. decide whether they may read this person AT ALL, before anything is read;
+//   3. WRITE THE ACCESS ROW, and stop here if it could not be written;
+//   4. only then build the profile, and only the view this reader is entitled to.
+//
+// Step 3 failing shows a refusal rather than the record. Where the audit row is the control, the
+// control has to have happened — the same rule src/lib/legal-hold.ts already enforces here.
+//
+// EVERY FIGURE ON THIS PAGE CARRIES ITS OWN JUSTIFICATION, computed with it, in the same object.
+// There is no drill-down fetch: a second round trip is a second chance for the explanation to
+// disagree with the number above it.
+//
+// AND THE PAGE PRINTS WHAT IT COULD NOT SEE. Providers that are not connected, signals that were
+// refused, sources that were withheld from this view — all named. A profile that rendered
+// confidently while a third of its inputs failed to load would be a lie about a person.
+//
+// CLIENT JAVASCRIPT: NONE. Disclosure is native <details>; the sparkline is <b> elements with an
+// inline height. Every `const` is declared ABOVE the POST handler that reads it.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { flashFailed } from '@/lib/flash-tone';
+import { can } from '@/lib/auth/permissions';
+import {
+  resolveViewer,
+  decideAccess,
+  logIntelligenceAccess,
+  viewFor,
+  viewSentence,
+  buildProfile,
+  storeSnapshot,
+  addNote,
+  dimensionTimeline,
+  headline,
+  confidenceLine,
+  sourceSentence,
+  statusTone,
+  bandTone,
+  agreementGlyph,
+  directionGlyph,
+  notConnectedSentence,
+  foundationNotice,
+  NOTE_STANCES,
+  NOTE_STANCE_LABELS,
+  READING_STATUS_LABELS,
+  MIN_NOTE_CHARS,
+  FUSION_CSS,
+  GLYPH_ADVISORY,
+  GLYPH_ATTRIBUTED,
+  GLYPH_LINK,
+  type DimensionReading,
+  type FusionProfile,
+} from '@/lib/fusion';
+
+const employeeId = String(Astro.params.employeeId || '');
+const PATH = '/admin/hr/fusion/' + employeeId;
+const DESK = '/admin/hr/fusion';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=' + encodeURIComponent(PATH));
+if (!can(user as any, 'admin.access')) return Astro.redirect('/admin');
+
+const viewer = await resolveViewer(user as any);
+const access = await decideAccess(viewer, employeeId);
+
+const back = (msg: string) =>
+  Astro.redirect(PATH + '?msg=' + encodeURIComponent(msg.slice(0, 300)));
+
+if (Astro.request.method === 'POST') {
+  if (!access.allowed || !viewer) return back('You are not able to open this record, so nothing was saved.');
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+
+  if (action === 'recompute') {
+    const built = await buildProfile({ employeeId });
+    if ('error' in built) return back(built.error);
+    const r = await storeSnapshot({
+      profile: built,
+      actorUserId: viewer.userId,
+      reason: String(fd.get('reason') || 'Recomputed from the profile page.'),
+    });
+    return back(r.ok
+      ? 'Snapshot stored. The next reading will be compared against this one.'
+      : (r.error || 'The snapshot could not be stored.'));
+  }
+
+  if (action === 'add_note') {
+    const r = await addNote({
+      employeeId,
+      dimension: String(fd.get('dimension') || '') || null,
+      authorUserId: viewer.userId,
+      authorRelationship: access.kind === 'self' ? 'the person themselves' : access.kind === 'manager' ? 'responsible for this work' : 'organisation-wide reader',
+      stance: String(fd.get('stance') || ''),
+      body: String(fd.get('body') || ''),
+    });
+    return back(r.ok
+      ? 'Your note is on the record beside that reading, with your name on it. It does not change the reading and it is not deleted.'
+      : (r.error || 'That note could not be saved.'));
+  }
+
+  return back('That action is not one this page performs.');
+}
+
+const params = Astro.url.searchParams;
+const msg = String(params.get('msg') || '').slice(0, 300);
+
+// -------------------------------------------------------------------------------------------------
+// STEP 3 THEN STEP 4. The access row before the record, and no record without it.
+// -------------------------------------------------------------------------------------------------
+
+let logged = { logged: true, note: null as string | null };
+if (access.allowed && access.aboutSomebodyElse && viewer) {
+  logged = await logIntelligenceAccess({ viewer, subjectEmployeeId: employeeId, kind: access.kind });
+}
+
+let profile: FusionProfile | null = null;
+let buildError: string | null = null;
+let timeline: { at: string; reading: number | null; confidence: number; status: string }[] = [];
+
+if (access.allowed && logged.logged && viewer) {
+  const built = await buildProfile({ employeeId });
+  if ('error' in built) buildError = built.error;
+  else {
+    const v = viewFor(built, viewer, access.kind);
+    profile = v.profile;
+    timeline = await dimensionTimeline(employeeId, 'current_capability', 24);
+  }
+}
+
+// Hoisted out of the template: `<` inside a JSX expression breaks .astro parsing, and a template
+// should not be doing arithmetic.
+const readCount = profile ? profile.dimensions.filter((d) => d.reading !== null).length : 0;
+const totalDims = profile ? profile.dimensions.length : 0;
+const sparkMax = timeline.reduce((m, t) => Math.max(m, t.reading ?? 0), 1);
+const spark = timeline.map((t) => ({
+  height: t.reading === null ? 4 : Math.max(4, Math.round((t.reading / sparkMax) * 34)),
+  on: t.reading !== null,
+  at: t.at.slice(0, 10),
+  reading: t.reading,
+}));
+const subjectName = profile?.subject.displayName || 'this person';
+const dimensionOptions = profile ? profile.dimensions.map((d) => ({ key: d.dimension, label: d.label })) : [];
+---
+
+<AdminLayout title="Intelligence profile" activeNav="hr">
+  <style set:html={FUSION_CSS}></style>
+
+  <div class="fu">
+    <p class="muted"><a href={DESK}>Back to the fusion desk</a></p>
+
+    {!access.allowed && (
+      <div class="deny">
+        <p><b>This record was not opened.</b></p>
+        <p style="margin-top:8px">{access.sentence}</p>
+        <p style="margin-top:8px">Your own record is on your workspace at
+          <a href="/portal/employee/fusion"> /portal/employee/fusion</a>.</p>
+      </div>
+    )}
+
+    {access.allowed && !logged.logged && (
+      <div class="deny">
+        <p><b>This record was not opened, on purpose.</b></p>
+        <p style="margin-top:8px">{logged.note}</p>
+        <p style="margin-top:8px" class="muted">
+          An unlogged read of somebody’s development record is not offered as a fallback here. Try
+          again in a moment; if it keeps happening, the access log itself needs attention.
+        </p>
+      </div>
+    )}
+
+    {access.allowed && logged.logged && buildError && (
+      <div class="deny">
+        <p><b>The profile could not be built.</b></p>
+        <p style="margin-top:8px">{buildError}</p>
+      </div>
+    )}
+
+    {profile && (
+      <>
+        <h1>{subjectName}</h1>
+        <p class="lede">
+          {profile.subject.designation || 'No role recorded'} · {readCount} of {totalDims} dimensions
+          could be read. {viewSentence(access.kind, !!viewer?.mayWeight)}
+        </p>
+
+        {msg && <p class={flashFailed(msg) ? 'flash warn' : 'flash'} role={flashFailed(msg) ? 'alert' : 'status'}>{msg}</p>}
+
+        <div class="card">
+          <h2>What this is not</h2>
+          <p class="muted">{profile.humanAuthority.sentence}</p>
+          <p class="muted" style="margin-top:8px">
+            There is no overall score on this page and no field one could be stored in. Ten readings
+            are reported as ten readings and are never totalled, averaged or ranked: a single figure
+            over things that measure different things is arithmetic wearing the costume of a
+            judgement, and a number is what people act on.
+          </p>
+          <p class="muted" style="margin-top:8px">{profile.fairness.sentence}</p>
+        </div>
+
+        {(profile.notConnected.length > 0 || profile.unreadable.length > 0 || profile.fairness.refusedSignals.length > 0 || profile.withheld.length > 0) && (
+          <div class="card">
+            <h2>What is missing from every reading below</h2>
+            <ul class="chain">
+              {profile.notConnected.map((m) => (<li>{notConnectedSentence(m)}</li>))}
+              {profile.unreadable.map((u) => (<li><b>{u.what}.</b> {u.because}</li>))}
+              {profile.withheld.map((w) => (<li><b>{w.what}.</b> {w.because}</li>))}
+              {profile.fairness.refusedSignals.map((r) => (<li><b>Refused from {r.providerKey}.</b> {r.because}</li>))}
+            </ul>
+            <p class="muted" style="margin-top:8px">
+              Each of these is an absence in the record. None of them is a lower reading about
+              {' '}{subjectName}.
+            </p>
+          </div>
+        )}
+
+        <div class="card">
+          <h2>The weighting these were produced under</h2>
+          <p class="muted">{profile.weighting.sentence}</p>
+          {profile.weighting.isBuiltInDefault && (
+            <p class="muted" style="margin-top:6px">Nobody owns it — it is the built-in default.</p>
+          )}
+        </div>
+
+        {spark.length > 1 && (
+          <div class="card">
+            <h2>Current capability over time</h2>
+            <div class="spark">
+              {spark.map((s) => (
+                <b class={s.on ? 'on' : ''} style={'height:' + s.height + 'px'}
+                   title={s.at + ' · ' + (s.reading === null ? 'no reading' : s.reading + '/100')}></b>
+              ))}
+            </div>
+            <p class="muted" style="margin-top:6px">
+              {spark.length} stored readings, oldest first. A short bar with no fill is a point at
+              which there was not enough on record to produce a reading at all — not a low one.
+            </p>
+          </div>
+        )}
+
+        <div class="grid">
+          {profile.dimensions.map((d: DimensionReading) => (
+            <div class="dim">
+              <h3>{d.label}</h3>
+              <p class="q">{d.question}</p>
+
+              <div class={d.reading === null ? 'num absent' : 'num'}>{headline(d)}</div>
+              {d.reading !== null && (
+                <span class={d.inverted ? 'meter inv' : 'meter'} aria-hidden="true">
+                  <i style={'width:' + d.reading + '%'}></i>
+                </span>
+              )}
+              <span class={'tag ' + statusTone(d.status)}>{READING_STATUS_LABELS[d.status]}</span>
+              {' '}
+              <span class={'tag ' + bandTone(d.explanation.confidence.band)}>
+                <span set:html={directionGlyph(d.explanation.confidence.direction)} />
+                {' '}{confidenceLine(d)}
+              </span>
+
+              <p class="say">{d.sentence}</p>
+              <p class="muted" style="margin-top:6px">{d.change.sentence}</p>
+
+              <details>
+                <summary>Where this came from — five kinds of evidence</summary>
+                {d.sources.map((v) => (
+                  <div class={v.effectiveWeight > 0 ? 'src' : 'src off'}>
+                    <span set:html={v.signalCount ? agreementGlyph(v.agreement) : agreementGlyph('silent')} />
+                    <span>{sourceSentence(v, access.kind === 'org' && !!viewer?.mayWeight)}</span>
+                  </div>
+                ))}
+              </details>
+
+              {(d.agreement.length > 0 || d.contradiction.length > 0) && (
+                <details>
+                  <summary>What the sources agree and disagree about</summary>
+                  {d.agreement.length > 0 && (
+                    <ul class="chain">{d.agreement.map((a) => (<li>{a}</li>))}</ul>
+                  )}
+                  {d.contradiction.length > 0 && (
+                    <>
+                      <p class="muted" style="margin-top:8px"><b>Contradiction</b></p>
+                      <ul class="chain">{d.contradiction.map((c) => (<li>{c}</li>))}</ul>
+                    </>
+                  )}
+                </details>
+              )}
+
+              <details>
+                <summary>Inputs, processing, evidence, confidence, timestamp</summary>
+                <p class="muted" style="margin-top:6px"><b>Inputs</b></p>
+                <ul class="chain">{d.explanation.inputs.map((i) => (<li>{i.sentence} <span class="muted">({i.ownerModule})</span></li>))}</ul>
+                <p class="muted" style="margin-top:8px"><b>Processing</b></p>
+                <ul class="chain">{d.explanation.processing.map((p) => (<li>{p}</li>))}</ul>
+                <p class="muted" style="margin-top:8px"><b>Evidence</b></p>
+                {d.explanation.evidence.length === 0
+                  ? <p class="muted">Nothing on record supports this dimension either way.</p>
+                  : (
+                    <ul class="chain">
+                      {d.explanation.evidence.map((e) => (
+                        <li>
+                          {e.url && <span set:html={GLYPH_LINK} />}
+                          {' '}{e.what}
+                          {' '}<span class="muted">({e.ownerModule}{e.at ? ', ' + e.at.slice(0, 10) : ''})</span>
+                          {e.url && <> — <a href={e.url} rel="noreferrer noopener" target="_blank">open</a></>}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                <p class="muted" style="margin-top:8px"><b>Confidence</b> — {d.explanation.confidence.sentence}</p>
+                <p class="muted" style="margin-top:6px"><b>Computed</b> {d.explanation.computedAt}</p>
+              </details>
+
+              {d.developmentNeeds.length > 0 && (
+                <details>
+                  <summary>Named as needing work ({d.developmentNeeds.length})</summary>
+                  <ul class="chain">{d.developmentNeeds.map((n) => (<li>{n}</li>))}</ul>
+                  <p class="muted" style="margin-top:6px">
+                    Listed in words and never folded into the number above.
+                  </p>
+                </details>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <div class="card">
+          <h2><span set:html={GLYPH_ADVISORY} /> About the inferred foundation</h2>
+          <p class="muted">{foundationNotice()}</p>
+        </div>
+
+        <div class="card">
+          <h2>Written responses on record</h2>
+          {profile.humanNotes.length === 0 ? (
+            <p class="muted">Nobody has written anything about these readings yet.</p>
+          ) : (
+            <ul class="chain">
+              {profile.humanNotes.map((n) => (
+                <li>
+                  <span set:html={GLYPH_ATTRIBUTED} />
+                  {' '}<b>{n.authorName || 'A named user'}</b>
+                  {n.authorRelationship ? ' (' + n.authorRelationship + ')' : ''}
+                  {' — '}{NOTE_STANCE_LABELS[n.stance]}
+                  {n.dimension ? ' on ' + n.dimension.replace(/_/g, ' ') : ''}
+                  {', '}{n.writtenAt.slice(0, 10)}
+                  <br />{n.body}
+                </li>
+              ))}
+            </ul>
+          )}
+          <p class="muted" style="margin-top:8px">
+            A note sits beside a reading. It does not change it, it is not deleted, and two people may
+            disagree with each other with both notes standing. One person’s view does not become the
+            organisation’s.
+          </p>
+
+          <form method="post">
+            <input type="hidden" name="action" value="add_note" />
+            <div class="row2">
+              <div>
+                <label for="n-dim">Which reading</label>
+                <select id="n-dim" name="dimension">
+                  <option value="">The profile as a whole</option>
+                  {dimensionOptions.map((o) => (<option value={o.key}>{o.label}</option>))}
+                </select>
+              </div>
+              <div>
+                <label for="n-stance">Your position</label>
+                <select id="n-stance" name="stance">
+                  {NOTE_STANCES.map((s) => (<option value={s}>{NOTE_STANCE_LABELS[s]}</option>))}
+                </select>
+              </div>
+            </div>
+            <label for="n-body">What you want on the record</label>
+            <textarea id="n-body" name="body" maxlength="4000" required
+              placeholder={'At least ' + MIN_NOTE_CHARS + ' characters. A one-word disagreement is not something the person it is about can answer.'}></textarea>
+            <button class="btn" type="submit">Record this</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h2>Store a snapshot</h2>
+          <p class="muted">
+            The readings above were computed just now and are not stored. Storing one is what makes
+            the NEXT reading comparable — evolution here is the difference between two stored
+            snapshots, never a running average. {profile.history.length} snapshot
+            {profile.history.length === 1 ? ' is' : 's are'} on record.
+          </p>
+          <form method="post">
+            <input type="hidden" name="action" value="recompute" />
+            <label for="s-reason">Why now</label>
+            <input id="s-reason" name="reason" maxlength="300" placeholder="End of the appraisal cycle" />
+            <button class="btn" type="submit">Store this snapshot</button>
+          </form>
+          {profile.history.length > 0 && (
+            <div class="tablewrap">
+              <table>
+                <thead><tr><th>Computed</th><th>Dimensions read</th></tr></thead>
+                <tbody>
+                  {profile.history.map((h) => (
+                    <tr>
+                      <td>{h.computedAt.slice(0, 16).replace('T', ' ')}</td>
+                      <td class="muted">{h.dimensionsRead} of {totalDims}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </>
+    )}
+  </div>
+</AdminLayout>

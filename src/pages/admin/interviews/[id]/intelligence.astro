@@ -1,0 +1,717 @@
+---
+// /admin/interviews/[id]/intelligence — THE INTERVIEWER'S CONSOLE. PATCH 09.
+//
+// THREE PANELS, ONE PER MOMENT OF AN INTERVIEW, on one page because an interviewer keeps this open
+// while the interview is happening and a two-page flow loses the note somebody was halfway through:
+//
+//   BEFORE      what the record already covers, what it does not, what to probe, what disagrees
+//   DURING      one form, eight kinds of observation, each optionally against a requirement
+//   AT THE END  the five-value recommendation, its evidence, the written feedback, and whether the
+//               room matched the record
+//
+// THERE IS NO SUGGESTED OUTCOME ANYWHERE ON THIS PAGE and there is no place to put one. The brief
+// prints its refusal in the position a reader's eye goes looking for a verdict.
+//
+// GATED ON THE `interviews` SECTION, which src/middleware.ts already maps for every path beneath
+// /admin/interviews. No new capability is invented by this page. VIEW opens it; the four write
+// actions require `edit`, on the same reasoning the scorecard page documents: canAccessSection()
+// gives a built-in role view/edit/export on its sections and reserves delete for super_admin, so
+// asking for 'delete' here would take this away from a role that holds interviews today.
+//
+// EVERY const AND HELPER IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted and a
+// declaration under the handler that reads it throws on the handler's first line. That has taken
+// pages down on this project twice.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import {
+  intelBundle,
+  lockInitialProfile,
+  recordObservation,
+  removeObservation,
+  recordAssessment,
+  INTEL_DIMENSIONS,
+  INTEL_RECOMMENDATIONS,
+  OBSERVATION_OUTCOMES,
+  OUTCOME_LABELS,
+  ALIGNMENTS,
+  NO_AUTOMATIC_DECISION,
+} from '@/lib/interview-intelligence';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const { id } = Astro.params;
+const canWrite = await canAccessSection(user as any, 'interviews', 'edit');
+
+let okMsg = '';
+let errorMsg = '';
+
+// -------------------------------------------------------------------------------------------------
+// HELPERS AND CONSTANTS — all of them above the handler.
+// -------------------------------------------------------------------------------------------------
+
+const NOT_PERMITTED =
+  'Your role can open this console but cannot record on it. Nothing was saved.';
+
+/** JSX in .astro cannot hold `<` or `<=`; every comparison a template needs is hoisted here. */
+const has = (n: number) => n > 0;
+
+const str = (fd: FormData, k: string) => String(fd.get(k) ?? '');
+
+const outcomeOptions = OBSERVATION_OUTCOMES.map((o) => ({ value: o, label: OUTCOME_LABELS[o] }));
+
+// POST-REDIRECT-GET, AND THE BUG IT EXISTS TO PREVENT.
+//
+// `interview_intel_observations` has no unique index and must not have one: an interview genuinely
+// produces several observations in the same dimension against the same requirement. That is correct,
+// and it makes a re-POST a DUPLICATE ROW rather than an idempotent upsert — so an interviewer who
+// refreshes after saving, or whose browser restores the page from bfcache, silently files the same
+// observation twice and the reconciliation then counts one person's single remark as two.
+//
+// So a successful write redirects and the message is rebuilt from the code below. A FAILED write
+// does not redirect: it re-renders with its own reason, which is worth more than a tidy URL, and a
+// refresh of a write that did not happen cannot duplicate anything.
+const SAVED_MESSAGES: Record<string, string> = {
+  locked: 'The pre-interview picture is frozen. What you record from here can be compared against it.',
+  observation: 'Observation recorded.',
+  removed: 'Observation removed.',
+  assessment: 'Your assessment is recorded. ' + NO_AUTOMATIC_DECISION,
+};
+
+const savedKind = String(Astro.url.searchParams.get('saved') || '');
+const redirectSaved = (kind: string) => Astro.redirect(Astro.url.pathname + '?saved=' + kind);
+
+const dimensionOptions = INTEL_DIMENSIONS.map((d) => ({
+  value: d.key,
+  label: d.label,
+  hint: d.hint,
+}));
+
+const recommendationOptions = INTEL_RECOMMENDATIONS.map((r) => ({
+  value: r.key,
+  label: r.label,
+  meaning: r.meaning,
+}));
+
+const alignmentOptions = ALIGNMENTS.map((a) => ({ value: a.key, label: a.label }));
+
+// Colour is a grouping cue and never the whole message: every one of these sits beside its own word.
+const PRIORITY_COLOUR: Record<string, string> = {
+  must_validate: '#ef4444',
+  worth_probing: '#fbbf24',
+  confirm_briefly: '#10b981',
+};
+
+const STATE_COLOUR: Record<string, string> = {
+  demonstrated_in_interview: '#10b981',
+  contradicted_in_interview: '#ef4444',
+  interviewers_disagree: '#fbbf24',
+  not_examined: '#6e6e78',
+};
+
+// -------------------------------------------------------------------------------------------------
+// WRITES
+// -------------------------------------------------------------------------------------------------
+
+if (Astro.request.method === 'POST') {
+  if (!canWrite) {
+    errorMsg = NOT_PERMITTED;
+  } else {
+    const fd = await Astro.request.formData();
+    const action = str(fd, 'action');
+
+    if (action === 'lock_profile') {
+      const r = await lockInitialProfile(String(id), String(user.id));
+      if (r.ok) return redirectSaved('locked');
+      errorMsg = r.error;
+    } else if (action === 'add_observation') {
+      const r = await recordObservation({
+        interviewId: String(id),
+        interviewerUserId: String(user.id),
+        dimension: str(fd, 'dimension'),
+        observation: str(fd, 'observation'),
+        skillId: str(fd, 'skill_id') || null,
+        skillName: str(fd, 'skill_name') || null,
+        outcome: str(fd, 'outcome') || null,
+      });
+      if (r.ok) return redirectSaved('observation');
+      errorMsg = r.error;
+    } else if (action === 'remove_observation') {
+      const r = await removeObservation(str(fd, 'observation_id'), String(user.id));
+      if (r.ok) return redirectSaved('removed');
+      errorMsg = r.error;
+    } else if (action === 'record_assessment') {
+      const r = await recordAssessment({
+        interviewId: String(id),
+        interviewerUserId: String(user.id),
+        recommendation: str(fd, 'recommendation'),
+        supportingEvidence: str(fd, 'supporting_evidence'),
+        writtenFeedback: str(fd, 'written_feedback'),
+        conditions: str(fd, 'conditions') || null,
+        alignment: str(fd, 'alignment'),
+        alignmentNote: str(fd, 'alignment_note') || null,
+      });
+      if (r.ok) return redirectSaved('assessment');
+      errorMsg = r.error;
+    } else {
+      errorMsg = 'That action was not recognised. Nothing was saved.';
+    }
+  }
+}
+
+// -------------------------------------------------------------------------------------------------
+// READ — after the writes, so the page renders what is now true rather than what was.
+// -------------------------------------------------------------------------------------------------
+
+const bundle = await intelBundle(String(id), String(user.id));
+const brief = bundle.brief;
+
+// "THIS ROUND DOES NOT EXIST" AND "THE QUERY DID NOT ANSWER" ARE OPPOSITE FACTS, and bouncing an
+// interviewer back to the list with no explanation makes an outage look like a deleted round.
+if (!brief.tablesPresent) {
+  return Astro.redirect('/admin/interviews?err=' + encodeURIComponent(
+    'The interview records could not be read just now, so the intelligence console could not open. '
+    + 'Nothing has changed. Try again in a moment.'));
+}
+if (!brief.interview) return Astro.redirect('/admin/interviews');
+
+const iv = brief.interview;
+const cov = brief.coverage;
+const comparison = bundle.comparison;
+const myAssessment = bundle.myAssessment;
+
+const myObservationCount = bundle.observations.filter((o) => o.interviewerUserId === String(user.id)).length;
+
+// The confirmation is rebuilt from what is true NOW rather than carried across the redirect in the
+// URL. The two caveats below are the ones recordAssessment() returns in its own message, and they
+// are derived here from the same facts so that a reload of the confirmed page keeps telling the
+// truth instead of repeating a sentence that was true one request ago.
+if (!okMsg && savedKind && SAVED_MESSAGES[savedKind]) {
+  okMsg = SAVED_MESSAGES[savedKind];
+  if (savedKind === 'assessment') {
+    if (!brief.snapshot) {
+      okMsg += ' No pre-interview profile was frozen for this round, so alignment was recorded as having '
+        + 'had no prior picture to compare against.';
+    }
+    if (myObservationCount === 0) {
+      okMsg += ' You recorded no observations against individual requirements during this interview, so the '
+        + 'predicted-versus-actual comparison has nothing of yours in it.';
+    }
+  }
+}
+
+const scheduledLocal = iv.scheduledAt || '';
+const requirementsMapped = brief.requirementsState === 'ok';
+const hasRequirements = has(brief.requirements.length);
+const hasStrengths = has(brief.strengths.length);
+const hasValidation = has(brief.requiresValidation.length);
+const hasProbes = has(brief.probes.length);
+const hasContradictions = has(brief.contradictions.length);
+const hasObservations = has(bundle.observations.length);
+const hasComparison = has(comparison.items.length);
+const hasUnattached = has(comparison.unattached.length);
+const hasOtherAssessments = has(bundle.assessments.filter((a) => a.interviewerUserId !== String(user.id)).length);
+const otherAssessments = bundle.assessments.filter((a) => a.interviewerUserId !== String(user.id));
+const hasPriorRounds = has(brief.priorRounds.length);
+const hasPlatformRecord = !!cov && (has(cov.platformRecord.certificates.length) || has(cov.platformRecord.assessments.length));
+
+/** Requirements an observation may be filed against. Empty is a legitimate state and is said. */
+const filableRequirements = brief.requirements.map((r) => ({
+  skillId: r.skillId,
+  skillName: r.skillName,
+  necessity: r.necessity,
+}));
+const hasFilable = has(filableRequirements.length);
+---
+<AdminLayout title="Interview Intelligence" activeNav="hr">
+<style>
+  .ii-card { background:#0f0f14; border:1px solid #1a1a1f; border-radius:12px; padding:16px; margin-bottom:14px; }
+  .ii-h { font-size:13px; font-weight:700; color:#fff; margin:0 0 4px; }
+  .ii-sub { font-size:11px; color:#8a8a94; margin:0 0 12px; line-height:1.55; }
+  .ii-note { font-size:11px; color:#6e6e78; line-height:1.6; margin:8px 0 0; }
+  .ii-row { border:1px solid #1a1a1f; border-radius:10px; padding:12px; margin-bottom:8px; background:#131318; }
+  .ii-tag { display:inline-block; font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; padding:3px 7px; border-radius:5px; }
+  .ii-input { width:100%; background:#15151a; border:1px solid #1a1a1f; border-radius:8px; padding:10px 12px; color:#fff; font-size:13px; outline:none; font-family:inherit; resize:vertical; }
+  .ii-input:focus { border-color:#FF4F00; }
+  .ii-btn { background:#FF4F00; border:none; color:#fff; font-size:13px; font-weight:700; padding:11px 16px; border-radius:9px; cursor:pointer; }
+  .ii-btn-quiet { background:transparent; border:1px solid #2a2a32; color:#8a8a94; font-size:11px; font-weight:600; padding:6px 10px; border-radius:7px; cursor:pointer; }
+  .ii-label { font-size:11px; font-weight:600; color:#d8d8de; margin:0 0 6px; display:block; }
+  .ii-pick { background:#15151a; border:1px solid #1a1a1f; border-radius:8px; padding:10px 12px; cursor:pointer; display:flex; align-items:flex-start; gap:9px; margin-bottom:6px; }
+  .ii-pick:has(input:checked) { border-color:#FF4F00; background:rgba(255,79,0,0.08); }
+  .ii-pick input { accent-color:#FF4F00; margin-top:2px; }
+  .ii-refuse { background:rgba(255,79,0,0.06); border:1px solid rgba(255,79,0,0.25); border-radius:10px; padding:13px 15px; font-size:12px; color:#d8d8de; line-height:1.65; }
+  .ii-sec { font-size:10px; font-weight:800; letter-spacing:0.1em; text-transform:uppercase; color:#6e6e78; margin:22px 0 10px; }
+</style>
+<div style="padding-bottom:80px;">
+
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;">
+    <a href="/admin/interviews" style="font-size:11px;color:#6e6e78;text-decoration:none;display:inline-flex;align-items:center;gap:4px;margin-bottom:8px;">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+      Back to interviews
+    </a>
+    <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">Interview Intelligence</h1>
+    <p style="font-size:12px;color:#8a8a94;margin:4px 0 0;">
+      {iv.candidateName} &middot; {iv.roleTitle || 'No role recorded'} &middot; Round {iv.roundNumber}
+    </p>
+    <p style="font-size:11px;color:#6e6e78;margin:6px 0 0;" data-ts={scheduledLocal}>{iv.scheduledAt || 'Not scheduled'}</p>
+  </div>
+
+  {errorMsg && <div style="margin:10px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:12px;line-height:1.6;">{errorMsg}</div>}
+  {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:12px;line-height:1.6;">{okMsg}</div>}
+  {!canWrite && <div style="margin:10px 16px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);color:#fcd34d;border-radius:8px;padding:10px 14px;font-size:12px;line-height:1.6;">You can read this console. Recording an observation or completing an interview needs edit access to the interviews section.</div>}
+
+  <div style="padding:14px 16px;max-width:900px;">
+
+    <!-- ============================================================ BEFORE THE INTERVIEW -->
+    <p class="ii-sec">Before the interview</p>
+
+    <div class="ii-card">
+      <p class="ii-h">How this person's records were reached</p>
+      <p class="ii-sub">{brief.subjectNote || 'No person record could be resolved for this application.'}</p>
+      <p class="ii-note">{brief.recordsNotPeople}</p>
+    </div>
+
+    {!requirementsMapped && (
+      <div class="ii-card">
+        <p class="ii-h">This role has nothing to compare against yet</p>
+        <p class="ii-sub">{brief.requirementsNote}</p>
+        <p class="ii-note">
+          The interview can still be run and everything you observe can still be recorded. What is missing is
+          the predicted side of the comparison, not the interview.
+        </p>
+      </div>
+    )}
+
+    {requirementsMapped && hasRequirements && (
+      <div class="ii-card">
+        <p class="ii-h">What this role asks for</p>
+        <p class="ii-sub">{brief.requirements.length} requirement(s) authored for this job in the skill catalogue.</p>
+        {brief.requirements.map((r) => (
+          <div class="ii-row" style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;">
+            <span style="font-size:12px;color:#fff;font-weight:600;">{r.skillName}</span>
+            <span style="font-size:10px;color:#8a8a94;text-align:right;flex-shrink:0;">
+              {r.necessity}{r.minLevel === null ? '' : ' - minimum level ' + r.minLevel}
+            </span>
+          </div>
+        ))}
+      </div>
+    )}
+
+    {hasStrengths && (
+      <div class="ii-card">
+        <p class="ii-h">Evidence-based strengths</p>
+        <p class="ii-sub">
+          Requirements a checked record already covers. The interview does not need to establish these.
+        </p>
+        {brief.strengths.map((s) => (
+          <div class="ii-row">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;">
+              <span style="font-size:12px;color:#fff;font-weight:600;">{s.skillName}</span>
+              <span class="ii-tag" style="background:rgba(16,185,129,0.15);color:#6ee7b7;">{s.statusLabel}</span>
+            </div>
+            <p class="ii-note">{s.chain.concluded}</p>
+            {has(s.chain.evidence.length) && (
+              <p class="ii-note" style="color:#8a8a94;">
+                {s.chain.evidence.map((c) => (
+                  <span style="display:block;">
+                    {c.kind}: {c.label}
+                    {c.url && <a href={c.url} style="color:#FF7040;text-decoration:none;margin-left:6px;">open</a>}
+                  </span>
+                ))}
+              </p>
+            )}
+          </div>
+        ))}
+      </div>
+    )}
+
+    {hasValidation && (
+      <div class="ii-card">
+        <p class="ii-h">Areas requiring validation</p>
+        <p class="ii-sub">
+          Essential and important requirements that nothing demonstrates. This is what the hour is for.
+        </p>
+        {brief.requiresValidation.map((s) => (
+          <div class="ii-row">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;">
+              <span style="font-size:12px;color:#fff;font-weight:600;">{s.skillName}</span>
+              <span class="ii-tag" style="background:rgba(251,191,36,0.15);color:#fcd34d;">{s.statusLabel}</span>
+            </div>
+            <p class="ii-note">{s.chain.concluded}</p>
+            {has(s.chain.uncertain.length) && <p class="ii-note" style="color:#8a8a94;">{s.chain.uncertain[0]}</p>}
+          </div>
+        ))}
+      </div>
+    )}
+
+    {hasProbes && (
+      <div class="ii-card">
+        <p class="ii-h">Suggested probes</p>
+        <p class="ii-sub">
+          One per requirement, derived from its coverage state by a fixed rule. The same record always
+          produces the same probe, and no language model wrote any of them. They are prompts for you,
+          not questions to read out.
+        </p>
+        {brief.probes.map((p) => (
+          <div class="ii-row">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;margin-bottom:6px;">
+              <span style="font-size:12px;color:#fff;font-weight:600;">{p.skillName}</span>
+              <span class="ii-tag" style={'background:' + PRIORITY_COLOUR[p.priority] + '22;color:' + PRIORITY_COLOUR[p.priority] + ';'}>
+                {p.priority === 'must_validate' ? 'Must validate' : p.priority === 'worth_probing' ? 'Worth probing' : 'Confirm briefly'}
+              </span>
+            </div>
+            <p class="ii-note" style="color:#8a8a94;">{p.why}</p>
+            <p class="ii-note" style="color:#d8d8de;">{p.prompt}</p>
+          </div>
+        ))}
+      </div>
+    )}
+
+    {hasContradictions && (
+      <div class="ii-card" style="border-color:rgba(239,68,68,0.28);">
+        <p class="ii-h">Where two records disagree</p>
+        <p class="ii-sub">
+          Each of these is a comparison of two stored rows. Nothing on record is not listed here; that is a
+          gap in our records and it sits above, under areas requiring validation.
+        </p>
+        {brief.contradictions.map((c) => (
+          <div class="ii-row" style="border-color:rgba(239,68,68,0.22);">
+            <p style="font-size:12px;color:#fca5a5;font-weight:600;margin:0 0 6px;">{c.headline}</p>
+            <p class="ii-note" style="color:#d8d8de;">{c.whatToDo}</p>
+            {c.evidence.map((e) => <p class="ii-note" style="color:#8a8a94;">{e}</p>)}
+          </div>
+        ))}
+      </div>
+    )}
+
+    {hasPriorRounds && (
+      <div class="ii-card">
+        <p class="ii-h">Earlier rounds of this application</p>
+        <p class="ii-sub">Scorecards recorded by other interviewers, linked rather than restated.</p>
+        {brief.priorRounds.map((p) => (
+          <div class="ii-row" style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;">
+            <span style="font-size:12px;color:#fff;">Round {p.roundNumber} &middot; {p.interviewerName}</span>
+            <a href={'/admin/interviews/' + p.interviewId + '/scorecard'} style="font-size:11px;color:#FF7040;text-decoration:none;flex-shrink:0;">Open scorecard</a>
+          </div>
+        ))}
+      </div>
+    )}
+
+    {hasPlatformRecord && cov && (
+      <div class="ii-card">
+        <p class="ii-h">Platform record</p>
+        <p class="ii-sub">{cov.platformRecord.sentence}</p>
+        {cov.platformRecord.certificates.map((c) => (
+          <div class="ii-row" style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;">
+            <span style="font-size:12px;color:#fff;">{c.title}</span>
+            {c.url && <a href={c.url} style="font-size:11px;color:#FF7040;text-decoration:none;flex-shrink:0;">Verify</a>}
+          </div>
+        ))}
+        {cov.platformRecord.assessments.map((a) => (
+          <div class="ii-row" style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;">
+            <span style="font-size:12px;color:#fff;">{a.title}</span>
+            <span style="font-size:11px;color:#8a8a94;flex-shrink:0;">{a.percentage === null ? 'Passed' : a.percentage + '%'}</span>
+          </div>
+        ))}
+      </div>
+    )}
+
+    <div class="ii-refuse">{brief.refusesVerdict}</div>
+
+    <div class="ii-card" style="margin-top:14px;">
+      <p class="ii-h">How this brief was assembled</p>
+      <p class="ii-sub">{brief.provenance.processing}</p>
+      <p class="ii-note"><strong style="color:#d8d8de;">Read from:</strong> {brief.provenance.inputs.join('; ') || 'nothing'}</p>
+      {brief.provenance.evidence.map((e) => <p class="ii-note">{e}</p>)}
+      <p class="ii-note"><strong style="color:#d8d8de;">Certainty:</strong> {brief.provenance.confidence}</p>
+      <p class="ii-note" data-ts={brief.provenance.timestamp}>{brief.provenance.timestamp}</p>
+    </div>
+
+    {requirementsMapped && (
+      <div class="ii-card">
+        <p class="ii-h">Freeze this picture before you start</p>
+        <p class="ii-sub">
+          A candidate profile changes as evidence is added, so "did what I saw match the record" is only
+          answerable against a picture pinned at a moment. Freezing stores what is above, with your name
+          and the time. It does not change anything about the candidate.
+        </p>
+        {brief.snapshot && (
+          <p class="ii-note" style="color:#6ee7b7;">
+            Frozen by {brief.snapshot.lockedByName || 'a colleague'}, covering {brief.snapshot.requirementCount} requirement(s).
+            <span data-ts={brief.snapshot.lockedAt || ''}> {brief.snapshot.lockedAt}</span>
+          </p>
+        )}
+        {canWrite && (
+          <form method="POST" style="margin-top:10px;">
+            <input type="hidden" name="action" value="lock_profile"/>
+            <button type="submit" class="ii-btn">{brief.snapshot ? 'Freeze again from the current record' : 'Freeze the pre-interview picture'}</button>
+          </form>
+        )}
+      </div>
+    )}
+
+    <!-- ============================================================ DURING THE INTERVIEW -->
+    <p class="ii-sec">During the interview</p>
+
+    <div class="ii-card">
+      <p class="ii-h">Record what you observe</p>
+      <p class="ii-sub">
+        One entry per thing observed. Naming the requirement is what lets an observation stand against the
+        prediction later; an entry with no requirement is still kept and still read.
+      </p>
+
+      {canWrite ? (
+        <form method="POST">
+          <input type="hidden" name="action" value="add_observation"/>
+
+          <label class="ii-label" for="dimension">What kind of observation is this</label>
+          <select id="dimension" name="dimension" class="ii-input" required>
+            {dimensionOptions.map((d) => <option value={d.value}>{d.label}</option>)}
+          </select>
+          <p class="ii-note" style="margin-bottom:12px;">
+            {dimensionOptions.map((d) => <span style="display:block;">{d.label}: {d.hint}</span>)}
+          </p>
+
+          <label class="ii-label" for="skill_id">Which requirement, if any</label>
+          {hasFilable ? (
+            <select id="skill_id" name="skill_id" class="ii-input" style="margin-bottom:12px;">
+              <option value="">Not about a specific requirement</option>
+              {filableRequirements.map((r) => <option value={r.skillId}>{r.skillName} ({r.necessity})</option>)}
+            </select>
+          ) : (
+            <p class="ii-note" style="margin-bottom:12px;">
+              This job has no requirements mapped to the skill catalogue, so there is nothing to file an
+              observation against. Record it unattached; it is still on the record.
+            </p>
+          )}
+
+          <label class="ii-label" for="outcome">What it does to that requirement</label>
+          <select id="outcome" name="outcome" class="ii-input" style="margin-bottom:12px;">
+            {outcomeOptions.map((o) => <option value={o.value}>{o.label}</option>)}
+          </select>
+
+          <label class="ii-label" for="observation">What they actually said or did</label>
+          <textarea id="observation" name="observation" rows="4" class="ii-input" required
+            placeholder="The specific thing. What they built, what they decided, what they could not answer."></textarea>
+
+          <p class="ii-note" style="margin-bottom:12px;">
+            Write it as what happened rather than as a judgement of the person. A sentence you would be
+            content to have read back to you is the right test.
+          </p>
+          <button type="submit" class="ii-btn">Record this observation</button>
+        </form>
+      ) : (
+        <p class="ii-note">Recording an observation needs edit access to the interviews section.</p>
+      )}
+    </div>
+
+    {!bundle.observationsPresent && (
+      <div class="ii-card">
+        <p class="ii-h">Observations could not be read</p>
+        <p class="ii-sub">
+          This is an outage, not an empty interview. Nothing already recorded has been lost, and nothing
+          about this candidate should be read into a blank list.
+        </p>
+      </div>
+    )}
+
+    {hasObservations && (
+      <div class="ii-card">
+        <p class="ii-h">Recorded so far</p>
+        <p class="ii-sub">{bundle.observations.length} observation(s) on this round, oldest first.</p>
+        {bundle.observations.map((o) => (
+          <div class="ii-row">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;margin-bottom:6px;">
+              <span style="font-size:11px;color:#8a8a94;">{o.interviewerName} &middot; {o.dimensionLabel}</span>
+              <span class="ii-tag" style="background:#1a1a1f;color:#8a8a94;flex-shrink:0;">{o.outcomeLabel}</span>
+            </div>
+            {o.skillName && <p style="font-size:12px;color:#FF7040;margin:0 0 4px;font-weight:600;">{o.skillName}</p>}
+            <p style="font-size:12px;color:#d8d8de;margin:0;line-height:1.6;">{o.observation}</p>
+            <p class="ii-note" data-ts={o.recordedAt || ''}>{o.recordedAt}</p>
+            {canWrite && o.interviewerUserId === String(user.id) && (
+              <form method="POST" style="margin-top:8px;">
+                <input type="hidden" name="action" value="remove_observation"/>
+                <input type="hidden" name="observation_id" value={o.id}/>
+                <button type="submit" class="ii-btn-quiet">Remove this observation</button>
+              </form>
+            )}
+          </div>
+        ))}
+      </div>
+    )}
+
+    <!-- ============================================================ PREDICTED VS ACTUAL -->
+    <p class="ii-sec">Predicted profile against actual interview evidence</p>
+
+    <div class="ii-card">
+      <p class="ii-h">What the record predicted, and what the room found</p>
+      <p class="ii-sub">{comparison.note || 'Nothing has been compared yet.'}</p>
+      <p class="ii-note">{comparison.observationGoverns}</p>
+
+      {hasComparison && comparison.items.map((r) => (
+        <div class="ii-row">
+          <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;margin-bottom:6px;">
+            <span style="font-size:12px;color:#fff;font-weight:600;">{r.skillName}</span>
+            <span class="ii-tag" style={'background:' + STATE_COLOUR[r.state] + '22;color:' + STATE_COLOUR[r.state] + ';'}>{r.stateLabel}</span>
+          </div>
+          <p class="ii-note" style="color:#8a8a94;">Predicted: {r.predictedLabel}</p>
+          <p class="ii-note" style="color:#d8d8de;">{r.sentence}</p>
+          {r.overrides && (
+            <p class="ii-note" style="color:#6ee7b7;">
+              What was observed supersedes the prediction for this requirement. The prediction is kept above
+              rather than replaced.
+            </p>
+          )}
+          {r.state === 'interviewers_disagree' && (
+            <p class="ii-note" style="color:#fcd34d;">
+              This is unresolved. Two people who were in the room recorded opposite findings, and nothing here
+              prefers one of them. It is not counted as the interview having settled this requirement.
+            </p>
+          )}
+          {r.observations.map((o) => (
+            <p class="ii-note" style="color:#8a8a94;">{o.interviewerName}: {o.observation}</p>
+          ))}
+        </div>
+      ))}
+
+      {hasUnattached && (
+        <div style="margin-top:12px;">
+          <p class="ii-h" style="font-size:12px;">Recorded, but not against a requirement</p>
+          {comparison.unattached.map((o) => (
+            <div class="ii-row">
+              <p style="font-size:11px;color:#8a8a94;margin:0 0 4px;">{o.interviewerName} &middot; {o.dimensionLabel}</p>
+              <p style="font-size:12px;color:#d8d8de;margin:0;line-height:1.6;">{o.observation}</p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <p class="ii-note"><strong style="color:#d8d8de;">Certainty:</strong> {comparison.provenance.confidence}</p>
+    </div>
+
+    <!-- ============================================================ AT COMPLETION -->
+    <p class="ii-sec">At completion</p>
+
+    <div class="ii-card">
+      <p class="ii-h">Your recommendation</p>
+      <p class="ii-sub">
+        This is your account of the interview. It is not a decision, and recording it moves nothing.
+      </p>
+
+      {myAssessment && (
+        <p class="ii-note" style="color:#6ee7b7;margin-bottom:12px;">
+          You already recorded {myAssessment.recommendationLabel} on this round. Saving again replaces it.
+          <span data-ts={myAssessment.submittedAt || ''}> {myAssessment.submittedAt}</span>
+        </p>
+      )}
+
+      {canWrite ? (
+        <form method="POST">
+          <input type="hidden" name="action" value="record_assessment"/>
+
+          <label class="ii-label">Overall recommendation</label>
+          {recommendationOptions.map((r) => (
+            <label class="ii-pick">
+              <input type="radio" name="recommendation" value={r.value} required
+                checked={myAssessment ? myAssessment.recommendation === r.value : false}/>
+              <span>
+                <span style="font-size:12px;font-weight:700;color:#fff;display:block;">{r.label}</span>
+                <span style="font-size:11px;color:#8a8a94;display:block;line-height:1.55;">{r.meaning}</span>
+              </span>
+            </label>
+          ))}
+
+          <label class="ii-label" style="margin-top:14px;" for="supporting_evidence">Evidence supporting this recommendation</label>
+          <textarea id="supporting_evidence" name="supporting_evidence" rows="4" class="ii-input" required
+            placeholder="What, specifically, showed it. Point at what was said or done.">{myAssessment ? myAssessment.supportingEvidence : ''}</textarea>
+          <p class="ii-note" style="margin-bottom:12px;">
+            A recommendation whose basis nobody can read back later is an opinion with a label on it. This
+            field is what makes it not one.
+          </p>
+
+          <label class="ii-label" for="conditions">Conditions or what is still outstanding</label>
+          <textarea id="conditions" name="conditions" rows="3" class="ii-input"
+            placeholder="Required if you recommend with conditions, or ask for further assessment.">{myAssessment ? (myAssessment.conditions || '') : ''}</textarea>
+          <p class="ii-note" style="margin-bottom:12px;">
+            Required for "Recommend with Conditions" and "Further Assessment Required". Without it both read
+            as a soft no that nobody can act on.
+          </p>
+
+          <label class="ii-label" for="written_feedback">Final written feedback</label>
+          <textarea id="written_feedback" name="written_feedback" rows="5" class="ii-input" required
+            placeholder="The considered account of this interview.">{myAssessment ? myAssessment.writtenFeedback : ''}</textarea>
+          <p class="ii-note" style="margin-bottom:12px;">
+            Write it as though the person may one day read it, because the fairest feedback is written that
+            way whether or not it is sent.
+          </p>
+
+          <label class="ii-label">Did what you observed match the pre-interview picture</label>
+          {alignmentOptions.map((a) => (
+            <label class="ii-pick">
+              <input type="radio" name="alignment" value={a.value} required
+                checked={myAssessment ? myAssessment.alignment === a.value : false}/>
+              <span style="font-size:12px;color:#fff;">{a.label}</span>
+            </label>
+          ))}
+          <p class="ii-note" style="margin:8px 0 12px;">
+            {brief.snapshot
+              ? 'Answer this against the picture frozen above, not against the live record.'
+              : 'No picture was frozen for this round, so whatever you pick will be recorded as having had no prior picture to compare against.'}
+          </p>
+
+          <label class="ii-label" for="alignment_note">What differed, if anything</label>
+          <textarea id="alignment_note" name="alignment_note" rows="3" class="ii-input"
+            placeholder="If the record was wrong about this person, this is the most useful thing you can write.">{myAssessment ? (myAssessment.alignmentNote || '') : ''}</textarea>
+
+          <p class="ii-note" style="margin:12px 0;">{NO_AUTOMATIC_DECISION}</p>
+          <button type="submit" class="ii-btn">{myAssessment ? 'Update my assessment' : 'Record my assessment'}</button>
+        </form>
+      ) : (
+        <p class="ii-note">Completing an interview needs edit access to the interviews section.</p>
+      )}
+    </div>
+
+    {hasOtherAssessments && (
+      <div class="ii-card">
+        <p class="ii-h">What the rest of the panel recorded</p>
+        <p class="ii-sub">
+          Shown side by side rather than combined. One person's account never becomes the panel's by itself.
+        </p>
+        {otherAssessments.map((a) => (
+          <div class="ii-row">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;margin-bottom:6px;">
+              <span style="font-size:12px;color:#fff;font-weight:600;">{a.interviewerName}</span>
+              <span class="ii-tag" style="background:#1a1a1f;color:#d8d8de;flex-shrink:0;">{a.recommendationLabel}</span>
+            </div>
+            <p class="ii-note" style="color:#8a8a94;">Alignment: {a.alignmentLabel}</p>
+            <p style="font-size:12px;color:#d8d8de;margin:6px 0 0;line-height:1.6;">{a.supportingEvidence}</p>
+          </div>
+        ))}
+      </div>
+    )}
+
+    <div class="ii-card">
+      <p class="ii-h">The panel's ratings live on the scorecard</p>
+      <p class="ii-sub">
+        This console records observations against requirements. The one-to-five ratings and the panel's
+        derived recommendation are a separate instrument with its own page, and neither is computed from
+        the other.
+      </p>
+      <a href={'/admin/interviews/' + iv.id + '/scorecard'} style="font-size:12px;color:#FF7040;text-decoration:none;">Open the scorecard for this round</a>
+    </div>
+
+  </div>
+</div>
+<script is:inline>
+document.querySelectorAll('[data-ts]').forEach(function (el) {
+  var ts = el.getAttribute('data-ts');
+  if (!ts) return;
+  var d = new Date(ts);
+  if (isNaN(d.getTime())) return;
+  el.textContent = d.toLocaleString(undefined, {
+    weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit',
+  });
+});
+</script>
+</AdminLayout>
