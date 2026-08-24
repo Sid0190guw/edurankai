@@ -499,42 +499,21 @@
 
     if (e.headline) art.appendChild(el('p', 'ci-role-why', e.headline));
 
-    // "Why this opportunity" in full, folded. Every line in it came from a contribution that moved
-    // the ranking — see src/lib/career-intel/explain.ts.
-    if (e.aligned.length || e.needMoreInfo.length || e.couldDevelop.length || e.demotedBecause.length) {
-      var det = el('details', 'ci-why');
-      var sum = el('summary', null, 'Why this opportunity?');
-      det.appendChild(sum);
-      if (e.aligned.length) {
-        det.appendChild(el('p', 'ci-why-h', 'What lines up'));
-        var ul = el('ul', 'ci-list');
-        e.aligned.forEach(function (x) {
-          var li = el('li');
-          li.appendChild(el('span', 'ci-why-signal', x.signal));
-          li.appendChild(document.createTextNode(' — ' + x.matched));
-          ul.appendChild(li);
-        });
-        det.appendChild(ul);
-      }
-      if (e.nothingMatched) det.appendChild(el('p', 'ci-why-none', boot.matchedNothing || 'Nothing you have told us so far lines up with this one. It is here so the list is not narrower than you are.'));
-      if (e.needMoreInfo.length) {
-        det.appendChild(el('p', 'ci-why-h', 'What we could not check'));
-        var ul2 = el('ul', 'ci-list');
-        e.needMoreInfo.forEach(function (x) { ul2.appendChild(el('li', null, x)); });
-        det.appendChild(ul2);
-      }
-      if (e.couldDevelop.length) {
-        det.appendChild(el('p', 'ci-why-h', 'What could strengthen your alignment'));
-        det.appendChild(el('p', 'ci-why-note', e.couldDevelop.join(' · ')));
-        // THE CAVEAT COMES WITH THE DATA. Typing a copy of it here is how the two drift and how a
-        // gap list eventually appears on a screen without the sentence that makes it honest.
-        det.appendChild(el('p', 'ci-why-note ci-why-caveat', e.couldDevelopNote || ''));
-      }
-      if (e.demotedBecause.length) {
-        det.appendChild(el('p', 'ci-why-h', 'Why it is lower down'));
-        e.demotedBecause.forEach(function (x) { det.appendChild(el('p', 'ci-why-note', x)); });
-      }
-      art.appendChild(det);
+    // WHY THIS OPPORTUNITY OPENS A DIALOG, IT DOES NOT UNFOLD IN PLACE.
+    //
+    // It used to be a <details> inside the card. Expanding one produced a card several times taller
+    // than its neighbours in a three-column grid, the reasoning was squeezed into a 300px column,
+    // and the posting's own description was not there at all -- so somebody deciding whether to
+    // apply had to leave for the full posting anyway.
+    //
+    // A dialog gets the full width, carries the description fetched on open, and puts Apply inside
+    // it, so the decision is made in one place. The card stays the height of a card.
+    if (e.aligned.length || e.needMoreInfo.length || e.couldDevelop.length || e.demotedBecause.length || e.nothingMatched) {
+      var why = el('button', 'ci-why-open', 'Why this opportunity?');
+      why.type = 'button';
+      why.setAttribute('aria-haspopup', 'dialog');
+      why.addEventListener('click', function () { openPosting(c, e, tier); });
+      art.appendChild(why);
     }
 
     var actions = el('div', 'ci-role-actions');
@@ -558,6 +537,167 @@
 
     art.appendChild(actions);
     return art;
+  }
+
+  /* ------------------------------------------------------------------ the posting dialog
+   *
+   * ONE PLACE TO DECIDE. The reasons this posting was ranked, the posting's own description, and
+   * the way to apply -- together, at full width, instead of a squeezed column and a trip to another
+   * page.
+   *
+   * <dialog> rather than a div: Escape, the backdrop, focus containment and inertness of the page
+   * behind it are the browser's job and it does them properly. The one thing it does not do is
+   * return focus to where you were, so that is done by hand below.
+   */
+  var dlg = null;
+  var dlgReturnFocus = null;
+
+  function ensureDialog() {
+    if (dlg) return dlg;
+    dlg = document.createElement('dialog');
+    dlg.className = 'ci-dialog';
+    dlg.setAttribute('aria-labelledby', 'ci-dialog-title');
+    dlg.addEventListener('close', function () {
+      if (dlgReturnFocus && dlgReturnFocus.focus) dlgReturnFocus.focus();
+      dlgReturnFocus = null;
+    });
+    // Clicking the backdrop closes it. The dialog element itself fills only part of the box, so a
+    // click landing on the element rather than its contents is a click on the backdrop.
+    dlg.addEventListener('click', function (ev) { if (ev.target === dlg) dlg.close(); });
+    document.body.appendChild(dlg);
+    return dlg;
+  }
+
+  function openPosting(card, explanation, tier) {
+    var d = ensureDialog();
+    dlgReturnFocus = document.activeElement;
+    d.innerHTML = '';
+
+    var head = el('div', 'ci-dialog-head');
+    var h = el('h2', 'ci-dialog-title', card.title);
+    h.id = 'ci-dialog-title';
+    head.appendChild(h);
+    var close = el('button', 'ci-dialog-close', '\u00d7');
+    close.type = 'button';
+    close.setAttribute('aria-label', 'Close');
+    close.addEventListener('click', function () { d.close(); });
+    head.appendChild(close);
+    d.appendChild(head);
+
+    var meta = el('p', 'ci-dialog-meta');
+    meta.textContent = [card.level, card.department, card.engagementType, card.location].filter(Boolean).join(' \u00b7 ');
+    d.appendChild(meta);
+
+    var body = el('div', 'ci-dialog-body');
+
+    // ---- why it is here, first: it is the reason this dialog is not just the job page ----
+    var whyCol = el('section', 'ci-dialog-why');
+    whyCol.appendChild(el('h3', 'ci-dialog-h', 'Why this opportunity'));
+    if (explanation.headline) whyCol.appendChild(el('p', 'ci-role-why', explanation.headline));
+    if (explanation.nothingMatched) {
+      whyCol.appendChild(el('p', 'ci-why-none', boot.matchedNothing || ''));
+    }
+    if (explanation.aligned.length) {
+      whyCol.appendChild(el('p', 'ci-why-h', 'What lines up'));
+      var ul = el('ul', 'ci-list');
+      explanation.aligned.forEach(function (x) {
+        var li = el('li');
+        li.appendChild(el('span', 'ci-why-signal', x.signal));
+        li.appendChild(document.createTextNode(' \u2014 ' + x.matched));
+        ul.appendChild(li);
+      });
+      whyCol.appendChild(ul);
+    }
+    if (explanation.needMoreInfo.length) {
+      whyCol.appendChild(el('p', 'ci-why-h', 'What we could not check'));
+      var ul2 = el('ul', 'ci-list');
+      explanation.needMoreInfo.forEach(function (x) { ul2.appendChild(el('li', null, x)); });
+      whyCol.appendChild(ul2);
+    }
+    if (explanation.couldDevelop.length) {
+      whyCol.appendChild(el('p', 'ci-why-h', 'What could strengthen your alignment'));
+      whyCol.appendChild(el('p', 'ci-why-note', explanation.couldDevelop.join(' \u00b7 ')));
+      whyCol.appendChild(el('p', 'ci-why-note ci-why-caveat', explanation.couldDevelopNote || ''));
+    }
+    if (explanation.demotedBecause.length) {
+      whyCol.appendChild(el('p', 'ci-why-h', 'Why it is lower down'));
+      explanation.demotedBecause.forEach(function (x) { whyCol.appendChild(el('p', 'ci-why-note', x)); });
+    }
+    body.appendChild(whyCol);
+
+    // ---- the posting itself, fetched on open ----
+    var postCol = el('section', 'ci-dialog-post');
+    postCol.appendChild(el('h3', 'ci-dialog-h', 'The posting'));
+    var loading = el('p', 'ci-why-note', 'Loading the description...');
+    postCol.appendChild(loading);
+    body.appendChild(postCol);
+
+    d.appendChild(body);
+
+    var foot = el('div', 'ci-dialog-foot');
+    var full = el('a', 'ci-btn', 'Open the full posting');
+    full.href = card.href;
+    foot.appendChild(full);
+    d.appendChild(foot);
+
+    if (typeof d.showModal === 'function') d.showModal(); else d.setAttribute('open', '');
+    close.focus();
+
+    fetch('/api/careers/posting?slug=' + encodeURIComponent(card.slug))
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        loading.remove();
+        if (!res || !res.ok) {
+          // "could not load" and "no longer listed" are different facts and are told apart.
+          postCol.appendChild(el('p', 'ci-note ci-note-warn',
+            res && res.notFound
+              ? 'This posting is no longer listed.'
+              : 'We could not load the description just now. The full posting still opens below.'));
+          return;
+        }
+        renderPosting(postCol, res.posting, foot, card);
+      })
+      .catch(function () {
+        loading.remove();
+        postCol.appendChild(el('p', 'ci-note ci-note-warn',
+          'We could not load the description just now. The full posting still opens below.'));
+      });
+  }
+
+  function renderPosting(host, p, foot, card) {
+    if (p.about) {
+      var about = el('p', 'ci-dialog-about');
+      about.textContent = p.about;
+      host.appendChild(about);
+    }
+    listBlock(host, 'What you would do', p.responsibilities);
+    listBlock(host, 'What it asks for', p.skills);
+    listBlock(host, 'Eligibility', p.eligibility);
+
+    if (p.workModeSentence) host.appendChild(el('p', 'ci-why-note', p.workModeSentence));
+    if (p.deadline) {
+      host.appendChild(el('p', 'ci-why-note', 'Applications close ' + new Date(p.deadline).toLocaleDateString()));
+    }
+
+    // APPLY GOES IN THE FOOTER, AND ONLY WHEN THE SERVER SAYS IT WILL BE ACCEPTED. `accepting` is
+    // derived from effectiveJobStatus, the same function the submission path calls -- so the button
+    // and the rule cannot disagree. When it is absent the reason is shown instead of nothing.
+    if (p.accepting && p.applyHref) {
+      var apply = el('a', 'ci-btn ci-btn-primary', 'Apply for this role');
+      apply.href = p.applyHref;
+      apply.addEventListener('click', function () { feedback(card.id, 'opened', null, null); });
+      foot.insertBefore(apply, foot.firstChild);
+    } else {
+      foot.insertBefore(el('span', 'ci-dialog-closed', p.statusNote || 'This posting is not accepting applications.'), foot.firstChild);
+    }
+  }
+
+  function listBlock(host, title, items) {
+    if (!items || !items.length) return;
+    host.appendChild(el('p', 'ci-why-h', title));
+    var ul = el('ul', 'ci-list');
+    items.forEach(function (x) { ul.appendChild(el('li', null, x)); });
+    host.appendChild(ul);
   }
 
   /* ---------------------------------------------------------- rendering: what we understand */
