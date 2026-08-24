@@ -98,12 +98,46 @@ function connect(): any {
   // IF THIS IS STILL NOT ENOUGH, the next lever is the pooler's own ceiling (Supabase → Database →
   // Connection pooling), not another guess at this number. Re-measure with the burst above before
   // changing it again: twelve parallel requests to /api/health, and count the 503s.
+  //
+  // A SERVER-SIDE BOUND, BECAUSE withDbTimeout() SHEDS THE WAIT AND NOT THE CONNECTION.
+  //
+  // src/lib/db-timeout.ts says it in its own words: "The losing promise keeps running; only the
+  // WAITING stops." postgres-js does not cancel the statement and does not return the connection to
+  // the pool until the server answers. So the client-side race turns a hung page into a fast 503 --
+  // and leaves one of only TWO connections on this instance reserved for as long as the pooler
+  // ignores it. Two abandoned reads wedge the whole instance for every other request it is serving,
+  // which is the same connection-exhaustion shape this file's history is entirely about.
+  //
+  // statement_timeout makes the SERVER give up and hand the slot back. It is sent in the startup
+  // packet, which the transaction pooler forwards, so it applies to every statement on the
+  // connection without a session-level SET (which transaction pooling would not keep).
+  //
+  // 30 SECONDS, DELIBERATELY GENEROUS, AND NOT A LATENCY BOUND. The latency bound is DB_TIMEOUT_MS
+  // (8s) on the client, which is what makes a page degrade quickly; this is only the backstop that
+  // stops a connection being held forever. Setting it near 8s instead would have killed the client
+  // race -- an error at 8s is an ordinary query failure, which deliberately does NOT open the
+  // circuit breaker, so /admin would go back to paying twelve separate failures instead of one --
+  // and it would kill legitimately long work in the nightly crons, which share this client. Nothing
+  // in a request can usefully run past 30s anyway: the platform gateway ends the invocation first.
+  //
+  // NOT AN ANSWER TO A SLOW QUERY. If something legitimately needs longer than this, the fix is the
+  // query, not this number.
   _client = postgres(connectionString, {
     prepare: false,
     max: 2,
     idle_timeout: 15,
     max_lifetime: 60 * 30,
     connect_timeout: 10,
+    connection: {
+      // A bare number is milliseconds to Postgres, which is what both of these want. postgres-js
+      // types them as numbers and stringifies them into the startup packet itself.
+      statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT_MS) > 0
+        ? Number(process.env.PG_STATEMENT_TIMEOUT_MS) : 30000,
+      // A transaction left open by a crashed handler holds its locks AND its slot. Bounded for the
+      // same reason: this deployment cannot afford either.
+      idle_in_transaction_session_timeout: Number(process.env.PG_IDLE_TXN_TIMEOUT_MS) > 0
+        ? Number(process.env.PG_IDLE_TXN_TIMEOUT_MS) : 15000,
+    },
   });
   _real = drizzle(_client, { schema });
   return _real;
