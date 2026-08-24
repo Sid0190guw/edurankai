@@ -191,6 +191,21 @@ describe('the match predicate renders SQL a database will accept', () => {
     expect(q.sql).toContain('roles.products');
     expect(q.sql).not.toContain('department_id');
   });
+
+  it('an unstaffed venture still renders a RUNNABLE narrowed query, not a reason to give up', () => {
+    // FOUND ON THE LIVE SITE, 2026-08-24. /ecosystem/foundational-models, sancharan, sampark and
+    // sambandh all printed "We could not load our openings just now." Nothing had failed. The tag
+    // columns do not exist on that database, so the tag-only first attempt threw, and the reader
+    // then returned readable:false because those ventures have no department to fall back on.
+    //
+    // They have no department because NOBODY IS HIRING AGAINST THEM — a fact the page has its own
+    // correct sentence for. The narrowed form must therefore stay a legal statement that matches
+    // nothing, so the caller can retry it and get an honest empty answer instead of an error state.
+    for (const slug of ['foundational-models', 'sancharan', 'sampark', 'sambandh']) {
+      const q = render(sql`SELECT 1 FROM roles WHERE ${productMatchClause(slug, false)}`);
+      expect({ slug, sql: q.sql.trim() }).toEqual({ slug, sql: 'SELECT 1 FROM roles WHERE false' });
+    }
+  });
 });
 
 // -------------------------------------------------------------------------------------------------

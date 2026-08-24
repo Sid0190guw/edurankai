@@ -109,7 +109,17 @@ export async function getRolesForProduct(productSlug: string, limit = 6): Promis
     // Two families of column can be absent here: the tag columns (product/products/openings, added
     // by an ensure that is a no-op in production) and job_status (added by the hand-run
     // db/xscale-schema.sql). The retry drops BOTH rather than guessing which, and says degraded.
-    if (!depts.length) return { readable: false, degraded: false, roles: [] };
+    //
+    // THE RETRY RUNS EVEN FOR A VENTURE WITH NO DEPARTMENTS, and that is not a wasted round trip.
+    // It used to return readable:false here, on the reasoning that there was no department half to
+    // fall back to — which put "We could not load our openings just now" on /ecosystem/
+    // foundational-models, sancharan, sampark and sambandh on the live site, because the tag
+    // columns do not exist yet and the tag-only first attempt therefore always throws. Nothing had
+    // failed. Those four ventures simply have no team hiring against them, which is a FACT the page
+    // has a correct sentence for. Trading one false claim for a different false claim is not a fix.
+    //
+    // With an empty list the narrowed query is a valid statement that matches nothing, so it comes
+    // back readable and empty — and `degraded` still says the tag half went unchecked.
     try {
       const r2 = await db.execute(sql`
         SELECT roles.slug, roles.title, roles.level, roles.department_id,
@@ -150,7 +160,6 @@ export async function getRolesForProduct(productSlug: string, limit = 6): Promis
 export async function getProductTeamBreakdown(productSlug: string): Promise<VentureTeams> {
   const empty: VentureTeams = { readable: true, degraded: false, total: 0, teams: [] };
   if (!productSlug) return empty;
-  const depts = departmentsForProduct(productSlug);
 
   const run = async (full: boolean) => {
     const r = await db.execute(sql`
@@ -176,7 +185,9 @@ export async function getProductTeamBreakdown(productSlug: string): Promise<Vent
     return { readable: true, degraded: false, total: out.total, teams: out.teams };
   } catch (e: any) {
     console.error('[role-products] getProductTeamBreakdown', e?.cause?.message || e?.message);
-    if (!depts.length) return { readable: false, degraded: false, total: 0, teams: [] };
+    // Retried even with no departments — see the note in getRolesForProduct. `run(false)` drops the
+    // tag half, and productMatchClause then renders a literal `false`, which is a valid predicate
+    // matching nothing rather than a reason to claim the page could not be loaded.
     try {
       const out = await run(false);
       console.error('[role-products] retried getProductTeamBreakdown narrowed and succeeded');
