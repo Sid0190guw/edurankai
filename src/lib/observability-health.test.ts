@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import {
   errorFingerprint, overallStatus, statusHttpCode, cronIntervalHours, cronRunState,
   relativeAge, deployMarker, releaseTag, publicErrorSummary, CONFIGURED_CRONS, BOOTSTRAP_MODULES,
+  BOOTSTRAP_COLUMNS,
 } from './observability-health';
 
 let pass = 0, fail = 0;
@@ -129,6 +130,23 @@ ok('an empty schedule falls back to daily', cronIntervalHours('') === 24);
 // ---- module catalogue sanity ----
 ok('every bootstrap module names a distinct table', new Set(BOOTSTRAP_MODULES.map((m) => m.table)).size === BOOTSTRAP_MODULES.length);
 ok('the error log itself is monitored', BOOTSTRAP_MODULES.some((m) => m.table === 'edu_error_log'));
+
+// ---- column catalogue: the blind spot the table list cannot see ----
+ok('every monitored column names a distinct table.column',
+  new Set(BOOTSTRAP_COLUMNS.map((c) => c.table + '.' + c.column)).size === BOOTSTRAP_COLUMNS.length);
+ok('every monitored column names the file that creates it',
+  BOOTSTRAP_COLUMNS.every((c) => !!c.owner && !!c.module && !!c.table && !!c.column));
+// The pair that prompted the list. /api/health reports both ALTERs as suppressed DDL, neither is in
+// src/lib/db/schema.ts, and db/application-stages-schema.sql keeps them commented out on purpose —
+// so asking the database is the only way to know, and that is what this entry buys.
+ok('the funnel stage column is monitored',
+  BOOTSTRAP_COLUMNS.some((c) => c.table === 'applications' && c.column === 'stage'));
+ok('the funnel stage timestamp is monitored',
+  BOOTSTRAP_COLUMNS.some((c) => c.table === 'applications' && c.column === 'stage_updated_at'));
+// A column whose parent table is registered would be caught either way; the whole point of this list
+// is columns on tables the table check already reports as PRESENT. applications is one of those.
+ok('the column list covers a table the table list does not monitor at all',
+  BOOTSTRAP_COLUMNS.some((c) => !BOOTSTRAP_MODULES.some((m) => m.table === c.table)));
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);

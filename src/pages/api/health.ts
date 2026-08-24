@@ -10,10 +10,12 @@
 // see an outage if the outage changes the status code. A DEGRADED result (a module table missing,
 // nothing has exercised it yet) stays 200 — it is information, not a page-somebody event.
 //
-// CHEAP ENOUGH TO POLL, AND HOLDS NOTHING OPEN. Exactly two statements (SELECT 1, and one
-// information_schema lookup for every module at once), no DDL, no writes, no transaction, no
-// timer. On the Supabase transaction pooler connections are precious — a health probe that leaked
-// one would become the outage it exists to detect.
+// CHEAP ENOUGH TO POLL, AND HOLDS NOTHING OPEN. Exactly three statements (SELECT 1, one
+// information_schema lookup for every module table at once, and one for every monitored column at
+// once), no DDL, no writes, no transaction, no timer. On the Supabase transaction pooler
+// connections are precious — a health probe that leaked one would become the outage it exists to
+// detect. Both information_schema reads are skipped entirely when the ping failed, so an outage
+// costs one statement, not three.
 //
 // UNAUTHENTICATED BY DESIGN, and therefore deliberately thin: reachability, latency, how many
 // module schemas have run, and the commit that is serving. Anything that discloses configuration —
@@ -97,6 +99,10 @@ export const GET: APIRoute = async () => {
       at: h.at,
       database: { ok: h.database.ok, latencyMs: h.database.latencyMs, ...(publicDbError ? { error: publicDbError } : {}) },
       schemas: { ran: h.schemas.ran, expected: h.schemas.expected, missingCount: h.schemas.missing.length },
+      // COUNT ONLY, for the same reason schemas.missing is a count here: a stranger does not need
+      // the column inventory to learn the deployment is degraded, and `applications.stage` names an
+      // internal table as surely as the table list did. The names are on /api/health/deep.
+      columns: { present: h.columns.present, expected: h.columns.expected, missingCount: h.columns.missing.length },
       // Per-instance, not site-wide: a serverless deployment has many instances and this is whichever
       // one answered. Non-zero `suppressed` means a bootstrap is still trying to run DDL on the
       // request path; the sample list names which statements, in the function logs.

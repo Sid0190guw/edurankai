@@ -490,6 +490,45 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   { module: 'Capability readings', table: 'match_evaluations', owner: 'src/lib/match.ts' },
 ];
 
+/**
+ * COLUMNS A MODULE ADDS TO SOMEBODY ELSE'S TABLE.
+ *
+ * BOOTSTRAP_MODULES checks information_schema.TABLES, and that is a blind spot with a shape: a
+ * module whose bootstrap does `ALTER TABLE <someone else's table> ADD COLUMN` adds nothing this
+ * endpoint can see. The parent table exists, so the check passes, so "all expected tables present"
+ * is printed — while the column the module actually reads and writes is not there.
+ *
+ * db/application-stages-schema.sql says it in one line: "A COLUMN CANNOT BE MONITORED BY
+ * BOOTSTRAP_MODULES ... The file is the only record." This list is the other record.
+ *
+ * NOT EVERY ALTERED COLUMN BELONGS HERE. The repo has hundreds of `ADD COLUMN IF NOT EXISTS`
+ * statements and listing them all would turn a signal into a wall. The bar is the one this endpoint
+ * exists for: a column that (a) a module reads or writes on a path a real person walks, and (b) is
+ * created by nothing except a bootstrap that production suppresses, or by a hand-run file whose
+ * application nobody can otherwise confirm. Add to it when a module adds a column to a table it does
+ * not own.
+ *
+ * PRESENCE HERE IS NOT AN ACCUSATION. Like the tables above, an entry is a question this endpoint
+ * can now answer, not a claim that the column is missing.
+ */
+export const BOOTSTRAP_COLUMNS: { module: string; table: string; column: string; owner: string }[] = [
+  // THE PAIR THAT PROMPTED THIS. /api/health has been reporting both of these ALTERs as suppressed
+  // DDL on every cold instance. They are not in src/lib/db/schema.ts, so drizzle-kit does not make
+  // them either, and db/application-stages-schema.sql keeps them commented out on purpose (the
+  // ACCESS EXCLUSIVE lock on `applications` is what queued every read on 2026-08-23). So the ONLY
+  // way to know whether the funnel's own column exists is to ask — which is this.
+  { module: 'Application stage', table: 'applications', column: 'stage', owner: 'src/lib/application-stages.ts' },
+  { module: 'Application stage timestamp', table: 'applications', column: 'stage_updated_at', owner: 'src/lib/application-stages.ts' },
+
+  // THE PRECEDENT, AND THE REASON THE BAR ABOVE IS WHERE IT IS. hr_clock_events IS in db/hr-schema.sql
+  // — without these seven. They come from db/attendance-clockout-tables.sql, a hand-run file, and a
+  // repo .sql is not an applied .sql. Clock-out reads them; a table that exists while its columns do
+  // not is exactly the fault this list was added to make visible.
+  { module: 'Clock-out QR station', table: 'hr_clock_events', column: 'qr_station_id', owner: 'db/attendance-clockout-tables.sql' },
+  { module: 'Clock-out face check', table: 'hr_clock_events', column: 'face_verified', owner: 'db/attendance-clockout-tables.sql' },
+  { module: 'Clock-out event source', table: 'hr_clock_events', column: 'source', owner: 'db/attendance-clockout-tables.sql' },
+];
+
 // ============================================================================================
 // DATABASE — short statements only. Nothing below holds a connection or runs a timer.
 // ============================================================================================
@@ -853,16 +892,56 @@ export async function bootstrapStatus(): Promise<{ module: string; table: string
 }
 
 /**
- * The pollable check. TWO statements, no DDL, no writes. 503 when the database is unreachable so an
- * external monitor can actually see an outage instead of a cheerful static 200.
+ * The same question for COLUMNS — see BOOTSTRAP_COLUMNS for why tables alone were not enough.
+ *
+ * ONE query for all of them, filtered on table_name only and matched to the pair in JavaScript. A
+ * row-constructor IN list would be the tighter SQL, and this driver is exactly the one that turned
+ * `= ANY(${jsArray})` into a query that threw on every call for weeks while the catch reported its
+ * failure as a finding. Fewer clever bindings is the lesson that incident actually taught.
  */
-export async function quickHealth(): Promise<{ status: Health; httpCode: number; checks: Check[]; database: { ok: boolean; latencyMs: number; error?: string }; schemas: { ran: number; expected: number; missing: string[] }; release: DeployMarker; at: string }> {
+export async function bootstrapColumnStatus(): Promise<{ module: string; table: string; column: string; owner: string; present: boolean }[]> {
+  const tables = Array.from(new Set(BOOTSTRAP_COLUMNS.map((c) => c.table)));
+  if (!tables.length) return [];
+  try {
+    const { db, sql } = await ctx();
+    const placeholders = sql.join(tables.map((t) => sql`${t}`), sql`, `);
+    const r = rows(await db.execute(sql`
+      SELECT table_name, column_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name IN (${placeholders})`));
+    const present = new Set(r.map((x: any) => String(x.table_name) + '.' + String(x.column_name)));
+    return BOOTSTRAP_COLUMNS.map((c) => ({ ...c, present: present.has(c.table + '.' + c.column) }));
+  } catch (e: any) {
+    // Fails closed and says why, for the same reason bootstrapStatus does: an unreadable check must
+    // never report health, and a silent catch is what let a permanently broken query look like a
+    // finding about the database.
+    console.error('[health] bootstrapColumnStatus could not read information_schema:',
+      e?.cause?.message || e?.message || 'unknown error');
+    return BOOTSTRAP_COLUMNS.map((c) => ({ ...c, present: false }));
+  }
+}
+
+/**
+ * The pollable check. THREE statements, no DDL, no writes. 503 when the database is unreachable so
+ * an external monitor can actually see an outage instead of a cheerful static 200.
+ *
+ * The third is the column check. It was two, and "all expected tables present" was printed over a
+ * blind spot: a module that adds a column to a table it does not own was invisible to a check that
+ * only ever asked about tables. Both information_schema reads run only when the ping succeeded, so
+ * an unreachable database still costs exactly one statement.
+ */
+export async function quickHealth(): Promise<{ status: Health; httpCode: number; checks: Check[]; database: { ok: boolean; latencyMs: number; error?: string }; schemas: { ran: number; expected: number; missing: string[] }; columns: { present: number; expected: number; missing: string[] }; release: DeployMarker; at: string }> {
   const ping = await dbPing();
   const boot = ping.ok ? await bootstrapStatus() : BOOTSTRAP_MODULES.map((m) => ({ ...m, present: false }));
+  const cols = ping.ok ? await bootstrapColumnStatus() : BOOTSTRAP_COLUMNS.map((c) => ({ ...c, present: false }));
   const missing = boot.filter((b) => !b.present).map((b) => b.table);
+  const missingCols = cols.filter((c) => !c.present).map((c) => c.table + '.' + c.column);
   const checks: Check[] = [
     { name: 'database', ok: ping.ok, critical: true, detail: ping.ok ? ping.latencyMs + 'ms' : ping.error },
     { name: 'schema-bootstrap', ok: ping.ok && missing.length === 0, detail: missing.length ? missing.length + ' module table(s) not yet created' : 'all expected tables present' },
+    // Separate from schema-bootstrap on purpose. A missing COLUMN on a table that exists is a
+    // different repair from a missing table, and folding them into one line would have this check
+    // report the fault it was added to distinguish as if it were the other one.
+    { name: 'schema-columns', ok: ping.ok && missingCols.length === 0, detail: missingCols.length ? missingCols.length + ' monitored column(s) missing' : 'all monitored columns present' },
   ];
   const status = overallStatus(checks);
   return {
@@ -871,6 +950,7 @@ export async function quickHealth(): Promise<{ status: Health; httpCode: number;
     checks,
     database: ping,
     schemas: { ran: boot.filter((b) => b.present).length, expected: boot.length, missing },
+    columns: { present: cols.filter((c) => c.present).length, expected: cols.length, missing: missingCols },
     release: deployMarker(),
     at: new Date().toISOString(),
   };
@@ -1130,7 +1210,10 @@ export async function deepHealth(): Promise<any> {
   const status = overallStatus(checks);
   return {
     status, httpCode: statusHttpCode(status), checks,
-    database: quick.database, schemas: quick.schemas, release: quick.release,
+    // `columns` carries the NAMES here, unlike /api/health which publishes a count. This endpoint is
+    // gated on the operator capability and exists precisely to disclose what the public one will not
+    // — and a count of missing columns is useless to the person who has to go and run a file.
+    database: quick.database, schemas: quick.schemas, columns: quick.columns, release: quick.release,
     queue, pool, crons, mail, errors,
     at: new Date().toISOString(),
   };
