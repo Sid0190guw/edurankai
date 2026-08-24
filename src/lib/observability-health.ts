@@ -381,6 +381,44 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   { module: 'RBAC role assignments', table: 'user_role_assignments', owner: 'src/lib/auth/registry.ts' },
   { module: 'Permission catalogue', table: 'permission_catalogue', owner: 'src/lib/auth/registry.ts' },
   { module: 'Permission grants', table: 'role_permission_grants', owner: 'src/lib/auth/registry.ts' },
+
+  // CAREER INTELLIGENCE, ADDED WITH THE FEATURE RATHER THAN AFTER THE INCIDENT.
+  //
+  // Both are created by db/career-intel-schema.sql, which is run by hand — the production default
+  // for schema bootstrap is off, so the ensure in src/lib/career-intel/store.ts creates nothing
+  // there. Registering them here on day one is the whole lesson of the five entries above: a table
+  // this endpoint says nothing about is a table whose absence reads as health.
+  //
+  // NEITHER IS LOAD-BEARING FOR THE PUBLIC EXPERIENCE, and that is stated so nobody reading a
+  // "missing" line panics on a careers outage that is not happening. An anonymous visitor's
+  // personalisation lives in their own browser; these two carry an explicit save and explicit
+  // recommendation feedback. Absent, the Save control reports honestly that saving is unavailable
+  // and the governance page reports that it cannot read, rather than showing an empty chart.
+  { module: 'Career profiles', table: 'career_profiles', owner: 'src/lib/career-intel/store.ts' },
+  { module: 'Career recommendation feedback', table: 'career_feedback_events', owner: 'src/lib/career-intel/store.ts' },
+
+  // HIRING DECISION SUPPORT, ADDED 2026-08-24 AFTER A REAL DECISION WAS REFUSED IN PRODUCTION.
+  //
+  // /admin/applications/[id]/decision answered a recorded hire with: relation "hiring_decisions"
+  // does not exist. src/lib/hiring-decision.ts shipped 2026-08-23 — the same day production stopped
+  // running request-path DDL — so ensureHiringDecisionSchema() has never created anything on the
+  // live database, and nothing here said so. The table is a person's accountable decision with
+  // their name and their reason on it; its absence is not a degraded feature, it is a decision that
+  // cannot be recorded at all. db/hiring-decision-schema.sql is the file that creates it.
+  { module: 'Hiring decisions', table: 'hiring_decisions', owner: 'src/lib/hiring-decision.ts' },
+
+  // THE CAPABILITY SPINE THE SAME REPORT READS. Named per FAILURE rather than per module, following
+  // the two-factor precedent above, because each of these is a separately worded panel on that
+  // screen: an unresolved person, unreadable job requirements, and no evidence to compare. All four
+  // are created only by ensureSpineSchema() / ensurePerformanceSchema(); no db/*.sql creates any of
+  // them. They predate the DDL guard, so they are probably present — "probably" is precisely what
+  // this list exists to replace with an answer, and ensureSpineSchema() creates its tables in one
+  // sequence where a single failure skips every CREATE after it.
+  { module: 'Person spine', table: 'hr_persons', owner: 'src/lib/person-spine.ts' },
+  { module: 'Person identity links', table: 'hr_person_identities', owner: 'src/lib/person-spine.ts' },
+  { module: 'Role requirements', table: 'hr_role_requirements', owner: 'src/lib/person-spine.ts' },
+  { module: 'Skill catalogue', table: 'hr_skills', owner: 'src/lib/performance-schema.ts' },
+  { module: 'Evidenced skills', table: 'hr_employee_skills', owner: 'src/lib/performance-schema.ts' },
 ];
 
 // ============================================================================================

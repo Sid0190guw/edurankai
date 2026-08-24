@@ -51,6 +51,22 @@ const MODULES: Array<{ name: string; run: () => Promise<unknown> }> = [
   { name: 'learning-progress', run: async () => (await import('@/lib/learning-progress')).ensureLearningProgressSchema() },
   { name: 'clock-out-checks', run: async () => (await import('@/lib/attendance-verify-clockout')).ensureClockOutSchema() },
   { name: 'lms', run: async () => (await import('@/lib/lms/schema')).ensureLmsSchema() },
+  // HIRING DECISION SUPPORT AND THE CAPABILITY SPINE IT READS, ADDED 2026-08-24.
+  //
+  // WHY: /admin/applications/[id]/decision refused to record a real decision in production with
+  // relation "hiring_decisions" does not exist. That table's only creator is
+  // ensureHiringDecisionSchema(), and src/lib/hiring-decision.ts shipped on 2026-08-23, the same day
+  // production stopped running request-path DDL — so it has never been created on the live database
+  // and this button, the one control an operator has for "create what is missing", could not create
+  // it either.
+  //
+  // ORDER MATTERS HERE, WHICH IS UNUSUAL FOR THIS LIST. hr_role_requirements and hr_skill_relations
+  // both REFERENCE hr_skills, and ensureSpineSchema() runs its CREATEs in one sequence that stops at
+  // the first failure — so the skill catalogue is created first, then the spine, then the decision
+  // table. Run the other way round, the spine's later statements fail and the failure is silent.
+  { name: 'capability-catalogue', run: async () => (await import('@/lib/performance-schema')).ensurePerformanceSchema() },
+  { name: 'person-spine', run: async () => (await import('@/lib/person-spine')).ensureSpineSchema() },
+  { name: 'hiring-decision', run: async () => (await import('@/lib/hiring-decision')).ensureHiringDecisionSchema() },
   // These two have no exported ensure; a harmless READ triggers the same internal bootstrap.
   { name: 'error-log', run: async () => (await import('@/lib/logger')).recentErrors(1) },
   { name: 'job-queue', run: async () => (await import('@/lib/job-queue')).claimBatch(0) },

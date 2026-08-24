@@ -225,6 +225,25 @@ export interface OpportunityFilters {
   skillCategory?: string;
   /** A single skill string, matched against the role's own skills array. */
   skill?: string;
+  /**
+   * ANY-OF over the discipline column, as opposed to `skillCategory`'s single value.
+   *
+   * Added for Career Intelligence (src/lib/career-intel/retrieve.ts), which reads several
+   * disciplines out of one sentence and must fetch a candidate pool for all of them in ONE query.
+   * The alternative — a query per discipline — is four round trips to build one page, and this
+   * project's own measurements say the round-trip COUNT is the lever that matters here.
+   *
+   * Empty or absent means "no constraint". It does NOT mean "match nothing".
+   */
+  skillCategoriesAny?: string[];
+  /**
+   * OR-of-ILIKE over the posting's own words. Same reason as above: a sentence yields several
+   * salient terms and they belong in one predicate, not one query each.
+   *
+   * `q` stays what it is — a single search box term, AND-ed with everything else. `terms` is a
+   * widening: a posting matching ANY of them qualifies.
+   */
+  terms?: string[];
   /** Postings created within this many days. */
   postedWithinDays?: number;
   /** Admin only. Omitted or empty means "the public rule": PUBLISHED and in date. */
@@ -325,6 +344,50 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
     ? new Date(Date.now() - f.postedWithinDays * 86400000).toISOString()
     : null;
 
+  // ANY-OF DISCIPLINES AND ANY-OF TERMS. Both are widenings and both default to "no constraint";
+  // an empty list must never be allowed to become a predicate that nothing can satisfy, which is
+  // the standard way an optional filter turns into a search that silently returns zero.
+  const catsAny = Array.from(new Set((f.skillCategoriesAny || [])
+    .map((s) => String(s || '').trim().toUpperCase())
+    .filter(Boolean)))
+    .slice(0, 8);
+  const hasCatsAny = catsAny.length > 0;
+
+  const anyTerms = Array.from(new Set((f.terms || [])
+    .map((s) => String(s || '').trim())
+    .filter((s) => s.length >= 2)))
+    .slice(0, 6);
+  const hasTerms = anyTerms.length > 0;
+
+  // A FACTORY, LIKE whereClause() BELOW, AND FOR THE SAME REASON. One shared `sql` fragment reused
+  // by the rows statement and the count statement is what produced "bind message supplies 36
+  // parameters, but prepared statement requires 34" — see the long note above whereClause(). These
+  // two build a fresh fragment per statement.
+  const termsFragment = () => (hasTerms
+    ? sql`(${sql.join(anyTerms.map((t) => {
+      const lk = '%' + t + '%';
+      return sql`(r.title ILIKE ${lk} OR r.function ILIKE ${lk} OR r.about ILIKE ${lk}
+                  OR COALESCE(d.name, '') ILIKE ${lk} OR COALESCE(v.name, '') ILIKE ${lk}
+                  OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(
+                       CASE WHEN jsonb_typeof(r.skills) = 'array' THEN r.skills ELSE '[]'::jsonb END
+                     ) AS s WHERE s ILIKE ${lk}))`;
+    }), sql` OR `)})`
+    : sql`TRUE`);
+
+  // `&&` is array overlap. Guarded by hasCatsAny so an empty list is a no-op rather than a
+  // predicate over an empty array, which overlaps with nothing and would return no rows at all.
+  const catsFragment = () => (hasCatsAny
+    ? sql`(COALESCE(r.skill_categories, ARRAY[]::text[]) && ${textArray(catsAny)})`
+    : sql`TRUE`);
+
+  // The same widening, narrowed to columns that exist on every database, for the retry path.
+  const narrowTerms = () => (hasTerms
+    ? sql`(${sql.join(anyTerms.map((t) => {
+      const lk = '%' + t + '%';
+      return sql`(r.title ILIKE ${lk} OR r.function ILIKE ${lk})`;
+    }), sql` OR `)})`
+    : sql`TRUE`);
+
   // The public rule, or the admin one. `includeUnpublished` is set only by an authenticated admin
   // surface; it is never derived from a query parameter on a public page.
   const publicOnly = f.includeUnpublished !== true;
@@ -364,6 +427,8 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
       AND (${f.workMode || null}::text IS NULL OR r.location ILIKE '%' || ${f.workMode || null} || '%')
       AND (${f.classification || null}::text IS NULL OR r.research_classification = ${f.classification || null})
       AND (${f.skillCategory || null}::text IS NULL OR ${f.skillCategory || null} = ANY(COALESCE(r.skill_categories, ARRAY[]::text[])))
+      AND ${catsFragment()}
+      AND ${termsFragment()}
       AND (${postedSince}::timestamptz IS NULL OR r.created_at >= ${postedSince}::timestamptz)
       AND (${bandLo}::int IS NULL OR (
             r.scale_min_exp IS NOT NULL AND r.scale_max_exp IS NOT NULL
@@ -444,6 +509,10 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
            AND (${f.level || null}::text IS NULL OR r.level::text = ${f.level || null})
       AND (${f.careerLevel ?? null}::int IS NULL OR r.career_level = ${f.careerLevel ?? null}::int)
            AND (${term === ''} OR r.title ILIKE ${like} OR r.function ILIKE ${like})
+           -- 'terms' survives the narrowing, on the two columns certain to exist on any database.
+           -- The discipline overlap does NOT, which is precisely why 'degraded' stays true below:
+           -- this result was produced without it and must not be presented as though it had it.
+           AND ${narrowTerms()}
          ORDER BY r.is_featured DESC, r.sort_order ASC, r.title ASC
          LIMIT ${limit} OFFSET ${offset}`);
       const list = rowsOf(fallback).map(mapOpportunity);

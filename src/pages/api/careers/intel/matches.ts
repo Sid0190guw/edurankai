@@ -1,0 +1,151 @@
+// POST /api/careers/intel/matches — RETRIEVE, RANK, EXPLAIN.
+//
+// =================================================================================================
+// THE PIPELINE, IN THE ORDER IT ACTUALLY RUNS
+// =================================================================================================
+//
+//   profile  ->  compileQuery()   the person's signals become SQL predicates
+//            ->  listOpportunities()   the DATABASE decides which rows, and counts them
+//            ->  rankAll()        the fetched page is ordered, with contributions recorded
+//            ->  explain()        the contributions become sentences
+//
+// Each step is somewhere else and each is testable on its own. The two that matter most are the
+// ones that are NOT here:
+//
+//   ELIGIBILITY is decided inside listOpportunities from the posting's own status and deadline,
+//   before anything about a person is consulted. Nothing in a profile can make a posting
+//   unreachable. Career stage and stated avoidances are RANKING inputs, not filters.
+//
+//   NO SCORE IS RETURNED. Each match carries a tier with a written meaning and the list of
+//   contributions that put it there. There is no percentage anywhere in this response, because
+//   there is no percentage anywhere in the model.
+//
+// PAGED, LIKE EVERYTHING ELSE. `offset` walks the same predicate; `total` is the SQL count over it.
+// A person can page through every posting that matched, and the number at the top is the number.
+
+import type { APIRoute } from 'astro';
+import { json, toMatchCard } from '@/lib/career-intel/wire';
+import { parseProfile } from '@/lib/career-intel/profile';
+import { retrieveForProfile } from '@/lib/career-intel/retrieve';
+import { rankAll, TIERS, type MatchableRole } from '@/lib/career-intel/rank';
+import { NOT_PERSONALISED } from '@/lib/career-intel/explain';
+import { profileReadiness } from '@/lib/career-intel/dimensions';
+import { shouldOfferResume } from '@/lib/career-intel/questions';
+import { domainLabel } from '@/lib/career-intel/ontology';
+import type { OpportunityRow } from '@/lib/xscale/roles-ext';
+
+export const prerender = false;
+
+const PAGE = 12;
+const MAX_PAGE = 24;
+
+/** The listing row, in the shape the ranker asks for. No new data — a projection. */
+function matchable(r: OpportunityRow): MatchableRole {
+  return {
+    id: r.id,
+    slug: r.slug,
+    title: r.title,
+    level: r.level,
+    functionText: r.functionText,
+    engagementType: r.engagementType,
+    departmentName: r.departmentName,
+    divisionName: r.divisionName,
+    researchClassification: r.researchClassification,
+    skills: r.skills,
+    skillCategories: r.skillCategories,
+    careerLevel: r.careerLevel,
+  };
+}
+
+export const POST: APIRoute = async ({ request }) => {
+  let body: any;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: 'Could not read that request.' }, 400);
+  }
+
+  const profile = parseProfile(body?.profile);
+  const limitRaw = Number(body?.limit);
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(MAX_PAGE, Math.floor(limitRaw)) : PAGE;
+  const offsetRaw = Number(body?.offset);
+  const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? Math.floor(offsetRaw) : 0;
+
+  // The person's own explicit choices — a search box, a department they clicked — are the only
+  // things allowed to REMOVE postings from the result. They travel separately from the profile so
+  // that distinction is visible at the call site rather than buried in the compiler.
+  const explicit = {
+    q: typeof body?.q === 'string' ? body.q.trim().slice(0, 120) : undefined,
+    departmentId: typeof body?.dept === 'string' ? body.dept.slice(0, 60) : undefined,
+    level: typeof body?.level === 'string' ? body.level.slice(0, 30) : undefined,
+    engagementType: typeof body?.type === 'string' ? body.type.slice(0, 30) : undefined,
+  };
+
+  const pool = await retrieveForProfile(profile, { limit, offset, explicit });
+
+  if (!pool.readable) {
+    // NOT an empty list. The careers page renders this as "we could not read the catalogue just
+    // now", with the plain search still available — never as "nothing matches you".
+    return json({
+      ok: false,
+      readable: false,
+      error: 'The catalogue could not be read just now.',
+      total: 0,
+      groups: [],
+    }, 503);
+  }
+
+  const byId = new Map(pool.rows.map((r) => [r.id, r]));
+  const ranked = rankAll(profile, pool.rows.map(matchable));
+  const personalised = !pool.compiled.unpersonalised && profileReadiness(profile) > 0;
+
+  const cards = ranked
+    .map((m) => {
+      const row = byId.get(m.role.id);
+      return row ? toMatchCard(m, row) : null;
+    })
+    .filter(Boolean) as ReturnType<typeof toMatchCard>[];
+
+  // Grouped by tier, in the tiers' own order, and empty groups are dropped rather than rendered as
+  // a heading with nothing under it.
+  const groups = TIERS
+    .map((t) => ({
+      tier: t.key,
+      label: t.label,
+      meaning: t.meaning,
+      matches: cards.filter((c) => c.tier === t.key),
+    }))
+    .filter((g) => g.matches.length > 0);
+
+  const nextOffset = offset + pool.rows.length;
+
+  return json({
+    ok: true,
+    readable: true,
+    // The extended columns were unavailable, so the discipline predicates did not run and this
+    // result is wider than what was asked for. The surface says so; it does not pass it off.
+    degraded: pool.degraded,
+    // The personalised query matched nothing and the catalogue was read instead.
+    widened: pool.widened,
+    personalised,
+    // Rendered above the results when nothing personalised them, so a list of the newest openings
+    // is never presented as a list chosen for somebody.
+    notPersonalisedNote: personalised ? null : NOT_PERSONALISED,
+    // What we actually looked in, in words. The search is not a black box.
+    lookedIn: {
+      disciplines: pool.compiled.disciplines.map(domainLabel),
+      terms: pool.compiled.terms,
+      explicit: Object.fromEntries(Object.entries(explicit).filter(([, v]) => !!v)),
+    },
+    total: pool.total,
+    catalogueTotal: pool.catalogueTotal,
+    offset,
+    limit,
+    count: cards.length,
+    hasMore: nextOffset < pool.total,
+    nextOffset: nextOffset < pool.total ? nextOffset : null,
+    readiness: profileReadiness(profile),
+    offerResume: shouldOfferResume(profile),
+    groups,
+  }, 200, 'no-store');
+};

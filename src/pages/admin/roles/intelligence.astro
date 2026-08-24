@@ -1,0 +1,377 @@
+---
+// /admin/roles/intelligence — WHAT CAREER INTELLIGENCE IS DOING, AND WHETHER IT IS DOING IT.
+//
+// =================================================================================================
+// THIS IS A GOVERNANCE SURFACE, NOT A DASHBOARD
+// =================================================================================================
+//
+// A system that reads what candidates say about themselves and orders opportunities for them needs a
+// place where somebody accountable can see what it is doing. Four questions, answered on one page:
+//
+//   1. Is it installed? db/career-intel-schema.sql is run by hand — production runs no DDL — so
+//      "the Save control says it cannot save" has one likely cause and this page names it rather
+//      than leaving somebody to guess.
+//   2. What is it ranking on? The dimension vocabulary, split into what may reach matching and what
+//      may not, read from the code rather than restated here.
+//   3. Is the ranking any good? Explicit feedback, and specifically dismissals out of the TOP tier,
+//      which is the signal that says the ranking is confidently wrong.
+//   4. What is it NOT allowed to do? Written down, on the screen, next to the rest.
+//
+// GATE: the same `roles` section as the rest of the catalogue console. Deliberately NOT a new
+// section key — a new key appears as a checkbox in /admin/team/roles that nothing enforces, and
+// would hide this page from every restricted admin on the day it shipped. Same reasoning as
+// /admin/roles/divisions, and the middleware already maps /admin/roles to that section.
+//
+// EVERY const IS DECLARED BEFORE ANYTHING READS IT. `const` is not hoisted, and a handler above its
+// dependencies throws on its first line while the page reports success.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { feedbackSummary, savedProfileCount, FEEDBACK_REASON_LABELS } from '@/lib/career-intel/store';
+import { DIMENSIONS, RELEVANCE_GROUPS, EXPLORATION_ONLY_GROUPS, MODEL_VERSION } from '@/lib/career-intel/dimensions';
+import { QUESTIONS } from '@/lib/career-intel/questions';
+import { TIERS } from '@/lib/career-intel/rank';
+import { INTEREST_DOMAINS } from '@/lib/career-intel/ontology';
+import { openPostingCount } from '@/lib/career-intel/retrieve';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+const canView = can(user as any, 'roles.view') || can(user as any, 'roles.edit');
+if (!canView) return Astro.redirect('/admin?denied=roles');
+
+const url = new URL(Astro.request.url);
+const daysRaw = Number(url.searchParams.get('days') || '30');
+const days = Number.isFinite(daysRaw) && daysRaw > 0 ? Math.min(365, Math.floor(daysRaw)) : 30;
+
+const summary = await feedbackSummary(days);
+const savedCount = await savedProfileCount();
+const openCount = await openPostingCount();
+
+// readable:false means THE READ FAILED. It is rendered as "could not read", never as "no feedback",
+// which is the confident-empty-state failure this project keeps relearning.
+const feedbackReadable = summary.readable;
+const profilesReadable = savedCount !== null;
+const installed = feedbackReadable && profilesReadable;
+const countKnown = openCount >= 0;
+
+// Every comparison in the frontmatter — a `<` inside a JSX expression breaks .astro parsing here.
+const relevanceDims = DIMENSIONS.filter((d) => RELEVANCE_GROUPS.includes(d.group));
+const explorationDims = DIMENSIONS.filter((d) => EXPLORATION_ONLY_GROUPS.includes(d.group));
+const coreQuestions = QUESTIONS.filter((q) => !q.optional);
+const optionalQuestions = QUESTIONS.filter((q) => q.optional);
+const filterableDomains = INTEREST_DOMAINS.filter((d) => !!d.skillCategory);
+const textDomains = INTEREST_DOMAINS.filter((d) => !d.skillCategory);
+
+const totalReactions = summary.totals.reduce((n, t) => n + t.n, 0);
+const hasReactions = totalReactions > 0;
+
+// THE NUMBER THAT MATTERS MOST ON THIS PAGE. A dismissal out of "Strong alignment" is the ranking
+// being confidently wrong, which is worse than being unhelpfully vague — and it is invisible in a
+// total. Pulled out on its own.
+const strongDismissals = summary.byTier
+  .filter((r) => r.tier === 'strong' && (r.event === 'dismissed' || r.event === 'not_interested'))
+  .reduce((n, r) => n + r.n, 0);
+const strongOpens = summary.byTier
+  .filter((r) => r.tier === 'strong' && r.event === 'opened')
+  .reduce((n, r) => n + r.n, 0);
+const strongTotal = strongDismissals + strongOpens;
+const strongRatio = strongTotal > 0 ? Math.round((strongDismissals / strongTotal) * 100) : null;
+const strongRatioKnown = strongRatio !== null;
+const strongRatioBad = strongRatioKnown && strongRatio > 50;
+
+const EVENT_LABELS: Record<string, string> = {
+  opened: 'Opened the posting',
+  saved: 'Saved',
+  dismissed: 'Dismissed',
+  not_interested: 'Marked not for me',
+  helpful: 'Explanation helped',
+  not_helpful: 'Explanation did not help',
+};
+---
+
+<AdminLayout title="Career Intelligence" activeNav="role-intelligence">
+  <div class="ci-admin">
+
+    <header class="ci-admin-head">
+      <div>
+        <p class="ci-admin-eyebrow">Careers</p>
+        <h1>Career Intelligence</h1>
+        <p class="ci-admin-sub">
+          What the guided careers experience is ranking on, what it is not allowed to touch, and
+          whether candidates agree with it. Model version <code>{MODEL_VERSION}</code>.
+        </p>
+      </div>
+      <a class="ci-admin-link" href="/careers">Open the candidate view</a>
+    </header>
+
+    <!-- ============================ INSTALLATION ============================ -->
+    <section class="ci-admin-card">
+      <h2>Installation</h2>
+      {installed ? (
+        <p class="ci-admin-ok">
+          Both tables are readable. Saved personalisations: <strong>{savedCount}</strong>.
+        </p>
+      ) : (
+        <div class="ci-admin-warn">
+          <p><strong>db/career-intel-schema.sql has not been applied to this database.</strong></p>
+          <ul>
+            {!profilesReadable && <li><code>career_profiles</code> could not be read &mdash; the Save control on the careers page will honestly report that saving is unavailable.</li>}
+            {!feedbackReadable && <li><code>career_feedback_events</code> could not be read &mdash; recommendation feedback is not being recorded.</li>}
+          </ul>
+          <p class="ci-admin-note">
+            Neither table is load-bearing for candidates. The careers page, the conversation, the
+            ranking and every explanation work with both absent &mdash; an anonymous visitor's
+            personalisation lives in their own browser and is never written here. What is lost is the
+            explicit save and the feedback signal.
+          </p>
+          <p class="ci-admin-note">
+            To fix: run <code>db/career-intel-schema.sql</code> against production yourself.
+            Production runs no DDL, so nothing in the application will create these.
+            A SQL-editor paste runs the whole file as one transaction; <code>psql -f</code> commits
+            statement by statement. Either is fine here &mdash; the file is idempotent.
+          </p>
+        </div>
+      )}
+      <p class="ci-admin-note">
+        Catalogue: {countKnown ? <span><strong>{openCount}</strong> positions currently open and published.</span> : <span>the open count could not be read just now.</span>}
+      </p>
+    </section>
+
+    <!-- ============================ THE BOUNDARY ============================ -->
+    <section class="ci-admin-card">
+      <h2>What may rank, and what may not</h2>
+      <p class="ci-admin-note">
+        Read from <code>src/lib/career-intel/dimensions.ts</code>, not restated here. The split is
+        enforced by <code>relevanceDimensions()</code>, which is the only way the ranker can read a
+        dimension at all, and asserted in <code>separation.test.ts</code>.
+      </p>
+
+      <div class="ci-admin-split">
+        <div>
+          <h3>May order recommendations</h3>
+          <p class="ci-admin-note">Stated preferences about the work itself. Quoted back as the reason a posting is where it is.</p>
+          <ul class="ci-admin-dims">
+            {relevanceDims.map((d) => (
+              <li><code>{d.key}</code> <span class="ci-admin-group">{d.group}</span><br /><span class="ci-admin-affirm">{d.affirm}</span></li>
+            ))}
+          </ul>
+        </div>
+        <div>
+          <h3>Never reaches matching</h3>
+          <p class="ci-admin-note">
+            Energy rhythm and self-reported working tendencies. Collected for the candidate's own
+            picture, shown to them, and read by nothing that decides an order. Non-diagnostic: this
+            is not a psychological assessment and is not presented as one.
+          </p>
+          <ul class="ci-admin-dims">
+            {explorationDims.map((d) => (
+              <li><code>{d.key}</code> <span class="ci-admin-group">{d.group}</span><br /><span class="ci-admin-affirm">{d.affirm}</span></li>
+            ))}
+          </ul>
+          <p class="ci-admin-note">
+            The optional astrology reflection is not in this list because it is not a dimension at
+            all. It lives in <code>src/lib/career-intel/reflection.ts</code>, which neither the ranker
+            nor retrieval imports; the test suite fails if that import ever appears.
+          </p>
+        </div>
+      </div>
+
+      <div class="ci-admin-rule">
+        <h3>And none of it decides eligibility</h3>
+        <p>
+          Whether a posting may be shown at all is decided in <code>listOpportunities()</code> from
+          the posting's own status and deadline, before anything about a person is consulted. Career
+          stage and a stated dislike are ranking weights: they move a posting down a list the
+          candidate can still scroll. Nothing about a candidate removes a posting from the catalogue.
+        </p>
+        <p>
+          Ranking is retrieval. It is not a screen, not a score and not a decision.
+          <code>src/lib/ai-boundary.ts</code> holds the line for the six decisions that belong to a
+          named human being, and nothing here is permitted to become one of them.
+        </p>
+      </div>
+    </section>
+
+    <!-- ============================ FEEDBACK ============================ -->
+    <section class="ci-admin-card">
+      <div class="ci-admin-card-head">
+        <h2>Is the ranking any good?</h2>
+        <nav class="ci-admin-days">
+          <a href="?days=7" class={days === 7 ? 'is-on' : ''}>7 days</a>
+          <a href="?days=30" class={days === 30 ? 'is-on' : ''}>30 days</a>
+          <a href="?days=90" class={days === 90 ? 'is-on' : ''}>90 days</a>
+        </nav>
+      </div>
+
+      {!feedbackReadable ? (
+        <p class="ci-admin-warn-line">
+          Feedback could not be read. This is a failed query, not an absence of feedback.
+        </p>
+      ) : !hasReactions ? (
+        <p class="ci-admin-note">
+          No explicit reactions recorded in the last {days} days. Only deliberate acts are
+          recorded &mdash; opening, saving, dismissing, and whether an explanation helped. There is
+          no passive view tracking here by design.
+        </p>
+      ) : (
+        <div>
+          <div class="ci-admin-stat-row">
+            <div class="ci-admin-stat">
+              <span class="ci-admin-stat-n">{totalReactions}</span>
+              <span class="ci-admin-stat-l">reactions in {days} days</span>
+            </div>
+            <div class={strongRatioBad ? 'ci-admin-stat is-bad' : 'ci-admin-stat'}>
+              <span class="ci-admin-stat-n">{strongRatioKnown ? strongRatio + '%' : 'n/a'}</span>
+              <span class="ci-admin-stat-l">of top-tier results dismissed</span>
+            </div>
+            <div class="ci-admin-stat">
+              <span class="ci-admin-stat-n">{strongDismissals}</span>
+              <span class="ci-admin-stat-l">dismissals out of Strong alignment</span>
+            </div>
+          </div>
+
+          {strongRatioBad && (
+            <p class="ci-admin-warn-line">
+              More than half of everything placed in the top tier was dismissed. That is the ranking
+              being confidently wrong, which is worse than being vague &mdash; look at the postings
+              below before changing any weights.
+            </p>
+          )}
+
+          <h3>By reaction</h3>
+          <table class="ci-admin-table">
+            <thead><tr><th>Reaction</th><th>Count</th></tr></thead>
+            <tbody>
+              {summary.totals.map((t) => (
+                <tr><td>{EVENT_LABELS[t.event] || t.event}</td><td>{t.n}</td></tr>
+              ))}
+            </tbody>
+          </table>
+
+          {summary.reasons.length > 0 && (
+            <div>
+              <h3>Why candidates dismissed</h3>
+              <p class="ci-admin-note">A fixed vocabulary, never free text &mdash; a dismissal box is not a place for somebody to type something personal about themselves.</p>
+              <table class="ci-admin-table">
+                <thead><tr><th>Reason</th><th>Count</th></tr></thead>
+                <tbody>
+                  {summary.reasons.map((r) => (
+                    <tr><td>{(FEEDBACK_REASON_LABELS as any)[r.reason] || r.reason}</td><td>{r.n}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {summary.dismissed.length > 0 && (
+            <div>
+              <h3>Most dismissed postings</h3>
+              <p class="ci-admin-note">
+                A posting near the top of this list is usually a ranking problem, not a role problem:
+                it is being recommended to people it does not suit. Check its discipline tags and its
+                career rung before assuming the posting itself is at fault.
+              </p>
+              <table class="ci-admin-table">
+                <thead><tr><th>Posting</th><th>Dismissals</th></tr></thead>
+                <tbody>
+                  {summary.dismissed.map((d) => (
+                    <tr><td>{d.title}</td><td>{d.n}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+
+    <!-- ============================ THE MODEL ============================ -->
+    <section class="ci-admin-card">
+      <h2>What it asks, and what it looks in</h2>
+
+      <h3>Result groups</h3>
+      <p class="ci-admin-note">
+        Four groups with written meanings, not a percentage. There is no numeric match score anywhere
+        in the model, so there is none to leak onto a screen.
+      </p>
+      <table class="ci-admin-table">
+        <thead><tr><th>Group</th><th>What it means to a candidate</th></tr></thead>
+        <tbody>
+          {TIERS.map((t) => (<tr><td>{t.label}</td><td>{t.meaning}</td></tr>))}
+        </tbody>
+      </table>
+
+      <h3>Questions</h3>
+      <p class="ci-admin-note">
+        {coreQuestions.length} questions that improve what can be shown, and {optionalQuestions.length}
+        offered afterwards for the candidate's own picture. None is a fixed sequence: each carries a
+        value function that falls to zero once the thing it would resolve is known, which is how the
+        engine stops. Every one takes an option, several options, or free text.
+      </p>
+      <table class="ci-admin-table">
+        <thead><tr><th>Question</th><th>Why it is asked</th><th>Kind</th></tr></thead>
+        <tbody>
+          {QUESTIONS.map((q) => (
+            <tr>
+              <td>{q.prompt}</td>
+              <td class="ci-admin-note-cell">{q.whyAsked}</td>
+              <td>{q.optional ? 'Optional' : 'Core'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <h3>Domain vocabulary</h3>
+      <p class="ci-admin-note">
+        {filterableDomains.length} research disciplines, generated from
+        <code>src/lib/xscale/taxonomy.ts</code> so there is one list rather than two that drift, each
+        mapping to a real filterable column on the postings table.
+        {textDomains.length} spoken pathways that have no column and become text predicates instead.
+      </p>
+      <p class="ci-admin-note">
+        A candidate's sentence becomes at most six discipline predicates or six text terms in ONE
+        query, never one query per signal.
+      </p>
+    </section>
+
+  </div>
+
+  <style>
+    .ci-admin { display:flex; flex-direction:column; gap:1rem; max-width:1100px; }
+    .ci-admin-head { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; flex-wrap:wrap; }
+    .ci-admin-eyebrow { font-size:0.68rem; font-weight:700; letter-spacing:0.1em; text-transform:uppercase; color:#8a8078; margin:0 0 0.2rem; }
+    .ci-admin h1 { font-size:1.5rem; font-weight:650; margin:0 0 0.3rem; }
+    .ci-admin-sub { font-size:0.85rem; color:#7A6F68; margin:0; max-width:60ch; line-height:1.6; }
+    .ci-admin-link { font-size:0.8rem; font-weight:600; text-decoration:none; padding:0.5rem 0.85rem; border:1px solid rgba(14,11,8,0.15); border-radius:10px; color:inherit; }
+    .ci-admin-card { background:#fff; border:1px solid rgba(14,11,8,0.10); border-radius:14px; padding:1.1rem 1.15rem; }
+    .ci-admin-card-head { display:flex; align-items:baseline; justify-content:space-between; gap:1rem; flex-wrap:wrap; }
+    .ci-admin-card h2 { font-size:1.05rem; font-weight:650; margin:0 0 0.5rem; }
+    .ci-admin-card h3 { font-size:0.86rem; font-weight:700; margin:1.1rem 0 0.35rem; text-transform:uppercase; letter-spacing:0.06em; color:#8a8078; }
+    .ci-admin-note { font-size:0.81rem; color:#7A6F68; line-height:1.6; margin:0 0 0.5rem; max-width:80ch; }
+    .ci-admin-note-cell { font-size:0.78rem; color:#7A6F68; }
+    .ci-admin-ok { font-size:0.86rem; color:#15803d; margin:0 0 0.4rem; }
+    .ci-admin-warn { background:#FFF3EE; border:1px solid #FFD4BC; border-radius:10px; padding:0.8rem 0.9rem; font-size:0.84rem; color:#2E2520; line-height:1.6; }
+    .ci-admin-warn ul { margin:0.4rem 0 0.6rem 1.1rem; }
+    .ci-admin-warn-line { font-size:0.84rem; color:#9a3412; background:#FFF3EE; border:1px solid #FFD4BC; border-radius:10px; padding:0.6rem 0.8rem; margin:0.4rem 0; line-height:1.6; }
+    .ci-admin-split { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr)); gap:1.2rem; }
+    .ci-admin-dims { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:0.4rem; }
+    .ci-admin-dims li { font-size:0.8rem; line-height:1.5; border-bottom:1px solid rgba(14,11,8,0.06); padding-bottom:0.35rem; }
+    .ci-admin-dims code { font-size:0.75rem; background:#F3EFE8; padding:0.05rem 0.35rem; border-radius:5px; }
+    .ci-admin-group { font-size:0.65rem; text-transform:uppercase; letter-spacing:0.07em; color:#8a8078; }
+    .ci-admin-affirm { color:#7A6F68; }
+    .ci-admin-rule { margin-top:1rem; border-left:4px solid #1045BB; background:#EBF0FF; border-radius:0 10px 10px 0; padding:0.75rem 0.9rem; }
+    .ci-admin-rule h3 { margin-top:0; color:#1045BB; }
+    .ci-admin-rule p { font-size:0.83rem; line-height:1.65; color:#2E2520; margin:0 0 0.5rem; max-width:80ch; }
+    .ci-admin-days { display:flex; gap:0.35rem; }
+    .ci-admin-days a { font-size:0.76rem; padding:0.3rem 0.6rem; border-radius:8px; border:1px solid rgba(14,11,8,0.12); text-decoration:none; color:#7A6F68; }
+    .ci-admin-days a.is-on { background:#FF4F00; border-color:#FF4F00; color:#fff; font-weight:600; }
+    .ci-admin-stat-row { display:flex; flex-wrap:wrap; gap:0.6rem; margin-bottom:0.7rem; }
+    .ci-admin-stat { flex:1 1 160px; background:#F3EFE8; border-radius:11px; padding:0.7rem 0.85rem; display:flex; flex-direction:column; gap:0.15rem; }
+    .ci-admin-stat.is-bad { background:#FFF3EE; border:1px solid #FFD4BC; }
+    .ci-admin-stat-n { font-size:1.35rem; font-weight:700; color:#0E0B08; }
+    .ci-admin-stat-l { font-size:0.72rem; color:#7A6F68; line-height:1.4; }
+    .ci-admin-table { width:100%; border-collapse:collapse; font-size:0.82rem; margin:0 0 0.6rem; display:block; overflow-x:auto; }
+    .ci-admin-table th { text-align:left; font-size:0.68rem; text-transform:uppercase; letter-spacing:0.07em; color:#8a8078; padding:0.35rem 0.5rem; border-bottom:1px solid rgba(14,11,8,0.12); }
+    .ci-admin-table td { padding:0.4rem 0.5rem; border-bottom:1px solid rgba(14,11,8,0.06); vertical-align:top; }
+    .ci-admin code { font-family:ui-monospace,monospace; font-size:0.76rem; }
+  </style>
+</AdminLayout>

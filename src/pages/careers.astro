@@ -1,631 +1,582 @@
-﻿---
-import BaseLayout from '@/layouts/BaseLayout.astro';
-import { db } from '@/lib/db';
-import { roles, departments } from '@/lib/db/schema';
-import { eq, asc, desc, and, or, ilike, sql } from 'drizzle-orm';
-import { ensureRoleProductColumn } from '@/lib/role-products';
-import { ensureRoleAicteColumns } from '@/lib/role-aicte';
-import { displayLocation } from '@/lib/work-mode';
-
-const url = new URL(Astro.request.url);
-const q = url.searchParams.get('q') || '';
-const deptFilter = url.searchParams.get('dept') || '';
-const levelFilter = url.searchParams.get('level') || '';
-const productFilter = url.searchParams.get('product') || '';
-// Edge-caching for anonymous visitors is handled centrally in middleware (isPublicCacheable).
-
-// `product` is a runtime column (not in the Drizzle schema) — ensure it exists
-// so the raw filter below is safe even on a fresh DB.
-await ensureRoleProductColumn().catch(() => {});
-// `keywords` is also a runtime column (src/lib/role-aicte.ts) and is searched below.
-await ensureRoleAicteColumns().catch(() => {});
-
-// Departments are loaded FIRST, because the search below needs them. They used to be fetched after
-// the roles query, which forced "match a department by name" to be written as a correlated subquery
-// evaluated once per row of `roles`. There are a few dozen departments; matching them in memory is
-// free and removes a per-row scan from the hottest query on this page.
-let allDepts: any[] = [];
-try { allDepts = await db.select().from(departments).orderBy(asc(departments.sortOrder)); }
-catch (e: any) { console.error('[careers] departments query failed:', e?.cause?.message || e?.message); Astro.response.headers.set('x-era-degraded', '1'); }
-
-// Department ids whose NAME matches the search term, resolved once.
-const qLower = q.trim().toLowerCase();
-const matchedDeptIds: string[] = qLower
-  ? allDepts.filter((d) => String(d.name || '').toLowerCase().includes(qLower)).map((d) => String(d.id))
-  : [];
-
-// Search predicate, built as a factory so the query below can retry with a narrower version.
-// A search that silently returns nothing for EVERY term is far worse than one matching fewer
-// fields, and that is exactly what happened once before (see the jsonb_typeof note below).
-const searchClause = (includeKeywords: boolean) => {
-  const like = '%' + q + '%';
-  const parts = [
-    sql`${roles.title} ILIKE ${like}`,
-    sql`${roles.function} ILIKE ${like}`,
-    // The long-form description: many terms appear only here.
-    sql`${roles.about} ILIKE ${like}`,
-    // roles.skills is a JSONB string array — jsonb_array_elements_text unpacks it so each tag is
-    // matched independently, not just as a substring of the whole array. GUARDED with
-    // jsonb_typeof: jsonb_array_elements_text throws a hard Postgres error on any row whose
-    // skills column isn't actually a JSON array (NULL, a stray object, legacy data) — and since
-    // this runs per-row across the whole table, ONE bad row silently killed EVERY search,
-    // surfacing as "0 results" even for terms that obviously match (e.g. "Engineer"). The CASE
-    // falls back to an empty array for any non-array value instead of erroring the whole query.
-    sql`EXISTS (
-      SELECT 1 FROM jsonb_array_elements_text(
-        CASE WHEN jsonb_typeof(${roles.skills}) = 'array' THEN ${roles.skills} ELSE '[]'::jsonb END
-      ) AS skill WHERE skill ILIKE ${like}
-    )`,
-  ];
-  // Let people search by department name ("Cybersecurity", "FinTech") and not just role text.
-  // Resolved above from allDepts rather than as EXISTS (SELECT ... FROM departments WHERE d.id =
-  // roles.department_id AND d.name ILIKE ...), which Postgres had to evaluate for every candidate
-  // row. Same results, no subquery. When nothing matches by name the term is simply not added,
-  // rather than adding a predicate that can never be true.
-  if (matchedDeptIds.length) {
-    parts.push(sql`${roles.departmentId} IN (${sql.join(matchedDeptIds.map((id) => sql`${id}`), sql`, `)})`);
-  }
-  if (includeKeywords) {
-    // Every catalogue role carries keyword tags ("GovTech", "LegalTech", "Space Systems") that
-    // appear in NO other column, so without this those searches return nothing at all.
-    parts.push(sql`EXISTS (SELECT 1 FROM unnest(COALESCE(keywords, '{}'::text[])) AS kw WHERE kw ILIKE ${like})`);
-  }
-  return sql`(${sql.join(parts, sql` OR `)})`;
-};
-
-const conditions = [eq(roles.isOpen, true)];
-if (deptFilter) conditions.push(eq(roles.departmentId, deptFilter));
-if (levelFilter) conditions.push(eq(roles.level, levelFilter as any));
-if (productFilter) conditions.push(sql`(${productFilter} = ANY(products) OR product = ${productFilter})`);
-
-// Resolve the product name for the "showing roles for X" banner.
-let productName = '';
-if (productFilter) {
-  try {
-    const pr = await db.execute(sql`SELECT name FROM products WHERE slug = ${productFilter} LIMIT 1`);
-    const prs = (Array.isArray(pr) ? pr : ((pr as any)?.rows || [])) as any[];
-    productName = prs[0]?.name || productFilter;
-  } catch (_) { productName = productFilter; }
-}
-const hasFilters = !!(q || deptFilter || levelFilter || productFilter);
-
-// Guarded so a DB hiccup degrades to an empty state instead of a 500 on a public marketing page.
-let openRoles: any[] = [];
-// A ceiling on a public, unauthenticated read — not a page size, and not a statement about how
-// many roles exist. It was set to 500 on the assumption that the catalogue would never reach it.
-// The catalogue passed it, and because `totalCount` was measured off THIS array, the page then
-// reported the cap as the catalogue size: it said "500 open roles" and listed 500, while the team
-// sidebar beside it — which counts in SQL and is not capped — already added up to more than that.
-// Two consequences, both fixed below: every role after the 500th was invisible, and the number was
-// wrong. Raised to a ceiling the catalogue is nowhere near, and the count now comes from SQL.
-const ROLE_LIST_CAP = 5000;
-const runRolesQuery = (where: any) => db.select({
-  id: roles.id,
-  title: roles.title,
-  slug: roles.slug,
-  level: roles.level,
-  departmentId: roles.departmentId,
-  function: roles.function,
-  engagementType: roles.engagementType,
-  location: roles.location,
-  salary: roles.salary,
-  skills: roles.skills,
-  isFeatured: roles.isFeatured
-}).from(roles).where(where).orderBy(desc(roles.isFeatured), asc(roles.sortOrder), asc(roles.title)).limit(ROLE_LIST_CAP);
-
-// Built as a factory so the COUNT below can be run against the SAME predicate the list actually
-// used. The retry path narrows the search, and counting with the wide predicate after the narrow
-// one succeeded would print a total the list could never reach.
-const listWhere = (includeKeywords: boolean) =>
-  and(...conditions, ...(q ? [searchClause(includeKeywords)] : []));
-
-let usedWhere: any = listWhere(true);
-try {
-  openRoles = await runRolesQuery(usedWhere);
-} catch (e: any) {
-  const reason = e?.cause?.message || e?.message;
-  console.error('[careers] roles query failed:', reason);
-  if (q) {
-    // The widest predicate failed — most likely the runtime `keywords` column is absent on this
-    // database. Retry without it rather than reporting "no roles match", which is what a bare
-    // catch here would do and is indistinguishable from a genuinely empty result.
-    try {
-      usedWhere = listWhere(false);
-      openRoles = await runRolesQuery(usedWhere);
-      console.error('[careers] retried search without keywords and succeeded');
-    } catch (e2: any) {
-      console.error('[careers] narrowed search also failed:', e2?.cause?.message || e2?.message);
-      Astro.response.headers.set('x-era-degraded', '1');
-    }
-  } else {
-    Astro.response.headers.set('x-era-degraded', '1');
-  }
-}
-
-const deptMap: Record<string, string> = Object.fromEntries(allDepts.map((d) => [d.id, d.name]));
-const deptByName: Record<string, any> = Object.fromEntries(allDepts.map((d) => [d.name, d]));
-
-// Group roles by department for display
-const groupedRoles: Record<string, any[]> = {};
-for (const r of openRoles) {
-  const deptName = deptMap[r.departmentId] || 'Other';
-  if (!groupedRoles[deptName]) groupedRoles[deptName] = [];
-  groupedRoles[deptName].push(r);
-}
-const deptOrder = allDepts.map((d) => d.name).filter((n) => groupedRoles[n]);
-
-// How many roles match the current filters — counted in SQL, not measured off the capped array.
-// The extra round trip is spent ONLY when the cap was actually reached, so the ordinary view
-// (which is every view until the catalogue grows past ROLE_LIST_CAP) still costs exactly what it
-// did before. `listedCount` stays the number of cards actually on the page, so the two can be
-// shown honestly against each other rather than one silently standing in for the other.
-const listedCount = openRoles.length;
-let totalCount = listedCount;
-if (listedCount >= ROLE_LIST_CAP) {
-  try {
-    const tc = await db.select({ n: sql<number>`COUNT(*)::int` }).from(roles).where(usedWhere);
-    const tcr = (Array.isArray(tc) ? tc : ((tc as any)?.rows || [])) as any[];
-    totalCount = Number(tcr[0]?.n ?? listedCount) || listedCount;
-  } catch (e: any) {
-    console.error('[careers] total count failed:', e?.cause?.message || e?.message);
-  }
-}
-const isTruncated = totalCount > listedCount;
-const LEVELS = ['C-Level', 'Lead', 'Senior', 'Mid', 'Junior', 'Intern', 'Apprentice'];
-
-// Both inline forms now live on dedicated pages: /careers/fee-waiver and
-// /careers/hr-support. This page just lists roles + fee policy.
-
-// Open departments for the metrics strip. The fee-range query that used to sit here went
-// with the fee itself (applications are free — src/lib/application-fee.ts): nothing ever
-// rendered feeRange, so it was one wasted database round trip per careers page view.
-const openDeptCount = Object.keys(groupedRoles).length;
-
-const levelDot: Record<string, string> = {
-  'C-Level': '#6d28d9', 'Lead': '#15803d', 'Senior': '#1045BB', 'Mid': '#FF4F00',
-  'Junior': '#8a8078', 'Intern': '#b45309', 'Apprentice': '#15803d'
-};
-const updated = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
-
-// Open-role counts per team (UNfiltered) for the "explore by team" discovery grid.
-let deptCounts: Record<string, number> = {};
-try {
-  const dc = await db.execute(sql`SELECT department_id, COUNT(*)::int AS n FROM roles WHERE is_open = true AND department_id IS NOT NULL GROUP BY department_id`);
-  const dcr = (Array.isArray(dc) ? dc : ((dc as any)?.rows || [])) as any[];
-  deptCounts = Object.fromEntries(dcr.map((r) => [r.department_id, Number(r.n)]));
-} catch (_) {}
-const teamsWithRoles = allDepts
-  .map((d) => ({ id: d.id as string, name: d.name as string, openCount: deptCounts[d.id] || 0 }))
-  .filter((d) => d.openCount > 0)
-  .sort((a, b) => b.openCount - a.openCount);
 ---
-<BaseLayout title="Careers - EduRankAI" description="Join EduRankAI — researchers, engineers, educators, designers, and operators building frontier AI for education. Roles across every team, from early-career talent to leadership. Every application is read by a human.">
-  <!-- ============================ HERO ============================ -->
-  <section class="px-[5vw] pt-9 md:pt-12 pb-3 max-w-7xl mx-auto">
-    <p class="eyebrow mb-2">Careers · Primarily on-site, in Bharat</p>
+// /careers — EDURANKAI CAREER INTELLIGENCE.
+//
+// =================================================================================================
+// WHAT CHANGED, AND WHY IT HAD TO
+// =================================================================================================
+//
+// This page used to SELECT up to five thousand postings and write every one of them into the
+// initial HTML, grouped by team. It worked. It was also a multi-megabyte document that grew with
+// the catalogue, and the number at the top of it was measured off the array it had managed to
+// fetch — so once the catalogue passed the fetch cap, the page reported the cap as the size of the
+// catalogue. It said "500 open roles" beside a team sidebar that already added up to more.
+//
+// Nothing on this page now renders a list of every posting. What loads is:
+//
+//   the hero, one input, seven suggestions, a team directory with SQL counts, six featured
+//   postings, and the static sections about applying.
+//
+// Everything else is fetched, a page at a time, from /api/careers/search (plain) and
+// /api/careers/intel/matches (personalised). Ten thousand postings would cost this page nothing.
+//
+// =================================================================================================
+// THIS PAGE IS COMPLETE BEFORE ANY SCRIPT RUNS
+// =================================================================================================
+//
+// The search box is a real <form method="GET"> that lands on /careers/opportunities, which is a
+// fully server-rendered, filterable, paginated catalogue. The seven pathway suggestions are real
+// links to filtered queries. The team directory is real links. public/career-intel.js upgrades all
+// of that into a conversation; if it never loads, every one of those controls still works.
+//
+// That is section 31 of the brief honoured structurally rather than with an error handler: the
+// careers page cannot be taken down by an intelligence endpoint, because the intelligence is not
+// what makes it a careers page.
+//
+// =================================================================================================
+// IT IS ALSO STILL EDGE-CACHEABLE
+// =================================================================================================
+//
+// /careers is in PUBLIC_CACHEABLE_EXACT in src/middleware.ts. This document is identical for every
+// visitor — the personalisation happens in the browser after it loads and is posted to a no-store
+// endpoint — so that stays true, and a repeat visit costs the database nothing at all.
+//
+// .astro RULES OBSERVED THROUGHOUT: every comparison is in the frontmatter, there is no typed
+// Record in the markup, no arrow characters inside JSX strings, and no emoji anywhere.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { discoverTeams, featuredPostings, openPostingCount } from '@/lib/career-intel/retrieve';
+import { openingPathways } from '@/lib/career-intel/questions';
+import { toCard } from '@/lib/career-intel/wire';
+import { REFLECTION_DISCLAIMER, REFLECTION_TITLE } from '@/lib/career-intel/reflection';
+import { MATCHED_NOTHING } from '@/lib/career-intel/explain';
+import { PRIMARY_SITE_TEXT } from '@/lib/work-mode';
 
-    <!-- Everything below the eyebrow is rollable: closed by default, one toggle reveals the
-         headline, description, stats and links cluster together. Reuses the existing
-         .dept-fold-toggle/.dept-fold pattern (generic handler further down — no new JS). -->
-    <button type="button" class="dept-fold-toggle" aria-expanded="false" aria-controls="hero-body">
-      <span>Show more</span>
-      <svg class="dept-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-    </button>
-    <div class="dept-fold" id="hero-body">
-      <div class="dept-fold-inner pt-3">
+// THREE READS FOR THE WHOLE PAGE. The old one ran eighteen ALTER TABLE statements before its first
+// SELECT — measured on the live site as the difference between a homepage that answered in 3.7s
+// under load and a careers page that answered four requests out of twenty. There is no DDL here.
+const discovery = await discoverTeams();
+const featured = await featuredPostings(6);
+const countedOpen = await openPostingCount();
 
-        <div class="max-w-3xl">
-          <h1 class="font-display text-[clamp(2rem,5.5vw,3.4rem)] font-semibold text-ink leading-[1.04] tracking-tight mb-3">
-            Build intelligence that <em class="italic text-burn font-medium">serves humanity.</em>
-          </h1>
-          <p class="text-[0.98rem] md:text-[1.05rem] text-ink-soft font-light leading-[1.6] max-w-2xl">
-            Join researchers, engineers, educators, designers, and operators across our products — from early-career talent to seasoned leaders. <span class="text-ink-2 font-normal">Every application is read by a human.</span>
-          </p>
-        </div>
+// openPostingCount returns -1 when it could not count. That is NOT zero, and the difference is the
+// whole point: "there are no openings" is a claim this page must never make on a failed query.
+const countKnown = countedOpen >= 0;
+const openCount = countKnown ? countedOpen : discovery.total;
+const haveCount = countKnown || discovery.readable;
+const countText = haveCount ? String(openCount) : '';
 
-        <!-- Compact meta: counts + fee + help in two tight lines — no big cards, jobs stay near the top. -->
-        <div class="mt-4 max-w-3xl space-y-1.5">
-          <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[0.84rem]">
-            <span class="text-ink"><strong class="font-semibold">{totalCount}</strong> <span class="text-ink-soft">open roles</span></span>
-            <span aria-hidden="true" class="text-ink/15">·</span>
-            <span class="text-ink"><strong class="font-semibold">{openDeptCount}</strong> <span class="text-ink-soft">departments</span></span>
-            <span aria-hidden="true" class="text-ink/15">·</span>
-            <span class="text-ink-soft"><strong class="text-ink font-semibold">Free</strong> to apply, every role</span>
-          </div>
-          <!-- Nested rollable cluster for the secondary links — closed by default, independent toggle. -->
-          <div class="mt-1">
-            <button type="button" class="dept-fold-toggle" aria-expanded="false" aria-controls="hero-links">
-              <span>More links</span>
-              <svg class="dept-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-            </button>
-            <div class="dept-fold" id="hero-links">
-              <div class="dept-fold-inner pt-2.5 flex flex-wrap items-center gap-x-4 gap-y-2 text-[0.82rem]">
-                <a href="/careers/hr-support" class="inline-flex items-center gap-1.5 text-sky font-semibold no-underline hover:underline underline-offset-2">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/></svg>
-                  Want help? Book a call
-                </a>
-                <a href="/careers/membership" class="inline-flex items-center gap-1.5 text-burn font-semibold no-underline hover:underline underline-offset-2">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2H22l-6 4.6 2.3 7.2-6.3-4.5-6.3 4.5 2.3-7.2-6-4.6h7.6z"/></svg>
-                  Membership
-                </a>
-                <a href="#applying" class="inline-flex items-center gap-1.5 text-ink-soft hover:text-ink no-underline">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 2-3 4"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                  How applying works
-                </a>
-              </div>
-            </div>
-          </div>
-        </div>
+const teams = discovery.teams;
+const teamsReadable = discovery.readable;
+const hasTeams = teams.length > 0;
+const featuredCards = featured.rows.map(toCard);
+const hasFeatured = featuredCards.length > 0;
 
-      </div>
-    </div>
-  </section>
+const pathways = openingPathways();
 
-  <!-- ========================= EXPLORE BY ========================= -->
-  <!-- Added, not substituted. Everything below this block is the original page and is untouched.
-       These five routes are the ways into the catalogue that this page could not offer, because a
-       team-grouped list cannot answer "show me computational work at the nanoscale". Each link is a
-       real filtered query on /careers/opportunities, not a placeholder. -->
-  <section class="px-[5vw] pt-2 pb-4 max-w-7xl mx-auto">
-    <div class="bg-white border border-ink/10 rounded-2xl p-4 md:p-5">
-      <h2 class="font-display text-[1.05rem] font-semibold text-ink m-0 mb-1">Explore another way</h2>
-      <p class="text-[0.82rem] text-ink-soft m-0 mb-3.5 max-w-2xl">
-        Research postings also carry a division, a research classification and a scale range. Browse by any of
-        them, or read the department directory first.
+// The rotating examples under the input. Plain text, rendered server-side, cycled by CSS only —
+// no script needed and nothing moves for anybody who has asked for reduced motion.
+const EXAMPLES = [
+  'I want to work on difficult AI problems.',
+  'I like maths and coding but do not know which role fits me.',
+  'I want to build something meaningful.',
+  'I am interested in research and education.',
+  'I know exactly what role I want.',
+];
+
+// Handed to the client script as JSON rather than through define:vars, which cannot be combined
+// with is:inline on this project.
+const bootJson = JSON.stringify({ matchedNothing: MATCHED_NOTHING, openCount: haveCount ? openCount : null });
+
+const updated = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
+---
+
+<BaseLayout
+  title="Careers - EduRankAI"
+  description="Explore opportunities across research, engineering, education, design and operations at EduRankAI. Start with what interests you, or search the full catalogue. Every application is read by a human."
+>
+  <!-- ================================ HERO ================================ -->
+  <section class="px-[5vw] pt-10 md:pt-14 pb-2 max-w-6xl mx-auto">
+    <p class="eyebrow mb-3">Careers &middot; On-site in Bharat &middot; {PRIMARY_SITE_TEXT}</p>
+
+    <h1 class="font-display text-[clamp(2.1rem,6vw,3.6rem)] font-semibold text-ink leading-[1.03] tracking-tight mb-4">
+      Find your <em class="italic text-burn font-medium">place.</em>
+    </h1>
+
+    {haveCount ? (
+      <p class="text-[1.02rem] md:text-[1.14rem] text-ink-soft font-light leading-[1.55] max-w-2xl mb-7">
+        <strong class="text-ink font-semibold">{countText}</strong> open positions across research, engineering,
+        education, design and operations. Start with what interests you &mdash; not with a job title you
+        already know.
       </p>
-      <div class="flex flex-wrap gap-2">
-        <a href="/careers/departments" class="inline-flex items-center gap-1.5 text-[0.8rem] font-semibold text-ink-2 bg-cream-2 border border-ink/12 rounded-xl px-3.5 py-2 no-underline hover:border-ink/28 transition-colors">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
-          Department directory
-        </a>
-        <a href="/careers/opportunities" class="inline-flex items-center gap-1.5 text-[0.8rem] font-semibold text-ink-2 bg-cream-2 border border-ink/12 rounded-xl px-3.5 py-2 no-underline hover:border-ink/28 transition-colors">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-          Search research opportunities
-        </a>
-        <a href="/careers/opportunities?classification=COMPUTATIONAL" class="inline-flex items-center gap-1.5 text-[0.8rem] font-semibold text-ink-2 bg-cream-2 border border-ink/12 rounded-xl px-3.5 py-2 no-underline hover:border-ink/28 transition-colors">
-          Browse by research classification
-        </a>
-        <a href="/careers/opportunities?band=BAND_05" class="inline-flex items-center gap-1.5 text-[0.8rem] font-semibold text-ink-2 bg-cream-2 border border-ink/12 rounded-xl px-3.5 py-2 no-underline hover:border-ink/28 transition-colors">
-          Browse by scale band
-        </a>
-        <a href="/careers/opportunities?skillcat=MATHEMATICS" class="inline-flex items-center gap-1.5 text-[0.8rem] font-semibold text-ink-2 bg-cream-2 border border-ink/12 rounded-xl px-3.5 py-2 no-underline hover:border-ink/28 transition-colors">
-          Browse by discipline
-        </a>
-      </div>
-    </div>
-  </section>
-
-  <!-- ========================= ROLES (team locator sidebar + jobs) ========================= -->
-  <section id="roles" class="px-[5vw] pt-4 pb-8 md:pb-12 max-w-7xl mx-auto scroll-mt-20">
-    <form method="GET" class="bg-white border border-ink/10 rounded-2xl p-2.5 mb-5 grid grid-cols-2 gap-2 md:flex md:flex-row md:items-center shadow-[0_2px_12px_rgba(0,0,0,0.03)]">
-      <div class="col-span-2 md:flex-1 flex items-center gap-2.5 bg-cream-2 border border-ink/10 rounded-xl px-3.5 py-2.5 focus-within:border-burn transition-colors">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-ink-soft/60 flex-shrink-0"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <input type="text" name="q" value={q} placeholder="Search roles, departments, or a skill (e.g. Python, ROS, GIS)..." class="flex-1 bg-transparent border-0 outline-none text-[0.9rem] text-ink placeholder:text-ink-soft/60" />
-      </div>
-      <select name="dept" class="border border-ink/15 bg-white rounded-xl px-3 py-2.5 text-[0.85rem] text-ink-2 outline-none focus:border-burn">
-        <option value="">All departments</option>
-        {allDepts.map((d) => <option value={d.id} selected={deptFilter === d.id}>{d.name}</option>)}
-      </select>
-      <select name="level" class="border border-ink/15 bg-white rounded-xl px-3 py-2.5 text-[0.85rem] text-ink-2 outline-none focus:border-burn">
-        <option value="">All levels</option>
-        {LEVELS.map((lv) => <option value={lv} selected={levelFilter === lv}>{lv}</option>)}
-      </select>
-      {productFilter && <input type="hidden" name="product" value={productFilter} />}
-      <button type="submit" class="btn-primary whitespace-nowrap col-span-2 md:col-auto">Filter</button>
-      {hasFilters && (
-        <a href="/careers" class="btn-ghost whitespace-nowrap col-span-2 md:col-auto text-center">Clear</a>
-      )}
-    </form>
-
-    {productFilter && (
-      <div class="mb-5 -mt-1 flex items-center justify-between gap-3 bg-burn-pale border border-burn-dim rounded-xl px-4 py-2.5">
-        <p class="text-[0.85rem] text-ink-2 inline-flex items-center gap-2 min-w-0">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0"><path d="M20.59 13.41 13.42 20.58a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><circle cx="7" cy="7" r="1.2" fill="#FF4F00"/></svg>
-          <span class="truncate">Showing roles for <strong class="text-ink font-semibold">{productName}</strong></span>
-        </p>
-        <a href="/careers" class="text-[0.8rem] font-semibold text-burn no-underline hover:underline whitespace-nowrap shrink-0">View all roles</a>
-      </div>
+    ) : (
+      <p class="text-[1.02rem] md:text-[1.14rem] text-ink-soft font-light leading-[1.55] max-w-2xl mb-7">
+        Openings across research, engineering, education, design and operations.
+        <span class="text-ink-2"> We could not count them just now &mdash; the catalogue itself is still browsable below.</span>
+      </p>
     )}
 
-    <div class="mb-5 flex items-center justify-between">
-      <p class="text-[0.85rem] text-ink-soft">
-        <strong class="text-ink font-semibold">{totalCount}</strong> {totalCount === 1 ? 'open role' : 'open roles'}{hasFilters ? ' match your filters' : ''}{isTruncated && <span class="text-ink-soft/70"> &middot; showing the first {listedCount} &mdash; filter by team or level to reach the rest</span>}
-      </p>
-      <span class="text-[0.75rem] font-mono text-ink-soft/60">Updated {updated}</span>
-    </div>
+    <!-- ============================ THE INPUT ============================ -->
+    <!--
+      A REAL FORM. method=GET, action=/careers/opportunities. Typing a sentence and pressing enter
+      with no JavaScript at all runs a server-side search and returns a paginated, filterable page.
+      career-intel.js intercepts the submit and answers in place instead.
+    -->
+    <div id="ci-root" data-busy="0">
+      <form id="ci-form" method="GET" action="/careers/opportunities" class="ci-form" role="search">
+        <label class="ci-label" for="ci-input">Tell us what you want to explore</label>
+        <div class="ci-input-wrap">
+          <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="ci-input-icon"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input
+            id="ci-input"
+            name="q"
+            type="text"
+            class="ci-input"
+            autocomplete="off"
+            placeholder="Describe what you enjoy, what you are good at, or what you are unsure about..."
+          />
+          <button id="ci-submit" type="submit" class="ci-go">
+            <span class="ci-go-label">Explore</span>
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+          </button>
+        </div>
+        <p class="ci-examples" aria-hidden="true">
+          {EXAMPLES.map((e, i) => (
+            <span class="ci-example" style={'animation-delay:' + (i * 4) + 's'}>{e}</span>
+          ))}
+        </p>
+        <p class="ci-help">
+          Say it however you like &mdash; a sentence, a subject, a job title, or that you have no idea yet.
+          You can also <a href="/careers/opportunities">browse every opening</a> without telling us anything.
+        </p>
+      </form>
 
-    <!-- Mobile: horizontal team locator (clean, swipeable) -->
-    {teamsWithRoles.length > 1 && (
-      <div class="lg:hidden -mx-[5vw] mb-6 border-y border-ink/8 bg-cream-2/40">
-        <div class="px-[5vw] py-2.5 flex gap-2 overflow-x-auto team-hscroll">
-          <a href="/careers#roles" class={'team-chip' + (!deptFilter ? ' is-active' : '')}><span>All</span><i class="team-ct">{totalCount}</i></a>
-          {teamsWithRoles.map((t) => (
-            <a href={`/careers?dept=${t.id}#roles`} class={'team-chip' + (deptFilter === t.id ? ' is-active' : '')}><span>{t.name}</span><i class="team-ct">{t.openCount}</i></a>
+      <!-- ===================== PATHWAY SUGGESTIONS ===================== -->
+      <!--
+        SUGGESTIONS, AND THE PAGE SAYS SO. Each is a genuine filtered query on the catalogue, so
+        they work with this page's script absent; with it present they open the conversation.
+      -->
+      <div class="ci-pathways">
+        <p class="ci-pathways-label">Or start from one of these. They are suggestions, not categories &mdash; you are not choosing a box.</p>
+        <div class="ci-chips">
+          {pathways.map((p) => (
+            <a
+              class="ci-chip"
+              href={'/careers/opportunities?q=' + encodeURIComponent(p.label)}
+              data-ci-pathway="1"
+              data-ci-text={'I want to do work about ' + p.label.toLowerCase() + '. ' + p.blurb}
+            >
+              <span class="ci-chip-label">{p.label}</span>
+              <span class="ci-chip-blurb">{p.blurb}</span>
+            </a>
+          ))}
+          <a class="ci-chip ci-chip-open" href="/careers/opportunities">
+            <span class="ci-chip-label">I am not sure yet</span>
+            <span class="ci-chip-blurb">Browse everything and see what stands out</span>
+          </a>
+        </div>
+      </div>
+
+      <p class="ci-status" id="ci-status" role="status" aria-live="polite"></p>
+
+      <!-- The conversation. Empty and invisible until something is said. -->
+      <div id="ci-thread" class="ci-thread"></div>
+
+      <!-- ======================= WHAT WE UNDERSTAND ======================= -->
+      <div class="ci-panel-wrap">
+        <button
+          id="ci-panel-toggle"
+          type="button"
+          class="ci-panel-toggle"
+          aria-expanded="false"
+          aria-controls="ci-panel"
+        >
+          <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+          What we currently understand
+        </button>
+        <div id="ci-panel" class="ci-panel" hidden tabindex="-1" aria-label="What we currently understand about you">
+          <p class="ci-panel-intro">
+            Everything below is held in this browser only. Nothing here is sent to us unless you press
+            something, and nothing about you is stored on our servers.
+            Change anything that is wrong, remove anything you would rather we did not keep.
+          </p>
+          <div id="ci-panel-body"></div>
+
+          <!-- =================== OPTIONAL REFLECTION LAYER =================== -->
+          <!--
+            SEPARATE, IN THE MARKUP AS WELL AS IN THE CODE. It sits inside the panel, below
+            everything that matters, behind its own control, with its disclaimer above the field
+            rather than under it. src/lib/career-intel/reflection.ts is not imported by the ranker
+            or by retrieval, and separation.test.ts fails if it ever is.
+          -->
+          <details class="ci-reflect">
+            <summary>{REFLECTION_TITLE}</summary>
+            <p class="ci-panel-note">{REFLECTION_DISCLAIMER}</p>
+            <form id="ci-reflect-form" class="ci-reflect-form">
+              <label for="ci-reflect-date">Date of birth</label>
+              <input id="ci-reflect-date" type="date" name="birthDate" />
+              <button type="submit" class="ci-btn">Show me the reflection</button>
+            </form>
+          </details>
+        </div>
+      </div>
+
+      <!-- Results. Server-rendered nothing; filled by the client, and by nothing else. -->
+      <div id="ci-results" class="ci-results" aria-live="polite"></div>
+
+      <!-- The introduction that the results replace. Visible until a conversation starts. -->
+      <div id="ci-intro" class="ci-intro">
+        <noscript>
+          <p class="ci-note ci-note-quiet">
+            The guided exploration needs JavaScript. Everything else on this page works without it:
+            the search box above runs a full server-side search, and every link below is a real
+            filtered query.
+          </p>
+        </noscript>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ EXPLORE BY TEAM ============================ -->
+  <section class="px-[5vw] py-10 max-w-6xl mx-auto">
+    <div class="flex items-baseline justify-between gap-4 mb-1">
+      <h2 class="font-display text-xl md:text-2xl font-semibold text-ink">Explore by team</h2>
+      <span class="text-[0.72rem] font-mono text-ink-soft/60">Updated {updated}</span>
+    </div>
+    <p class="text-[0.9rem] text-ink-soft mb-6 max-w-2xl">
+      Every count below is the number of positions genuinely open in that team right now, counted in
+      the database rather than measured off this page.
+    </p>
+
+    {teamsReadable ? (
+      hasTeams ? (
+        <div class="ci-teams">
+          {teams.map((t) => (
+            <a class="ci-team" href={'/careers/opportunities?dept=' + encodeURIComponent(t.id)}>
+              <span class="ci-team-name">{t.name}</span>
+              <span class="ci-team-count">{t.openCount}</span>
+            </a>
           ))}
         </div>
-      </div>
-    )}
-
-    <!-- Roles + desktop team sidebar (sticky locator) -->
-    <div class={teamsWithRoles.length > 1 ? 'lg:grid lg:grid-cols-[214px_minmax(0,1fr)] lg:gap-9 lg:items-start' : ''}>
-      {teamsWithRoles.length > 1 && (
-        <aside class="hidden lg:block sticky top-24 self-start">
-          <p class="eyebrow mb-3">Teams</p>
-          <nav class="flex flex-col gap-0.5 max-h-[calc(100vh-10rem)] overflow-y-auto team-vscroll pr-1 -mr-1">
-            <a href="/careers#roles" class={'team-nav' + (!deptFilter ? ' is-active' : '')}>
-              <span class="team-nav-label"><i class="team-bar"></i><span class="truncate">All roles</span></span><i class="team-ct">{totalCount}</i>
-            </a>
-            {teamsWithRoles.map((t) => (
-              <a href={`/careers?dept=${t.id}#roles`} class={'team-nav' + (deptFilter === t.id ? ' is-active' : '')}>
-                <span class="team-nav-label"><i class="team-bar"></i><span class="truncate">{t.name}</span></span><i class="team-ct">{t.openCount}</i>
-              </a>
-            ))}
-          </nav>
-          <a href="#applying" class="mt-4 ml-1.5 inline-flex items-center gap-1.5 text-[0.78rem] font-semibold text-ink-soft hover:text-burn no-underline transition-colors">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-            How applying works
-          </a>
-        </aside>
-      )}
-
-      <div class="min-w-0">
-    {totalCount === 0 && (
-      <div class="bg-cream-2 border border-ink/10 rounded-2xl p-10 md:p-14 text-center">
-        <p class="font-display text-2xl font-medium text-ink mb-3">No roles match your filters right now.</p>
-        <p class="text-[0.9rem] text-ink-soft mb-6 max-w-md mx-auto leading-relaxed">
-          Try clearing filters, or write to us anyway. Brilliant people open new roles wherever they land.
+      ) : (
+        <p class="ci-note ci-note-quiet">
+          There are no open positions in any team at the moment. Write to us anyway &mdash;
+          <a href="mailto:hr@edurankai.in?subject=Open Application">hr@edurankai.in</a>.
         </p>
-        <a href="mailto:hr@edurankai.in?subject=Open Application" class="btn-primary">Write to HR</a>
-      </div>
+      )
+    ) : (
+      <p class="ci-note ci-note-warn">
+        We could not read the team directory just now. This is a problem at our end, not an empty
+        catalogue &mdash; <a href="/careers/opportunities">the full search</a> may still work.
+      </p>
     )}
 
-    {deptOrder.map((deptName) => {
-      const deptRoles = groupedRoles[deptName];
-      const isFounders = deptName === "Founder's Office";
-      const deptIntro = deptByName[deptName]?.description as string | null;
-      const foldId = 'dept-' + deptName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-      return (
-        <div class="mb-14">
-          <div class={'flex items-center gap-3 mb-5 pb-3 ' + (isFounders ? 'border-b-2 border-burn' : 'border-b border-ink/10')}>
-            <h2 class="font-display text-lg md:text-xl font-semibold text-ink">{deptName}</h2>
-            <span class="text-[0.7rem] font-mono uppercase tracking-wider text-burn bg-burn-pale border border-burn-dim px-2.5 py-0.5 rounded-full font-semibold">
-              {deptRoles.length} {deptRoles.length === 1 ? 'role' : 'roles'}
-            </span>
-            <div class="ml-auto flex items-center gap-2">
-              {isFounders && (
-                <span class="inline-flex items-center gap-1 text-[0.65rem] font-mono uppercase tracking-wider text-burn bg-burn-pale border border-burn-dim px-2.5 py-0.5 rounded-full font-bold">
-                  <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="m12 2 2.9 6.26 6.84.6-5.17 4.53 1.54 6.7L12 17.27 5.89 20.6l1.54-6.7L2.26 8.86l6.84-.6z"/></svg>
-                  Flagship
-                </span>
-              )}
-              {deptIntro && (
-                <button type="button" class="dept-fold-toggle" aria-expanded="false" aria-controls={foldId}>
-                  <span>About</span>
-                  <svg class="dept-chev" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                </button>
-              )}
-            </div>
-          </div>
-          {deptIntro && (
-            <div class="dept-fold" id={foldId}>
-              <div class="dept-fold-inner">
-                <div class="bg-cream-2 border border-ink/10 rounded-2xl p-5 md:p-6 mb-5">
-                  <p class="text-[0.9rem] text-ink-2 font-light leading-[1.85] whitespace-pre-line">{deptIntro}</p>
-                </div>
-              </div>
-            </div>
-          )}
-          <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3.5">
-            {deptRoles.map((r: any) => {
-              const href = '/careers/' + r.slug;
-              const isFeat = r.isFeatured;
-              return (
-                // A stretched-link overlay (not a wrapping <a>) so the skill-tag pills below can be
-                // real, independently-clickable <a> elements — an <a> can never legally nest inside
-                // another <a>, which is what broke here before (the browser would silently split or
-                // ignore the outer link once it hit the first tag).
-                <div class={'group relative bg-white border rounded-2xl p-5 transition-all duration-200 hover:-translate-y-1 hover:shadow-[0_14px_32px_rgba(14,11,8,0.10)] flex flex-col ' + (isFeat ? 'border-burn-dim hover:border-burn' : 'border-ink/10 hover:border-burn-dim')}>
-                  <a href={href} class="absolute inset-0 rounded-2xl z-0" aria-label={r.title}></a>
-                  {isFeat && <svg class="absolute top-4 right-4 text-burn pointer-events-none" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="m12 2 2.9 6.26 6.84.6-5.17 4.53 1.54 6.7L12 17.27 5.89 20.6l1.54-6.7L2.26 8.86l6.84-.6z"/></svg>}
-                  <div class="relative z-[1] pointer-events-none flex flex-col flex-1">
-                    <div class="flex items-center gap-2 mb-2.5">
-                      <span class="inline-block rounded-full" style={'width:7px;height:7px;flex-shrink:0;background:' + (levelDot[r.level] || '#8a8078')}></span>
-                      <span class="text-[0.62rem] font-bold uppercase tracking-[0.1em] text-ink-soft">{r.level}</span>
-                    </div>
-                    <h3 class="font-display text-[1.08rem] font-semibold text-ink mb-2 leading-snug group-hover:text-burn transition-colors pr-4">{r.title}</h3>
-                    <p class="text-[0.8rem] text-ink-soft font-light leading-relaxed mb-3 flex-1">{r.function}</p>
-                  </div>
-                  {Array.isArray(r.skills) && r.skills.length > 0 && (
-                    <div class="relative z-[1] flex flex-wrap gap-1.5 mb-3">
-                      {r.skills.slice(0, 4).map((s: string) => (
-                        <a href={`/careers?q=${encodeURIComponent(s)}`} class="text-[0.66rem] font-medium text-ink-2 bg-cream-2 hover:bg-burn-pale hover:text-burn border border-ink/8 px-2 py-0.5 rounded-full no-underline transition-colors">{s}</a>
-                      ))}
-                      {r.skills.length > 4 && <span class="text-[0.66rem] text-ink-soft/70 px-1 py-0.5">+{r.skills.length - 4}</span>}
-                    </div>
-                  )}
-                  <div class="relative z-[1] pointer-events-none flex items-center justify-between gap-2 pt-3 border-t border-ink/8">
-                    <div class="flex items-center gap-1.5 min-w-0">
-                      <span class="text-[0.66rem] font-semibold text-ink-soft bg-cream-2 border border-ink/10 px-2 py-0.5 rounded-md whitespace-nowrap">{r.engagementType}</span>
-                      {r.location && <span class="text-[0.66rem] text-ink-soft inline-flex items-center gap-1 truncate"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" class="flex-shrink-0"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg><span class="truncate">{displayLocation(r.engagementType, r.level, r.location)}</span></span>}
-                    </div>
-                    <span class="text-[0.8rem] font-semibold text-burn inline-flex items-center gap-1 group-hover:gap-2 transition-all whitespace-nowrap">View role &rarr;</span>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      );
-    })}
-      </div>
+    <div class="mt-5 flex flex-wrap gap-2">
+      <a href="/careers/opportunities" class="ci-link-btn">Search every opening &rarr;</a>
+      <a href="/careers/departments" class="ci-link-btn">Department directory &rarr;</a>
+      <a href="/careers/opportunities?classification=COMPUTATIONAL" class="ci-link-btn">By research classification &rarr;</a>
+      <a href="/careers/opportunities?skillcat=MATHEMATICS" class="ci-link-btn">By discipline &rarr;</a>
+      <a href="/careers/opportunities?band=BAND_05" class="ci-link-btn">By scale band &rarr;</a>
     </div>
+  </section>
 
-    <!-- ============ FEES, WAIVERS & SUPPORT — locatable detail, folded so it never blocks applying ============ -->
-    <div id="applying" class="mt-14 max-w-5xl scroll-mt-24">
-      <div class="flex items-center gap-3 mb-4 pb-3 border-b border-ink/10">
-        <h2 class="font-display text-lg md:text-xl font-semibold text-ink">Applying &amp; support</h2>
-        <span class="text-[0.78rem] text-ink-soft">Everything you need before applying — short version.</span>
-      </div>
-
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-        <div class="bg-white rounded-2xl p-5" style="color:inherit;border:1px solid rgba(14,11,8,0.10);border-left:4px solid #128a3f;">
-          <span class="grid place-items-center mb-3" style="width:40px;height:40px;border-radius:12px;background:#E7F6EC;">
-            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="#128a3f" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
-          </span>
-          <h3 class="font-display text-[1.05rem] font-semibold text-ink leading-tight m-0 mb-1.5">Free to apply</h3>
-          <p class="text-[0.84rem] text-ink-soft leading-relaxed m-0">Every role is free to apply to, at every level. Money is never the reason you can't apply.</p>
-        </div>
-
-        <a href="/careers/hr-support" class="group bg-white rounded-2xl p-5 no-underline transition-all hover:-translate-y-0.5" style="color:inherit;border:1px solid rgba(14,11,8,0.10);border-left:4px solid #1045BB;">
-          <span class="grid place-items-center mb-3" style="width:40px;height:40px;border-radius:12px;background:#EBF0FF;">
-            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="#1045BB" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-          </span>
-          <h3 class="font-display text-[1.05rem] font-semibold text-ink leading-tight m-0 mb-1.5">Want help applying?</h3>
-          <p class="text-[0.84rem] text-ink-soft leading-relaxed m-0 mb-3">Book a 30-minute call with our HR team and we walk you through it, step by step. Entirely optional.</p>
-          <span class="text-sky font-semibold text-[0.82rem] inline-flex items-center gap-1 group-hover:gap-2 transition-all">Book a call →</span>
-        </a>
-
-        <a href="/policy/candidate-transparency" class="group bg-white rounded-2xl p-5 no-underline transition-all hover:-translate-y-0.5" style="color:inherit;border:1px solid rgba(14,11,8,0.10);border-left:4px solid #DC5000;">
-          <span class="grid place-items-center mb-3" style="width:40px;height:40px;border-radius:12px;background:#FCEBE2;">
-            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="#DC5000" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-          </span>
-          <h3 class="font-display text-[1.05rem] font-semibold text-ink leading-tight m-0 mb-1.5">Your data, plainly</h3>
-          <p class="text-[0.84rem] text-ink-soft leading-relaxed m-0 mb-3">What we collect, what it costs, and what we'll never do — no ads, no selling, no training models on your data.</p>
-          <span class="text-burn font-semibold text-[0.82rem] inline-flex items-center gap-1 group-hover:gap-2 transition-all">2-minute read →</span>
-        </a>
-      </div>
-
-      <!-- What applying costs — folded, plain and kind. -->
-      <div class="mt-3 bg-white rounded-2xl px-5 py-4" style="border:1px solid rgba(14,11,8,0.08);border-left:4px solid #128a3f;">
-        <button type="button" class="dept-fold-toggle w-full" aria-expanded="false" aria-controls="why-fee" style="justify-content:space-between;border:0;background:transparent;padding:0;color:inherit;">
-          <span class="font-display text-[1.02rem] font-semibold text-ink">What does applying cost?</span>
-          <svg class="dept-chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#128a3f" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-        </button>
-        <div class="dept-fold" id="why-fee">
-          <div class="dept-fold-inner">
-            <p class="text-[0.88rem] text-ink-2 leading-[1.7] m-0 pt-3">
-              Nothing. Applying to any role is free, at every level. Every application is read by our recruitment, technical, academic and leadership teams. If you're a strong fit, please apply — the worst outcome is a thoughtful reply.
-            </p>
-          </div>
-        </div>
-      </div>
-
-      <!-- Merit-first hiring policy — folded, same pattern as "What does applying cost?" above. -->
-      <div class="mt-3 bg-white rounded-2xl px-5 py-4" style="border:1px solid rgba(14,11,8,0.08);border-left:4px solid #DC5000;">
-        <button type="button" class="dept-fold-toggle w-full" aria-expanded="false" aria-controls="merit-policy" style="justify-content:space-between;border:0;background:transparent;padding:0;color:inherit;">
-          <span class="font-display text-[1.02rem] font-semibold text-ink">Our merit-first hiring policy</span>
-          <svg class="dept-chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#DC5000" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-        </button>
-        <div class="dept-fold" id="merit-policy">
-          <div class="dept-fold-inner">
-            <p class="text-[0.88rem] text-ink-2 leading-[1.7] m-0 pt-3">
-              We select on capability, merit, innovation, research potential, leadership, execution and impact. In line with our focus on nurturing talent from institutions and communities traditionally underrepresented in highly competitive recruitment, we do not give — or consider requests for — preferential treatment based on affiliation with any centrally-funded premier institution. Your work speaks; your badge does not.
-            </p>
-          </div>
-        </div>
-      </div>
-
-      <div class="flex flex-wrap gap-2 mt-3">
-        <a href="/policy/hiring" class="inline-flex items-center gap-1.5 text-[0.76rem] font-semibold text-burn px-3 py-1.5 rounded-lg border border-burn-dim bg-burn-pale hover:bg-burn-pale/70 transition-colors no-underline">Hiring policy &rarr;</a>
-        <a href="/policy/recruitment" class="inline-flex items-center gap-1.5 text-[0.76rem] font-semibold text-burn px-3 py-1.5 rounded-lg border border-burn-dim bg-burn-pale hover:bg-burn-pale/70 transition-colors no-underline">Recruitment &amp; work &rarr;</a>
-        <a href="/policy/work-culture" class="inline-flex items-center gap-1.5 text-[0.76rem] font-semibold text-burn px-3 py-1.5 rounded-lg border border-burn-dim bg-burn-pale hover:bg-burn-pale/70 transition-colors no-underline">Work culture &rarr;</a>
-      </div>
-    </div>
-
-    <!-- How hiring works + what we look for -->
-    <div class="mt-14 max-w-5xl">
-      <p class="eyebrow mb-1">The process</p>
-      <h2 class="font-display text-lg md:text-xl font-semibold text-ink mb-5">How hiring <em class="italic text-burn font-medium">works.</em></h2>
-      <div class="grid grid-cols-2 md:grid-cols-5 gap-2.5 mb-12">
-        {[
-          ['Apply', 'Pick a role and submit. Minutes, not hours.'],
-          ['Human review', 'A real person reads every application.'],
-          ['Assessment', 'A focused task that mirrors the real work.'],
-          ['Interviews', 'Technical depth, then values and fit.'],
-          ['Offer', 'Decision and written feedback within 5 days.'],
-        ].map((step: any, i: number) => (
-          <div class="bg-white border border-ink/10 rounded-2xl p-4 flex flex-col">
-            <span class="font-mono text-[0.72rem] font-bold text-burn">{'0' + (i + 1)}</span>
-            <h3 class="font-display text-[0.96rem] font-semibold text-ink mt-1.5 mb-1">{step[0]}</h3>
-            <p class="text-[0.76rem] text-ink-soft leading-relaxed">{step[1]}</p>
-          </div>
+  <!-- ============================ FEATURED OPENINGS ============================ -->
+  {hasFeatured && (
+    <section class="px-[5vw] py-8 max-w-6xl mx-auto">
+      <h2 class="font-display text-xl md:text-2xl font-semibold text-ink mb-1">A few we are especially keen to fill</h2>
+      <p class="text-[0.9rem] text-ink-soft mb-6 max-w-2xl">
+        Six of them, not six hundred. The rest are one search away.
+      </p>
+      <div class="ci-cards">
+        {featuredCards.map((c) => (
+          <article class="ci-role">
+            <a class="ci-role-title" href={c.href}>{c.title}</a>
+            <p class="ci-role-meta">{[c.level, c.department, c.engagementType, c.location].filter(Boolean).join(' · ')}</p>
+            <p class="ci-role-fn">{c.functionText}</p>
+            <div class="ci-role-actions">
+              <a class="ci-btn ci-btn-primary" href={c.href}>Read the full posting</a>
+            </div>
+          </article>
         ))}
       </div>
+    </section>
+  )}
 
-      <p class="eyebrow mb-1">What we look for</p>
-      <h2 class="font-display text-lg md:text-xl font-semibold text-ink mb-5">We hire for <em class="italic text-burn font-medium">character &amp; craft.</em></h2>
-      <div class="grid grid-cols-2 md:grid-cols-5 gap-2.5">
-        {[
-          ['Curiosity', 'You go deep, not wide and shallow.'],
-          ['Ownership', 'You finish what you start.'],
-          ['Craft', 'You care how it is built, not just that it works.'],
-          ['Speed', 'You ship, learn, and iterate.'],
-          ['Humility', 'You measure outcomes, not noise.'],
-        ].map((v: any) => (
-          <div class="bg-cream-2 border border-ink/10 rounded-2xl p-4">
-            <h3 class="font-display text-[0.98rem] font-semibold text-ink mb-1">{v[0]}</h3>
-            <p class="text-[0.76rem] text-ink-soft leading-relaxed">{v[1]}</p>
-          </div>
-        ))}
+  <!-- ============================ HOW THIS WORKS ============================ -->
+  <section class="px-[5vw] py-10 max-w-6xl mx-auto">
+    <h2 class="font-display text-xl md:text-2xl font-semibold text-ink mb-1">How the guided exploration works</h2>
+    <p class="text-[0.9rem] text-ink-soft mb-6 max-w-2xl">
+      Written down here rather than left to be inferred, because a system that reads what you say
+      about yourself owes you a plain account of what it does with it.
+    </p>
+    <div class="ci-how">
+      <div class="ci-how-card">
+        <h3>It reads, it does not decide</h3>
+        <p>
+          What you write is turned into signals, which order the openings and explain why each one
+          is there. Nothing you tell us can make a posting disappear &mdash; whether a position is
+          open is decided by the position, never by anything about you.
+        </p>
+      </div>
+      <div class="ci-how-card">
+        <h3>You can correct it</h3>
+        <p>
+          Everything it concludes is shown back before it is used, and can be confirmed, adjusted or
+          rejected. Your own words are kept exactly as typed, separately from our reading of them.
+        </p>
+      </div>
+      <div class="ci-how-card">
+        <h3>Nothing is stored on our servers</h3>
+        <p>
+          Your answers live in this browser. Clearing them is one button, and it is a real delete.
+          Sign in only if you want them kept across devices, and even then only when you ask.
+        </p>
+      </div>
+      <div class="ci-how-card">
+        <h3>Some of it is only for you</h3>
+        <p>
+          Energy rhythm, self-reported working tendencies and the optional reflection are for your
+          own picture. They play no part in which openings you see or in what order, and no part in
+          any application. Nothing here is a psychological assessment.
+        </p>
+      </div>
+      <div class="ci-how-card">
+        <h3>No CV required, ever</h3>
+        <p>
+          There is no upload wall. If more context would genuinely sharpen the ranking we say so and
+          offer it &mdash; and every path past that offer carries on without one.
+        </p>
+      </div>
+      <div class="ci-how-card">
+        <h3>A person reads every application</h3>
+        <p>
+          Ranking is a way of finding things. It is not a screen, not a score, and not a decision.
+          Hiring decisions here are made by named people, and automated signals are advisory only.
+        </p>
       </div>
     </div>
+  </section>
 
-    <!-- Open application CTA -->
-    <div class="mt-14 relative overflow-hidden bg-ink rounded-3xl p-9 md:p-12 text-center">
+  <!-- ============================ APPLYING & SUPPORT ============================ -->
+  <section id="applying" class="px-[5vw] py-10 max-w-6xl mx-auto scroll-mt-24">
+    <h2 class="font-display text-xl md:text-2xl font-semibold text-ink mb-6">Applying &amp; support</h2>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div class="bg-white rounded-2xl p-5" style="border:1px solid rgba(14,11,8,0.10);border-left:4px solid #128a3f;">
+        <h3 class="font-display text-[1.05rem] font-semibold text-ink leading-tight m-0 mb-1.5">Free to apply</h3>
+        <p class="text-[0.84rem] text-ink-soft leading-relaxed m-0">Every position is free to apply to, at every level. Money is never the reason you cannot apply.</p>
+      </div>
+      <a href="/careers/hr-support" class="group bg-white rounded-2xl p-5 no-underline transition-all hover:-translate-y-0.5" style="color:inherit;border:1px solid rgba(14,11,8,0.10);border-left:4px solid #1045BB;">
+        <h3 class="font-display text-[1.05rem] font-semibold text-ink leading-tight m-0 mb-1.5">Want help applying?</h3>
+        <p class="text-[0.84rem] text-ink-soft leading-relaxed m-0 mb-3">Book a 30-minute call with our HR team and we walk you through it. Entirely optional.</p>
+        <span class="text-sky font-semibold text-[0.82rem]">Book a call &rarr;</span>
+      </a>
+      <a href="/policy/candidate-transparency" class="group bg-white rounded-2xl p-5 no-underline transition-all hover:-translate-y-0.5" style="color:inherit;border:1px solid rgba(14,11,8,0.10);border-left:4px solid #DC5000;">
+        <h3 class="font-display text-[1.05rem] font-semibold text-ink leading-tight m-0 mb-1.5">Your data, plainly</h3>
+        <p class="text-[0.84rem] text-ink-soft leading-relaxed m-0 mb-3">What we collect, what it is for, and what we will never do &mdash; no ads, no selling, no training models on your data.</p>
+        <span class="text-burn font-semibold text-[0.82rem]">2-minute read &rarr;</span>
+      </a>
+    </div>
+
+    <div class="mt-6 grid grid-cols-2 md:grid-cols-5 gap-2.5">
+      {[
+        ['Apply', 'Pick a position and submit. Minutes, not hours.'],
+        ['Human review', 'A real person reads every application.'],
+        ['Assessment', 'A focused task that mirrors the real work.'],
+        ['Interviews', 'Technical depth, then values and fit.'],
+        ['Offer', 'Decision and written feedback within 5 days.'],
+      ].map((step: any, i: number) => (
+        <div class="bg-white border border-ink/10 rounded-2xl p-4 flex flex-col">
+          <span class="font-mono text-[0.72rem] font-bold text-burn">{'0' + (i + 1)}</span>
+          <h3 class="font-display text-[0.96rem] font-semibold text-ink mt-1.5 mb-1">{step[0]}</h3>
+          <p class="text-[0.76rem] text-ink-soft leading-relaxed">{step[1]}</p>
+        </div>
+      ))}
+    </div>
+
+    <div class="mt-4 bg-white rounded-2xl px-5 py-4" style="border:1px solid rgba(14,11,8,0.08);border-left:4px solid #DC5000;">
+      <h3 class="font-display text-[1.02rem] font-semibold text-ink m-0 mb-2">Our merit-first hiring policy</h3>
+      <p class="text-[0.88rem] text-ink-2 leading-[1.7] m-0">
+        We select on capability, merit, innovation, research potential, leadership, execution and
+        impact. In line with our focus on nurturing talent from institutions and communities
+        traditionally underrepresented in highly competitive recruitment, we do not give &mdash; or
+        consider requests for &mdash; preferential treatment based on affiliation with any
+        centrally-funded premier institution. Your work speaks; your badge does not.
+      </p>
+    </div>
+
+    <div class="flex flex-wrap gap-2 mt-3">
+      <a href="/policy/hiring" class="ci-link-btn">Hiring policy &rarr;</a>
+      <a href="/policy/recruitment" class="ci-link-btn">Recruitment &amp; work &rarr;</a>
+      <a href="/policy/work-culture" class="ci-link-btn">Work culture &rarr;</a>
+    </div>
+  </section>
+
+  <!-- ============================ OPEN APPLICATION ============================ -->
+  <section class="px-[5vw] pb-14 max-w-6xl mx-auto">
+    <div class="relative overflow-hidden bg-ink rounded-3xl p-9 md:p-12 text-center">
       <div aria-hidden="true" class="absolute inset-0 opacity-[0.06]" style="background-image:radial-gradient(circle at 20% 20%, #FF4F00 0, transparent 45%), radial-gradient(circle at 80% 80%, #1045BB 0, transparent 45%);"></div>
       <div class="relative">
-        <p class="text-[0.62rem] font-mono uppercase tracking-[0.18em] text-burn-pale/90 font-bold mb-3">No role fits?</p>
+        <p class="text-[0.62rem] font-mono uppercase tracking-[0.18em] text-burn-pale/90 font-bold mb-3">Nothing fits?</p>
         <h3 class="font-display text-2xl md:text-3xl font-medium text-white mb-4">Write to us anyway.</h3>
         <p class="text-[0.92rem] text-white/70 font-light leading-relaxed mb-7 max-w-xl mx-auto">
-          We read every email personally. Tell us what you do, what you have built, and what you want to build at EduRankAI.
+          We read every email personally. Tell us what you do, what you have built, and what you want
+          to build here.
         </p>
         <a href="mailto:hr@edurankai.in?subject=Open Application" class="inline-flex items-center gap-2 bg-burn text-white font-semibold text-[0.9rem] px-6 py-3 rounded-xl no-underline transition-all hover:-translate-y-0.5 hover:bg-burn/90">hr@edurankai.in</a>
       </div>
     </div>
   </section>
 
+  <script type="application/json" id="ci-boot" set:html={bootJson}></script>
+  <script src="/career-intel.js" defer is:inline></script>
+
   <style>
-    .dept-fold-toggle { display:inline-flex; align-items:center; gap:5px; font-family:inherit; font-size:0.72rem; font-weight:600; color:#9a5b3f; background:#fff; border:1px solid rgba(255,79,0,0.25); border-radius:100px; padding:4px 11px; cursor:pointer; transition:background .18s ease, border-color .18s ease; white-space:nowrap; }
-    .dept-fold-toggle:hover { background:#FFF1EA; border-color:#FF4F00; }
-    .dept-chev { transition: transform .3s ease; }
-    .dept-fold-toggle[aria-expanded="true"] .dept-chev { transform: rotate(180deg); }
-    /* Accordion Pleat Slide (#21) — smooth open/close via grid-rows */
-    .dept-fold { display:grid; grid-template-rows:0fr; transition: grid-template-rows .35s cubic-bezier(.4,0,.2,1); }
-    .dept-fold.open { grid-template-rows:1fr; }
-    .dept-fold-inner { overflow:hidden; min-height:0; }
-    /* ---- Team locator (desktop sticky sidebar) ---- */
-    .team-nav { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:7px 9px 7px 6px; border-radius:9px; text-decoration:none; color:#6b6259; transition:background .18s ease, color .18s ease; }
-    .team-nav:hover { background:#FBF6F1; color:#1a1510; }
-    .team-nav.is-active { background:#FFF1EA; color:#FF4F00; font-weight:600; }
-    .team-nav-label { display:flex; align-items:center; gap:9px; min-width:0; font-size:0.85rem; }
-    .team-bar { width:3px; height:8px; border-radius:99px; background:transparent; transition:background .2s ease, height .2s ease; flex-shrink:0; }
-    .team-nav:hover .team-bar { background:rgba(26,21,16,0.18); height:15px; }
-    .team-nav.is-active .team-bar { background:#FF4F00; height:15px; }
-    .team-ct { font-family:ui-monospace,monospace; font-size:0.64rem; font-style:normal; color:#9a8f84; background:rgba(26,21,16,0.05); padding:1px 7px; border-radius:99px; flex-shrink:0; transition:all .18s ease; }
-    .team-nav.is-active .team-ct { color:#FF4F00; background:#fff; }
-    /* ---- Team chips (mobile horizontal locator) ---- */
-    .team-chip { display:inline-flex; align-items:center; gap:7px; flex-shrink:0; padding:6px 12px; border-radius:99px; border:1px solid rgba(26,21,16,0.12); background:#fff; color:#6b6259; font-size:0.8rem; font-weight:500; text-decoration:none; white-space:nowrap; transition:background .18s ease, color .18s ease, border-color .18s ease; }
-    .team-chip.is-active { background:#FF4F00; border-color:#FF4F00; color:#fff; font-weight:600; }
-    .team-chip.is-active .team-ct { background:rgba(255,255,255,0.22); color:#fff; }
-    /* hide scrollbars on locators */
-    .team-hscroll, .team-vscroll { scrollbar-width:none; -ms-overflow-style:none; scroll-behavior:smooth; }
-    .team-hscroll::-webkit-scrollbar, .team-vscroll::-webkit-scrollbar { display:none; }
+    /* ---------------------------------------------------------------- the input */
+    .ci-form { margin: 0 0 1.35rem; }
+    .ci-label { display:block; font-size:0.74rem; font-weight:700; letter-spacing:0.1em; text-transform:uppercase; color:#8a8078; margin-bottom:0.5rem; }
+    .ci-input-wrap { display:flex; align-items:center; gap:0.65rem; background:#fff; border:1.5px solid rgba(14,11,8,0.12); border-radius:16px; padding:0.55rem 0.55rem 0.55rem 1rem; box-shadow:0 2px 14px rgba(14,11,8,0.04); transition:border-color .18s ease, box-shadow .18s ease; }
+    .ci-input-wrap:focus-within { border-color:#FF4F00; box-shadow:0 4px 22px rgba(255,79,0,0.10); }
+    .ci-input-icon { color:rgba(122,111,104,0.6); flex-shrink:0; }
+    .ci-input { flex:1; min-width:0; border:0; outline:none; background:transparent; font:inherit; font-size:1rem; color:#0E0B08; padding:0.55rem 0; }
+    .ci-input::placeholder { color:rgba(122,111,104,0.62); }
+    .ci-go { display:inline-flex; align-items:center; gap:0.45rem; flex-shrink:0; background:#FF4F00; color:#fff; border:0; border-radius:12px; padding:0.7rem 1.1rem; font:inherit; font-size:0.9rem; font-weight:650; cursor:pointer; transition:background .18s ease, transform .18s ease; }
+    .ci-go:hover { background:#e64700; }
+    .ci-go:disabled { opacity:0.55; cursor:progress; }
+    .ci-go:focus-visible, .ci-chip:focus-visible, .ci-btn:focus-visible, .ci-opt:focus-visible, .ci-team:focus-visible { outline:3px solid #1045BB; outline-offset:2px; }
+
+    /* Rotating examples. CSS only, and stationary under reduced motion. */
+    .ci-examples { position:relative; height:1.3rem; margin:0.6rem 0 0; overflow:hidden; }
+    .ci-example { position:absolute; inset:0; font-size:0.85rem; color:rgba(122,111,104,0.85); font-style:italic; opacity:0; animation:ci-cycle 20s linear infinite; }
+    @keyframes ci-cycle { 0%,2% { opacity:0; } 4%,18% { opacity:1; } 20%,100% { opacity:0; } }
+    .ci-help { font-size:0.84rem; color:#7A6F68; margin:0.55rem 0 0; line-height:1.6; }
+    .ci-help a { color:#1045BB; font-weight:600; }
+
+    /* ------------------------------------------------------------- pathway chips */
+    .ci-pathways { margin-bottom:1.4rem; }
+    .ci-pathways-label { font-size:0.82rem; color:#7A6F68; margin:0 0 0.7rem; }
+    .ci-chips { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:0.55rem; }
+    .ci-chip { display:flex; flex-direction:column; gap:0.15rem; padding:0.75rem 0.9rem; background:#fff; border:1px solid rgba(14,11,8,0.10); border-radius:14px; text-decoration:none; color:inherit; transition:border-color .18s ease, transform .18s ease; min-height:44px; }
+    .ci-chip:hover { border-color:#FFD4BC; transform:translateY(-2px); }
+    .ci-chip-open { background:#F3EFE8; }
+    .ci-chip-label { font-weight:650; font-size:0.9rem; color:#0E0B08; }
+    .ci-chip-blurb { font-size:0.76rem; color:#7A6F68; line-height:1.45; }
+
+    /* ------------------------------------------------------------------ status */
+    .ci-status { font-size:0.85rem; color:#7A6F68; margin:0 0 0.8rem; min-height:1.2rem; }
+    .ci-status.is-warn { color:#9a3412; font-weight:600; }
+    .ci-status.is-ok { color:#15803d; font-weight:600; }
+
+    /* ------------------------------------------------------------ the conversation */
+    .ci-thread { display:flex; flex-direction:column; gap:0.8rem; margin-bottom:1rem; }
+    .ci-card { background:#fff; border:1px solid rgba(14,11,8,0.10); border-radius:16px; padding:1.1rem 1.15rem; }
+    .ci-understood { border-left:4px solid #1045BB; }
+    .ci-offer { border-left:4px solid #C49A00; background:#FFFBEA; }
+    .ci-eyebrow { font-size:0.7rem; font-weight:700; letter-spacing:0.1em; text-transform:uppercase; color:#8a8078; margin:0 0 0.55rem; }
+    .ci-list { margin:0 0 0.85rem; padding-left:1.15rem; display:flex; flex-direction:column; gap:0.3rem; }
+    .ci-list li { font-size:0.9rem; color:#2E2520; line-height:1.55; }
+    .ci-offer-text { font-size:0.9rem; color:#2E2520; line-height:1.6; margin:0 0 0.85rem; }
+
+    .ci-q-head { display:flex; align-items:baseline; gap:0.6rem; flex-wrap:wrap; }
+    .ci-q-prompt { font-family:"Cormorant Garamond",serif; font-size:1.2rem; font-weight:600; color:#0E0B08; margin:0 0 0.2rem; line-height:1.3; }
+    .ci-q-why { font-size:0.8rem; color:#7A6F68; margin:0 0 0.85rem; font-style:italic; }
+    .ci-chip-quiet { font-size:0.66rem; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:#8a5a00; background:#FBF3E2; border:1px solid #EDD96A; border-radius:99px; padding:0.1rem 0.5rem; }
+    .ci-options { display:flex; flex-wrap:wrap; gap:0.45rem; margin-bottom:0.75rem; }
+    .ci-opt { font:inherit; font-size:0.86rem; padding:0.5rem 0.85rem; min-height:44px; border-radius:99px; border:1px solid rgba(14,11,8,0.14); background:#FAF8F5; color:#2E2520; cursor:pointer; transition:background .16s ease, border-color .16s ease, color .16s ease; }
+    .ci-opt:hover { border-color:#FFD4BC; }
+    .ci-opt.is-on { background:#FF4F00; border-color:#FF4F00; color:#fff; font-weight:600; }
+    .ci-q-text { width:100%; border:1px solid rgba(14,11,8,0.12); border-radius:12px; padding:0.6rem 0.75rem; font:inherit; font-size:0.9rem; resize:vertical; background:#FAF8F5; }
+    .ci-q-text:focus { outline:none; border-color:#FF4F00; }
+
+    .ci-actions { display:flex; flex-wrap:wrap; gap:0.45rem; margin-top:0.75rem; }
+    .ci-btn { display:inline-flex; align-items:center; justify-content:center; gap:0.35rem; font:inherit; font-size:0.85rem; font-weight:600; padding:0.55rem 0.95rem; min-height:44px; border-radius:11px; border:1px solid rgba(14,11,8,0.14); background:#fff; color:#2E2520; cursor:pointer; text-decoration:none; transition:border-color .16s ease, background .16s ease; }
+    .ci-btn:hover { border-color:#FFD4BC; background:#FFF3EE; }
+    .ci-btn-primary { background:#FF4F00; border-color:#FF4F00; color:#fff; }
+    .ci-btn-primary:hover { background:#e64700; border-color:#e64700; color:#fff; }
+    .ci-btn-quiet { background:transparent; border-color:transparent; color:#7A6F68; text-decoration:underline; text-underline-offset:3px; }
+    .ci-btn-quiet:hover { background:transparent; color:#0E0B08; border-color:transparent; }
+    .ci-btn-danger { border-color:#FFD4BC; color:#9a3412; background:#FFF3EE; margin-top:0.9rem; }
+
+    /* ------------------------------------------------------------------ the panel */
+    .ci-panel-wrap { margin-bottom:1.1rem; }
+    .ci-panel-toggle { display:inline-flex; align-items:center; gap:0.4rem; font:inherit; font-size:0.82rem; font-weight:600; color:#1045BB; background:transparent; border:0; padding:0.35rem 0; cursor:pointer; }
+    .ci-panel { margin-top:0.7rem; background:#F3EFE8; border:1px solid rgba(14,11,8,0.10); border-radius:16px; padding:1.05rem 1.1rem; }
+    .ci-panel-intro { font-size:0.82rem; color:#2E2520; line-height:1.6; margin:0 0 0.9rem; }
+    .ci-panel-h { font-size:0.7rem; font-weight:700; letter-spacing:0.09em; text-transform:uppercase; color:#8a8078; margin:0.9rem 0 0.4rem; }
+    .ci-panel-note { font-size:0.78rem; color:#7A6F68; line-height:1.55; margin:0 0 0.5rem; }
+    .ci-panel-line { font-size:0.86rem; color:#2E2520; margin:0 0 0.35rem; line-height:1.5; }
+    .ci-panel-quote { display:flex; align-items:flex-start; gap:0.5rem; font-size:0.84rem; color:#2E2520; background:#fff; border:1px solid rgba(14,11,8,0.08); border-radius:10px; padding:0.5rem 0.6rem; margin-bottom:0.35rem; line-height:1.5; }
+    .ci-tags { display:flex; flex-wrap:wrap; gap:0.35rem; }
+    .ci-tag { display:inline-flex; align-items:center; gap:0.3rem; font-size:0.8rem; background:#fff; border:1px solid rgba(14,11,8,0.12); border-radius:99px; padding:0.25rem 0.35rem 0.25rem 0.7rem; color:#2E2520; }
+    .ci-tag-x { font:inherit; font-size:0.95rem; line-height:1; background:transparent; border:0; color:#7A6F68; cursor:pointer; padding:0.35rem; min-width:32px; min-height:32px; border-radius:8px; }
+    .ci-tag-x:hover { color:#9a3412; background:rgba(255,79,0,0.08); }
+    .ci-dim { display:flex; align-items:center; justify-content:space-between; gap:0.6rem; font-size:0.84rem; color:#2E2520; padding:0.3rem 0; border-bottom:1px solid rgba(14,11,8,0.06); }
+    .ci-dim.is-confirmed .ci-dim-label { font-weight:650; }
+    .ci-dim-actions { display:flex; gap:0.1rem; flex-shrink:0; }
+    .ci-reflect { margin-top:1.1rem; border-top:1px solid rgba(14,11,8,0.10); padding-top:0.8rem; }
+    .ci-reflect summary { font-size:0.84rem; font-weight:600; color:#6B1FBE; cursor:pointer; }
+    .ci-reflect-form { display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem; margin-top:0.55rem; }
+    .ci-reflect-form label { font-size:0.8rem; color:#7A6F68; }
+    .ci-reflect-form input { font:inherit; font-size:0.85rem; padding:0.5rem 0.6rem; min-height:44px; border:1px solid rgba(14,11,8,0.14); border-radius:10px; background:#fff; }
+
+    /* ------------------------------------------------------------------ results */
+    .ci-results:focus { outline:none; }
+    .ci-results-head { margin:1.2rem 0 0.5rem; }
+    .ci-count { font-size:0.95rem; color:#2E2520; margin:0; }
+    .ci-count strong { color:#0E0B08; font-weight:700; }
+    .ci-note { font-size:0.84rem; line-height:1.6; border-radius:12px; padding:0.65rem 0.85rem; margin:0.4rem 0; }
+    .ci-note-quiet { color:#7A6F68; background:#F3EFE8; }
+    .ci-note-warn { color:#9a3412; background:#FFF3EE; border:1px solid #FFD4BC; }
+    .ci-note a { color:inherit; font-weight:600; }
+    .ci-group { margin-top:1.6rem; }
+    .ci-group-title { font-family:"Cormorant Garamond",serif; font-size:1.35rem; font-weight:600; color:#0E0B08; margin:0 0 0.15rem; }
+    .ci-group-meaning { font-size:0.82rem; color:#7A6F68; margin:0 0 0.85rem; }
+    .ci-cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr)); gap:0.7rem; }
+    .ci-role { display:flex; flex-direction:column; gap:0.35rem; background:#fff; border:1px solid rgba(14,11,8,0.10); border-left:4px solid rgba(14,11,8,0.10); border-radius:16px; padding:1rem 1.05rem; min-width:0; }
+    .ci-role-strong { border-left-color:#128a3f; }
+    .ci-role-potential { border-left-color:#1045BB; }
+    .ci-role-adjacent { border-left-color:#C49A00; }
+    .ci-role-explore { border-left-color:rgba(14,11,8,0.15); }
+    .ci-role.is-dismissed { opacity:0.4; }
+    .ci-role-title { font-family:"Cormorant Garamond",serif; font-size:1.12rem; font-weight:650; color:#0E0B08; text-decoration:none; line-height:1.3; }
+    .ci-role-title:hover { color:#FF4F00; }
+    .ci-role-meta { font-size:0.74rem; color:#7A6F68; margin:0; }
+    .ci-role-fn { font-size:0.83rem; color:#2E2520; line-height:1.55; margin:0.15rem 0 0; }
+    .ci-role-why { font-size:0.82rem; color:#15803d; background:#EBF5EF; border-radius:9px; padding:0.45rem 0.6rem; margin:0.35rem 0 0; line-height:1.5; }
+    .ci-why { margin-top:0.4rem; }
+    .ci-why summary { font-size:0.8rem; font-weight:600; color:#1045BB; cursor:pointer; padding:0.35rem 0; }
+    .ci-why-h { font-size:0.68rem; font-weight:700; letter-spacing:0.09em; text-transform:uppercase; color:#8a8078; margin:0.6rem 0 0.3rem; }
+    .ci-why-signal { font-weight:650; color:#0E0B08; }
+    .ci-why-note { font-size:0.8rem; color:#7A6F68; line-height:1.55; margin:0 0 0.3rem; }
+    .ci-why-caveat { font-style:italic; }
+    .ci-why-none { font-size:0.8rem; color:#7A6F68; line-height:1.55; }
+    .ci-role-actions { display:flex; flex-wrap:wrap; gap:0.4rem; margin-top:0.6rem; }
+    .ci-more { margin-top:1.1rem; }
+
+    /* -------------------------------------------------------------------- teams */
+    .ci-teams { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,210px),1fr)); gap:0.5rem; }
+    .ci-team { display:flex; align-items:center; justify-content:space-between; gap:0.6rem; background:#fff; border:1px solid rgba(14,11,8,0.10); border-radius:13px; padding:0.7rem 0.9rem; min-height:44px; text-decoration:none; color:inherit; transition:border-color .16s ease, transform .16s ease; }
+    .ci-team:hover { border-color:#FFD4BC; transform:translateY(-2px); }
+    .ci-team-name { font-size:0.86rem; font-weight:600; color:#2E2520; min-width:0; overflow-wrap:anywhere; }
+    .ci-team-count { font-family:ui-monospace,monospace; font-size:0.72rem; color:#FF4F00; background:#FFF3EE; border:1px solid #FFD4BC; border-radius:99px; padding:0.1rem 0.55rem; flex-shrink:0; }
+    .ci-link-btn { display:inline-flex; align-items:center; font-size:0.79rem; font-weight:600; color:#2E2520; background:#F3EFE8; border:1px solid rgba(14,11,8,0.12); border-radius:11px; padding:0.5rem 0.85rem; min-height:44px; text-decoration:none; transition:border-color .16s ease; }
+    .ci-link-btn:hover { border-color:rgba(14,11,8,0.28); }
+
+    /* ---------------------------------------------------------------- how it works */
+    .ci-how { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,260px),1fr)); gap:0.7rem; }
+    .ci-how-card { background:#fff; border:1px solid rgba(14,11,8,0.10); border-radius:16px; padding:1rem 1.05rem; }
+    .ci-how-card h3 { font-family:"Cormorant Garamond",serif; font-size:1.06rem; font-weight:650; color:#0E0B08; margin:0 0 0.35rem; }
+    .ci-how-card p { font-size:0.83rem; color:#7A6F68; line-height:1.6; margin:0; }
+
+    /* ------------------------------------------------------------------- motion */
     @media (prefers-reduced-motion: reduce) {
-      .dept-fold { transition:none; }
-      .dept-chev { transition:none; }
-      .team-nav, .team-bar, .team-ct, .team-chip { transition:none; }
+      .ci-example { animation:none; opacity:0; }
+      .ci-example:first-child { opacity:1; }
+      .ci-chip, .ci-team, .ci-btn, .ci-opt, .ci-go { transition:none; }
+      .ci-chip:hover, .ci-team:hover { transform:none; }
+    }
+    @media (max-width: 640px) {
+      .ci-go-label { display:none; }
+      .ci-go { padding:0.75rem 0.85rem; }
+      .ci-chips { grid-template-columns:1fr 1fr; }
+      .ci-chip-blurb { display:none; }
     }
   </style>
-  <script is:inline>
-    document.addEventListener('click', function (e) {
-      var t = e.target;
-      var btn = (t && t.closest) ? t.closest('.dept-fold-toggle') : null;
-      if (!btn) return;
-      var id = btn.getAttribute('aria-controls');
-      var panel = id ? document.getElementById(id) : null;
-      if (!panel) return;
-      var open = panel.classList.toggle('open');
-      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
-    });
-  </script>
 </BaseLayout>

@@ -677,6 +677,13 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   // from every restricted admin on the day it shipped. The page's own gate is
   // can(roles.view) || can(roles.edit), so 'roles' is EXACTLY the population the door admits.
   { id: 'role-divisions', label: 'Divisions', href: '/admin/roles/divisions', icon: 'grid', section: 'roles' },
+  // THE GOVERNANCE SURFACE FOR THE GUIDED CAREERS EXPERIENCE. What /careers ranks on, what it is
+  // structurally unable to touch, and whether candidates agree with the order it produces.
+  //
+  // It is in the nav rather than being a page somebody has to know about, because a system that
+  // reads what candidates say about themselves and orders opportunities for them needs a place
+  // somebody accountable actually walks past. Same section key, same door, same reason as above.
+  { id: 'role-intelligence', label: 'Career Intelligence', href: '/admin/roles/intelligence', icon: 'grid', section: 'roles' },
   // THE EVALUATION PIPELINE. Read-only register of the internal stages an application is worked
   // through, and the published step each one projects onto.
   //
