@@ -488,6 +488,27 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   // The stored capability reading and what a human did about it. Third unreadable panel on the same
   // screen, third table absent from the live database, same single creator behind an ensure.
   { module: 'Capability readings', table: 'match_evaluations', owner: 'src/lib/match.ts' },
+
+  // ============================================================================================
+  // TWO PROVED ABSENT FROM OUTSIDE, 2026-08-24, BY ASKING THE LIVE SITE RATHER THAN THE DATABASE
+  // ============================================================================================
+  //
+  // Neither of these was on this list, so /api/health called the deployment healthy while both were
+  // missing and both were breaking a page anybody can open. The evidence in each case is a URL and
+  // the response it gave, which is the only kind available when the rule is not to open a connection.
+  //
+  // aq_progress_share: /aquintutor/shared-progress/<token> answered HTTP 500 to every token — three
+  // tried. resolveShare() reads this table with nothing catching the throw, and its only creator was
+  // ensureShareSchema(), request-path DDL that production refuses. The page now degrades honestly
+  // instead of erroring, and db/aquintutor-share-schema.sql is what makes the feature exist.
+  { module: 'Shared progress links', table: 'aq_progress_share', owner: 'db/aquintutor-share-schema.sql' },
+
+  // divisions: /api/careers/search answers `degraded: true` for EVERY query, which is
+  // listOpportunities() telling us its main statement failed and the narrowed retry answered
+  // instead. That statement joins `divisions`. The table is created only by db/xscale-schema.sql,
+  // a hand-run file, and `reference: a repo .sql is not an applied .sql`. Registering it turns a
+  // flag buried in an API response into something the health endpoint states.
+  { module: 'Extreme-Scale divisions', table: 'divisions', owner: 'db/xscale-schema.sql' },
 ];
 
 /**
@@ -527,6 +548,32 @@ export const BOOTSTRAP_COLUMNS: { module: string; table: string; column: string;
   { module: 'Clock-out QR station', table: 'hr_clock_events', column: 'qr_station_id', owner: 'db/attendance-clockout-tables.sql' },
   { module: 'Clock-out face check', table: 'hr_clock_events', column: 'face_verified', owner: 'db/attendance-clockout-tables.sql' },
   { module: 'Clock-out event source', table: 'hr_clock_events', column: 'source', owner: 'db/attendance-clockout-tables.sql' },
+
+  // ============================================================================================
+  // THE EXTREME-SCALE COLUMNS ON `roles` — THE EXACT BLIND SPOT THE HEADER ABOVE DESCRIBES
+  // ============================================================================================
+  //
+  // `roles` is in src/lib/db/schema.ts, so the TABLE check passes and always has. db/xscale-schema.sql
+  // adds sixteen columns to it, is hand-run, and has not been run here: measured 2026-08-24,
+  // /api/careers/search answers `degraded: true` for every query, including one with no filters at
+  // all. That flag is listOpportunities() reporting that its real statement failed and the narrowed
+  // retry answered instead — so the division, classification, scale-band and discipline filters were
+  // NOT applied and the result is wider than what was asked for.
+  //
+  // A public search that quietly ignores its own filters is precisely "a path a real person walks",
+  // and until now the only way to learn it was to read a boolean buried in a JSON response.
+  //
+  // FIVE, NOT SIXTEEN, because the header above is right that a wall is not a signal. These are the
+  // five the code actually branches on: publication, the two filters most used, the one that decides
+  // the seniority rung, and the one whose absence broke the RETRY as well as the main query.
+  { module: 'Posting publication status', table: 'roles', column: 'job_status', owner: 'db/xscale-schema.sql' },
+  { module: 'Posting division', table: 'roles', column: 'division_id', owner: 'db/xscale-schema.sql' },
+  { module: 'Posting research classification', table: 'roles', column: 'research_classification', owner: 'db/xscale-schema.sql' },
+  { module: 'Posting discipline categories', table: 'roles', column: 'skill_categories', owner: 'db/xscale-schema.sql' },
+  // The one that took the fallback down with it: the narrowed retry carried a predicate on this
+  // column, and Postgres parses a statement before it evaluates a null guard. See
+  // src/lib/xscale/fallback.test.ts.
+  { module: 'Posting career level', table: 'roles', column: 'career_level', owner: 'db/xscale-schema.sql' },
 ];
 
 // ============================================================================================
