@@ -472,7 +472,7 @@ const OPP_COLUMNS = `o.id, o.opportunity_code, o.position_id, o.department_id, o
  * substitution here would return the wrong column into toOpportunity() with nothing failing loudly.
  *
  * IT IS USED. The three RETURNING clauses below originally ran OPP_COLUMNS through
- * `.replace(/o\./g, '')` — the exact substitution this constant exists to avoid — leaving this
+ * `.replace(/\bo\./g, '')` — the exact substitution this constant exists to avoid — leaving this
  * one unreferenced and the comment above it describing something no statement did.
  */
 const OPP_RETURNING = `id, opportunity_code, position_id, department_id, role_id, title,

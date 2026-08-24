@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { stripOwnershipPromise, publicCompensation, isTraineeRole, isPaidTrainee } from '@/lib/compensation-text';
+import {
+  stripOwnershipPromise,
+  publicCompensation,
+  isTraineeRole,
+  isPaidTrainee,
+  isUnpaidTrainee,
+  stripTraineePayProse,
+  stripTraineePayItems,
+} from '@/lib/compensation-text';
 
 describe('stripOwnershipPromise', () => {
   it('returns null for empty input', () => {
@@ -134,5 +142,73 @@ describe('trainee pay policy', () => {
     expect(isPaidTrainee('llm-engineer-intern')).toBe(false);
     expect(isPaidTrainee('ai-research-intern')).toBe(false);
     expect(isPaidTrainee(null)).toBe(false);
+  });
+});
+
+describe('pay claims in prose', () => {
+  // The exact sentence that was live on /careers/ai-research-intern, built by
+  // .dev-scripts/seed-hiring-posts.cjs interpolating the salary into `about`.
+  const ABOUT = 'About this role: AI Research Intern — up to ₹3 LPA + research stipend. '
+    + 'Internship, 8 hours per day. Part-time options are available — see the Career page for details.';
+
+  it('drops the sentence that carries the pay claim and keeps the rest', () => {
+    const out = stripTraineePayProse(ABOUT);
+    expect(out).not.toMatch(/3 LPA|research stipend/);
+    expect(out).toContain('8 hours per day');
+    expect(out).toContain('Part-time options are available');
+  });
+
+  it('leaves prose with no pay claim byte-for-byte alone', () => {
+    const clean = 'You will work alongside researchers on live problems. Expect to read papers weekly.';
+    expect(stripTraineePayProse(clean)).toBe(clean);
+  });
+
+  it('never removes a sentence that says the role is unpaid', () => {
+    const honest = 'This is an unpaid internship. There is no stipend of any amount, not 1 rupee.';
+    expect(stripTraineePayProse(honest)).toBe(honest);
+  });
+
+  it('drops the CHF bullet that was live on /careers/ui-ux-design-intern', () => {
+    const perks = [
+      'Certificate of completion',
+      'Stipend of up to 1,000 CHF during the internship period.',
+      'Performance-Based Bonus',
+      'Letter of recommendation',
+    ];
+    expect(stripTraineePayItems(perks)).toEqual([
+      'Certificate of completion',
+      'Performance-Based Bonus',
+      'Letter of recommendation',
+    ]);
+  });
+
+  it('catches the shapes these rows actually use', () => {
+    for (const claim of [
+      'Full-time stipend: up to ₹25,000/mo for the duration.',
+      'Stipend: INR 15,000 - 35,000 per month.',
+      'Up to 1,000 CHF plus a performance bonus.',
+      'You may be awarded up to USD 1,000 per month.',
+    ]) {
+      expect(stripTraineePayProse(claim)).toBe('');
+    }
+  });
+
+  it('keeps paragraph structure rather than collapsing the copy', () => {
+    const text = 'First para stands.\n\nSecond para pays ₹3 LPA.\n\nThird para stands.';
+    const out = stripTraineePayProse(text);
+    expect(out).toBe('First para stands.\n\nThird para stands.');
+  });
+
+  it('applies to unpaid trainees only', () => {
+    expect(isUnpaidTrainee({ slug: 'ai-research-intern', level: 'Intern' })).toBe(true);
+    expect(isUnpaidTrainee({ slug: 'llm-engineering-intern', level: 'Intern' })).toBe(false);
+    expect(isUnpaidTrainee({ slug: 'staff-engineer', level: 'Lead', engagementType: 'Full-Time' })).toBe(false);
+  });
+
+  it('handles empty and non-array input without throwing', () => {
+    expect(stripTraineePayProse(null)).toBe('');
+    expect(stripTraineePayProse(undefined)).toBe('');
+    expect(stripTraineePayItems(null)).toEqual([]);
+    expect(stripTraineePayItems('not an array')).toEqual([]);
   });
 });

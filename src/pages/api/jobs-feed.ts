@@ -2,7 +2,7 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { roles } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
-import { publicCompensation } from '@/lib/compensation-text';
+import { publicCompensation, isUnpaidTrainee, stripTraineePayProse, stripTraineePayItems } from '@/lib/compensation-text';
 import { displayLocation, resolveWorkMode, workModeLabel } from '@/lib/work-mode';
 
 export const prerender = false;
@@ -29,11 +29,18 @@ const TYPE: Record<string, string> = {
   'Apprenticeship': 'CONTRACT',
 };
 
+// Nulling `salary` was not enough: this feed's own description carried
+// "About this role: AI Research Intern - up to INR 3 LPA + research stipend." straight out of the
+// stored `about`, and a board that mirrors the feed publishes the description too. For an unpaid
+// trainee role the prose is filtered the same way the public page filters it.
 function description(r: any): string {
   const parts: string[] = [];
-  if (r.about) parts.push(String(r.about).trim());
+  const unpaidTrainee = isUnpaidTrainee(r);
+  const about = unpaidTrainee ? stripTraineePayProse(r.about) : r.about;
+  if (about) parts.push(String(about).trim());
   const list = (label: string, items: unknown) => {
-    if (Array.isArray(items) && items.length) parts.push(`${label}:\n` + items.map((x) => `- ${x}`).join('\n'));
+    const clean = unpaidTrainee ? stripTraineePayItems(items) : (Array.isArray(items) ? items : []);
+    if (clean.length) parts.push(`${label}:\n` + clean.map((x) => `- ${x}`).join('\n'));
   };
   list('Responsibilities', r.responsibilities);
   list('Skills', r.skills);

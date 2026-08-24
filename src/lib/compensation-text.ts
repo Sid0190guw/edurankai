@@ -118,3 +118,64 @@ export function publicCompensation(
   if (isTraineeRole(role) && !isPaidTrainee(role?.slug)) return null;
   return stripOwnershipPromise(role?.salary);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pay claims hiding in the PROSE, not in the salary column
+//
+// Suppressing the salary field was not enough. /careers/ai-research-intern published
+// "About this role: AI Research Intern — up to INR 3 LPA + research stipend." in its body copy, in
+// its JSON-LD description, and through /api/jobs-feed's description field, while the compensation
+// card beside it was correctly hidden. .dev-scripts/seed-hiring-posts.cjs builds `about` by
+// interpolating the salary INTO the sentence, so correcting the column left the claim standing.
+// /careers/ui-ux-design-intern rendered a "Compensation & Benefits" bullet promising
+// "Stipend of up to 1,000 CHF during the internship period." from its AICTE perks list.
+//
+// A candidate reads the prose. So does a board mirroring the feed, and a wrong pay claim cannot be
+// recalled once mirrored.
+//
+// Whole segments are removed - a sentence, or a bullet - never fragments, on the same principle as
+// stripOwnershipPromise above: a half-cut sentence is worse than a missing one. It applies ONLY to
+// unpaid trainee roles, so the flagship programme's stipend prose is untouched, and it never
+// removes a segment that says the role is UNPAID - "not a stipend" has to survive.
+
+/** A monetary promise: a currency with a number, an Indian pay unit, or a rate per period. */
+const MONEY_CLAIM = /(?:INR|Rs\.?|CHF|USD|EUR|GBP|[₹$€£])\s*\d|\d[\d,.]*\s*(?:INR|Rs\.?|CHF|USD|EUR|GBP)\b|\d[\d,.]*\s*(?:LPA|lakhs?|crores?|k\b)|\d[\d,.]*\s*(?:\/|per\s+)(?:mo\b|month|annum|year|week|hour)|\bstipend\b[^.]*\d/i;
+
+/** Says the engagement pays nothing. Such a segment must never be dropped as a "pay claim". */
+const DECLARES_NO_PAY = /\bunpaid\b|\bno\s+stipend\b|\bnot\s+a\s+stipend\b|\bwithout\s+(?:a\s+)?stipend\b|\bnil\s+stipend\b/i;
+
+function isPayClaim(segment: string): boolean {
+  if (!segment.trim()) return false;
+  if (DECLARES_NO_PAY.test(segment)) return false;
+  return MONEY_CLAIM.test(segment);
+}
+
+/**
+ * Remove money-promising sentences from free prose stored against an unpaid trainee role.
+ *
+ * Sentence-level, because that is the smallest unit droppable without leaving half a claim behind.
+ * Returns the text unchanged when nothing matches, and an empty string when every sentence was a
+ * pay claim - a caller should treat empty as "render nothing here".
+ */
+export function stripTraineePayProse(text: unknown): string {
+  const raw = String(text ?? '');
+  if (!raw.trim() || !MONEY_CLAIM.test(raw)) return raw;
+  const paragraphs = raw.split(/\n\s*\n/).map((para) => {
+    const sentences = para.match(/[^.!?]+[.!?]+[\s]*|[^.!?]+$/g) || [para];
+    return sentences.filter((sentence) => !isPayClaim(sentence)).join('').trim();
+  });
+  return paragraphs.filter(Boolean).join('\n\n').trim();
+}
+
+/** The list form: drops whole bullets that promise money, preserving the order of the survivors. */
+export function stripTraineePayItems(items: unknown): string[] {
+  if (!Array.isArray(items)) return [];
+  return items.map((x) => String(x ?? '')).filter((x) => x.trim() && !isPayClaim(x));
+}
+
+/** A trainee role that pays nothing - the only case the two strippers above apply to. */
+export function isUnpaidTrainee(
+  role: { slug?: unknown; level?: unknown; engagementType?: unknown; title?: unknown } | null | undefined,
+): boolean {
+  return isTraineeRole(role) && !isPaidTrainee(role?.slug);
+}

@@ -108,7 +108,7 @@ UPDATE roles SET
 -- Step 1 (read-only): list what is left.
 SELECT slug, title, level, salary
   FROM roles
- WHERE salary ~* '(esop|equity|stock|yshares?y|ownership stake|employee ownership|profit[- ]?shar|revenue[- ]?shar|vest)'
+ WHERE salary ~* '(esop|equity|stock|\yshares?\y|ownership stake|employee ownership|profit[- ]?shar|revenue[- ]?shar|vest)'
  ORDER BY level, slug;
 
 -- Step 2: one statement per slug from step 1, with the pay text you decide on.
@@ -122,7 +122,7 @@ UPDATE roles
 -- Step 3 (read-only): confirm. Expect 0.
 SELECT count(*) AS rows_still_promising_equity
   FROM roles
- WHERE salary ~* '(esop|equity|stock|yshares?y|ownership stake|employee ownership|profit[- ]?shar|revenue[- ]?shar|vest)';
+ WHERE salary ~* '(esop|equity|stock|\yshares?\y|ownership stake|employee ownership|profit[- ]?shar|revenue[- ]?shar|vest)';
 
--- Note: y is the Postgres word boundary.  means backspace in Postgres regex -- do not
--- rewrite these patterns with .
+-- Note: \y is the Postgres word boundary. \b means backspace in Postgres regex -- do not
+-- rewrite these patterns with \b.
