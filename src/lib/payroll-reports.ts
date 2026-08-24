@@ -68,6 +68,7 @@ import { sql } from 'drizzle-orm';
 import { numeric } from '@/lib/money';
 import { logAudit } from '@/lib/audit';
 import { MONTH_NAMES } from '@/lib/payroll';
+import { csvCell } from '@/lib/csv';
 
 // -------------------------------------------------------------------------------------------------
 // CONSTANTS FIRST
@@ -445,10 +446,12 @@ export async function registerCsv(
 ): Promise<{ filename: string; csv: string } | null> {
   if (!isUuid(runId)) return null;
 
-  // Quote every field. A component label, an employee name or a designation is free text somebody
-  // typed, and a comma or a quote in it would otherwise shift every later column by one — which in a
-  // payroll register means paying the wrong amount to the right person.
-  const cell = (v: any): string => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+  // A component label, an employee name or a designation is free text somebody typed, and a comma
+  // or a quote in it would otherwise shift every later column by one — which in a payroll register
+  // means paying the wrong amount to the right person. csvCell also stops a name beginning with
+  // `=` from becoming a formula, while leaving a negative deduction like -1500 as a NUMBER, so the
+  // total at the bottom of the accountant's column still adds up. See src/lib/csv.ts.
+  const cell = csvCell;
 
   try {
     const meta = rows(await db.execute(sql`

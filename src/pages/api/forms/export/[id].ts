@@ -3,12 +3,9 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { denyAdminApi } from '@/lib/auth/api-guard';
+import { csvCell } from '@/lib/csv';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
-function csvCell(v: any): string {
-  const s = v == null ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
-  return '"' + s.replace(/"/g, '""') + '"';
-}
 
 export const GET: APIRoute = async ({ params, locals }) => {
   // Bulk CSV of every respondent's name, email and phone for one form. It sits outside /admin, so

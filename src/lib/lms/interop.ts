@@ -22,6 +22,7 @@
 // The parsers are pure and exported, so they are tested without a database and without a network.
 
 import { ensureLmsSchema, rows } from './schema';
+import { csvCell } from '@/lib/csv';
 
 async function ctx() {
   const { db } = await import('@/lib/db');
@@ -368,10 +369,10 @@ export async function importRoster(sectionId: string, parsed: RosterRow[], byUse
 // GRADES CSV OUT
 // ================================================================================================
 
-export function csvCell(value: unknown): string {
-  const text = value == null ? '' : String(value);
-  return /[",\r\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
-}
+// Re-exported so every caller of this module shares ONE cell writer. The local copy quoted
+// correctly but let a leading `=` through, and a student's display name is text they chose, which
+// is all a formula injection needs. See src/lib/csv.ts.
+export { csvCell };
 
 /** Build the registrar's export from a gradebook matrix. Pure — the route just sets the headers. */
 export function buildGradeCsv(matrix: { assignments: any[]; students: any[] }): string {

@@ -2,14 +2,7 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-
-function escapeCSV(val: any): string {
-  if (val == null) return '';
-  let s = String(val);
-  if (val instanceof Date) s = val.toISOString();
-  if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
-  return s;
-}
+import { csvCell } from '@/lib/csv';
 
 export const GET: APIRoute = async ({ locals }) => {
   const user = locals.user;
@@ -49,9 +42,9 @@ export const GET: APIRoute = async ({ locals }) => {
     const rows = Array.isArray(r) ? r : (r?.rows || []);
     if (rows.length === 0) return new Response('No data', { status: 404 });
     const columns = Object.keys(rows[0] as any);
-    const csvRows = [columns.map(escapeCSV).join(',')];
+    const csvRows = [columns.map(csvCell).join(',')];
     for (const row of rows as any[]) {
-      csvRows.push(columns.map(c => escapeCSV(row[c])).join(','));
+      csvRows.push(columns.map(c => csvCell(row[c])).join(','));
     }
     return new Response('\uFEFF' + csvRows.join('\n'), {
       headers: {

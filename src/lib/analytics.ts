@@ -2,6 +2,7 @@
 // (Prompt 4/8), edu_progress (P4), edu_attempts (P8), edu_runtime_trace (P4). No synthetic numbers.
 // Role-scoped: a student sees only their own; staff (audit capability) see anonymized aggregates.
 // The aggregators are pure and unit-tested; empty input yields zeroes, never fabricated values.
+import { csvCell } from '@/lib/csv';
 
 export function masterySummary(entries: { state?: string; verified?: boolean }[]): { mastered: number; growing: number; total: number } {
   let mastered = 0, growing = 0;
@@ -26,8 +27,9 @@ export function canViewAnalytics(viewer: { id: string; isStaff: boolean }, targe
 
 // ---- CSV (real data only) ----
 export function toCsv(headers: string[], records: (string | number)[][]): string {
-  const esc = (v: any) => { const s = String(v == null ? '' : v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
-  return [headers.map(esc).join(','), ...records.map((r) => r.map(esc).join(','))].join('\n');
+  // csvCell, not a local escaper: a course title or a learner name is text somebody typed, and a
+  // leading `=` in it is a formula in whatever spreadsheet opens this. See src/lib/csv.ts.
+  return [headers.map(csvCell).join(','), ...records.map((r) => r.map(csvCell).join(','))].join('\n');
 }
 
 // ============================ DB reads (no schema of its own — reads existing stores) ============
