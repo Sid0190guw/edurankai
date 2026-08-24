@@ -3,6 +3,7 @@
 // chain along relationships (equation/formula -> animation -> assessment -> voice -> translations),
 // push local dirty up + pull server changes down, and set synchronizationState=conflict when BOTH
 // sides changed (never a silent overwrite). Reconciles the objects Prompt 6 enqueues on reconnect.
+import { ddlPermitted } from '@/lib/schema-bootstrap';
 import type { RelationshipType } from '@/lib/kernel';
 import type { ProgressEntry } from '@/lib/offline/manifest-schema';
 import { uuidIn } from '@/lib/pg-array';
@@ -93,7 +94,18 @@ export async function ensureSyncSchema(): Promise<void> {
   await db.execute(sql.raw(`ALTER TABLE edu_sync_queue ADD COLUMN IF NOT EXISTS base_version INTEGER`));
   await db.execute(sql.raw(`CREATE TABLE IF NOT EXISTS edu_sync_audit (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), object_id UUID NOT NULL, action TEXT NOT NULL, from_version INTEGER, to_version INTEGER, resolution TEXT, actor UUID, at TIMESTAMPTZ NOT NULL DEFAULT NOW())`));
   await db.execute(sql.raw(`CREATE INDEX IF NOT EXISTS edu_sync_audit_obj_idx ON edu_sync_audit (object_id, at DESC)`));
-  booted = true;
+  // NOT `= true`. A suppressed DDL run must not latch as a completed one.
+  //
+  // db.execute refuses DDL when schema bootstrap is off (src/lib/schema-bootstrap.ts) and returns
+  // the same empty result a real statement would, deliberately, so nothing downstream has to
+  // change. The cost of that indistinguishability is exactly here: setting the flag
+  // unconditionally recorded "already bootstrapped" for a loop that created nothing. Any earlier
+  // request on a warm instance -- a page render, a health probe, even loading /admin/setup before
+  // pressing its button -- would latch it, and the operator's allowingDdl() pass would then return
+  // at the guard above and report success having done nothing.
+  // Recording what actually happened means a suppressed run stays unlatched and the deliberate
+  // operator pass re-runs it for real.
+  booted = ddlPermitted();
 }
 
 async function edgesFor(ids: string[]): Promise<Edge[]> {

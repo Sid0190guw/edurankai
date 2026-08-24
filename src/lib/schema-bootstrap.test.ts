@@ -154,6 +154,44 @@ describe('allowingDdl scopes the escape hatch to one call chain', () => {
   });
 });
 
+describe('allowingDdl actually reaches ensureOnce', () => {
+  restoreEnvAfterEach();
+
+  // THE REGRESSION TEST FOR THE DEFECT THIS PAIR SHIPPED WITH.
+  //
+  // ensure-once.ts asked schemaBootstrapEnabled() -- the ENVIRONMENT only -- while the escape hatch
+  // lives in an AsyncLocalStorage scope that only ddlPermitted() can see. So /admin/setup's Repair
+  // button and POST /api/admin/ops/bootstrap opened the scope, every ensureOnce() key still returned
+  // a resolved promise, and each module reported ok:true having created nothing. `auth-registry` is
+  // the only creator of audit_log in the whole repository, so the operator would have watched every
+  // row go green while the verification step under it kept reporting the same tables missing.
+  //
+  // Asserted on the CALLBACK, not on the return value: ensureOnce resolves either way, and resolving
+  // is exactly what it did while doing nothing. Only "did the DDL body run" distinguishes them.
+  it('runs the bootstrap body inside allowingDdl, and not outside it', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.SCHEMA_BOOTSTRAP = 'off';
+    const { ensureOnce } = await import('./ensure-once');
+
+    let ranOutside = false;
+    await ensureOnce('test:hatch:outside', async () => { ranOutside = true; });
+    expect(ranOutside).toBe(false);
+
+    let ranInside = false;
+    await allowingDdl(() => ensureOnce('test:hatch:inside', async () => { ranInside = true; }));
+    expect(ranInside).toBe(true);
+  });
+
+  it('still refuses when the operator scope is not open, whatever the key', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.SCHEMA_BOOTSTRAP = 'off';
+    const { ensureOnce } = await import('./ensure-once');
+    let ran = false;
+    await ensureOnce('test:hatch:still-off', async () => { ran = true; });
+    expect(ran).toBe(false);
+  });
+});
+
 describe('the database circuit breaker', () => {
   restoreEnvAfterEach();
 

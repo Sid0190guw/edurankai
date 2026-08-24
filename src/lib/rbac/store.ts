@@ -5,6 +5,7 @@
 import { CORE_CAPABILITIES, type Capability } from './capabilities';
 import { SEED_ROLES, resolveRoleCapabilities, type SeedRole } from './roles';
 import { RBAC_DDL, RBAC_TOKENS_DDL } from './schema';
+import { ddlPermitted } from '@/lib/schema-bootstrap';
 import { assertPermissionTransition, type CapabilityToken, type PermissionGrant, type PermissionState, type Principal } from './types';
 import type { AuditEntry } from './guard';
 import { textIn, textArray } from '@/lib/pg-array';
@@ -28,7 +29,18 @@ export async function ensureRbacSchema(): Promise<void> {
   if (bootstrapped) return;
   const { db, sql } = await ctx();
   for (const ddl of [...RBAC_DDL, ...RBAC_TOKENS_DDL]) await db.execute(sql.raw(ddl));
-  bootstrapped = true;
+  // NOT `= true`. A suppressed DDL run must not latch as a completed one.
+  //
+  // db.execute refuses DDL when schema bootstrap is off (src/lib/schema-bootstrap.ts) and returns
+  // the same empty result a real statement would, deliberately, so nothing downstream has to
+  // change. The cost of that indistinguishability is exactly here: setting the flag
+  // unconditionally recorded "already bootstrapped" for a loop that created nothing. Any earlier
+  // request on a warm instance -- a page render, a health probe, even loading /admin/setup before
+  // pressing its button -- would latch it, and the operator's allowingDdl() pass would then return
+  // at the guard above and report success having done nothing.
+  // Recording what actually happened means a suppressed run stays unlatched and the deliberate
+  // operator pass re-runs it for real.
+  bootstrapped = ddlPermitted();
 }
 
 /** Idempotently seed capabilities + roles + role_capabilities from the code roster. */

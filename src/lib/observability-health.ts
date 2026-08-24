@@ -27,6 +27,8 @@
 // PURE — no database, no environment beyond an injectable bag. Tested.
 // ============================================================================================
 
+import { ddlPermitted } from '@/lib/schema-bootstrap';
+
 export type Health = 'ok' | 'degraded' | 'down';
 export interface Check { name: string; ok: boolean; critical?: boolean; detail?: string }
 
@@ -370,7 +372,18 @@ export async function ensureObservabilitySchema(): Promise<void> {
   if (_obsReady) return;
   const { db, sql } = await ctx();
   for (const d of OBS_DDL) await db.execute(sql.raw(d));
-  _obsReady = true;
+  // NOT `= true`. A suppressed DDL run must not latch as a completed one.
+  //
+  // db.execute refuses DDL when schema bootstrap is off (src/lib/schema-bootstrap.ts) and returns
+  // the same empty result a real statement would, deliberately, so nothing downstream has to
+  // change. The cost of that indistinguishability is exactly here: setting the flag
+  // unconditionally recorded "already bootstrapped" for a loop that created nothing. Any earlier
+  // request on a warm instance -- a page render, a health probe, even loading /admin/setup before
+  // pressing its button -- would latch it, and the operator's allowingDdl() pass would then return
+  // at the guard above and report success having done nothing.
+  // Recording what actually happened means a suppressed run stays unlatched and the deliberate
+  // operator pass re-runs it for real.
+  _obsReady = ddlPermitted();
 }
 
 /**

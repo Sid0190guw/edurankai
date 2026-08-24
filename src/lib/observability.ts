@@ -3,6 +3,8 @@
 // admissions, enrolment, settings, tutor, …), real system health, and feature flags that safely
 // disable a subsystem's routes. Strictly superadmin-gated at the call sites. The flag logic is pure.
 
+import { ddlPermitted } from '@/lib/schema-bootstrap';
+
 export interface Flag { key: string; enabled: boolean }
 /** Resolve a feature flag; unknown flags default ON so nothing breaks until explicitly disabled. Pure. */
 export function isEnabled(flags: Flag[], key: string, defaultOn = true): boolean {
@@ -57,7 +59,18 @@ async function ctx() { const { db } = await import('@/lib/db'); const { sql } = 
 export async function ensureFlagSchema(): Promise<void> {
   if (booted) return; const { db, sql } = await ctx();
   await db.execute(sql.raw(`CREATE TABLE IF NOT EXISTS edu_feature_flags (key TEXT PRIMARY KEY, enabled BOOLEAN NOT NULL DEFAULT true, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`));
-  booted = true;
+  // NOT `= true`. A suppressed DDL run must not latch as a completed one.
+  //
+  // db.execute refuses DDL when schema bootstrap is off (src/lib/schema-bootstrap.ts) and returns
+  // the same empty result a real statement would, deliberately, so nothing downstream has to
+  // change. The cost of that indistinguishability is exactly here: setting the flag
+  // unconditionally recorded "already bootstrapped" for a loop that created nothing. Any earlier
+  // request on a warm instance -- a page render, a health probe, even loading /admin/setup before
+  // pressing its button -- would latch it, and the operator's allowingDdl() pass would then return
+  // at the guard above and report success having done nothing.
+  // Recording what actually happened means a suppressed run stays unlatched and the deliberate
+  // operator pass re-runs it for real.
+  booted = ddlPermitted();
 }
 export async function getFlags(): Promise<Flag[]> {
   try { await ensureFlagSchema(); const { db, sql } = await ctx(); return rows(await db.execute(sql`SELECT key, enabled FROM edu_feature_flags`)); } catch { return []; }

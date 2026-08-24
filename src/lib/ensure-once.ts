@@ -55,10 +55,26 @@ const cache = new Map<string, Promise<void>>();
 // ever covered the bootstraps that went THROUGH ensureOnce -- about forty modules run their ALTER
 // TABLEs from a page's frontmatter without it, and were never switched off at all. Two enforcement
 // points asking the same question is fine; two definitions of the answer would have drifted.
-import { schemaBootstrapEnabled } from '@/lib/schema-bootstrap';
+//
+// AND IT ASKS ddlPermitted(), NOT schemaBootstrapEnabled(). That distinction is the whole point of
+// the escape hatch and it was wrong here first time round.
+//
+// schemaBootstrapEnabled() reads the environment only. ddlPermitted() reads the environment OR the
+// AsyncLocalStorage scope that allowingDdl() opens around a deliberate operator action -- the Repair
+// button on /admin/setup and POST /api/admin/ops/bootstrap. With the environment-only test, those two
+// surfaces opened the scope, every ensureOnce() key still short-circuited to Promise.resolve(), and
+// each module reported ok:true having created nothing.
+//
+// That is not a small bug. `auth-registry` (src/lib/auth/registry.ts) is the ONLY creator of
+// audit_log anywhere in this repository, and `error-log` (src/lib/logger.ts) owns edu_error_log's
+// columns and indexes. An operator pressing Repair during an incident would have watched every row
+// go green while the verification step underneath kept reporting the same tables missing -- which is
+// verbatim the "ok: true, ran: 8, failed: 0 while ten tables were missing" failure this file's own
+// header cites as the reason the swallow below is never silent.
+import { ddlPermitted } from '@/lib/schema-bootstrap';
 
 function bootstrapDisabled(): boolean {
-  return !schemaBootstrapEnabled();
+  return !ddlPermitted();
 }
 
 export function ensureOnce(key: string, fn: () => Promise<void>): Promise<void> {
