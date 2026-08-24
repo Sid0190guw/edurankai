@@ -5,16 +5,55 @@
 export const prerender = false;
 import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
 import { can } from '@/lib/rbac';
-import { search, logQuery, facetValues } from '@/lib/search-index';
+import { search, logQuery, facetValues, indexStatus } from '@/lib/search-index';
 
 const user = Astro.locals.user;
 const url = Astro.url;
 const q = (url.searchParams.get('q') || '').trim();
 const filters = { school: url.searchParams.get('school') || '', level: url.searchParams.get('level') || '', language: url.searchParams.get('language') || '' };
 const canEnrolled = user ? (await can(user, 'read', { type: 'KnowledgeObject', securityLabels: ['enrolled-only'] })).allow : false;
-const results = await search(q, filters, { canEnrolled }, 40).catch(() => []);
-if (q) await logQuery(q, user?.id ?? null, results.length).catch(() => {});
+// A FAILED SEARCH IS NOT AN EMPTY CATALOGUE, AND THIS PAGE USED TO SAY IT WAS.
+//
+// `.catch(() => [])` turned every error into zero results. edu_search_index is created only by
+// ensureSearchSchema(), and db.execute refuses DDL in production (src/lib/schema-bootstrap.ts), so
+// the table has never existed on the live database — and every student who searched was told
+// "Nothing found" about a catalogue that was never read. /admin/search already drew this
+// distinction between none and unknown; the learner surface is the one where it matters.
+let results: any[] = [];
+let searchError = '';
+try { results = await search(q, filters, { canEnrolled }, 40); }
+catch (e: any) {
+  // The real Postgres reason is on e.cause; e.message is only the failed SQL. It goes to the server
+  // log, never onto a learner's screen — the page below says the search failed without handing a
+  // student the schema.
+  console.error('[aquintutor/search] search failed:', e?.cause?.message || e?.message || 'unknown error');
+  searchError = 'the catalogue search did not answer';
+}
+
+// Only log a search that really ran. Logging a failed read as a 0-result query would write the
+// outage into /admin/search's analytics as genuine student misses.
+if (q && !searchError) await logQuery(q, user?.id ?? null, results.length).catch(() => {});
+
+// Facets come from the same table, so they fail with it. Empty selects are the right fallback here:
+// the failure is already reported once, above the results.
 const facets = await facetValues().catch(() => ({ schools: [], levels: [], languages: [] }));
+
+// AN EMPTY INDEX AND A QUERY THAT MATCHED NOTHING ARE DIFFERENT ANSWERS, AND ONLY ONE OF THEM IS
+// THE READER'S FAULT. Reindex has never run here, so every search returns zero rows from a table
+// that is present and empty -- no error to catch, and "Nothing found. Try a different term" sends a
+// student off to rephrase a query that was never going to match anything. One COUNT, only on the
+// path where the page would otherwise say that, tells the two apart. /admin/search shows this same
+// number; the learner surface was the one that could not see it.
+let indexEmpty = false;
+if (!searchError && results.length === 0) {
+  indexEmpty = await indexStatus().then((st) => st.count === 0).catch(() => false);
+}
+
+// A filter the viewer is actually using must stay in its dropdown even when the facet list came back
+// empty, or resubmitting the form silently drops it and the results change under them.
+const activeSchool = filters.school !== '' && !facets.schools.includes(filters.school);
+const activeLevel = filters.level !== '' && !facets.levels.includes(filters.level);
+const activeLanguage = filters.language !== '' && !facets.languages.includes(filters.language);
 
 const IN = 'font-family:Inter Tight,sans-serif;font-size:14px;padding:9px 11px;border:1px solid var(--line,#e6e1d6);border-radius:9px;';
 function href(d: any) { return d.type === 'CourseObject' ? '/aquintutor/lesson-index/' + d.id : d.type === 'KnowledgeObject' ? '/aquintutor/lesson/' + d.id : '#'; }
@@ -27,16 +66,28 @@ function typeLabel(t: string) { return t === 'CourseObject' ? 'Course' : t === '
 
     <form method="GET" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
       <input name="q" value={q} placeholder="Search courses, lessons, concepts…" style={IN + 'flex:1;min-width:220px;'} />
-      <select name="school" style={IN}><option value="">All schools</option>{facets.schools.map((s) => <option value={s} selected={filters.school === s}>{s}</option>)}</select>
-      <select name="level" style={IN}><option value="">Any level</option>{facets.levels.map((l) => <option value={l} selected={filters.level === l}>{l}</option>)}</select>
-      <select name="language" style={IN}><option value="">Any language</option>{facets.languages.map((l) => <option value={l} selected={filters.language === l}>{l}</option>)}</select>
+      <select name="school" style={IN}><option value="">All schools</option>{activeSchool ? <option value={filters.school} selected>{filters.school}</option> : null}{facets.schools.map((s) => <option value={s} selected={filters.school === s}>{s}</option>)}</select>
+      <select name="level" style={IN}><option value="">Any level</option>{activeLevel ? <option value={filters.level} selected>{filters.level}</option> : null}{facets.levels.map((l) => <option value={l} selected={filters.level === l}>{l}</option>)}</select>
+      <select name="language" style={IN}><option value="">Any language</option>{activeLanguage ? <option value={filters.language} selected>{filters.language}</option> : null}{facets.languages.map((l) => <option value={l} selected={filters.language === l}>{l}</option>)}</select>
       <button type="submit" style="background:var(--ink,#1a1712);color:var(--sand-50,#fbfaf4);border:none;border-radius:9px;padding:9px 20px;font-family:'Inter Tight',sans-serif;font-size:14px;font-weight:600;cursor:pointer;">Search</button>
     </form>
 
-    <p style="font-family:'Inter Tight',sans-serif;font-size:13px;color:#8a8478;margin:0 0 20px;">{q ? results.length + ' result' + (results.length === 1 ? '' : 's') + ' for "' + q + '"' : 'Browse published courses and lessons, or search above.'}</p>
+    {searchError ? null : <p style="font-family:'Inter Tight',sans-serif;font-size:13px;color:#8a8478;margin:0 0 20px;">{q ? results.length + ' result' + (results.length === 1 ? '' : 's') + ' for "' + q + '"' : 'Browse published courses and lessons, or search above.'}</p>}
 
-    {results.length === 0 ? (
+    {searchError ? (
+      <div style="border:1px solid #e0c9a6;background:#fdf6ea;border-radius:12px;padding:16px 18px;margin:0 0 20px;">
+        <p style="font-family:'Inter Tight',sans-serif;font-size:15px;font-weight:600;color:var(--ink,#1a1712);margin:0 0 6px;">Search is unavailable right now.</p>
+        <p style="font-family:'Inter Tight',sans-serif;font-size:13.5px;color:#6b6455;margin:0;line-height:1.55;">This is not an empty catalogue — the search index could not be read, so nothing can be said about what is in it. Please try again shortly.</p>
+      </div>
+    ) : results.length === 0 ? (
+      indexEmpty ? (
+      <div style="border:1px solid var(--line,#e6e1d6);background:#fff;border-radius:12px;padding:16px 18px;">
+        <p style="font-family:'Inter Tight',sans-serif;font-size:15px;font-weight:600;color:var(--ink,#1a1712);margin:0 0 6px;">The catalogue has not been indexed yet.</p>
+        <p style="font-family:'Inter Tight',sans-serif;font-size:13.5px;color:#6b6455;margin:0;line-height:1.55;">There is nothing to search here yet — this is not a result about your search terms. Published courses and lessons appear once the index has been built.</p>
+      </div>
+      ) : (
       <p style="font-family:'Inter Tight',sans-serif;font-size:15px;color:#6b6455;">Nothing found. Try a different term{filters.school || filters.level || filters.language ? ' or clear the filters' : ''}.</p>
+      )
     ) : (
       <div style="display:flex;flex-direction:column;gap:10px;">{results.map((d: any) => (
         <a href={href(d)} style="text-decoration:none;background:#fff;border:1px solid var(--line,#e6e1d6);border-radius:12px;padding:14px 18px;">

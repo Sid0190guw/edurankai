@@ -309,6 +309,78 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   { module: 'Course certificates', table: 'training_certificates', owner: 'src/lib/learning-progress.ts' },
   // The clock-out identity trail, same module and same bootstrap as the revisions table above.
   { module: 'Clock-out checks', table: 'hr_clock_out_checks', owner: 'src/lib/attendance-verify-clockout.ts' },
+
+  // DISCOVERY, ADDED 2026-08-24 AFTER /admin/search REPORTED BOTH OF THEM MISSING IN PRODUCTION.
+  //
+  // Same story as the three above and one worse consequence. ensureSearchSchema() is their only
+  // creator, it runs through db.execute, and db.execute refuses DDL in production — so neither
+  // table has ever existed on the live database, and neither appeared here to say so. The learner
+  // surface /aquintutor/search caught the missing relation and rendered "Nothing found", which is
+  // not a feature with no rows: it is a student being told the catalogue is empty. Now created by
+  // db/search-index-schema.sql, and monitored here.
+  { module: 'Search index', table: 'edu_search_index', owner: 'src/lib/search-index.ts' },
+  { module: 'Search query log', table: 'edu_search_queries', owner: 'src/lib/search-index.ts' },
+
+  // ============================================================================================
+  // THE AUTHENTICATION TABLES, ADDED 2026-08-24. THE WHOLE SUBSYSTEM WAS UNMONITORED.
+  // ============================================================================================
+  //
+  // Not one table in src/lib/auth/ was named here, so this endpoint had nothing to say about any of
+  // them — sign-in, second factors, passkeys, recovery, the permission registry. Silence from a
+  // health check reads as health, and that is the defect being fixed. It is NOT a claim that any of
+  // them is missing.
+  //
+  // THE CLAIM THAT WAS WRONG, KEPT BECAUSE THE REASONING MATTERS. A first pass here asserted these
+  // tables were absent in production, on the strength of two facts: no db/*.sql creates any of them,
+  // and the live endpoint was reporting `ddl.suppressed: 7` naming their CREATE statements. Both
+  // facts are true and the conclusion does not follow. These bootstraps do not go through
+  // ensureOnce — they call db.execute directly behind a module-level `let ensured` — so they ran on
+  // every cold instance from the day each shipped until the DDL guard landed on 2026-08-23.
+  // src/lib/auth/twofactor.ts shipped on 2026-06-30 and is reached on every successful password
+  // sign-in. `suppressed` counts ATTEMPTS, not failures; a no-op CREATE TABLE IF NOT EXISTS against
+  // an existing table is attempted and refused exactly like one against a missing table.
+  //
+  // The point of these entries is that nobody should have to reason about any of that again. The
+  // endpoint answers it, every time it is polled, and db/auth-schema.sql is the file that fixes
+  // whatever the answer turns out to be.
+  //
+  // ONE ENTRY PER FAILURE, NOT ONE PER MODULE. The convention above is one representative table per
+  // module, on the reasoning that a module's bootstrap either ran or did not. That does not hold for
+  // two-factor.ts, whose ensure creates three tables that are read in three different places — the
+  // attempt limiter on the password form, the policy after a correct password, and the pending
+  // challenge — so all three are named.
+
+  // The shared attempt limiter, and the newest of this set, which makes it the one most worth
+  // confirming: countAttempt() INSERTs here with no catch of its own, on all four password sign-in
+  // forms and on the public form limiter.
+  { module: 'Auth attempt limiter', table: 'auth_attempt_limit', owner: 'src/lib/auth/two-factor.ts' },
+  // Read by isSecondStepRequired() after a CORRECT password on /admin/login, /portal/login,
+  // /aquintutor/login and /hei/login. A missing relation is an ordinary query error there, and each
+  // page's catch turns it into "Sign-in is temporarily unavailable" — a sign-in outage, not a
+  // degraded feature.
+  { module: 'Second-step policy', table: 'user_2fa_policy', owner: 'src/lib/auth/two-factor.ts' },
+  // The half-finished sign-in itself. No challenge can be issued or completed without it.
+  { module: 'Pending sign-in challenge', table: 'auth_pending_2fa', owner: 'src/lib/auth/two-factor.ts' },
+  // TOTP enrolment and the hashed one-time recovery codes.
+  { module: 'TOTP secrets', table: 'user_totp', owner: 'src/lib/auth/twofactor.ts' },
+  { module: 'Recovery codes', table: 'user_backup_codes', owner: 'src/lib/auth/twofactor.ts' },
+  // Passkey / fingerprint / Face ID. On this deployment any ONE of password, passkey, face or TOTP
+  // signs you in, so this is a front door and not an extra.
+  { module: 'Passkeys', table: 'user_passkeys', owner: 'src/lib/auth/webauthn.ts' },
+  // Account recovery. Absent, a locked-out person cannot be let back in by the path built for it.
+  { module: 'Account recovery tokens', table: 'auth_recovery_token', owner: 'src/lib/auth/recovery.ts' },
+  // Not a feature table: the record that facial data was erased, by whom, and why. Its absence does
+  // not break a screen — it means the erasure happened with no evidence that it happened.
+  { module: 'Face erasure record', table: 'face_erasure_log', owner: 'src/lib/auth/face-erasure.ts' },
+  // The RBAC registry. Near-certainly present already, because src/middleware.ts reads
+  // role_permissions and user_role_assignments through getViewableSectionKeys() on every admin page
+  // load and admin pages open — but "near-certainly" is what this list exists to replace with an
+  // answer, and no committed file creates them either.
+  { module: 'RBAC roles', table: 'team_roles', owner: 'src/lib/auth/registry.ts' },
+  { module: 'RBAC page permissions', table: 'role_permissions', owner: 'src/lib/auth/registry.ts' },
+  { module: 'RBAC role assignments', table: 'user_role_assignments', owner: 'src/lib/auth/registry.ts' },
+  { module: 'Permission catalogue', table: 'permission_catalogue', owner: 'src/lib/auth/registry.ts' },
+  { module: 'Permission grants', table: 'role_permission_grants', owner: 'src/lib/auth/registry.ts' },
 ];
 
 // ============================================================================================

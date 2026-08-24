@@ -24,6 +24,9 @@ const MODULES: Array<{ name: string; run: () => Promise<unknown> }> = [
   { name: 'feature-flags', run: async () => (await import('@/lib/observability')).ensureFlagSchema() },
   { name: 'knowledge-sync', run: async () => (await import('@/lib/knowledge-sync')).ensureSyncSchema() },
   { name: 'mail', run: async () => (await import('@/lib/mail')).ensureMailSchema() },
+  // Discovery. Both its tables are read by /aquintutor/search and /admin/search, and created by
+  // nothing else on this deployment -- see db/search-index-schema.sql.
+  { name: 'search-index', run: async () => (await import('@/lib/search-index')).ensureSearchSchema() },
   // These two have no exported ensure; a harmless READ triggers the same internal bootstrap.
   { name: 'error-log', run: async () => (await import('@/lib/logger')).recentErrors(1) },
   { name: 'job-queue', run: async () => (await import('@/lib/job-queue')).claimBatch(0) },
@@ -70,7 +73,8 @@ export const POST: APIRoute = async ({ locals }) => {
   // A green result from a call is not evidence the call did anything; the only evidence is the
   // database itself, so ask it.
   const EXPECTED = ['audit_log', 'edu_cron_runs', 'edu_error_log', 'edu_feature_flags', 'edu_job_log',
-    'edu_jobs', 'edu_releases', 'edu_sync_queue', 'mail_config', 'rbac_audit'];
+    'edu_jobs', 'edu_releases', 'edu_search_index', 'edu_search_queries', 'edu_sync_queue',
+    'mail_config', 'rbac_audit'];
   let present: string[] = [];
   let verifyError = '';
   try {
