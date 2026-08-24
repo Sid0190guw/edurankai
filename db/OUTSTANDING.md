@@ -11,7 +11,29 @@ established pattern here is that migrations are handed over as a command.
 
 ---
 
-## 1. `db/xscale-schema.sql` — NOT APPLIED
+## STATUS: nothing is outstanding (confirmed 2026-08-24, late)
+
+All three sections below have since been run. Read live, not assumed:
+
+```
+/api/health              status=ok   schemas=51/51   columns=11/11
+/api/careers/search      degraded=False   total=1017
+/aquintutor/shared-progress/<any token>   "this link isn't active"  (not "could not be checked")
+```
+
+Both missing-counts are zero and the two behavioural tells have flipped. **This file is kept rather
+than deleted**, because the three sections are the recipe for a database that does not have them —
+a rebuild, a staging environment, a restore — and because the warnings under "Do NOT run these
+blind" and "Do not mass-apply everything" are about the folder, not about today.
+
+Each section keeps its evidence for how it was found missing. That is the part worth preserving: the
+tell came from a `degraded` flag and a 500, and only became a number on `/api/health` after the
+objects were added to its watch lists. **If you are checking this file to find out today's state, do
+not trust the prose — run the three commands above.**
+
+---
+
+## 1. `db/xscale-schema.sql` — APPLIED
 
 ```bash
 psql "$DATABASE_URL" -f db/xscale-schema.sql
@@ -21,14 +43,15 @@ psql "$DATABASE_URL" -f db/xscale-schema.sql
 columns were added to its watch lists: `schemas.missingCount` rose by exactly 1 and
 `columns.missingCount` by exactly 5 — every object this file creates that is monitored is absent.
 
-It was first found the harder way, and that is worth keeping: `/api/careers/search` answers
+It was first found the harder way, and that is worth keeping: `/api/careers/search` answered
 `"degraded": true` to every query, including one with no filters at all. That flag is
 `listOpportunities()` reporting that its real statement failed and the narrowed retry answered
-instead — and the real statement joins `divisions`, which only this file creates.
+instead — and the real statement joins `divisions`, which only this file creates. It now answers
+`degraded=False` across all 1,017 postings, which is the same tell read the other way.
 
-**What is broken until it runs.** The public careers search silently ignores its own division,
-classification, scale-band and discipline filters: the result is *wider* than what was asked for,
-and only the `degraded` flag says so. The Extreme-Scale department cannot exist at all — the
+**What was broken until it ran.** The public careers search silently ignored its own division,
+classification, scale-band and discipline filters: the result was *wider* than what was asked for,
+and only the `degraded` flag said so. The Extreme-Scale department could not exist at all — the
 `divisions` table lives only in this file and in an `ensure*()` that production suppresses.
 
 **Read the file's own header before running it.** It explains why the indexes are built
@@ -41,46 +64,57 @@ on `/admin/roles/divisions`.
 
 ---
 
-## 2. `db/aquintutor-share-schema.sql` — NOT APPLIED
+## 2. `db/aquintutor-share-schema.sql` — APPLIED
 
 ```bash
 psql "$DATABASE_URL" -f db/aquintutor-share-schema.sql
 ```
 
 **Evidence.** `/aquintutor/shared-progress/<token>` answered HTTP 500 to every token — three tried,
-three 500s. `resolveShare()` reads `aq_progress_share` and nothing caught the throw. The page now
-degrades honestly instead of erroring, and still reports "We could not check this link", which is
-the table saying it is absent.
+three 500s. `resolveShare()` reads `aq_progress_share` and nothing caught the throw. The page was
+changed to degrade honestly instead of erroring, and then said "We could not check this link" —
+which was the table reporting its own absence.
 
-**What is broken until it runs.** Progress sharing: a learner cannot mint a read-only link and a
-parent or teacher cannot open one.
+It now says **"this link isn't active"**, which is the page answering about the TOKEN rather than
+about our schema. Those two sentences exist as separate states for exactly this reason: one is a
+claim about the learner's choice, the other is a claim about us, and only one of them was ever true
+at a time.
+
+**What was broken until it ran.** Progress sharing: a learner could not mint a read-only link and a
+parent or teacher could not open one.
 
 ---
 
-## 3. One more registered module table, name not visible from outside
+## 3. One more registered module table — APPLIED
 
-As of 2026-08-24 `/api/health` reports:
+```bash
+psql "$DATABASE_URL" -f db/application-invitations-schema.sql
+```
+
+**Evidence, and the reason this section reads oddly.** Mid-afternoon `/api/health` reported:
 
 ```
 schemas: { ran: 48, expected: 51, missingCount: 3 }
 columns: { present: 5, expected: 10, missingCount: 5 }
 ```
 
-Two of those three tables and all five columns are items 1 and 2 above. **One table is left over**,
-and the public endpoint deliberately gives a count rather than a name — a stranger does not need the
-inventory of internal tables. **The name is on `/api/health/deep` or the `/admin/ops` bootstrap
-panel**, both of which need an operator sign-in.
+Two of those three tables and all five columns were sections 1 and 2. One was left over, and the
+public endpoint gives a count rather than a name on purpose — a stranger does not need the inventory
+of internal tables, and the name is on `/api/health/deep` or the `/admin/ops` bootstrap panel, both
+behind an operator sign-in. It was inferred to be `application_invitations`, because that entry had
+just been added to `BOOTSTRAP_MODULES` and its file was committed but unrun.
 
-Most likely `application_invitations`: it was added to `BOOTSTRAP_MODULES` by the most recent commit
-to touch that list, and `db/application-invitations-schema.sql` is committed but there is no evidence
-it has been run.
+**Both counts are now zero**, so whichever it was, it is there.
 
-```bash
-psql "$DATABASE_URL" -f db/application-invitations-schema.sql
-```
+### The thing to take from this section
 
-**Running all three files takes the endpoint to `schemas 51/51` and `columns 10/10`.** That is the
-whole outstanding set, as far as anything currently watched can see.
+The counts got *worse* before they got better — from `48/49` to `48/51`, and columns from `5/5` to
+`5/10` — and nothing about the database changed in between. What changed is that `divisions`,
+`aq_progress_share` and five `roles` columns were added to the health endpoint's watch lists.
+
+Every one of them was already absent. The endpoint had simply never been asked about them, and a
+table nothing asks about reads as health. If a migration ever looks like it made the numbers worse,
+check whether something was added to the list before concluding anything about the database.
 
 ---
 
