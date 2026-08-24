@@ -260,19 +260,42 @@ export async function deliverMessage(opts: DeliverInput): Promise<DeliverResult>
   const internalUsers = new Map<string, RecipientKind>(); // userId -> first kind
   const external: { email: string; kind: RecipientKind }[] = [];
 
+  // RESOLVE, THEN INSERT ONCE — rather than resolve-and-insert per address.
+  //
+  // This was three awaited round trips per recipient on a thirty-address send: a resolve, a
+  // mail_recipients insert, and later a mail_box insert. The inserts are trivial; what they cost is
+  // a pooler connection held for a ~140ms network hop each, and sending a company-wide mail is not a
+  // background job here — it happens inside a request while every other page competes for the same
+  // handful of connections.
+  //
+  // The two INSERTS collapse to one statement each. The RESOLVE deliberately does not: batching it
+  // needs a LEFT JOIN LATERAL to keep "first match wins, per address" and this is mail ROUTING —
+  // delivering to the wrong person is a worse failure than a slow send, so it is left for a change
+  // that can be tested against real address data rather than folded into a latency pass.
+  const pending: { kind: RecipientKind; userId: string | null; email: string; name: string | null }[] = [];
   for (const [kind, list] of kinds) {
     for (const email of list) {
       const resolved = await resolveAddress(email);
-      await db.execute(sql`
-        INSERT INTO mail_recipients (message_id, kind, user_id, email, name)
-        VALUES (${messageId}, ${kind}, ${resolved.userId}, ${resolved.email}, ${resolved.name})
-      `);
+      pending.push({ kind, userId: resolved.userId, email: resolved.email, name: resolved.name });
       if (resolved.userId) {
         if (!internalUsers.has(resolved.userId)) internalUsers.set(resolved.userId, kind);
       } else {
         external.push({ email: resolved.email, kind });
       }
     }
+  }
+
+  // jsonb_to_recordset rather than a VALUES list built from N placeholders: one parameter whatever
+  // the recipient count, so the statement cannot grow toward the parameter limit on a large send.
+  // The empty guard matters — jsonb_to_recordset over [] inserts nothing, but sending the statement
+  // at all is a round trip for no rows.
+  if (pending.length) {
+    await db.execute(sql`
+      INSERT INTO mail_recipients (message_id, kind, user_id, email, name)
+      SELECT ${messageId}, x.kind, x.user_id, x.email, x.name
+        FROM jsonb_to_recordset(${JSON.stringify(pending)}::jsonb)
+          AS x(kind text, user_id uuid, email text, name text)
+    `);
   }
 
   // Sender copy
@@ -282,13 +305,18 @@ export async function deliverMessage(opts: DeliverInput): Promise<DeliverResult>
     ON CONFLICT (user_id, message_id) DO UPDATE SET folder = EXCLUDED.folder
   `);
 
-  // Internal recipient copies (skip drafts; skip sender to keep their Sent copy)
+  // Internal recipient copies (skip drafts; skip sender to keep their Sent copy).
+  // One statement for the whole distribution list, for the same reason as above. The sender filter
+  // and the ON CONFLICT are unchanged, so a recipient who is also the sender still keeps the Sent
+  // copy written just above rather than gaining an inbox row.
   if (!opts.asDraft) {
-    for (const [userId] of internalUsers) {
-      if (userId === opts.fromUserId) continue;
+    const boxUserIds = [...internalUsers.keys()].filter((u) => u !== opts.fromUserId);
+    if (boxUserIds.length) {
       await db.execute(sql`
         INSERT INTO mail_box (user_id, message_id, thread_id, folder, is_read)
-        VALUES (${userId}, ${messageId}, ${threadId}, 'inbox', false)
+        SELECT x.user_id, ${messageId}, ${threadId}, 'inbox', false
+          FROM jsonb_to_recordset(${JSON.stringify(boxUserIds.map((u) => ({ user_id: u })))}::jsonb)
+            AS x(user_id uuid)
         ON CONFLICT (user_id, message_id) DO NOTHING
       `);
     }
