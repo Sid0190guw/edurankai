@@ -23,6 +23,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import postgres from 'postgres';
 import dotenv from 'dotenv';
+import { splitStatements } from './sql-split.mjs';
 
 const args = process.argv.slice(2);
 const file = args.find((a) => !a.startsWith('--'));
@@ -61,43 +62,11 @@ if (!process.env.DATABASE_URL) {
 
 const raw = fs.readFileSync(abs, 'utf8');
 
-// Split into statements. Strips `--` line comments first, then splits on semicolons that are not
-// inside a single-quoted string or a $$-quoted body.
-function splitStatements(text) {
-  const out = [];
-  let buf = '';
-  let inSingle = false, inDollar = false, dollarTag = '';
-  const lines = text.split(/\r?\n/);
-  for (const line of lines) {
-    let stripped = '';
-    for (let i = 0; i < line.length; i++) {
-      const two = line.slice(i, i + 2);
-      if (!inSingle && !inDollar && two === '--') break;          // rest of line is a comment
-      const ch = line[i];
-      if (!inDollar && ch === "'") inSingle = !inSingle;
-      if (!inSingle && ch === '$') {
-        const m = line.slice(i).match(/^\$[A-Za-z_0-9]*\$/);
-        if (m) {
-          if (!inDollar) { inDollar = true; dollarTag = m[0]; }
-          else if (m[0] === dollarTag) { inDollar = false; dollarTag = ''; }
-          stripped += m[0]; i += m[0].length - 1; continue;
-        }
-      }
-      stripped += ch;
-    }
-    buf += stripped + '\n';
-    if (!inSingle && !inDollar) {
-      let idx;
-      while ((idx = buf.indexOf(';')) !== -1) {
-        const stmt = buf.slice(0, idx).trim();
-        if (stmt) out.push(stmt);
-        buf = buf.slice(idx + 1);
-      }
-    }
-  }
-  if (buf.trim()) out.push(buf.trim());
-  return out;
-}
+// Split into statements. The splitter lives in scripts/sql-split.mjs so it can be tested without
+// a database in the room — the version that used to sit here shredded every `DO $$ ... $$` block
+// in db/ into unrunnable fragments, and reported it as a handful of failed statements in an
+// otherwise green run. See the header of that file.
+
 
 const statements = splitStatements(raw);
 const label = (s) => s.replace(/\s+/g, ' ').slice(0, 92);
