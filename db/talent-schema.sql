@@ -552,10 +552,14 @@ CREATE INDEX IF NOT EXISTS tal_event_undelivered_idx
 ON tal_event (delivered_at, id) WHERE delivered_at IS NULL;
 CREATE INDEX IF NOT EXISTS tal_event_subject_idx
 ON tal_event (subject_kind, subject_id, occurred_at DESC);
+-- EXPECTED false HERE. This asks whether a PART 2 column exists, and PART 2 has not run yet --
+-- it is below. The alias says so out loud because when this read "AS present" it was the last
+-- row-returning statement in the file, so a SQL console showed the entire migration as one cell
+-- reading false, on a run that had committed every statement.
 SELECT EXISTS (
 SELECT 1 FROM information_schema.columns
  WHERE table_schema = 'public' AND table_name = 'org_positions'
-   AND column_name = 'onboarding_pack') AS present;
+   AND column_name = 'onboarding_pack') AS part2_not_run_yet_false_is_correct;
 
 
 -- ================================================================================================
@@ -614,3 +618,13 @@ ALTER TABLE org_positions ADD COLUMN IF NOT EXISTS onboarding_pack TEXT;
 -- 3. Only then deploy the talent surfaces.
 -- ================================================================================================
 
+-- ================================================================================================
+-- DID IT LAND? This is the LAST statement in the file, so this row is what a SQL console shows when
+-- the paste finishes. Two trues and 29 is a complete migration; anything else names which half.
+-- ================================================================================================
+SELECT (SELECT count(*)::int FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name LIKE 'tal\_%')  AS tal_tables_expect_29,
+       to_regclass('public.tal_event_subject_idx') IS NOT NULL         AS part1_core_done,
+       EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'org_positions'
+                  AND column_name = 'onboarding_pack')                 AS part2_bridge_done;
