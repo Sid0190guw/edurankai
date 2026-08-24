@@ -102,12 +102,24 @@ export class PgKernelStore implements KernelStore {
     return { db, sql };
   }
 
+  // SECURITY_LABELS IS text[], AND A JS ARRAY CANNOT BE BOUND TO IT DIRECTLY.
+  // `${o.securityLabels}` renders as a ROW constructor through this repo's PgDialect -- ($1, $2) for
+  // two labels, ($1) for one -- so Postgres answers "is of type text[] but expression is of type
+  // record", or "malformed array literal" for the single-label case that is the default for every
+  // object (repository.ts). src/lib/pg-array.ts was written after this exact pattern silently broke
+  // four other features for months; textArray() carries its own type, so never add a ::text[] cast.
+  private async labels(xs: readonly string[] | undefined) {
+    const { textArray } = await import('@/lib/pg-array');
+    return textArray(xs || ['public']);
+  }
+
   async insertObject(o: KernelObject): Promise<void> {
     const { db, sql } = await this.ctx();
+    const labels = await this.labels(o.securityLabels);
     await db.execute(sql`INSERT INTO kernel_objects
       (id, type, version, owner, permissions, metadata, learning_metadata, security_labels, synchronization_state, lifecycle_state, data, created_at, updated_at, archived_at)
       VALUES (${o.id}, ${o.type}, ${o.version}, ${o.owner}, ${JSON.stringify(o.permissions)}::jsonb, ${JSON.stringify(o.metadata)}::jsonb,
-              ${JSON.stringify(o.learningMetadata)}::jsonb, ${o.securityLabels as any}, ${o.synchronizationState}, ${o.lifecycleState},
+              ${JSON.stringify(o.learningMetadata)}::jsonb, ${labels}, ${o.synchronizationState}, ${o.lifecycleState},
               ${JSON.stringify(o.data)}::jsonb, ${o.createdAt}, ${o.updatedAt}, ${o.archivedAt})`);
   }
   async getObject(id: string): Promise<KernelObject | null> {
@@ -117,10 +129,11 @@ export class PgKernelStore implements KernelStore {
   }
   async updateObject(o: KernelObject): Promise<void> {
     const { db, sql } = await this.ctx();
+    const labels = await this.labels(o.securityLabels);
     await db.execute(sql`UPDATE kernel_objects SET
       type=${o.type}, version=${o.version}, owner=${o.owner}, permissions=${JSON.stringify(o.permissions)}::jsonb,
       metadata=${JSON.stringify(o.metadata)}::jsonb, learning_metadata=${JSON.stringify(o.learningMetadata)}::jsonb,
-      security_labels=${o.securityLabels as any}, synchronization_state=${o.synchronizationState}, lifecycle_state=${o.lifecycleState},
+      security_labels=${labels}, synchronization_state=${o.synchronizationState}, lifecycle_state=${o.lifecycleState},
       data=${JSON.stringify(o.data)}::jsonb, updated_at=${o.updatedAt}, archived_at=${o.archivedAt}
       WHERE id=${o.id}`);
   }

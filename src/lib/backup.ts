@@ -1,5 +1,5 @@
 // src/lib/backup.ts — Backup, restore & data integrity (Prompt 23). Export kernel objects +
-import { uuidIn } from '@/lib/pg-array';
+import { uuidIn, textArray } from '@/lib/pg-array';
 // relationships to a portable JSON package (whole, or scoped per-course); a VERIFIED restore path
 // that validates + integrity-checks and supports a dry-run before writing; consistency checks
 // (orphaned edges, invalid lifecycle states). Restores are ADDITIVE + non-destructive (ON CONFLICT
@@ -70,7 +70,7 @@ export async function applyRestore(pkg: BackupPackage): Promise<{ objects: numbe
   let oc = 0, ec = 0;
   for (const o of pkg.objects) {
     const r = rows(await db.execute(sql`INSERT INTO kernel_objects (id, type, version, owner, permissions, metadata, learning_metadata, security_labels, synchronization_state, lifecycle_state, data, created_at, updated_at, archived_at)
-      VALUES (${o.id}, ${o.type}, ${o.version || 1}, ${o.owner ?? null}, ${JSON.stringify(o.permissions || [])}::jsonb, ${JSON.stringify(o.metadata || {})}::jsonb, ${JSON.stringify(o.learning_metadata || {})}::jsonb, ${o.security_labels || ['public']}, ${o.synchronization_state || 'synced'}, ${o.lifecycle_state || 'created'}, ${JSON.stringify(o.data || {})}::jsonb, ${o.created_at || new Date().toISOString()}, ${o.updated_at || new Date().toISOString()}, ${o.archived_at ?? null})
+      VALUES (${o.id}, ${o.type}, ${o.version || 1}, ${o.owner ?? null}, ${JSON.stringify(o.permissions || [])}::jsonb, ${JSON.stringify(o.metadata || {})}::jsonb, ${JSON.stringify(o.learning_metadata || {})}::jsonb, ${textArray(o.security_labels || ['public'])}, ${o.synchronization_state || 'synced'}, ${o.lifecycle_state || 'created'}, ${JSON.stringify(o.data || {})}::jsonb, ${o.created_at || new Date().toISOString()}, ${o.updated_at || new Date().toISOString()}, ${o.archived_at ?? null})
       ON CONFLICT (id) DO NOTHING RETURNING id`).catch(() => []));
     if (rows(r).length) oc++;
   }

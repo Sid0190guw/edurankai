@@ -112,6 +112,26 @@ describe('no live instance of either mistake remains', () => {
     expect(bad.join(', ')).toBe('');
   });
 
+  // ADDED 2026-08-24, AFTER THIS SCAN MISSED THREE LIVE INSTANCES FOR MONTHS.
+  //
+  // The scans above look for `= ANY(${...})` — a READ. The same mistake on a WRITE has no ANY() in
+  // it and so matched nothing: kernel_objects.security_labels (store.ts insertObject/updateObject
+  // and backup.ts's restore) and edu_search_index.security_labels (search-index.ts reindex) all bound
+  // the JS array straight into the template. Rendered by this repo's own PgDialect that is a ROW
+  // constructor, so every one of those statements failed — reindex could never write a row, and a
+  // restored backup rejected every object. All three sat behind a catch, which is why nothing showed.
+  //
+  // The invariant is deliberately coarse: a file that WRITES a text[] column must mention textArray.
+  // It cannot prove the right value was wrapped, but it cannot be satisfied by accident either.
+  it('every file that writes a text[] column goes through textArray', () => {
+    const writesArrayColumn = (src: string) =>
+      /INSERT INTO[\s\S]{0,600}?security_labels/.test(src) || /SET[\s\S]{0,300}?security_labels\s*=/.test(src);
+    const bad = BODY
+      .filter((x) => writesArrayColumn(code(x.s)) && !/textArray\(/.test(code(x.s)))
+      .map((x) => x.f);
+    expect(bad.join(', ')).toBe('');
+  });
+
   it('every file that calls the helpers imports them', () => {
     const bad = BODY
       .filter((x) => /\b(uuidIn|textIn)\(/.test(code(x.s)) && !/from '@\/lib\/pg-array'/.test(x.s))
