@@ -574,6 +574,13 @@ export const BOOTSTRAP_COLUMNS: { module: string; table: string; column: string;
   // column, and Postgres parses a statement before it evaluates a null guard. See
   // src/lib/xscale/fallback.test.ts.
   { module: 'Posting career level', table: 'roles', column: 'career_level', owner: 'db/xscale-schema.sql' },
+
+  // The typed invitation code. application_invitations has its own file and its own entry in the
+  // table list above, but these columns arrived AFTER that table was already applied to production —
+  // so the table can be present while the columns are not, which is exactly the shape this list
+  // exists to make visible. Absent, the link half of an invitation still works and the code half
+  // answers "not valid" to a code that is genuinely correct.
+  { module: 'Invitation code', table: 'application_invitations', column: 'code_hash', owner: 'db/application-invitations-code.sql' },
 ];
 
 // ============================================================================================

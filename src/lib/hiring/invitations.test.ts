@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import {
   generateToken, hashToken, tokenPrefixOf, normaliseEmail, isEmail,
   statusOf, isLive, inviteUrl, ttlDays, parseInvite,
+  generateCode, normaliseCode, formatCode, hashCode, codePrefixOf,
   DEFAULT_TTL_DAYS, MAX_TTL_DAYS,
 } from '@/lib/hiring/invitations';
 import { isGatedApplyPath } from '@/lib/talent/gate-pass';
@@ -173,5 +174,62 @@ describe('parseInvite', () => {
   it('truncates rather than rejecting an over-long note', () => {
     const out = parseInvite({ email: 'a@b.co', note: 'x'.repeat(5000) }) as { value: { note: string } };
     expect(out.value.note).toHaveLength(1000);
+  });
+});
+
+describe('the typed code', () => {
+  it('uses the project alphabet, so O, 0, I and 1 can never be minted', () => {
+    for (let i = 0; i < 40; i++) {
+      const body = generateCode();
+      expect(body).toHaveLength(15);
+      expect(body).toMatch(/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]+$/);
+      expect(body).not.toMatch(/[O0I1]/);
+    }
+  });
+
+  it('never mints the same code twice', () => {
+    const seen = new Set(Array.from({ length: 200 }, () => generateCode()));
+    expect(seen.size).toBe(200);
+  });
+
+  it('displays as ERA-INV and not as ERA-SEL, which means a different thing entirely', () => {
+    const shown = formatCode('ABCDEFGHJKLMNPQ');
+    expect(shown).toBe('ERA-INV-ABCDE-FGHJK-LMNPQ');
+    expect(shown.startsWith('ERA-SEL')).toBe(false);
+  });
+
+  it('reads back whatever form a person actually types', () => {
+    const body = 'ABCDEFGHJKLMNPQ';
+    for (const typed of [
+      'ERA-INV-ABCDE-FGHJK-LMNPQ',
+      'era-inv-abcde-fghjk-lmnpq',
+      '  ERA INV ABCDE FGHJK LMNPQ  ',
+      'ABCDEFGHJKLMNPQ',
+      'abcde fghjk lmnpq',
+      'ABCDE-FGHJK-LMNPQ',
+    ]) {
+      expect(normaliseCode(typed)).toBe(body);
+    }
+  });
+
+  it('refuses anything that is not a complete code', () => {
+    expect(normaliseCode('')).toBeNull();
+    expect(normaliseCode('ERA-INV-ABCDE')).toBeNull();
+    expect(normaliseCode('ABCDEFGHJKLMNPQR')).toBeNull();
+    expect(normaliseCode(null)).toBeNull();
+  });
+
+  it('hashes to something that is not the code, and not the token hash of the same string', () => {
+    const body = 'ABCDEFGHJKLMNPQ';
+    expect(hashCode(body)).toHaveLength(64);
+    expect(hashCode(body)).not.toContain(body);
+    expect(hashCode(body)).toBe(hashCode(body));
+    // Domain-separated: the same string used as a token and as a code must not collide, or one
+    // lookup could resolve the other's row.
+    expect(hashCode(body)).not.toBe(hashToken(body));
+  });
+
+  it('shows only the first group as a prefix', () => {
+    expect(codePrefixOf('ABCDEFGHJKLMNPQ')).toBe('ABCDE');
   });
 });

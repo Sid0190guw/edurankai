@@ -27,11 +27,18 @@
 // PRODUCTION NOTE: the table is created by db/application-invitations-schema.sql, run by hand, and
 // registered in BOOTSTRAP_MODULES. ensureInvitationSchema() below is the local-development path only
 // — bootstrap DDL is suppressed in production by design, so nothing here may assume it ran.
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomInt } from 'node:crypto';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 import { publicOrigin } from '@/lib/public-origin';
+// The code vocabulary is IMPORTED, never restated. src/lib/talent/codes.ts was reconciled onto this
+// exact rule after two definitions of one code format existed side by side and whichever happened to
+// be imported decided whether a code validated. A second invitation-flavoured alphabet here would
+// recreate that, and it would also mean /apply/gateway telling somebody the wrong characters are
+// forbidden.
+import { CODE_ALPHABET, CODE_GROUP_LEN, CODE_GROUPS, CODE_BODY_LEN } from '@/lib/talent/types';
+import { countAttempt } from '@/lib/auth/two-factor';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 const fail = (where: string, e: any) => console.error('[invitations] ' + where + ':', e?.cause?.message || e?.message);
@@ -50,6 +57,7 @@ export interface Invitation {
   roleSlug: string;
   roleTitle: string;
   tokenPrefix: string;
+  codePrefix: string;
   note: string;
   waiveFee: boolean;
   invitedBy: string | null;
@@ -92,6 +100,83 @@ const EMAIL_RE = /^[^@\s]+@[^@\s.]+\.[^@\s]{2,}$/;
 
 export function isEmail(input: unknown): boolean {
   return EMAIL_RE.test(normaliseEmail(input));
+}
+
+// =================================================================================================
+// THE TYPED CODE — the half of an invitation that survives a broken link
+// =================================================================================================
+//
+// A URL token is fine when the person can click it and useless when they cannot: an email client
+// mangles the link, they read the mail on a phone and apply on a laptop, somebody reads it out over
+// a call. The code is ERA-INV-XXXXX-XXXXX-XXXXX and is typed at /invite.
+//
+// ERA-INV, NOT ERA-SEL, AND THAT DISTINCTION IS LOAD-BEARING. ERA-SEL means somebody was already
+// SELECTED and goes straight to onboarding with no application. /apply/gateway is built around the
+// two doors never opening onto each other, because one hire holding both a selection and an
+// application is the contradiction that whole gate exists to prevent. A code that looked like the
+// other one would be an invitation into the wrong door.
+//
+// WHY THIS NEEDS MORE CARE THAN THE TOKEN. Fifteen characters is short enough to be guessed at, and
+// a hit is not nothing: it reveals who was invited, to which posting, the line the administrator
+// wrote them, and whether their fee was waived. Hence the shared alphabet, one sentence for every
+// refusal, and attempts counted in the limiter this project already has.
+
+/** Displayed as ERA-INV-XXXXX-XXXXX-XXXXX. Distinct from ERA-SEL on purpose — see above. */
+export const INVITE_CODE_PREFIX = 'ERA-INV';
+
+/** Per IP, per window. A code is typed by a person, so a human never comes close to this. */
+export const CODE_ATTEMPTS_PER_IP = 10;
+export const CODE_ATTEMPT_WINDOW_SECONDS = 600;
+
+/** The one sentence every failed code gets. Wrong, spent, withdrawn and never-existed are the same. */
+export const INVALID_CODE =
+  'That code is not valid. If you were sent one, check it against the email you received, or reply '
+  + 'to that message and we will look it up for you.';
+
+export const RATE_LIMITED_CODE =
+  'Too many attempts from this connection. Wait ten minutes and try again, or open the link in your '
+  + 'invitation email instead.';
+
+/** A fresh code body — CODE_BODY_LEN characters from the project's shared alphabet. */
+export function generateCode(): string {
+  let out = '';
+  for (let i = 0; i < CODE_BODY_LEN; i++) {
+    out += CODE_ALPHABET[randomInt(0, CODE_ALPHABET.length)];
+  }
+  return out;
+}
+
+/**
+ * What somebody typed, reduced to a comparable body — or null if it cannot be one.
+ *
+ * Accepts the whole displayed form, the body alone, lower case, and any spacing or punctuation,
+ * because people paste what they were sent and type what they remember. Characters outside the
+ * alphabet are DROPPED rather than rejected: the alphabet excludes O, 0, I and 1 precisely because
+ * they are mistyped for one another, so a stray hyphen or space must not be treated as a wrong code.
+ */
+export function normaliseCode(input: unknown): string | null {
+  const raw = String(input ?? '').toUpperCase();
+  const withoutPrefix = raw.replace(/^\s*ERA[\s-]*INV[\s-]*/, '');
+  const body = withoutPrefix.split('').filter((c) => CODE_ALPHABET.includes(c)).join('');
+  return body.length === CODE_BODY_LEN ? body : null;
+}
+
+/** The displayed form. The only place the grouping is decided. */
+export function formatCode(body: string): string {
+  const groups: string[] = [];
+  for (let i = 0; i < CODE_GROUPS; i++) {
+    groups.push(body.slice(i * CODE_GROUP_LEN, (i + 1) * CODE_GROUP_LEN));
+  }
+  return INVITE_CODE_PREFIX + '-' + groups.join('-');
+}
+
+export function hashCode(body: string): string {
+  return createHash('sha256').update('invite-code:' + String(body || ''), 'utf8').digest('hex');
+}
+
+/** The first group only. Enough to recognise which invitation somebody means on a call. */
+export function codePrefixOf(body: string): string {
+  return String(body || '').slice(0, CODE_GROUP_LEN);
 }
 
 /**
@@ -202,6 +287,8 @@ export function ensureInvitationSchema(): Promise<void> {
       role_title TEXT NOT NULL DEFAULT '',
       token_hash TEXT NOT NULL,
       token_prefix TEXT NOT NULL DEFAULT '',
+      code_hash TEXT,
+      code_prefix TEXT NOT NULL DEFAULT '',
       note TEXT NOT NULL DEFAULT '',
       waive_fee BOOLEAN NOT NULL DEFAULT FALSE,
       invited_by UUID,
@@ -219,13 +306,14 @@ export function ensureInvitationSchema(): Promise<void> {
       revoked_by UUID
     )`);
     await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS app_inv_token_uq ON application_invitations (token_hash)`);
+    await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS app_inv_code_uq ON application_invitations (code_hash) WHERE code_hash IS NOT NULL`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS app_inv_email_idx ON application_invitations (email, role_slug)`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS app_inv_created_idx ON application_invitations (created_at DESC)`);
     await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS app_inv_active_uq ON application_invitations (email, role_slug) WHERE status IN ('pending', 'opened')`);
   });
 }
 
-const COLS = `id, email, full_name, role_id, role_slug, role_title, token_prefix, note, waive_fee,
+const COLS = `id, email, full_name, role_id, role_slug, role_title, token_prefix, code_prefix, note, waive_fee,
               invited_by, invited_by_name, status, email_sent, email_error, application_id,
               created_at, expires_at, sent_at, opened_at, applied_at, revoked_at`;
 
@@ -238,6 +326,7 @@ function toInvitation(r: any): Invitation {
     roleSlug: String(r.role_slug || ''),
     roleTitle: String(r.role_title || ''),
     tokenPrefix: String(r.token_prefix || ''),
+    codePrefix: String(r.code_prefix || ''),
     note: String(r.note || ''),
     waiveFee: r.waive_fee === true,
     invitedBy: r.invited_by ? String(r.invited_by) : null,
@@ -264,6 +353,8 @@ export interface CreateResult {
   invitation?: Invitation;
   /** Returned exactly once. Not recoverable afterwards. */
   token?: string;
+  /** The same, for the typed form. Both are hashed at rest; this response is the only copy. */
+  code?: string;
 }
 
 /**
@@ -281,6 +372,7 @@ export async function createInvitation(args: {
   invitedByName: string;
 }): Promise<CreateResult> {
   const token = generateToken();
+  const code = generateCode();
   const expires = new Date(Date.now() + args.clean.days * 86400000).toISOString();
   try {
     const inserted = await db.transaction(async (tx: any) => {
@@ -292,13 +384,15 @@ export async function createInvitation(args: {
            AND status IN ('pending', 'opened')`);
       const r = await tx.execute(sql`
         INSERT INTO application_invitations
-          (email, full_name, role_id, role_slug, role_title, token_hash, token_prefix, note,
+          (email, full_name, role_id, role_slug, role_title, token_hash, token_prefix,
+           code_hash, code_prefix, note,
            waive_fee, invited_by, invited_by_name, expires_at)
         VALUES
           (${args.clean.email}, ${args.clean.fullName},
            ${args.roleId}::uuid,
            ${args.clean.roleSlug}, ${args.roleTitle},
-           ${hashToken(token)}, ${tokenPrefixOf(token)}, ${args.clean.note},
+           ${hashToken(token)}, ${tokenPrefixOf(token)},
+           ${hashCode(code)}, ${codePrefixOf(code)}, ${args.clean.note},
            ${args.clean.waiveFee},
            ${args.invitedBy}::uuid,
            ${args.invitedByName}, ${expires}::timestamptz)
@@ -306,7 +400,7 @@ export async function createInvitation(args: {
       return rows(r)[0];
     });
     if (!inserted) return { ok: false, error: 'The invitation could not be saved.' };
-    return { ok: true, invitation: toInvitation(inserted), token };
+    return { ok: true, invitation: toInvitation(inserted), token, code: formatCode(code) };
   } catch (e: any) {
     fail('createInvitation', e);
     return { ok: false, error: e?.cause?.message || 'The invitation could not be saved.' };
@@ -332,6 +426,65 @@ export async function findByToken(token: string): Promise<Invitation | null> {
     fail('findByToken', e);
     return null;
   }
+}
+
+/** Read one invitation by its typed code. Null for every failure, same as findByToken. */
+export async function findByCode(typed: string): Promise<Invitation | null> {
+  const body = normaliseCode(typed);
+  if (!body) return null;
+  try {
+    const r = await db.execute(sql`
+      SELECT ${sql.raw(COLS)} FROM application_invitations
+       WHERE code_hash = ${hashCode(body)} LIMIT 1`);
+    const row = rows(r)[0];
+    return row ? toInvitation(row) : null;
+  } catch (e: any) {
+    fail('findByCode', e);
+    return null;
+  }
+}
+
+export interface Resolution {
+  invitation: Invitation | null;
+  /** True when the caller has spent their allowance. The surface says so instead of INVALID_CODE. */
+  rateLimited: boolean;
+}
+
+/**
+ * The ONE lookup both surfaces use — the landing page and the code form.
+ *
+ * Two things live here rather than in either caller. First, an input can be a URL token or a typed
+ * code and the person does not know or care which; second, the attempt limit has to bite wherever
+ * the guess arrives, and a limiter that only guards the POST is not a limiter when the GET does the
+ * same lookup.
+ *
+ * ONLY CODE-SHAPED INPUT IS COUNTED. A URL token is 43 characters of randomness and nobody is
+ * guessing one; counting page loads of a valid link toward a limit would lock people out of their
+ * own invitation for opening the email twice.
+ *
+ * FAILS CLOSED. If the limiter cannot be read, the answer is rate-limited rather than "carry on" —
+ * the same reading src/lib/auth/recovery.ts takes, for the same reason.
+ */
+export async function resolveInvitation(input: string, ip: string): Promise<Resolution> {
+  const raw = String(input || '').trim();
+  if (!raw) return { invitation: null, rateLimited: false };
+
+  const byToken = await findByToken(raw);
+  if (byToken) return { invitation: byToken, rateLimited: false };
+
+  const body = normaliseCode(raw);
+  if (!body) return { invitation: null, rateLimited: false };
+
+  const bucket = 'invitecode:ip:' + createHash('sha256').update(String(ip || 'unknown')).digest('hex').slice(0, 32);
+  try {
+    const used = await countAttempt(bucket, CODE_ATTEMPT_WINDOW_SECONDS);
+    if (used > CODE_ATTEMPTS_PER_IP) return { invitation: null, rateLimited: true };
+  } catch (e: any) {
+    fail('resolveInvitation limiter', e);
+    return { invitation: null, rateLimited: true };
+  }
+
+  return { invitation: await findByCode(body), rateLimited: false };
 }
 
 export async function markOpened(id: string): Promise<void> {

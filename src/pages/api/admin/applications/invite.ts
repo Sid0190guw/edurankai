@@ -18,6 +18,7 @@ import {
   parseInvite, createInvitation, revokeInvitation, recordSend, inviteUrl,
   ensureInvitationSchema, type CleanInvite, type Invitation,
 } from '@/lib/hiring/invitations';
+import { publicOrigin } from '@/lib/public-origin';
 
 export const prerender = false;
 
@@ -50,7 +51,7 @@ async function lookupRole(slug: string): Promise<{ id: string | null; title: str
   }
 }
 
-function invitationEmail(inv: Invitation, url: string, fromName: string): { subject: string; html: string; text: string } {
+function invitationEmail(inv: Invitation, url: string, code: string, fromName: string): { subject: string; html: string; text: string } {
   const forRole = inv.roleTitle ? ' for ' + inv.roleTitle : '';
   const subject = inv.roleTitle
     ? 'You are invited to apply — ' + inv.roleTitle
@@ -77,6 +78,18 @@ function invitationEmail(inv: Invitation, url: string, fromName: string): { subj
     '<p style="margin:0 0 14px;">You still fill in the application and it is read by a person. An ' +
     'invitation is not an offer, and it does not decide the outcome.</p>',
   );
+  // THE CODE IS IN THE MAIL, NOT ONLY THE LINK. A button is useless to somebody whose mail client
+  // mangled it, or who read this on a phone and wants to apply on a laptop. Both open the same
+  // invitation, so neither is a fallback for the other — they are two ways in.
+  if (code) {
+    bodyParts.push(
+      '<p style="margin:18px 0 6px;font-size:13px;color:#555;">If the button does not work, go to ' +
+      '<strong>' + esc(publicOrigin()) + '/invite</strong> and enter this code:</p>' +
+      '<p style="margin:0 0 14px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:18px;' +
+      'font-weight:700;letter-spacing:0.06em;color:#0f0f14;background:#f6f5f1;border:1px solid rgba(0,0,0,0.08);' +
+      'border-radius:8px;padding:12px 14px;text-align:center;">' + esc(code) + '</p>',
+    );
+  }
 
   const html = brandedEmail({
     preheader: 'An invitation to apply' + forRole + '.',
@@ -99,6 +112,7 @@ function invitationEmail(inv: Invitation, url: string, fromName: string): { subj
     inv.waiveFee ? 'The application fee has been waived for you.' : '',
     '',
     'Open the application: ' + url,
+    code ? '\nOr go to ' + publicOrigin() + '/invite and enter this code: ' + code : '',
     '',
     'You still fill in the application and it is read by a person. An invitation is not an offer.',
     'This link stops working on ' + new Date(inv.expiresAt).toISOString().slice(0, 10) + '.',
@@ -135,7 +149,7 @@ async function issue(
   let emailError = '';
   if (wantEmail) {
     try {
-      const msg = invitationEmail(created.invitation, url, invitedByName);
+      const msg = invitationEmail(created.invitation, url, created.code || '', invitedByName);
       const r = await sendEmail({ to: created.invitation.email, subject: msg.subject, html: msg.html, text: msg.text });
       emailed = r.ok;
       emailError = r.ok ? '' : (r.error || 'The mail server did not accept it.');
@@ -161,6 +175,7 @@ async function issue(
   return json({
     ok: true,
     url,
+    code: created.code || '',
     emailed,
     emailError,
     invitation: { ...created.invitation, emailSent: emailed, emailError },

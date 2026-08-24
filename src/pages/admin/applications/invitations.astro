@@ -9,6 +9,7 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { can, canAccessSection } from '@/lib/auth/permissions';
+import { effectiveJobStatus } from '@/lib/xscale/taxonomy';
 import { listInvitations, ensureInvitationSchema, type Invitation } from '@/lib/hiring/invitations';
 
 export const prerender = false;
@@ -37,19 +38,82 @@ try {
   listError = e?.cause?.message || e?.message || 'The invitations could not be read.';
 }
 
-// Open postings for the dropdown. A failure here narrows the form to "any role" rather than taking
-// the page down: inviting somebody without naming a posting is a supported invitation.
-let roleOptions: { slug: string; title: string }[] = [];
+// =================================================================================================
+// THE ROLE LIST — read from `roles` on every load, so it is the postings that exist right now
+// =================================================================================================
+//
+// Nothing is hardcoded and nothing is cached: add a posting and it is in this dropdown on the next
+// page load; close or delete one and it is gone. That is the whole sync mechanism, and it is the
+// right one — a copy of the catalogue kept anywhere else is a copy that goes stale.
+//
+// ONLY POSTINGS THAT ACCEPT APPLICATIONS ARE OFFERED, resolved through effectiveJobStatus() — the
+// same function /apply and /careers/[slug] use, so this dropdown cannot disagree with the page the
+// invited person lands on. Inviting somebody to a closed posting is a promise the apply flow would
+// then refuse server-side, which is a worse experience than not offering it.
+//
+// AN INVITATION ALREADY SENT KEEPS ITS ROLE. role_slug and role_title are snapshots on the
+// invitation row, so a posting that is later renamed or removed does not rewrite the history of who
+// was invited to what. Only this dropdown is live.
+let roleGroups: { dept: string; roles: { slug: string; title: string }[] }[] = [];
+let openCount = 0;
+let closedHidden = 0;
+let roleListError = '';
+let roleListCapped = false;
+const ROLE_CAP = 2000;
+
 try {
-  const r = await db.execute(sql`
-    SELECT slug, title FROM roles
-     WHERE COALESCE(is_active, TRUE) = TRUE
-     ORDER BY title ASC LIMIT 500`);
-  roleOptions = rowsOf(r).map((x: any) => ({ slug: String(x.slug || ''), title: String(x.title || '') }))
-    .filter((x) => x.slug && x.title);
+  // The narrowed retry is not defensive theatre: job_status arrives from db/xscale-schema.sql, a
+  // hand-run file, and a raw reader of an additive column on this project has to survive its absence.
+  let raw: any[] = [];
+  try {
+    raw = rowsOf(await db.execute(sql`
+      SELECT r.slug, r.title, r.is_open, r.job_status, r.application_deadline,
+             COALESCE(d.name, '') AS dept
+        FROM roles r
+        LEFT JOIN departments d ON d.id = r.department_id
+       WHERE COALESCE(r.is_active, TRUE) = TRUE
+       ORDER BY dept ASC, r.title ASC
+       LIMIT ${ROLE_CAP + 1}`));
+  } catch {
+    raw = rowsOf(await db.execute(sql`
+      SELECT r.slug, r.title, r.is_open, r.application_deadline,
+             COALESCE(d.name, '') AS dept
+        FROM roles r
+        LEFT JOIN departments d ON d.id = r.department_id
+       WHERE COALESCE(r.is_active, TRUE) = TRUE
+       ORDER BY dept ASC, r.title ASC
+       LIMIT ${ROLE_CAP + 1}`));
+  }
+
+  // NO SILENT CAP. If the catalogue outgrows the ceiling the page says so, rather than showing a
+  // shortened list that reads as the whole thing.
+  roleListCapped = raw.length > ROLE_CAP;
+  if (roleListCapped) raw = raw.slice(0, ROLE_CAP);
+
+  const grouped = new Map<string, { slug: string; title: string }[]>();
+  for (const x of raw) {
+    const slug = String(x.slug || '');
+    const title = String(x.title || '');
+    if (!slug || !title) continue;
+    const status = effectiveJobStatus({
+      jobStatus: x.job_status, isOpen: x.is_open, applicationDeadline: x.application_deadline,
+    });
+    if (!status.acceptsApplications) { closedHidden++; continue; }
+    openCount++;
+    const dept = String(x.dept || '').trim() || 'Other';
+    if (!grouped.has(dept)) grouped.set(dept, []);
+    grouped.get(dept)!.push({ slug, title });
+  }
+  roleGroups = Array.from(grouped.entries()).map(([dept, roles]) => ({ dept, roles }));
 } catch (e: any) {
-  console.error('[invitations] roles:', e?.cause?.message || e?.message);
+  // A failure narrows the form to "any role" rather than taking the page down — inviting somebody
+  // without naming a posting is a supported invitation — but it SAYS so, because a dropdown holding
+  // only "Any role" otherwise reads as a company with no open postings.
+  roleListError = e?.cause?.message || e?.message || 'The postings could not be read.';
+  console.error('[invitations] roles:', roleListError);
 }
+
+const roleJson = JSON.stringify(roleGroups);
 
 const preRole = Astro.url.searchParams.get('role') || '';
 
@@ -122,13 +186,26 @@ const dateOnly = (s: string | null) => (s ? String(s).slice(0, 10) : '');
 
         <label style="display:flex;flex-direction:column;gap:5px;">
           <span style="font-size:11px;font-weight:600;color:#8a8a94;">Role</span>
-          <select name="roleSlug"
+          <input type="text" id="roleFilter" placeholder="Type to narrow the list" autocomplete="off"
+                 style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:7px 12px;color:#fff;font-size:12px;outline:none;" />
+          <select name="roleSlug" id="roleSelect" size="1"
                   style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;color:#fff;font-size:13px;outline:none;">
             <option value="">Any role &mdash; they choose</option>
-            {roleOptions.map((r) => (
-              <option value={r.slug} selected={r.slug === preRole}>{r.title}</option>
+            {roleGroups.map((g) => (
+              <optgroup label={g.dept}>
+                {g.roles.map((r) => (
+                  <option value={r.slug} selected={r.slug === preRole}>{r.title}</option>
+                ))}
+              </optgroup>
             ))}
           </select>
+          <small id="roleCount" style="font-size:10.5px;color:#6b7280;line-height:1.5;">
+            {roleListError
+              ? 'The postings could not be read, so only "Any role" is offered: ' + roleListError
+              : openCount + ' open posting(s), read from the roles table on every load'
+                + (closedHidden ? ' · ' + closedHidden + ' closed or past deadline, not offered' : '')
+                + (roleListCapped ? ' · list truncated at ' + ROLE_CAP + ', narrow with the filter' : '')}
+          </small>
         </label>
 
         <label style="display:flex;flex-direction:column;gap:5px;">
@@ -186,8 +263,24 @@ const dateOnly = (s: string | null) => (s ? String(s).slice(0, 10) : '');
           <button type="button" id="copyBtn"
                   style="background:#15151a;border:1px solid #1a1a1f;color:#fff;font-size:12px;font-weight:600;padding:9px 14px;border-radius:8px;cursor:pointer;white-space:nowrap;">Copy</button>
         </div>
+        <div id="codeRow" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid #1a1a1f;">
+          <p style="font-size:11px;font-weight:700;color:#FF7040;margin:0 0 6px;letter-spacing:0.06em;text-transform:uppercase;">Or the typed code</p>
+          <p style="font-size:11.5px;color:#8a8a94;margin:0 0 8px;line-height:1.5;">
+            For somebody whose mail client breaks the link, or who reads the email on a phone and
+            applies on a laptop. They enter it at <strong>/invite</strong>. It is in the email too.
+          </p>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input id="codeText" readonly
+                   style="flex:1;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;color:#fff;font-size:14px;font-family:'Geist Mono',monospace;letter-spacing:0.08em;outline:none;min-width:0;" />
+            <button type="button" id="copyCodeBtn"
+                    style="background:#15151a;border:1px solid #1a1a1f;color:#fff;font-size:12px;font-weight:600;padding:9px 14px;border-radius:8px;cursor:pointer;white-space:nowrap;">Copy</button>
+          </div>
+        </div>
         <p id="mailState" style="font-size:11.5px;margin:8px 0 0;"></p>
       </div>
+
+      <!-- The live catalogue, for the filter below. Rendered from the same query the select is. -->
+      <script type="application/json" id="roleData" set:html={roleJson} />
     </div>
 
     <!-- ── THE LIST ───────────────────────────────────────────────────────────────────────── -->
@@ -213,6 +306,9 @@ const dateOnly = (s: string | null) => (s ? String(s).slice(0, 10) : '');
                     <span style="display:block;font-weight:600;">{inv.fullName || inv.email}</span>
                     {inv.fullName ? <span style="display:block;color:#8a8a94;font-size:11px;">{inv.email}</span> : null}
                     {inv.waiveFee ? <span style="display:inline-block;margin-top:3px;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.3);color:#10b981;font-size:10px;font-weight:600;padding:1px 7px;border-radius:100px;">fee waived</span> : null}
+                    {/* The first group only. Enough to recognise which invitation somebody means on
+                        a call; never enough to reconstruct the code, which is stored as a hash. */}
+                    {inv.codePrefix ? <span style="display:block;margin-top:3px;color:#6b7280;font-size:10.5px;font-family:'Geist Mono',monospace;">ERA-INV-{inv.codePrefix}&hellip;</span> : null}
                   </td>
                   <td style="padding:10px 12px;color:#e8e8ee;">{inv.roleTitle || 'Any role'}</td>
                   <td style="padding:10px 12px;">
@@ -281,10 +377,65 @@ const dateOnly = (s: string | null) => (s ? String(s).slice(0, 10) : '');
     }
   }
 
+  // ── the role filter ──────────────────────────────────────────────────────────────────────────
+  // The select is rendered server-side and works with no JavaScript at all; this only narrows it.
+  // Rebuilding from the JSON rather than hiding <option> elements, because hiding options is not
+  // honoured consistently across browsers and a filter that silently does nothing is worse than none.
+  const roleSelect = document.getElementById('roleSelect');
+  const roleFilter = document.getElementById('roleFilter');
+  const roleDataEl = document.getElementById('roleData');
+  let roleData = [];
+  try { roleData = JSON.parse((roleDataEl && roleDataEl.textContent) || '[]'); } catch (e) { roleData = []; }
+
+  function renderRoles(term) {
+    if (!roleSelect) return;
+    const q = String(term || '').trim().toLowerCase();
+    const keep = roleSelect.value;
+    roleSelect.innerHTML = '';
+    const any = document.createElement('option');
+    any.value = '';
+    any.textContent = 'Any role — they choose';
+    roleSelect.appendChild(any);
+    let shown = 0;
+    roleData.forEach((g) => {
+      const matches = g.roles.filter((r) =>
+        !q || r.title.toLowerCase().indexOf(q) !== -1 || g.dept.toLowerCase().indexOf(q) !== -1);
+      if (!matches.length) return;
+      const group = document.createElement('optgroup');
+      group.label = g.dept;
+      matches.forEach((r) => {
+        const o = document.createElement('option');
+        o.value = r.slug;
+        o.textContent = r.title;
+        if (r.slug === keep) o.selected = true;
+        group.appendChild(o);
+        shown++;
+      });
+      roleSelect.appendChild(group);
+    });
+    if (q && shown === 0) {
+      const none = document.createElement('option');
+      none.value = '';
+      none.disabled = true;
+      none.textContent = 'No open posting matches "' + term + '"';
+      roleSelect.appendChild(none);
+    }
+  }
+
+  if (roleFilter) {
+    roleFilter.addEventListener('input', () => renderRoles(roleFilter.value));
+  }
+
   function showLink(data) {
     if (!linkBox || !linkText || !mailState) return;
     linkBox.style.display = 'block';
     linkText.value = data.url || '';
+    const codeRow = document.getElementById('codeRow');
+    const codeText = document.getElementById('codeText');
+    if (codeRow && codeText) {
+      if (data.code) { codeText.value = data.code; codeRow.style.display = 'block'; }
+      else { codeRow.style.display = 'none'; }
+    }
     if (data.emailed) {
       mailState.textContent = 'The invitation email was sent.';
       mailState.style.color = '#10b981';
@@ -331,20 +482,23 @@ const dateOnly = (s: string | null) => (s ? String(s).slice(0, 10) : '');
     });
   }
 
-  if (copyBtn && linkText) {
-    copyBtn.addEventListener('click', async () => {
+  function wireCopy(button, field) {
+    if (!button || !field) return;
+    button.addEventListener('click', async () => {
       try {
-        await navigator.clipboard.writeText(linkText.value);
-        copyBtn.textContent = 'Copied';
-        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+        await navigator.clipboard.writeText(field.value);
+        button.textContent = 'Copied';
+        setTimeout(() => { button.textContent = 'Copy'; }, 1500);
       } catch (e) {
         // Clipboard is blocked in some contexts. Selecting the text is the honest fallback.
-        linkText.select();
-        copyBtn.textContent = 'Press Ctrl+C';
-        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 2500);
+        field.select();
+        button.textContent = 'Press Ctrl+C';
+        setTimeout(() => { button.textContent = 'Copy'; }, 2500);
       }
     });
   }
+  wireCopy(copyBtn, linkText);
+  wireCopy(document.getElementById('copyCodeBtn'), document.getElementById('codeText'));
 
   document.querySelectorAll('[data-revoke]').forEach((el) => {
     el.addEventListener('click', async () => {
