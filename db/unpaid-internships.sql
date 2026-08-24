@@ -20,6 +20,9 @@
 -- falls back to localhost:5432, and the "Connection refused" you get names a host that appears
 -- nowhere in a Supabase connection string. The helper also sets PGCLIENTENCODING=UTF8.
 --
+-- NO psql? The Supabase SQL editor cannot run this file - \if, \echo and \set are psql
+-- features. Use db/unpaid-internships-editor.sql there instead, one section per run.
+--
 -- ENCODING. The replacement text below writes its em dash as the Unicode escape U&'...\2014...'
 -- rather than as a literal character. A Windows console on codepage 1252 can hand psql mis-decoded
 -- bytes — every byte of the UTF-8 sequence E2 80 94 is *defined* in WIN1252, so nothing errors, psql reports

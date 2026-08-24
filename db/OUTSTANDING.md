@@ -129,7 +129,7 @@ up to date":
 | `talent-os-backfill.sql`, `workflow-backfill-leave.sql` | backfills |
 | `backfill-xp-ledger.sql` | `UPDATE user_xp SET level = …` — recomputes people's levels |
 | `roles-work-mode.sql` | `UPDATE roles SET location = …` — rewrites posting text |
-| `unpaid-internships.sql` | `UPDATE roles SET salary = …` — rewrites stored pay text on every trainee row. Preview-only unless run with `-v apply=1`; read section 2 of its output first |
+| `unpaid-internships.sql`, `unpaid-internships-editor.sql` | `UPDATE roles SET salary = …` — rewrites stored pay text on every trainee row. The psql file is preview-only unless run with `-v apply=1`; the editor file is the same predicate with the psql meta-commands removed, **one section per run**. Read section 2 of the output first |
 | `org-graph-rollback.sql`, `workflow-rollback.sql` | destructive by design |
 
 `*-validate.sql` and `incident-2026-08-24-diagnostics.sql` are read-only and are useful **after** a

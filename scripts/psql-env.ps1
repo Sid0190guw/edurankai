@@ -29,9 +29,17 @@ $candidates = @('.env.production.local', '.env.production', '.env.vercel.local',
 # a stray non-breaking space. IndexOf does not care.
 $url = $null
 $source = $null
-$present = @()   # files where the key exists but no value could be taken from it
+$present = @()   # files where the key exists but its value is empty
+
+# An already-set $env:DATABASE_URL wins over every file. Without this the script ignored the very
+# fallback its own failure message tells you to use, which is the worst kind of dead end.
+if ($env:DATABASE_URL) {
+    $url = $env:DATABASE_URL
+    $source = 'the current shell ($env:DATABASE_URL)'
+}
 
 foreach ($name in $candidates) {
+    if ($url) { break }
     $path = Join-Path $repo $name
     if (-not (Test-Path -LiteralPath $path)) { continue }
 
@@ -95,9 +103,18 @@ if (-not $url) {
         if (-not $hit) { Write-Host ("  {0,-26} no DATABASE_URL line" -f $name) }
     }
     Write-Host ""
-    Write-Host "Only lengths and character codes are shown - no value was printed. Fallback:"
+    Write-Host "Only lengths and character codes are shown - no value was printed."
+    Write-Host ""
+    Write-Host "An empty value is what `"vercel env pull`" writes for a variable marked SENSITIVE in"
+    Write-Host "the Vercel dashboard: the value is never handed back, so these files cannot supply it."
+    Write-Host "Take the connection string from Supabase (Project > Connect > session pooler, 5432),"
+    Write-Host "then either:"
+    Write-Host ""
     Write-Host "    `$env:DATABASE_URL = '<paste the postgresql:// URL>'"
     Write-Host "    .\scripts\psql-env.ps1 -f db\unpaid-internships.sql"
+    Write-Host ""
+    Write-Host "or skip psql entirely: paste db/unpaid-internships-editor.sql into the Supabase SQL"
+    Write-Host "editor, ONE SECTION PER RUN - an editor paste is a single implicit transaction."
     exit 1
 }
 
