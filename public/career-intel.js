@@ -337,7 +337,12 @@
       // count: openPostingCount returns it when the count FAILED, so the phrase is dropped rather
       // than rendered as "of  open positions".
       var tail = (data.total === 1 ? ' opening' : ' openings');
-      if (data.catalogueTotal > 0) tail += ' of ' + data.catalogueTotal + ' open';
+      // "1017 openings of 1017 open" was two true numbers rendered as nonsense. The second phrase
+      // only means anything when the list is NARROWER than the catalogue; when they are equal the
+      // count already is the catalogue. And it needs its noun: "of 1017 open" is not a phrase.
+      if (data.catalogueTotal > 0 && data.catalogueTotal > data.total) {
+        tail += ' of ' + data.catalogueTotal + ' open positions';
+      }
       if (data.personalised) tail += ', ranked for what you told us';
       count.appendChild(document.createTextNode(tail));
       head.appendChild(count);
@@ -351,7 +356,18 @@
           'Nothing matched our reading of what you said, so this is the whole catalogue instead. '
           + 'That is our reading being too narrow, not a shortage of openings.', 'warn'));
       }
-      if (data.degraded) {
+      // DEGRADED ONLY MEANS SOMETHING IF SOMETHING WAS ASKED FOR.
+      //
+      // The flag says the discipline and classification predicates could not run — true whenever
+      // the extended columns are unavailable, including for a visitor who has said nothing at all.
+      // Telling that visitor the list is "wider than what you asked for" names a request they never
+      // made, and it appeared under a heading that had already said the results were not
+      // personalised. It is shown when there was a filter to lose, and not otherwise.
+      var asked = data.lookedIn
+        && (data.lookedIn.disciplines.length
+          || data.lookedIn.terms.length
+          || (data.lookedIn.explicit && Object.keys(data.lookedIn.explicit).length));
+      if (data.degraded && asked) {
         els.results.appendChild(note(
           'Discipline and classification filters could not be applied on this request, so these results are wider than what you asked for.', 'warn'));
       }
@@ -625,13 +641,28 @@
       });
     }
 
-    if (u.reflection) {
-      els.panelBody.appendChild(el('p', 'ci-panel-h', u.reflection.label + ' — optional reflection'));
-      els.panelBody.appendChild(el('p', 'ci-panel-line', u.reflection.prompt));
-      els.panelBody.appendChild(el('p', 'ci-panel-note', u.reflectionDisclaimer));
+    // THE OPTIONAL PERSONAL BLOCK. It used to be a star sign; it is now what the person told us
+    // about their own day and their own nature, echoed back exactly as they gave it.
+    //
+    // `any = true` IS THE FIX FOR A PANEL THAT CONTRADICTED ITSELF. This branch used to render its
+    // content without setting the flag, so somebody whose ONLY entry was this block was shown their
+    // own answers followed immediately by "Nothing yet. Tell us anything and it appears here."
+    // The panel is the page's promise that you can see everything it holds; a panel that denies
+    // holding what it is displaying breaks exactly that promise.
+    if (u.personal && u.personal.lines && u.personal.lines.length) {
+      any = true;
+      els.panelBody.appendChild(el('p', 'ci-panel-h', 'A few things about you'));
+      u.personal.lines.forEach(function (ln) {
+        var row = el('p', 'ci-personal-line');
+        row.appendChild(el('strong', null, ln.label + ':'));
+        row.appendChild(document.createTextNode(' ' + ln.value));
+        els.panelBody.appendChild(row);
+      });
+      if (u.personal.prompt) els.panelBody.appendChild(el('p', 'ci-panel-line', u.personal.prompt));
+      els.panelBody.appendChild(el('p', 'ci-panel-note', u.personalDisclaimer));
       var forget = el('button', 'ci-btn ci-btn-quiet', 'Remove this');
       forget.type = 'button';
-      forget.addEventListener('click', function () { send({ action: 'forget-reflection' }); });
+      forget.addEventListener('click', function () { send({ action: 'forget-personal' }); });
       els.panelBody.appendChild(forget);
     }
 
@@ -652,6 +683,7 @@
       if (els.map) { els.map.innerHTML = ''; els.map.hidden = true; }
       renderThread();
       renderPanel(null);
+      fillPersonal(null);
       if (els.intro) els.intro.hidden = false;
       say('Everything has been removed from this browser.', 'ok');
     });
@@ -696,6 +728,7 @@
     }
     renderThread();
     renderPanel(b.understanding);
+    fillPersonal(state.profile && state.profile.personal);
     if (els.intro && (state.understood || state.lastQuestion)) els.intro.hidden = true;
   }
 
@@ -805,16 +838,70 @@
     if (state.panelOpen) els.panel.focus({ preventScroll: true });
   }
 
-  // The optional reflection layer. Opt-in, and its own control — never part of a question flow.
-  var reflectForm = document.getElementById('ci-reflect-form');
-  if (reflectForm) {
-    reflectForm.addEventListener('submit', function (ev) {
+  // The optional personal layer. Opt-in, its own control, and never part of a question flow — the
+  // conversation above must never be able to lead somebody into typing their weight.
+  var personalForm = document.getElementById('ci-personal-form');
+  if (personalForm) {
+    personalForm.addEventListener('submit', function (ev) {
       ev.preventDefault();
-      var d = document.getElementById('ci-reflect-date');
-      if (!d || !d.value) return;
-      send({ action: 'reflect', birthDate: d.value });
+      var nature = [];
+      var boxes = personalForm.querySelectorAll('input[name="nature"]:checked');
+      Array.prototype.forEach.call(boxes, function (b) { nature.push(b.value); });
+      var wakeEl = personalForm.querySelector('input[name="wake"]:checked');
+      var h = document.getElementById('ci-height');
+      var w = document.getElementById('ci-weight');
+      var n = document.getElementById('ci-personal-note');
+      send({
+        action: 'personal',
+        wake: wakeEl ? wakeEl.value : '',
+        nature: nature,
+        // Sent as typed. The server bounds them; guessing at a correction here would silently
+        // change a number somebody entered about themselves.
+        heightCm: h ? h.value : '',
+        weightKg: w ? w.value : '',
+        note: n ? n.value : '',
+      });
       openPanel(true);
     });
+  }
+
+  // REMOVE MEANS REMOVE, AND THE FORM EMPTIES WITH IT. Clearing the stored block while leaving the
+  // fields filled in would show somebody their weight in a form directly under a panel that says it
+  // holds nothing about them.
+  var personalClear = document.getElementById('ci-personal-clear');
+  if (personalClear) {
+    personalClear.addEventListener('click', function () {
+      if (personalForm) personalForm.reset();
+      send({ action: 'forget-personal' });
+      openPanel(true);
+    });
+  }
+
+  /**
+   * PUT THE STORED ANSWERS BACK IN THE FORM.
+   *
+   * The panel says "change anything that is wrong". That is only true if the controls come back
+   * showing what is actually held — a returning visitor whose block says 175 cm, in front of an
+   * empty height field, has been told they can edit something the form has already forgotten.
+   */
+  function fillPersonal(p) {
+    if (!personalForm) return;
+    personalForm.reset();
+    if (!p) return;
+    if (p.wake) {
+      var wake = personalForm.querySelector('input[name="wake"][value="' + p.wake + '"]');
+      if (wake) wake.checked = true;
+    }
+    (p.nature || []).forEach(function (id) {
+      var box = personalForm.querySelector('input[name="nature"][value="' + id + '"]');
+      if (box) box.checked = true;
+    });
+    var h = document.getElementById('ci-height');
+    var w = document.getElementById('ci-weight');
+    var n = document.getElementById('ci-personal-note');
+    if (h) h.value = (p.heightCm === null || p.heightCm === undefined) ? '' : String(p.heightCm);
+    if (w) w.value = (p.weightKg === null || p.weightKg === undefined) ? '' : String(p.weightKg);
+    if (n) n.value = p.note || '';
   }
 
   /* --------------------------------------------------------------------------- resuming a visit */
