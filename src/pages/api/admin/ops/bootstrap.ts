@@ -9,6 +9,7 @@
 // Nothing here drops or alters existing data. Safe to run repeatedly.
 import type { APIRoute } from 'astro';
 import { can } from '@/lib/auth/permissions';
+import { allowingDdl } from '@/lib/schema-bootstrap';
 
 function j(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -35,6 +36,18 @@ export const POST: APIRoute = async ({ locals }) => {
   // the union answers false for EVERY role including super_admin, so this is checked, not assumed.
   if (!can(user as any, 'settings.edit')) return j({ ok: false, error: 'not permitted' }, 403);
 
+  // INSIDE allowingDdl(), BECAUSE THIS ENDPOINT IS THE ESCAPE HATCH.
+  //
+  // src/lib/db/index.ts refuses DDL at db.execute when SCHEMA_BOOTSTRAP is off, which is the
+  // production default, and that is right for every request-time bootstrap. It is exactly wrong
+  // here: creating the module tables on demand IS this endpoint's entire contract, and an operator
+  // reaches for it during an incident. Without this wrapper every CREATE TABLE below is suppressed
+  // while each module still reports ok:true — the silent failure the verify step further down was
+  // already written to catch, now arriving through a new door.
+  //
+  // Scoped to this handler by AsyncLocalStorage, so nothing else in the process is affected while
+  // it runs, and the permission checks above still decide who may reach it.
+  const results = await allowingDdl(async () => {
   const results: Array<{ module: string; ok: boolean; error?: string }> = [];
   for (const m of MODULES) {
     try {
@@ -48,6 +61,8 @@ export const POST: APIRoute = async ({ locals }) => {
       results.push({ module: m.name, ok: false, error: why });
     }
   }
+  return results;
+  });
 
   // VERIFY, do not trust the return. ensureOnce() ends in `p.catch(() => {})`, so a DDL statement
   // that threw still resolves and every ensure above reports success. The first run of this endpoint

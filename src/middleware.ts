@@ -487,7 +487,27 @@ export const onRequest = defineMiddleware(async (context, next) => {
   try {
     result = await withDbTimeout(validateSessionToken(token), 'middleware.session');
   } catch (e: any) {
-    if (isDbUnavailable(e)) return dbUnavailable('session');
+    if (isDbUnavailable(e)) {
+      // A PAGE THAT NEEDS NO USER MUST STAY REACHABLE WHILE THE DATABASE IS NOT.
+      //
+      // This gate only runs for somebody who already HOLDS a session cookie — an anonymous visitor
+      // returned above and never gets here — so a bare 503 here locked exactly the wrong person out
+      // of exactly the wrong doors: signing out, /api/health in a browser, the reset and enrolment
+      // surfaces. Every one of those is on the exemption list precisely because it does not need to
+      // know who you are, and every one of them was answering 503 to the admin trying to diagnose
+      // the outage while answering 200 to a signed-out stranger.
+      //
+      // So: for an exempt path, an unreachable database is treated as no session rather than as a
+      // refusal. Nothing is granted by this — locals.user stays null, so any page that does need a
+      // user still finds none, and isProtected() below still guards what it always guarded.
+      if (isExempt(path)) {
+        console.warn('[middleware] session unreadable on exempt path, continuing anonymous:', path);
+        context.locals.user = null;
+        context.locals.session = null;
+        return next();
+      }
+      return dbUnavailable('session');
+    }
     // Any other failure is treated as it always was: no valid session.
     console.error('[middleware] session validation failed', e?.cause?.message || e?.message);
     result = null as any;
