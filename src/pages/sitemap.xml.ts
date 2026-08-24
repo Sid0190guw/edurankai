@@ -41,15 +41,36 @@ export const GET: APIRoute = async () => {
   const today = new Date().toISOString().split('T')[0];
 
   // Dynamic: every open role gets a sitemap entry so Google for Jobs crawls them
+  //
+  // A FAILURE HERE MUST NOT BE CACHED. MEASURED ON THE LIVE SITE, 2026-08-24.
+  //
+  // https://www.edurankai.in/sitemap.xml served 101 URLs, of which ZERO were job postings. The same
+  // URL with a cache-busting query string, seconds later, served 1,092. Generation was never
+  // broken: one request had lost the database, this catch swallowed it, the role-less sitemap was
+  // returned with `max-age=900`, and the CDN pinned that answer for fifteen minutes and handed it
+  // to every crawler that asked.
+  //
+  // Connecting to this database fails intermittently -- roughly one attempt in four stalls while
+  // the same database answers a reused connection in ~130ms -- so this is not a rare event. Every
+  // time it happens, Google for Jobs is told this company has no openings, for fifteen minutes, and
+  // nothing anywhere reports it. A short sitemap still validates.
+  //
+  // That is the same defect the middleware already refuses to make for HTML pages: it will not
+  // CDN-cache a render that set `x-era-degraded`. This route builds its own Response and never
+  // participated in that rule, so it makes the guarantee itself, below.
   let openRoles: Array<{ slug: string; updatedAt: Date | null; isFeatured: boolean | null }> = [];
+  let rolesReadable = true;
   try {
     openRoles = await db.select({
       slug: roles.slug,
       updatedAt: roles.updatedAt,
       isFeatured: roles.isFeatured,
     }).from(roles).where(eq(roles.isOpen, true)).orderBy(desc(roles.updatedAt));
-  } catch (_) {
-    // DB unreachable - degrade to static sitemap
+  } catch (e: any) {
+    // The real Postgres reason, not the failed SQL. Logged rather than swallowed silently: this
+    // went unnoticed precisely because nothing said anything.
+    console.error('[sitemap] open roles query failed:', e?.cause?.message || e?.message);
+    rolesReadable = false;
   }
 
   // Department and division pages. Both degrade to nothing rather than taking the sitemap down:
@@ -212,11 +233,15 @@ export const GET: APIRoute = async () => {
     + staticUrls.concat(roleUrls).concat(departmentUrls).concat(divisionUrls).concat(courseUrls).concat(pathUrls).concat(instructorUrls).concat(schoolUrls).join('\n') + '\n'
     + '</urlset>\n';
 
+  // A sitemap missing every job posting is not a slightly smaller sitemap; it is a statement that
+  // there are no jobs. It ships (a 500 is worse for indexing than a short file) but it is never
+  // stored, so the next crawl re-asks instead of being handed the same wrong answer for 15 minutes.
+  const degraded = !rolesReadable;
   return new Response(xml, {
     status: 200,
     headers: {
       'Content-Type': 'application/xml; charset=utf-8',
-      'Cache-Control': 'public, max-age=900',
+      'Cache-Control': degraded ? 'no-store' : 'public, max-age=900',
     },
   });
 };
