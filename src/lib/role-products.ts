@@ -29,11 +29,14 @@ import { db } from '@/lib/db';
 import { textArray, textIn } from '@/lib/pg-array';
 import { sql } from 'drizzle-orm';
 import { ensureBatch } from '@/lib/ensure-once';
-import { departmentsForProduct, productMatchClause, productTagClause, PRODUCT_DOMAINS } from '@/lib/product-domains';
+import {
+  departmentsForProduct, domainForProduct, openPostingClause, productMatchClause, productTagClause,
+  PRODUCT_DOMAINS,
+} from '@/lib/product-domains';
 
 // Re-exported so a page importing the linkage does not have to know which of the two modules the
 // predicate happens to live in.
-export { productMatchClause, productTagClause };
+export { openPostingClause, productMatchClause, productTagClause };
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 const clean = (slugs: string[]): string[] =>
@@ -53,12 +56,38 @@ export function ensureRoleProductColumn(): Promise<void> {
   return ensureBatch('roles_product_cols_v2', ROLES_PRODUCT_DDL);
 }
 
+// =================================================================================================
+//   THE THREE VENTURE READS
+// =================================================================================================
+//
+// EVERY ONE OF THEM REPORTS WHETHER IT COULD ANSWER, AND WHETHER THE ANSWER IS COMPLETE.
+//
+// They used to return [] / {} on any error. That is the defect class this whole change was written
+// to remove, reintroduced one layer down: an empty list rendered as "No roles are open right now",
+// so a pool stall, an open circuit breaker or a statement timeout produced exactly the same
+// confident sentence as a genuinely empty catalogue. listOpportunities() next door already carries
+// `readable` and `degraded` for this reason; these now do too.
+//
+//   readable:false  the query failed and the page must NOT claim anything about hiring.
+//   degraded:true   the narrowed retry answered. It ran WITHOUT the tag columns (so hand-tagged
+//                   roles outside the mapped departments are missing) and WITHOUT the job_status /
+//                   deadline gate (so a withdrawn posting may be counted). Say so; do not present
+//                   it as the filtered result. That is verbatim the mistake roles-ext.ts documents.
+
+export interface VentureRoles { readable: boolean; degraded: boolean; roles: any[] }
+export interface VentureTeams {
+  readable: boolean;
+  degraded: boolean;
+  total: number;
+  teams: Array<{ id: string; name: string; openCount: number }>;
+}
+
 /**
  * Open roles that build a given product: explicitly tagged, or in one of the departments that
  * build it. Tagged roles sort first, so a deliberate hand-tag always leads the list.
  */
-export async function getRolesForProduct(productSlug: string, limit = 6): Promise<any[]> {
-  if (!productSlug) return [];
+export async function getRolesForProduct(productSlug: string, limit = 6): Promise<VentureRoles> {
+  if (!productSlug) return { readable: true, degraded: false, roles: [] };
   const depts = departmentsForProduct(productSlug);
   try {
     await ensureRoleProductColumn();
@@ -69,18 +98,18 @@ export async function getRolesForProduct(productSlug: string, limit = 6): Promis
              ${productTagClause(productSlug)} AS tagged
       FROM roles
       LEFT JOIN departments d ON d.id = roles.department_id
-      WHERE roles.is_open = true
+      WHERE ${openPostingClause(true)}
         AND ${productMatchClause(productSlug, true)}
       ORDER BY tagged DESC, roles.is_featured DESC, roles.sort_order ASC, roles.title ASC
       LIMIT ${limit}
     `);
-    return rows(r);
+    return { readable: true, degraded: false, roles: rows(r) };
   } catch (e: any) {
     console.error('[role-products] getRolesForProduct', e?.cause?.message || e?.message);
-    // The tag columns are the only part of that statement a database can be missing. Ask the
-    // department question on its own rather than reporting "nothing is open", which is the exact
-    // false claim this whole change exists to remove.
-    if (!depts.length) return [];
+    // Two families of column can be absent here: the tag columns (product/products/openings, added
+    // by an ensure that is a no-op in production) and job_status (added by the hand-run
+    // db/xscale-schema.sql). The retry drops BOTH rather than guessing which, and says degraded.
+    if (!depts.length) return { readable: false, degraded: false, roles: [] };
     try {
       const r2 = await db.execute(sql`
         SELECT roles.slug, roles.title, roles.level, roles.department_id,
@@ -88,16 +117,16 @@ export async function getRolesForProduct(productSlug: string, limit = 6): Promis
                0 AS openings, false AS tagged
         FROM roles
         LEFT JOIN departments d ON d.id = roles.department_id
-        WHERE roles.is_open = true
+        WHERE ${openPostingClause(false)}
           AND roles.department_id IN ${textIn(depts)}
         ORDER BY roles.is_featured DESC, roles.sort_order ASC, roles.title ASC
         LIMIT ${limit}
       `);
-      console.error('[role-products] retried getRolesForProduct without the tag columns and succeeded');
-      return rows(r2);
+      console.error('[role-products] retried getRolesForProduct narrowed and succeeded');
+      return { readable: true, degraded: true, roles: rows(r2) };
     } catch (e2: any) {
       console.error('[role-products] narrowed getRolesForProduct also failed', e2?.cause?.message || e2?.message);
-      return [];
+      return { readable: false, degraded: false, roles: [] };
     }
   }
 }
@@ -105,32 +134,33 @@ export async function getRolesForProduct(productSlug: string, limit = 6): Promis
 /**
  * The teams hiring for a venture, with a count each, and the honest total across them.
  *
- * ONE round trip for both numbers: the venture page needs the total ("39 open roles") and the
+ * ONE round trip for both numbers: the venture page needs the total ("8 open roles") and the
  * per-team split in the same render, and grouping gives both.
  *
- * WHY THE PAGE NEEDS THIS AT ALL. `/careers?product=<slug>` was the "see all of them" link, and
- * the careers rewrite of 2026-08-24 dropped that parameter — the page and /api/careers/search now
- * read `q`, `dept`, `division`, `level`, `type`, `classification`, `band`, `skill` and `domain`,
- * and nothing else. A link carrying a parameter nobody reads shows the whole catalogue while
- * claiming to show one venture's roles, so the venture page links per TEAM instead, at
- * /careers/department/<id>, which is a route that filters.
+ * `total` is a sum over GROUP BY roles.department_id, so it counts each role exactly once — a role
+ * has exactly one department, and the grouping key is the department id, not the joined name.
+ *
+ * WHY THE PAGE LINKS PER TEAM. `/careers?product=<slug>` was the "see all of them" link, and the
+ * careers rewrite of 2026-08-24 dropped that parameter — the page and /api/careers/search read `q`,
+ * `dept`, `division`, `level`, `type`, `classification`, `band`, `skill` and `domain`, and nothing
+ * else. A link carrying a parameter nobody reads shows the whole catalogue while claiming to show
+ * one venture, so the chips point at /careers/department/<id>, which filters — and, because the
+ * gate above is now that page's gate, agrees with the number it prints.
  */
-export async function getProductTeamBreakdown(
-  productSlug: string
-): Promise<{ total: number; teams: Array<{ id: string; name: string; openCount: number }> }> {
-  const empty = { total: 0, teams: [] as Array<{ id: string; name: string; openCount: number }> };
+export async function getProductTeamBreakdown(productSlug: string): Promise<VentureTeams> {
+  const empty: VentureTeams = { readable: true, degraded: false, total: 0, teams: [] };
   if (!productSlug) return empty;
   const depts = departmentsForProduct(productSlug);
 
-  const run = async (includeTags: boolean) => {
+  const run = async (full: boolean) => {
     const r = await db.execute(sql`
       SELECT roles.department_id AS id,
              COALESCE(d.name, roles.department_id) AS name,
              COUNT(*)::int AS n
       FROM roles
       LEFT JOIN departments d ON d.id = roles.department_id
-      WHERE roles.is_open = true
-        AND ${productMatchClause(productSlug, includeTags)}
+      WHERE ${openPostingClause(full)}
+        AND ${productMatchClause(productSlug, full)}
       GROUP BY roles.department_id, d.name
       ORDER BY n DESC, name ASC
     `);
@@ -142,31 +172,38 @@ export async function getProductTeamBreakdown(
 
   try {
     await ensureRoleProductColumn();
-    return await run(true);
+    const out = await run(true);
+    return { readable: true, degraded: false, total: out.total, teams: out.teams };
   } catch (e: any) {
     console.error('[role-products] getProductTeamBreakdown', e?.cause?.message || e?.message);
-    if (!depts.length) return empty;
+    if (!depts.length) return { readable: false, degraded: false, total: 0, teams: [] };
     try {
       const out = await run(false);
-      console.error('[role-products] retried getProductTeamBreakdown without the tag columns and succeeded');
-      return out;
+      console.error('[role-products] retried getProductTeamBreakdown narrowed and succeeded');
+      return { readable: true, degraded: true, total: out.total, teams: out.teams };
     } catch (e2: any) {
       console.error('[role-products] narrowed getProductTeamBreakdown also failed', e2?.cause?.message || e2?.message);
-      return empty;
+      return { readable: false, degraded: false, total: 0, teams: [] };
     }
   }
 }
 
 /**
- * Open-role count per product slug — tagged ∪ domain, deduplicated.
+ * Open-role count per product slug — tagged plus domain, deduplicated.
  *
  * Two grouped reads rather than one join against a VALUES list of the mapping: the tag pairs are
  * counted in SQL and the department totals are counted in SQL, and the OVERLAP (a role both tagged
  * to a venture and sitting in one of its departments) is subtracted in JS from the pair rows. Naive
  * addition would double-count exactly those roles and quietly inflate every card on /ecosystem.
+ *
+ * `readable:false` matters as much here as it does above: /ecosystem renders a badge only when the
+ * count is above zero, so a failed read is indistinguishable from a company that is not hiring —
+ * every card silently loses its number and nothing on the page says why.
  */
-export async function getOpenRoleCountsByProduct(productSlugs?: string[]): Promise<Record<string, number>> {
-  const out: Record<string, number> = {};
+export async function getOpenRoleCountsByProduct(
+  productSlugs?: string[]
+): Promise<{ readable: boolean; degraded: boolean; counts: Record<string, number> }> {
+  const counts: Record<string, number> = {};
   // KEYED BY THE CALLER'S OWN SLUGS, not by the canonical ones in PRODUCT_DOMAINS.
   //
   // `products.slug` and the canonical key are not always the same string — AquinTutor has shipped
@@ -177,29 +214,42 @@ export async function getOpenRoleCountsByProduct(productSlugs?: string[]): Promi
     ? Array.from(new Set(productSlugs.filter(Boolean)))
     : PRODUCT_DOMAINS.map((p) => p.slug);
 
-  // Department totals first: this read touches no runtime column, so it is the one that survives a
-  // database where the ALTER never ran.
+  // Department totals first. This read touches no runtime column except job_status, and retries
+  // without it, so it is the one that survives a database missing either migration.
   const perDept: Record<string, number> = {};
+  let readable = false;
+  let degraded = false;
+  const deptCounts = (full: boolean) => db.execute(sql`
+    SELECT department_id, COUNT(*)::int AS n
+    FROM roles
+    WHERE ${openPostingClause(full)} AND department_id IS NOT NULL
+    GROUP BY department_id
+  `);
   try {
-    const d = await db.execute(sql`
-      SELECT department_id, COUNT(*)::int AS n
-      FROM roles
-      WHERE is_open = true AND department_id IS NOT NULL
-      GROUP BY department_id
-    `);
-    for (const row of rows(d)) perDept[String(row.department_id)] = Number(row.n) || 0;
+    for (const row of rows(await deptCounts(true))) perDept[String(row.department_id)] = Number(row.n) || 0;
+    readable = true;
   } catch (e: any) {
     console.error('[role-products] department counts failed', e?.cause?.message || e?.message);
+    try {
+      for (const row of rows(await deptCounts(false))) perDept[String(row.department_id)] = Number(row.n) || 0;
+      readable = true;
+      degraded = true;
+      console.error('[role-products] retried department counts without job_status and succeeded');
+    } catch (e2: any) {
+      console.error('[role-products] narrowed department counts also failed', e2?.cause?.message || e2?.message);
+      return { readable: false, degraded: false, counts: {} };
+    }
   }
   for (const slug of wanted) {
     // departmentsForProduct() resolves the alias, so a DB slug of `aquintutor-ai` still finds the
     // `aquintutor` mapping and its departments.
     const n = departmentsForProduct(slug).reduce((acc, id) => acc + (perDept[id] || 0), 0);
-    if (n) out[slug] = n;
+    if (n) counts[slug] = n;
   }
 
-  // Then the tags. One row per (open tagged role, product) — two rows today, bounded by the
-  // catalogue even if every role were tagged.
+  // Then the tags. One row per (open tagged role, product) — two rows today, and bounded by the
+  // catalogue even if every role were tagged. Their absence degrades the answer; it does not void
+  // it, because the department half above already produced a real number.
   try {
     await ensureRoleProductColumn();
     const r = await db.execute(sql`
@@ -209,19 +259,20 @@ export async function getOpenRoleCountsByProduct(productSlugs?: string[]): Promi
         COALESCE(NULLIF(products, '{}'),
                  CASE WHEN product IS NOT NULL AND product <> '' THEN ARRAY[product] ELSE ARRAY[]::text[] END)
       ) AS prod
-      WHERE is_open = true
+      WHERE ${openPostingClause(!degraded)}
     `);
     for (const row of rows(r)) {
       const slug = String(row.product || '');
       if (!slug) continue;
       // Already counted through its department? Then the tag adds nothing to the total.
       if (departmentsForProduct(slug).includes(String(row.department_id))) continue;
-      out[slug] = (out[slug] || 0) + 1;
+      counts[slug] = (counts[slug] || 0) + 1;
     }
   } catch (e: any) {
     console.error('[role-products] tag counts unavailable, showing domain counts only', e?.cause?.message || e?.message);
+    degraded = true;
   }
-  return out;
+  return { readable, degraded, counts };
 }
 
 /** Persist a role's product tags (array) — keeps legacy `product` = first slug. */
@@ -280,5 +331,103 @@ export async function getProductOptions(): Promise<Array<{ slug: string; name: s
     return rows(r).map((x: any) => ({ slug: x.slug, name: x.name }));
   } catch {
     return [];
+  }
+}
+
+/**
+ * Write the venture tags into the database, from the same mapping the pages read.
+ *
+ * WHY THIS EXISTS AS A FUNCTION AND NOT AS A .sql FILE.
+ *
+ * db/product-domains-schema.sql creates the three columns, and stops there. Deciding WHICH product
+ * row a mapping entry belongs to needs domainForProduct()'s token-boundary matcher — `aquintutor-ai`
+ * must resolve to the `aquintutor` mapping, and `hei` must not match a slug that merely contains
+ * the letters "hei". Writing that as LIKE patterns in SQL would be a second, subtly different
+ * definition of a rule this repository already has one of, and divergent copies of the same
+ * predicate is the defect class that produced the empty venture pages in the first place.
+ *
+ * So the mapping is resolved in JS against the REAL product slugs in the database, and the writes
+ * are one bulk UPDATE per venture — eight statements, not one per role.
+ *
+ * IT NEVER OVERWRITES A HAND EDIT. Only rows with no tag at all are touched, which is the same
+ * rule the AICTE repair on /admin/roles/diagnose follows.
+ *
+ * TAGS ARE NOT WHAT MAKES THE VENTURE PAGES WORK. Those resolve a role's venture from its
+ * department at read time and never needed this. Running it makes the linkage a recorded fact —
+ * visible in the admin role editor, usable by anything that filters on the column, and no longer
+ * an inference recomputed on every render.
+ */
+export async function backfillProductTagsFromDomains(): Promise<{
+  tagged: number;
+  perProduct: Record<string, number>;
+  unmatchedVentures: string[];
+  untaggedProducts: string[];
+}> {
+  await ensureRoleProductColumn();
+
+  // The REAL slugs, from the products table — not the canonical keys in PRODUCT_DOMAINS.
+  const options = await getProductOptions();
+  const jobs: Array<{ slug: string; canonical: string; depts: string[] }> = [];
+  const matchedCanonical = new Set<string>();
+  const untaggedProducts: string[] = [];
+  for (const p of options) {
+    const d = domainForProduct(p.slug);
+    if (d && d.departments.length) {
+      jobs.push({ slug: p.slug, canonical: d.slug, depts: d.departments });
+      matchedCanonical.add(d.slug);
+    } else {
+      untaggedProducts.push(p.slug);
+    }
+  }
+
+  // A venture that HAS departments but whose product row could not be found. Reported rather than
+  // swallowed: it means either the products table has not been seeded or a slug has drifted, and
+  // either way that venture's tags are silently not being written.
+  const unmatchedVentures = PRODUCT_DOMAINS
+    .filter((p) => p.departments.length && !matchedCanonical.has(p.slug))
+    .map((p) => p.slug);
+
+  const perProduct: Record<string, number> = {};
+  let tagged = 0;
+  for (const j of jobs) {
+    // Per-venture isolation: one failing UPDATE must not abandon the other seven.
+    try {
+      const r = await db.execute(sql`
+        UPDATE roles
+           SET products = ${textArray([j.slug])}, product = ${j.slug}, updated_at = now()
+         WHERE department_id IN ${textIn(j.depts)}
+           AND COALESCE(array_length(products, 1), 0) = 0
+           AND (product IS NULL OR product = '')
+        RETURNING id`);
+      const n = rows(r).length;
+      if (n) { perProduct[j.slug] = n; tagged += n; }
+    } catch (e: any) {
+      console.error('[role-products] backfill failed for ' + j.slug, e?.cause?.message || e?.message);
+      throw e;
+    }
+  }
+  return { tagged, perProduct, unmatchedVentures, untaggedProducts };
+}
+
+/**
+ * Do the three runtime columns actually exist on this database?
+ *
+ * Read as its own question because "the venture page is empty" has two completely different causes
+ * that look identical from outside — no tags, or no COLUMN to hold them — and the second one is
+ * invisible: every reader of those columns sits behind a catch. This is what /admin/roles/diagnose
+ * shows so an operator can tell which it is without a database client.
+ */
+export async function productColumnStatus(): Promise<{ present: string[]; missing: string[] }> {
+  const want = ['product', 'products', 'openings'];
+  try {
+    const r = await db.execute(sql`
+      SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'roles'
+         AND column_name IN ${textIn(want)}`);
+    const present = rows(r).map((x: any) => String(x.column_name));
+    return { present, missing: want.filter((c) => !present.includes(c)) };
+  } catch (e: any) {
+    console.error('[role-products] productColumnStatus', e?.cause?.message || e?.message);
+    return { present: [], missing: want };
   }
 }

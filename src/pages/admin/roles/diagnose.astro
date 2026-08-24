@@ -7,7 +7,11 @@
 // itself errors and the resilience fallback in careers.astro silently covers for it. This page
 // runs the exact same SQL the careers page runs and reports which it is.
 //
-// Strictly SELECT-only. Nothing here writes, alters, or deletes.
+// THE CHECKS ARE SELECT-ONLY. The buttons are not: this page also carries the bulk REPAIRS for
+// the same data it diagnoses (AICTE fields, work mode, venture tags), because they run inside the
+// app, which already holds the right credentials, and no connection string has to be copied
+// anywhere. Every repair touches only rows that are actually empty or actually contradict the
+// policy, so a hand edit is never overwritten.
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { can } from '@/lib/auth/permissions';
@@ -80,6 +84,37 @@ if (Astro.request.method === 'POST') {
     }
   }
 
+  // Venture tags from the department mapping.
+  //
+  // The repair above can only tag the two catalogue entries that carry a `productMatch` — that is
+  // the whole reason every venture page read "no roles are open right now". This one tags from
+  // src/lib/product-domains.ts instead, which covers every department that builds a venture, and
+  // it resolves the product row with the SAME matcher the pages use rather than a second copy of
+  // the rule written in SQL.
+  if (fd.get('_action') === 'tag-ventures') {
+    try {
+      const { backfillProductTagsFromDomains } = await import('@/lib/role-products');
+      const res = await backfillProductTagsFromDomains();
+      const per = Object.entries(res.perProduct).map(([s, n]) => s + ': ' + n).join(', ');
+      repairMsg = res.tagged === 0
+        ? 'No role needed a venture tag. Either every role in a mapped department already carries one, or no product row matched the mapping.'
+        : `Tagged ${res.tagged} role(s) by venture${per ? ' — ' + per : ''}.`;
+      if (res.unmatchedVentures.length) {
+        repairMsg += ` NOT WRITTEN for ${res.unmatchedVentures.join(', ')}: the mapping has departments for `
+          + 'these but no row in `products` matched the slug, so nothing was tagged for them.';
+      }
+      if (res.untaggedProducts.length) {
+        repairMsg += ` No department mapping exists for: ${res.untaggedProducts.join(', ')} (expected for the`
+          + ' ventures nobody is hired against).';
+      }
+    } catch (e: any) {
+      // Surfaced verbatim, because the likely cause is that the three columns do not exist on this
+      // database — which is a different problem with a different fix (db/product-domains-schema.sql)
+      // and must not be reported as "nothing to tag".
+      repairMsg = 'Venture tagging failed: ' + (e?.cause?.message || e?.message || 'unknown');
+    }
+  }
+
   // Work-mode repair. The catalogue and every rendering surface were corrected in code, but the
   // roles ALREADY in this table still carry the string they were imported with -- and that string
   // is what an exported feed, an offer letter draft and an admin export read. This rewrites only
@@ -138,6 +173,69 @@ try {
   );
 } catch (e: any) {
   add('Work mode: on-site, hybrid for trainees only', null, 'Could not read: ' + (e?.cause?.message || e?.message));
+}
+
+// 0b. THE VENTURE LINKAGE. "/ecosystem/<venture> shows no roles" has three causes that look
+// identical from outside the database, and this section separates them:
+//
+//   (a) the three tag columns do not exist    -> run db/product-domains-schema.sql
+//   (b) they exist but no role is tagged      -> press "Tag roles from the venture mapping"
+//   (c) the mapped departments have no OPEN roles -> a catalogue problem, not a schema one
+//
+// (c) is the one that matters most: the venture pages resolve roles by department and do not need
+// the tags at all, so if this check is green and the page is still empty, the postings are closed.
+try {
+  const { productColumnStatus } = await import('@/lib/role-products');
+  const { PRODUCT_DOMAINS } = await import('@/lib/product-domains');
+  const colStatus = await productColumnStatus();
+  add('Venture tag columns exist on roles', colStatus.missing.length === 0,
+    colStatus.missing.length === 0
+      ? 'product, products and openings are all present.'
+      : `MISSING: ${colStatus.missing.join(', ')}. No file in db/ creates them and SCHEMA_BOOTSTRAP is `
+        + 'off in production, so they were never added. Run db/product-domains-schema.sql. Until then the '
+        + 'venture pages fall back to matching by department, which still works.');
+
+  if (colStatus.missing.length === 0) {
+    const t = rows(await db.execute(sql`
+      SELECT COUNT(*) FILTER (WHERE COALESCE(array_length(products, 1), 0) > 0)::int AS tagged,
+             COUNT(*)::int AS total
+        FROM roles WHERE is_open = true`))[0];
+    add('Open roles carrying a venture tag', Number(t?.tagged || 0) > 0,
+      `${t?.tagged || 0} of ${t?.total || 0} open roles are tagged. Two catalogue entries in src/data carry `
+      + 'a product tag; every other tag has to come from the venture mapping. Use "Tag roles from the '
+      + 'venture mapping" below.');
+  }
+
+  // Every department the mapping resolves through, and whether it actually has open postings.
+  //
+  // `is_open` alone, deliberately, and it is an UPPER BOUND rather than the number the venture page
+  // will print. The page gates on openPostingClause() — is_open AND job_status='PUBLISHED' AND an
+  // unexpired deadline — but `job_status` comes from the hand-run db/xscale-schema.sql and may not
+  // exist here, and a diagnostic that errors on a missing column tells you less than one that
+  // answers a slightly wider question.
+  const mapped = Array.from(new Set(PRODUCT_DOMAINS.flatMap((p) => p.departments)));
+  if (mapped.length) {
+    const counts = rows(await db.execute(sql`
+      SELECT department_id, COUNT(*)::int AS n
+        FROM roles
+       WHERE is_open = true AND department_id IN (SELECT jsonb_array_elements_text(${JSON.stringify(mapped)}::jsonb))
+       GROUP BY department_id`));
+    const byDept: Record<string, number> = {};
+    for (const c of counts) byDept[String(c.department_id)] = Number(c.n) || 0;
+    const dead = PRODUCT_DOMAINS
+      .filter((p) => p.departments.length)
+      .filter((p) => p.departments.reduce((a, d) => a + (byDept[d] || 0), 0) === 0)
+      .map((p) => p.slug);
+    add('Every mapped venture has open postings', dead.length === 0,
+      dead.length === 0
+        ? PRODUCT_DOMAINS.filter((p) => p.departments.length)
+            .map((p) => p.slug + ': ' + p.departments.reduce((a, d) => a + (byDept[d] || 0), 0))
+            .join(' | ')
+        : `These ventures resolve to departments with ZERO open roles, so their page is empty no matter `
+          + `what the tags say: ${dead.join(', ')}. The postings are closed or were never imported.`);
+  }
+} catch (e: any) {
+  add('Venture linkage', null, 'Could not read: ' + (e?.cause?.message || e?.message));
 }
 
 const AICTE_COLS = ['keywords', 'learning_outcomes', 'qualification_type', 'qualifications', 'specialisations',
@@ -240,8 +338,9 @@ const failed = checks.filter((c) => c.ok === false).length;
   <div style="max-width:900px;">
     <h1 style="font-family:'Fraunces',serif;font-size:26px;margin:0 0 6px;">Role data diagnostic</h1>
     <p style="font-size:13px;color:#8a8a94;margin:0 0 20px;">
-      Read-only. Runs the exact SQL the careers page uses, to show whether the AICTE columns hold data
-      and whether the keyword-search clause is valid. Nothing on this page writes to the database.
+      Runs the exact SQL the careers and venture pages use, to show whether the columns hold data and
+      whether the clauses are valid. The checks below only read. The buttons above write, in bulk, and
+      only to rows that are empty or contradict the policy.
     </p>
 
     <div style={`padding:12px 14px;border-radius:10px;margin-bottom:18px;border:1px solid ${failed ? '#7f1d1d' : '#14532d'};background:${failed ? 'rgba(127,29,29,0.18)' : 'rgba(20,83,45,0.18)'};`}>
@@ -261,6 +360,17 @@ const failed = checks.filter((c) => c.ok === false).length;
       </button>
       <span style="font-size:11.5px;color:#6e6e78;margin-left:10px;">
         Runs in bulk. Only fills rows that are actually empty, so hand edits are never overwritten.
+      </span>
+    </form>
+
+    <form method="POST" style="margin-bottom:18px;">
+      <input type="hidden" name="_action" value="tag-ventures" />
+      <button type="submit" style="background:#FF4F00;border:0;color:#fff;font-weight:700;font-size:13px;padding:10px 18px;border-radius:8px;cursor:pointer;">
+        Tag roles from the venture mapping
+      </button>
+      <span style="font-size:11.5px;color:#6e6e78;margin-left:10px;">
+        Writes the venture tag onto every role in a department that builds it (src/lib/product-domains.ts).
+        One statement per venture, and only rows with no tag at all are touched. Needs the three columns above.
       </span>
     </form>
 

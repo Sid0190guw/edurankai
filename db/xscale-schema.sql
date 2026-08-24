@@ -36,6 +36,16 @@
 --
 --   *** CREATE INDEX CONCURRENTLY CANNOT RUN INSIDE A TRANSACTION BLOCK. ***
 --
+-- NO psql? USE THE SPLIT FILES INSTEAD OF THIS ONE.
+--
+--   db/xscale-schema.paste-1-tables.sql    tables + columns + backfill   (safe in any SQL console)
+--   db/xscale-schema.paste-2-indexes.sql   the same indexes, plain       (brief write lock)
+--
+-- They exist because a web SQL console wraps a paste in one transaction, so pasting THIS file fails
+-- on the first CONCURRENTLY and rolls back every ALTER above it — the console shows one error and
+-- the migration silently did nothing. The split files carry the identical DDL and are kept in step
+-- with this one by src/lib/product-domains.test.ts.
+--
 -- psql with -f runs in autocommit and is fine. A migration runner that wraps the file in
 -- BEGIN/COMMIT will fail on the first CONCURRENTLY statement; either disable that wrapper or drop
 -- the keyword and accept a brief write lock during a quiet window.

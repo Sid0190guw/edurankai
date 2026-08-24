@@ -35,6 +35,31 @@
 // exist BECAUSE of a venture are listed here, and several say so in their own description in
 // src/data/role-catalog.ts (smart-cities and geospatial both name the Holistic Education Index).
 //
+// THE RULE OF EVIDENCE, LEARNED THE HARD WAY.
+//
+// A department may be mapped to a venture only when THE POSTINGS THEMSELVES carry the link — the
+// role's own `about` text names the venture or its subject matter. A department DESCRIPTION that
+// claims the link is not enough, and neither is a plausible-sounding architectural argument.
+//
+// The first draft of this file mapped four departments to Viśvambhara and one to Foundational
+// Models on exactly that kind of reasoning, and a review of the actual role text found 31 of the 39
+// resulting roles had nothing to do with the venture they were being advertised under. What passes
+// the rule reads like these, all verbatim from src/data:
+//
+//   Smart City Intern     "...informing how the Holistic Education Index thinks about institutional
+//                          and regional infrastructure."
+//   GIS Analyst Intern    "Our Holistic Education Index and AquinTutor partner network span
+//                          institutions across geographies..."
+//   sports-tech (dept)    "...built on the real Karate.support community platform."
+//
+// What fails it reads like these, also verbatim:
+//
+//   Quantum Finance Intern  "Quantitative finance problems recast for quantum methods..."
+//   VLSI Design Intern      "VLSI chip-design fundamentals - RTL design, verification basics..."
+//   ROS Development Intern  "Hands-on Robot Operating System development - nodes, topics..."
+//
+// Before adding a department here, read its postings. Not its description, and not its name.
+//
 // A VENTURE WITH NO DEPARTMENT KEEPS AN EMPTY LIST, AND THAT IS THE HONEST ANSWER.
 //
 // Sancharan, Sampark and Sambandh are listed below with no departments on purpose. Nobody is hired
@@ -61,11 +86,17 @@ export const PRODUCT_DOMAINS: ProductDomain[] = [
   {
     slug: 'visvambhara',
     aliases: ['vesper'],
-    departments: ['aerospace-space', 'robotics-autonomous', 'semiconductor-embedded', 'quantum-tech'],
+    departments: ['aerospace-space'],
     note:
-      'The autonomous aerospace programme. aerospace-space and robotics-autonomous are the airframe '
-      + 'and the autonomy; semiconductor-embedded is the only flight-hardware team there is; '
-      + 'quantum-tech is the Akasha-Q command and control backbone named in the programme description.',
+      'The autonomous aerospace programme. ONE department, and the shortlist was cut down to it after '
+      + 'a review read the actual postings. robotics-autonomous, semiconductor-embedded and quantum-tech '
+      + 'were all mapped here on plausible-sounding reasoning ("the autonomy", "the only flight-hardware '
+      + 'team", "the Akasha-Q backbone") and every one of them was wrong: those departments hold ROS '
+      + 'Development, Industrial Automation, VLSI Design, PCB Design, Quantum Finance and Quantum '
+      + 'Chemistry, and not one posting in any of them mentions aerospace, VESPER, a UAV or Akasha-Q. '
+      + 'They would have put 31 unrelated roles on this page against 8 real ones. A candidate applying '
+      + 'to Quantum Chemistry Intern believing it was work on an interplanetary command vessel is the '
+      + 'exact harm this whole mapping is supposed to prevent. See RULE OF EVIDENCE in the header.',
   },
   {
     slug: 'karate-support',
@@ -89,18 +120,25 @@ export const PRODUCT_DOMAINS: ProductDomain[] = [
     aliases: ['holistic-education-index'],
     departments: ['smart-cities', 'geospatial', 'public-sector-impact'],
     note:
-      'All three name the index or its network in their own department description — urban and '
-      + 'infrastructure data "supporting the Holistic Education Index", spatial analysis of "our '
-      + 'institutional and partner network", and the public-sector education policy work behind the '
-      + 'access mission.',
+      'The only three that pass the rule of evidence on their POSTINGS, not just their department '
+      + 'description. Smart City Intern: "informing how the Holistic Education Index thinks about '
+      + 'institutional and regional infrastructure". GIS Analyst Intern: "Our Holistic Education Index '
+      + 'and AquinTutor partner network span institutions across geographies". Policy Analytics Intern: '
+      + '"applying data analysis to education-policy questions". Checked one by one during the review '
+      + 'that removed quantum-tech from Visvambhara, and these survived it.',
   },
   {
     slug: 'foundational-models',
     aliases: ['foundation-models', 'frontier-models'],
-    departments: ['ai-research'],
+    departments: [],
     note:
-      'The research line itself. ai-research is mapped here and nowhere else precisely because it is '
-      + 'this venture rather than a shared function.',
+      'UNSTAFFED, after ai-research was removed. Mapping it here contradicted the header of this file '
+      + 'and its aquintutor note, both of which name ai-research as cross-company — and the postings '
+      + 'prove the header right: the department holds Data Analytics, Business Intelligence, Data '
+      + 'Engineering and MLOps alongside the model work, and Multimodal AI Intern says in its own text '
+      + 'that it is about how AquinTutor teaches. Advertising all 32 as frontier-model research would '
+      + 'mislead, and quietly moving them off the AquinTutor side of the house would be a second error. '
+      + 'No department is exclusively this venture, so it has none.',
   },
 
   // Ventures with no hiring domain of their own. Listed, not omitted — see the header.
@@ -151,6 +189,47 @@ export function domainForProduct(productSlug: string | null | undefined): Produc
  */
 export function departmentsForProduct(productSlug: string | null | undefined): string[] {
   return domainForProduct(productSlug)?.departments ?? [];
+}
+
+/**
+ * "This posting is actually on offer", as SQL — the house definition, not a local one.
+ *
+ * WHY THIS IS NOT JUST `is_open = true`.
+ *
+ * Every careers surface gates a public listing on THREE conditions, not one:
+ *
+ *   is_open = TRUE
+ *   AND COALESCE(job_status, 'PUBLISHED') = 'PUBLISHED'
+ *   AND (application_deadline IS NULL OR application_deadline > NOW())
+ *
+ * — src/lib/xscale/roles-ext.ts listOpportunities(), src/lib/xscale/divisions.ts, the department
+ * directory, and the sitemap. The venture readers checked only the first, which was invisible while
+ * the product tag matched two roles company-wide and became very visible the moment a whole
+ * department started feeding a public count: /ecosystem/visvambhara would print a total, and a team
+ * chip would print a number, and both would land the visitor on /careers/department/<id> — a page
+ * rendered under the stricter gate, showing fewer.
+ *
+ * A page whose count disagrees with the page it links to is the failure this repository keeps
+ * having, and it is the same one the header of this file is about: two surfaces answering the same
+ * question two different ways.
+ *
+ * THE REACHABLE WAY THEY DIVERGE is not an expired deadline (nothing in the admin writes one). It
+ * is this: /admin/roles/[id] has a status control that writes job_status AND is_open together, and
+ * a separate plain Save form that writes is_open ALONE while deliberately preserving job_status.
+ * Close a posting with the status button, re-open it later by ticking the checkbox on the Save
+ * form, and you have job_status='CLOSED' with is_open=true. Two ordinary clicks.
+ *
+ * @param extended false drops job_status and the deadline — for the narrowed retry on a database
+ *                 where db/xscale-schema.sql has never been applied and `job_status` does not
+ *                 exist. That is the same fallback listOpportunities() takes, so in that state the
+ *                 two surfaces still agree with each other.
+ */
+export function openPostingClause(extended = true, table = 'roles') {
+  const col = (name: string) => sql.raw(table + '.' + name);
+  if (!extended) return sql`${col('is_open')} = true`;
+  return sql`(${col('is_open')} = true
+              AND COALESCE(${col('job_status')}, 'PUBLISHED') = 'PUBLISHED'
+              AND (${col('application_deadline')} IS NULL OR ${col('application_deadline')} > NOW()))`;
 }
 
 /** Inverse lookup: which venture a department builds, if any. One department, one venture. */

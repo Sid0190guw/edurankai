@@ -13,6 +13,8 @@
 //     mapping to an empty team is the same empty page);
 //   - the shared departments must stay unmapped (the reason the tag existed in the first place).
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { CATALOG_DEPARTMENTS, ROLE_CATALOG } from '@/data/role-catalog';
@@ -23,6 +25,7 @@ import {
   productForDepartment,
   productMatchClause,
   productTagClause,
+  openPostingClause,
 } from '@/lib/product-domains';
 
 const DEPT_IDS = new Set(CATALOG_DEPARTMENTS.map((d) => String(d.id)));
@@ -34,8 +37,15 @@ const rolesPerDept = (() => {
   return m;
 })();
 
-/** Ventures that are deliberately unstaffed — they assert the opposite of the rules below. */
-const UNSTAFFED = new Set(['sancharan', 'sampark', 'sambandh']);
+/**
+ * Ventures that are deliberately unstaffed — they assert the OPPOSITE of the rules below.
+ *
+ * foundational-models is here because the review that read the actual postings found ai-research
+ * to be cross-company (Data Analytics, Business Intelligence, MLOps, and a Multimodal AI role whose
+ * own text is about AquinTutor). Removing it left this venture with no department of its own, and
+ * an empty list is the honest answer — see RULE OF EVIDENCE in src/lib/product-domains.ts.
+ */
+const UNSTAFFED = new Set(['sancharan', 'sampark', 'sambandh', 'foundational-models']);
 
 describe('the mapping points at departments that exist', () => {
   it('every department id is a real catalogue department', () => {
@@ -180,5 +190,173 @@ describe('the match predicate renders SQL a database will accept', () => {
     const q = render(sql`SELECT 1 FROM roles WHERE ${productMatchClause('sambandh')}`);
     expect(q.sql).toContain('roles.products');
     expect(q.sql).not.toContain('department_id');
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// The hand-run SQL file must not drift from the mapping.
+//
+// db/product-domains-schema.sql ends with a verification query that lists the mapped departments so
+// an operator can see which of them actually have open postings. That list is a COPY of the mapping,
+// and a copy that nobody checks is a copy that goes stale — the operator would then run a query that
+// silently omits a venture and read the result as "that venture has no roles".
+// -------------------------------------------------------------------------------------------------
+describe('db/product-domains-schema.sql agrees with the mapping', () => {
+  const sqlFile = readFileSync(
+    fileURLToPath(new URL('../../db/product-domains-schema.sql', import.meta.url)),
+    'utf8',
+  );
+
+  it('creates all three columns the code reads', () => {
+    for (const col of ['product', 'products', 'openings']) {
+      expect(sqlFile).toContain('ADD COLUMN IF NOT EXISTS ' + col);
+    }
+  });
+
+  it('creates the GIN index the @> predicate needs', () => {
+    expect(sqlFile).toContain('roles_products_gin');
+    expect(sqlFile).toContain('USING GIN (products)');
+  });
+
+  it('lists exactly the departments the mapping resolves through', () => {
+    // The verification query's IN (...) list, parsed back out of the file.
+    const block = sqlFile.slice(sqlFile.indexOf('AND r.department_id IN ('));
+    const listed = new Set(
+      (block.slice(0, block.indexOf(')')).match(/'([a-z0-9-]+)'/g) || []).map((q) => q.slice(1, -1)),
+    );
+    const mapped = new Set(PRODUCT_DOMAINS.flatMap((p) => p.departments));
+    const missingFromSql = [...mapped].filter((d) => !listed.has(d));
+    const staleInSql = [...listed].filter((d) => !mapped.has(d));
+    expect(missingFromSql.join(', ')).toBe('');
+    expect(staleInSql.join(', ')).toBe('');
+  });
+
+  it('does not try to tag anything: resolving a venture is the app matcher job', () => {
+    // A second, LIKE-based copy of domainForProduct() living in SQL is exactly the divergence this
+    // whole change exists to remove. If an UPDATE on roles.products ever appears in this file, the
+    // repository has two definitions of the same rule again.
+    expect(/UPDATE\s+roles/i.test(sqlFile)).toBe(false);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// The open-posting gate. A venture page whose count disagrees with the page its own chip links to
+// is a defect this repository has shipped before, and the only defence is that both sides render
+// the SAME predicate.
+// -------------------------------------------------------------------------------------------------
+describe('the open-posting gate matches the one every careers surface uses', () => {
+  it('applies all three conditions, not just is_open', () => {
+    const q = render(sql`SELECT 1 FROM roles WHERE ${openPostingClause(true)}`);
+    expect(q.sql).toContain('roles.is_open = true');
+    expect(q.sql).toContain("COALESCE(roles.job_status, 'PUBLISHED') = 'PUBLISHED'");
+    expect(q.sql).toContain('roles.application_deadline IS NULL');
+    expect(q.sql).toContain('roles.application_deadline > NOW()');
+  });
+
+  it('is the same predicate listOpportunities renders', () => {
+    // Checked against the house definition in src/lib/xscale/roles-ext.ts rather than restated here.
+    // If that file's gate is edited and this one is not, the venture pages start disagreeing with
+    // /careers/department/<id> again, and this test is what says so.
+    const house = readFileSync(
+      fileURLToPath(new URL('./xscale/roles-ext.ts', import.meta.url)),
+      'utf8',
+    ).replace(/\s+/g, ' ');
+    for (const part of [
+      'r.is_open = TRUE',
+      "COALESCE(r.job_status, 'PUBLISHED') = 'PUBLISHED'",
+      'r.application_deadline IS NULL OR r.application_deadline > NOW()',
+    ]) {
+      expect({ part, inHouse: house.includes(part) }).toEqual({ part, inHouse: true });
+    }
+    // ...and the same three, on this side, with our own table alias.
+    const mine = render(sql`SELECT 1 FROM roles WHERE ${openPostingClause(true)}`).sql.replace(/\s+/g, ' ');
+    for (const part of [
+      'roles.is_open = true',
+      "COALESCE(roles.job_status, 'PUBLISHED') = 'PUBLISHED'",
+      'roles.application_deadline IS NULL OR roles.application_deadline > NOW()',
+    ]) {
+      expect({ part, inMine: mine.includes(part) }).toEqual({ part, inMine: true });
+    }
+  });
+
+  it('narrows to is_open alone, which is the same fallback listOpportunities takes', () => {
+    // db/xscale-schema.sql is hand-run and this repo has confirmed it unapplied in production, so
+    // job_status can be absent. When it is, BOTH surfaces drop to is_open and still agree.
+    const q = render(sql`SELECT 1 FROM roles WHERE ${openPostingClause(false)}`);
+    expect(q.sql).toContain('roles.is_open = true');
+    expect(q.sql).not.toContain('job_status');
+    expect(q.sql).not.toContain('application_deadline');
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// The paste-safe split of db/xscale-schema.sql must not drift from the original.
+//
+// The Extreme-Scale / Nano department needs a hand-run migration, and the original file cannot be
+// run from a web SQL console at all: it ends in CREATE INDEX CONCURRENTLY, a console wraps a paste
+// in one transaction, and CONCURRENTLY is illegal there — so the paste fails on the first index and
+// rolls back every ALTER above it. The console reports one error and the migration did nothing.
+//
+// The two paste-* files carry the same DDL for that route. Two copies of one migration is exactly
+// the divergence this repository keeps getting bitten by, so they are checked against the original
+// here: a column added to one and not the others fails the build, instead of failing silently on
+// somebody's database months later.
+// -------------------------------------------------------------------------------------------------
+describe('the xscale paste files match db/xscale-schema.sql', () => {
+  const read = (name: string) =>
+    readFileSync(fileURLToPath(new URL('../../db/' + name, import.meta.url)), 'utf8');
+  const original = read('xscale-schema.sql');
+  const paste1 = read('xscale-schema.paste-1-tables.sql');
+  const paste2 = read('xscale-schema.paste-2-indexes.sql');
+
+  /** Every `roles` column the file adds. */
+  const columnsOf = (s: string) =>
+    new Set((s.match(/ADD COLUMN IF NOT EXISTS\s+(\w+)/g) || []).map((m) => m.split(/\s+/).pop() as string));
+  /** Every index the file creates, however it creates it. Whitespace-tolerant: these files align
+   *  their statements into columns, so `CREATE INDEX        IF NOT EXISTS` is normal here. */
+  const indexesOf = (s: string) =>
+    new Set((s.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?IF\s+NOT\s+EXISTS\s+(\w+)/g) || [])
+      .map((m) => m.split(/\s+/).pop() as string));
+
+  it('paste 1 adds exactly the columns the original does', () => {
+    const want = [...columnsOf(original)].sort();
+    const got = [...columnsOf(paste1)].sort();
+    expect(got.join(', ')).toBe(want.join(', '));
+    expect(want.length).toBe(16);
+  });
+
+  it('paste 1 and paste 2 together create exactly the indexes the original does', () => {
+    const want = [...indexesOf(original)].sort();
+    const got = [...new Set([...indexesOf(paste1), ...indexesOf(paste2)])].sort();
+    expect(got.join(', ')).toBe(want.join(', '));
+  });
+
+  it('paste 1 creates the divisions table and runs the job_status backfill', () => {
+    expect(paste1).toContain('CREATE TABLE IF NOT EXISTS divisions');
+    expect(paste1).toContain('divisions_department_id_fkey');
+    expect(/UPDATE roles\s+SET job_status/.test(paste1)).toBe(true);
+  });
+
+  it('neither paste file BUILDS an index concurrently, which is the whole reason they exist', () => {
+    // One creeping back in would make the split file fail in the console it was written for, and
+    // fail in the same invisible way as the original: one error, and nothing applied.
+    //
+    // An executable statement, not the word, and not a quotation of it — both files explain in
+    // prose WHY they avoid CONCURRENTLY (paste 1 quotes the rule verbatim), so the SQL comments are
+    // stripped first. A test that forbade the word would forbid its own explanation.
+    const sqlOnly = (s: string) => s.split('\n').filter((l) => !/^\s*--/.test(l)).join('\n');
+    const builds = (s: string) => /CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY/i.test(sqlOnly(s));
+    expect(builds(paste1)).toBe(false);
+    expect(builds(paste2)).toBe(false);
+    // ...while the original, which is the psql route, still does.
+    expect(builds(original)).toBe(true);
+  });
+
+  it('the original points readers at the split, and the split back at the admin steps', () => {
+    // A migration that lands and is then never imported or published is indistinguishable, from the
+    // careers site, from one that never ran at all. Both files have to say what comes next.
+    expect(original).toContain('xscale-schema.paste-1-tables.sql');
+    expect(paste1).toContain('/admin/roles/divisions');
+    expect(paste2).toContain('/admin/roles/divisions');
   });
 });
