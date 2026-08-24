@@ -66,10 +66,41 @@ function connect(): any {
   // connection cost ~1.4s across two continents. The functions now run in bom1, next to the
   // database (19e34eb), so that handshake is local and cheap, and holding five idle connections per
   // instance for five minutes is a cost with nothing left to buy.
+  // =================================================================================================
+  // MEASURED AGAIN ON 2026-08-24, AND max:5 WITH idle_timeout:60 DID NOT HOLD
+  // =================================================================================================
+  //
+  // The paragraph above reasoned that five was "few enough that the transaction pooler is not the
+  // next thing to run out". It was the next thing to run out. Twelve concurrent requests to
+  // /api/health — a route whose entire database cost is ONE ping — answered four and returned 503 on
+  // the other eight, each after ~7.3s, with "database did not answer within 5000ms". A single
+  // request at the same moment answered in 136ms.
+  //
+  // THAT SHAPE RULES OUT QUEUEING, which is what tells us the direction to move. If the eight were
+  // simply waiting behind five busy connections they would have completed late, not timed out: one
+  // ping is 136ms, so twelve of them serialised through even a single connection is under two
+  // seconds. A five-second timeout on acquiring a connection is the pooler declining to give one
+  // out. The bound that matters is not five per instance — it is five TIMES the number of instances
+  // Vercel decides to run, and that number rises with exactly the concurrency that triggers this.
+  //
+  // idle_timeout:60 made it stick: every instance kept up to five connections for a full minute
+  // after it stopped needing them, so a brief burst held the pooler down long after the burst ended.
+  // That is the part the user actually experienced — the admin console, which fires several reads
+  // per page, would not open, while /about stayed fast because it touches no database at all.
+  //
+  // TWO, NOT ONE. max:1 is what this was before 3a65d6fd, and it serialised a page's own queries
+  // against each other — the bottleneck that commit correctly removed. Two keeps a slow query from
+  // blocking the fast one behind it on the same instance while halving what each instance can hold.
+  // Fifteen seconds is still comfortably longer than the local bom1 handshake this pool sits next
+  // to, and four times faster at handing a connection back than sixty was.
+  //
+  // IF THIS IS STILL NOT ENOUGH, the next lever is the pooler's own ceiling (Supabase → Database →
+  // Connection pooling), not another guess at this number. Re-measure with the burst above before
+  // changing it again: twelve parallel requests to /api/health, and count the 503s.
   _client = postgres(connectionString, {
     prepare: false,
-    max: 5,
-    idle_timeout: 60,
+    max: 2,
+    idle_timeout: 15,
     max_lifetime: 60 * 30,
     connect_timeout: 10,
   });
