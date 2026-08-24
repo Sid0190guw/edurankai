@@ -64,16 +64,24 @@ function cooldownMs(): number {
 }
 
 export class DbTimeoutError extends Error {
+  // The label was only ever in the prose of the message, so the one endpoint that reports these had
+  // to publish the whole sentence in order to name the gate that failed — and publicErrorSummary()
+  // then read `health.quick` as a hostname and replaced it with `<host>`. Carrying it as a field
+  // lets the reason be scrubbed and the gate still be named.
+  readonly label: string;
   constructor(label: string, ms: number) {
     super('database did not answer within ' + ms + 'ms (' + label + ')');
     this.name = 'DbTimeoutError';
+    this.label = label;
   }
 }
 
 export class DbCircuitOpenError extends Error {
+  readonly label: string;
   constructor(label: string) {
     super('database is not answering; this read was refused without waiting (' + label + ')');
     this.name = 'DbCircuitOpenError';
+    this.label = label;
   }
 }
 
@@ -85,6 +93,87 @@ export function isDbUnavailable(e: any): boolean {
 
 let openedAt = 0;
 let timeoutCount = 0;
+
+// -------------------------------------------------------------------------------------------------
+// WHAT THE DATABASE ACTUALLY SAID, KEPT WHERE SOMEBODY CAN READ IT
+// -------------------------------------------------------------------------------------------------
+//
+// The header of src/lib/db/index.ts is four consecutive changes to one number — max:1, then 5/60,
+// then 2/15, then 5/15 — and it says of itself that each "was diagnosed from the same 5s-timeout
+// symptom that all four settings produce". That is the real defect, and it is in THIS file: the
+// symptom is all there is. "database did not answer within 5000ms" is what a visitor sees, and what
+// the logs record, whether the pooler is refusing connections, the instance has run out of disk, the
+// password is wrong, or the host does not exist. The driver separates all four in a single sentence,
+// and that sentence was being thrown away — withDbTimeout below shows exactly where.
+//
+// One slot, overwritten, nothing allocated on the happy path. It lives as long as the serverless
+// instance does, which is the scope of every other counter in this file.
+//
+// `reason` IS DELIBERATELY NOT SCRUBBED HERE. A Postgres connection error carries the pooler
+// hostname, the role and the port; the function logs should keep those and an anonymous caller must
+// not see them. That is the reader's decision, not this module's — /api/health puts it through
+// publicErrorSummary() before publishing it. Scrubbing at the point of capture would destroy the
+// half operators need, to protect a half only one caller ever exposes.
+export interface DbFailureRecord {
+  at: string;
+  label: string;
+  /** The driver's own message, unscrubbed. Scrub before showing it to anyone unauthenticated. */
+  reason: string;
+  /** How long the attempt ran before it failed. */
+  afterMs: number;
+  /**
+   * `raced` — it failed before the bound elapsed, so its own caller received this error and could
+   * report it. `abandoned` — the bound elapsed first, the caller was handed a DbTimeoutError, and
+   * this is the real reason arriving afterwards with nobody left to tell. The second case is the one
+   * this record exists for.
+   */
+  phase: 'raced' | 'abandoned';
+}
+
+let lastFailure: DbFailureRecord | null = null;
+
+/**
+ * The most recent driver-level failure this process saw, or null.
+ *
+ * IT SURVIVES THE RECOVERY, which is the point. The circuit closes and the consecutive counter
+ * resets the moment one read succeeds, so ten minutes after an outage the only honest answer to
+ * "what actually failed" was a shrug. This is the one thing that still remembers.
+ */
+export function lastDbFailure(): DbFailureRecord | null {
+  return lastFailure ? { ...lastFailure } : null;
+}
+
+/** For tests, and for an operator screen that has just acted on a fault and wants a clean slate. */
+export function clearDbFailure(): void {
+  lastFailure = null;
+}
+
+/** The real Postgres reason lives on `e.cause`; `e.message` is only the statement that failed. */
+function driverReason(e: any): string {
+  const code = e?.code || e?.cause?.code || e?.errno;
+  const text = String(e?.cause?.message || e?.message || e || 'unknown failure').replace(/\s+/g, ' ').trim();
+  return (code && !text.includes(String(code)) ? String(code) + ': ' : '') + text;
+}
+
+function recordDriverFailure(label: string, e: any, afterMs: number, phase: 'raced' | 'abandoned'): void {
+  // Our own two errors are not evidence about the database — they are this file describing itself.
+  // Recording one would overwrite the driver's reason with the symptom, which is the entire problem
+  // this record exists to end.
+  if (isDbUnavailable(e)) return;
+  const reason = driverReason(e);
+  lastFailure = { at: new Date().toISOString(), label, reason, afterMs, phase };
+  console.error(JSON.stringify({
+    ts: lastFailure.at, level: 'error', event: 'db.driver_error', label, phase, afterMs, reason,
+  }));
+}
+
+/** The abandoned attempt answering late. Logged, and deliberately not fed to the breaker. */
+function noteLateAnswer(label: string, afterMs: number, boundMs: number): void {
+  console.warn(JSON.stringify({
+    ts: new Date().toISOString(), level: 'warn', event: 'db.late_answer', label, afterMs, boundMs,
+    note: 'the database answered after the caller had given up: slow, not gone',
+  }));
+}
 
 /** Is the circuit currently refusing waits? */
 export function dbCircuitOpen(): boolean {
@@ -211,13 +300,38 @@ export function withDbTimeout<T>(work: Promise<T>, label: string, ms: number = D
   //
   // Both sides check and set the same flag, so whichever settles first claims the outcome and the
   // loser becomes a no-op. `settled` is per-call, not shared.
+  //
+  // AND BOTH OUTCOMES OF THE WORK ARE OBSERVED, INCLUDING THE ONE NOBODY IS WAITING FOR ANY MORE.
+  //
+  // This attached an onFulfilled handler and nothing else. A REJECTION therefore travelled into
+  // Promise.race, arrived after the race had already settled on the timeout, and was absorbed with
+  // nothing written down anywhere. That rejection is the driver's own account of the failure —
+  // CONNECT_TIMEOUT, "Max client connections reached", "remaining connection slots are reserved",
+  // "no space left on device", an authentication failure — and it is the only sentence in the system
+  // that tells those apart. Every one of them reached the visitor, the logs and /api/health as the
+  // identical "database did not answer within 5000ms".
+  //
+  // Recording it changes nothing about what the caller receives: the rejection is re-thrown
+  // untouched, and the flag below still decides which side claims the outcome.
+  const startedAt = Date.now();
   let settled = false;
   let timer: ReturnType<typeof setTimeout>;
-  return Promise.race([
-    Promise.resolve(work).then((v) => {
-      if (!settled) { settled = true; noteSuccess(); }
+  const observed = Promise.resolve(work).then(
+    (v) => {
+      if (!settled) { settled = true; noteSuccess(); return v; }
+      // The abandoned attempt landing after its caller gave up. It must NOT close the circuit — the
+      // paragraph above is entirely about why — but it is the difference between a database that is
+      // slow and one that is gone, and that is worth one line.
+      noteLateAnswer(label, Date.now() - startedAt, ms);
       return v;
-    }),
+    },
+    (e) => {
+      recordDriverFailure(label, e, Date.now() - startedAt, settled ? 'abandoned' : 'raced');
+      throw e;
+    },
+  );
+  return Promise.race([
+    observed,
     new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         if (settled) return;

@@ -35,7 +35,7 @@
 //      table inventory to know the deployment is degraded; a COUNT says the same thing to a monitor.
 //      The names stay on /api/health/deep and on the /admin/ops bootstrap panel.
 import type { APIRoute } from 'astro';
-import { quickHealth, publicErrorSummary } from '@/lib/observability-health';
+import { quickHealth, publicErrorSummary, deployMarker } from '@/lib/observability-health';
 // A health check that can hang is not a health check. On 2026-08-23 this route held requests open
 // past 100 seconds while the database was unreachable, so the one endpoint whose entire job is to
 // turn an outage into a 503 reported nothing at all for the quarter hour the site was down. The
@@ -46,7 +46,7 @@ import { withDbTimeout } from '@/lib/db';
 // refused instantly rather than waited out), and is request-time DDL still being attempted by
 // bootstraps that never got onto ensureOnce. A guard nobody can see is the next invisible incident,
 // and this project has already shipped one bootstrap that reported success while doing nothing.
-import { dbCircuitState } from '@/lib/db-timeout';
+import { dbCircuitState, lastDbFailure } from '@/lib/db-timeout';
 import { suppressedDdlState } from '@/lib/schema-bootstrap';
 
 export const prerender = false;
@@ -57,6 +57,30 @@ const json = (body: any, status: number): Response =>
     status,
     headers: { 'Content-Type': 'application/json', 'cache-control': 'no-store, max-age=0' },
   });
+
+// Declared before the handler for the same reason as `json` above.
+//
+// THE LAST REAL REASON, SCRUBBED, ON BOTH PATHS — INCLUDING THE HEALTHY ONE.
+//
+// A database outage leaves nothing behind once it clears: the circuit closes, the consecutive
+// counter resets on the first success, and this endpoint goes back to reporting a 130ms round trip
+// as if nothing had happened. On 2026-08-24 the site answered "we cannot reach the database" on
+// every surface for several minutes and then recovered on its own, and the only thing anyone could
+// learn afterwards from outside was that it was fine now.
+//
+// It is published on the same terms as `database.error`: configuration stripped by
+// publicErrorSummary(), cause intact. That is not over-sharing, it is the only route available —
+// /api/health/deep gates on can(), which resolves the principal FROM the database, so during a
+// database outage nobody can read the deep endpoint at all.
+//
+// `label` is published unscrubbed because it is a code identifier (`middleware.session`,
+// `health.quick`), not configuration, and it is what turns "something failed" into "the session gate
+// failed". Sending it through the scrubber is what produced `(<host>)`.
+const publicDbFailure = () => {
+  const f = lastDbFailure();
+  if (!f) return null;
+  return { at: f.at, label: f.label, phase: f.phase, afterMs: f.afterMs, reason: publicErrorSummary(f.reason) };
+};
 
 export const GET: APIRoute = async () => {
   try {
@@ -78,6 +102,7 @@ export const GET: APIRoute = async () => {
       // request path; the sample list names which statements, in the function logs.
       ddl: (() => { const d = suppressedDdlState(); return { bootstrapEnabled: d.bootstrapEnabled, suppressed: d.count, samples: d.samples.slice(0, 5) }; })(),
       dbCircuit: dbCircuitState(),
+      lastDbFailure: publicDbFailure(),
       release: { commit: h.release.shortCommit, ref: h.release.ref, environment: h.release.environment, region: h.release.region, known: h.release.known },
       checks: h.checks.map((c) => ({
         name: c.name,
@@ -99,7 +124,31 @@ export const GET: APIRoute = async () => {
       const { trackError } = await import('@/lib/logger');
       await withDbTimeout(trackError('health.check_failed', e, {}), 'health.trackError', 2000);
     } catch { /* never let logging mask the outage */ }
-    return json({ status: 'down', at: new Date().toISOString(), database: { ok: false, latencyMs: -1, error: message }, checks: [{ name: 'database', ok: false, critical: true, detail: message }] }, 503);
+    // THE OUTAGE BODY NOW CARRIES WHAT THE HEALTHY BODY CARRIES, MINUS ONLY WHAT NEEDS A QUERY.
+    //
+    // This branch dropped `dbCircuit` and `release`, so the one response a person actually reads
+    // during an outage could not say whether reads were being refused without waiting, or which
+    // commit was serving. Neither costs a query — both are in-process — and their absence is why
+    // "is this the deploy I just pushed?" was unanswerable at exactly the moment it was being asked.
+    //
+    // `lastDbFailure` is the reason the DRIVER gave. `message` above cannot be that: on a timeout it
+    // is written by us and says only that we stopped waiting.
+    const marker = deployMarker();
+    return json({
+      status: 'down',
+      at: new Date().toISOString(),
+      database: {
+        ok: false,
+        latencyMs: -1,
+        error: message,
+        // Which gate gave up, from the error's own field rather than from its prose.
+        ...(e?.label ? { label: String(e.label) } : {}),
+      },
+      dbCircuit: dbCircuitState(),
+      lastDbFailure: publicDbFailure(),
+      release: { commit: marker.shortCommit, ref: marker.ref, environment: marker.environment, region: marker.region, known: marker.known },
+      checks: [{ name: 'database', ok: false, critical: true, detail: message }],
+    }, 503);
   }
 };
 

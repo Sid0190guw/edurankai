@@ -9,6 +9,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   withDbRetry, withDbTimeout, DbTimeoutError, DbCircuitOpenError, isDbUnavailable, dbCircuitState,
+  lastDbFailure, clearDbFailure,
 } from './db-timeout';
 
 const never = () => new Promise<never>(() => {});
@@ -130,5 +131,87 @@ describe('withDbRetry', () => {
     const e = await withDbRetry(() => never(), 'test.shape', 20, 20).catch((x) => x);
     expect(e).toBeInstanceOf(DbTimeoutError);
     expect(isDbUnavailable(e)).toBe(true);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// THE DRIVER'S OWN REASON MUST SURVIVE THE BOUND THAT STOPPED WAITING FOR IT
+// -------------------------------------------------------------------------------------------------
+//
+// The failure this covers is not hypothetical and it is not a logging nicety. On 2026-08-24 every
+// database-backed surface answered "we cannot reach the database right now" for several minutes,
+// and the only sentence available anywhere -- to the visitor, in the function logs, and on
+// /api/health -- was "database did not answer within 5000ms". That sentence is written by us. It is
+// identical whether the pooler refused the connection, the instance ran out of disk, or the
+// credentials were wrong, which is precisely why src/lib/db/index.ts carries four consecutive
+// changes to one number, each diagnosed from it.
+//
+// The `abandoned` case is the whole point: the caller has already been handed a DbTimeoutError and
+// walked away, and the real reason arrives afterwards with nobody left to tell. Before this it was
+// absorbed by a settled Promise.race and lost.
+describe('lastDbFailure', () => {
+  beforeEach(async () => { await resetCircuit(); clearDbFailure(); });
+  afterEach(async () => { await resetCircuit(); clearDbFailure(); });
+
+  it('records the driver reason when the work rejects inside the bound', async () => {
+    const e: any = new Error('write CONNECT_TIMEOUT');
+    e.cause = { message: 'Max client connections reached' };
+    await withDbTimeout(Promise.reject(e), 'test.raced', 500).catch(() => {});
+    const f = lastDbFailure();
+    expect(f?.label).toBe('test.raced');
+    expect(f?.phase).toBe('raced');
+    // e.cause, not e.message: the message is only the statement that failed.
+    expect(f?.reason).toContain('Max client connections reached');
+  });
+
+  it('records the reason that arrives AFTER the caller was handed a timeout', async () => {
+    const slowFailure = new Promise((_, rej) => setTimeout(() => {
+      const e: any = new Error('CONNECT_TIMEOUT');
+      e.cause = { message: 'no space left on device' };
+      rej(e);
+    }, 40));
+    const thrown = await withDbTimeout(slowFailure, 'test.abandoned', 10).catch((x) => x);
+    // The caller still gets our timeout, unchanged -- every isDbUnavailable() gate depends on it.
+    expect(thrown).toBeInstanceOf(DbTimeoutError);
+    expect(lastDbFailure()).toBeNull(); // nothing to report yet; the attempt is still running
+    await settle(60);
+    const f = lastDbFailure();
+    expect(f?.phase).toBe('abandoned');
+    expect(f?.reason).toContain('no space left on device');
+  });
+
+  it('never overwrites the driver reason with our own timeout or circuit error', async () => {
+    const e: any = new Error('the real one');
+    e.cause = { message: 'password authentication failed' };
+    await withDbTimeout(Promise.reject(e), 'test.real-cause', 500).catch(() => {});
+    // A later timeout, and a later refusal by the open circuit, are this file describing itself.
+    const prev = process.env.DB_CIRCUIT_OPEN_AFTER;
+    process.env.DB_CIRCUIT_OPEN_AFTER = '1';
+    try {
+      await withDbTimeout(never(), 'test.symptom', 10).catch(() => {});
+      await withDbTimeout(Promise.resolve(1), 'test.refused', 50).catch(() => {});
+    } finally {
+      if (prev === undefined) delete process.env.DB_CIRCUIT_OPEN_AFTER;
+      else process.env.DB_CIRCUIT_OPEN_AFTER = prev;
+    }
+    expect(lastDbFailure()?.reason).toContain('password authentication failed');
+    expect(lastDbFailure()?.label).toBe('test.real-cause');
+  });
+
+  it('carries the label as a field, so a reporter need not parse it out of the prose', async () => {
+    const prev = process.env.DB_CIRCUIT_OPEN_AFTER;
+    process.env.DB_CIRCUIT_OPEN_AFTER = '1';
+    try {
+      const t = await withDbTimeout(never(), 'middleware.session', 10).catch((x) => x);
+      expect(t).toBeInstanceOf(DbTimeoutError);
+      expect(t.label).toBe('middleware.session');
+      // That one timeout opened the circuit, so the next read is refused rather than waited out.
+      const c = await withDbTimeout(Promise.resolve(1), 'admin.gate', 50).catch((x) => x);
+      expect(c).toBeInstanceOf(DbCircuitOpenError);
+      expect(c.label).toBe('admin.gate');
+    } finally {
+      if (prev === undefined) delete process.env.DB_CIRCUIT_OPEN_AFTER;
+      else process.env.DB_CIRCUIT_OPEN_AFTER = prev;
+    }
   });
 });
