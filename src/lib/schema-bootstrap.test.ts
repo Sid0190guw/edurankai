@@ -213,12 +213,44 @@ describe('the database circuit breaker', () => {
     expect(dbCircuitOpen()).toBe(false);
   }
 
-  it('a timeout rejects with DbTimeoutError and opens the circuit', async () => {
+  /**
+   * Time out enough times IN A ROW to open it.
+   *
+   * The breaker needs DB_CIRCUIT_OPEN_AFTER consecutive timeouts, not one. That is the whole point:
+   * a single slow read must not refuse every other read in the instance. These cases set the
+   * threshold explicitly rather than inheriting the default, so a future change to the default
+   * cannot quietly turn them into assertions about something else.
+   */
+  async function tripCircuit(times = 3): Promise<void> {
+    for (let i = 0; i < times; i += 1) await withDbTimeout(hang(), 'test.hang', 20).catch(() => {});
+  }
+
+  it('ONE timeout rejects the caller but does NOT open the circuit', async () => {
+    // The property this file exists to protect, and the one it originally had backwards. A page that
+    // fans out more reads than the pool has slots will queue the surplus and some will blow their
+    // fuse; if that opened the breaker, every later read in the instance was refused and the site
+    // answered "we cannot reach the database" while psql got 143ms replies from it. One slow read is
+    // one degraded panel, not an outage.
+    process.env.DB_CIRCUIT_OPEN_AFTER = '3';
     await closeCircuit();
     process.env.DB_CIRCUIT_COOLDOWN_MS = '5000';
     await expect(withDbTimeout(hang(), 'test.hang', 20)).rejects.toBeInstanceOf(DbTimeoutError);
-    expect(dbCircuitOpen()).toBe(true);
+    expect(dbCircuitOpen()).toBe(false);
     expect(dbCircuitState().timeouts).toBeGreaterThan(0);
+  });
+
+  it('opens only after a RUN of timeouts, and a success in between resets the run', async () => {
+    process.env.DB_CIRCUIT_OPEN_AFTER = '3';
+    await closeCircuit();
+    process.env.DB_CIRCUIT_COOLDOWN_MS = '5000';
+    await tripCircuit(2);
+    expect(dbCircuitOpen()).toBe(false);
+    // A success between failures means the database is answering, so the count starts over.
+    await withDbTimeout(Promise.resolve('ok'), 'test.ok', 1000);
+    await tripCircuit(2);
+    expect(dbCircuitOpen()).toBe(false);
+    await tripCircuit(1);
+    expect(dbCircuitOpen()).toBe(true);
     expect(dbCircuitState().msRemaining).toBeGreaterThan(0);
   });
 
@@ -227,9 +259,10 @@ describe('the database circuit breaker', () => {
     // /admin issues roughly twelve sequential reads, and twelve consecutive 8-second timeouts is
     // ninety-six seconds — a gateway timeout reached by a slower route. One timeout, eleven instant
     // refusals, and the page renders its "could not be read" states instead.
+    process.env.DB_CIRCUIT_OPEN_AFTER = '3';
     await closeCircuit();
     process.env.DB_CIRCUIT_COOLDOWN_MS = '5000';
-    await withDbTimeout(hang(), 'test.hang', 20).catch(() => {});
+    await tripCircuit();
     expect(dbCircuitOpen()).toBe(true);
     const started = Date.now();
     await expect(withDbTimeout(hang(), 'test.refused', 5000)).rejects.toBeInstanceOf(DbCircuitOpenError);
@@ -240,6 +273,7 @@ describe('the database circuit breaker', () => {
   it('both failures report as database-unavailable; an ordinary query error does not', async () => {
     await closeCircuit();
     process.env.DB_CIRCUIT_COOLDOWN_MS = '5000';
+    process.env.DB_CIRCUIT_OPEN_AFTER = '1';
     const seen: any[] = [];
     await withDbTimeout(hang(), 'test.hang', 20).catch((e) => seen.push(e));
     await withDbTimeout(hang(), 'test.refused', 5000).catch((e) => seen.push(e));
@@ -252,8 +286,9 @@ describe('the database circuit breaker', () => {
   });
 
   it('a success closes the circuit again, so recovery needs no deploy', async () => {
+    process.env.DB_CIRCUIT_OPEN_AFTER = '3';
     process.env.DB_CIRCUIT_COOLDOWN_MS = '5000';
-    await withDbTimeout(hang(), 'test.hang', 20).catch(() => {});
+    await tripCircuit();
     expect(dbCircuitOpen()).toBe(true);
     // The cooldown lapses, one probe is let through, it answers — and the breaker is closed.
     process.env.DB_CIRCUIT_COOLDOWN_MS = '1';

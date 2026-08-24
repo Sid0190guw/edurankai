@@ -84,9 +84,11 @@ let timeoutCount = 0;
 export function dbCircuitOpen(): boolean {
   if (!openedAt) return false;
   if (Date.now() - openedAt >= cooldownMs()) {
-    // Cooldown elapsed. Let the next call through to find out whether the database is back; it will
-    // re-open the circuit if it times out again.
+    // Cooldown elapsed. Let the next call through to find out whether the database is back. The
+    // consecutive counter is cleared too, so the probe gets a full run of OPEN_AFTER attempts to
+    // prove the database is gone rather than re-opening on its first stumble.
     openedAt = 0;
+    consecutiveTimeouts = 0;
     return false;
   }
   return true;
@@ -102,17 +104,48 @@ export function dbCircuitState(): { open: boolean; timeouts: number; msRemaining
   };
 }
 
+/**
+ * HOW MANY TIMEOUTS IN A ROW MEAN THE DATABASE IS GONE, rather than one query being slow.
+ *
+ * This was 1, and 1 was wrong. It turned a single slow read into a whole-instance outage: the
+ * breaker is process-global, so one page that fanned out more reads than the pool had slots would
+ * queue the surplus, the queued ones would blow their 8s fuse, and every subsequent read in that
+ * instance — including the middleware session gate on the next request — was refused instantly.
+ * /admin/help answering "we cannot reach the database" while the database was answering psql in
+ * 143ms is what that looks like from outside.
+ *
+ * It is a CONSECUTIVE count, reset by any success, because that is the distinction that matters:
+ * three failures in a row is a database that has gone away, three failures spread among successes
+ * is a slow query and nothing more.
+ */
+function openAfter(): number {
+  // Read per call, not once at module scope — the same rule cooldownMs() above follows, and for the
+  // same two reasons: the value should be whatever the environment says NOW, and a threshold frozen
+  // at import time cannot be exercised by a test without reloading the module. The first draft of
+  // this was a module-level const and the suite caught it immediately.
+  const n = Number(process.env.DB_CIRCUIT_OPEN_AFTER);
+  return Number.isFinite(n) && n > 0 ? Math.max(1, Math.floor(n)) : 3;
+}
+
+let consecutiveTimeouts = 0;
+
 /** Close the circuit. Called on any bounded wait that SUCCEEDS. */
 function noteSuccess(): void {
   openedAt = 0;
+  consecutiveTimeouts = 0;
 }
 
 function noteTimeout(label: string): void {
   timeoutCount += 1;
-  openedAt = Date.now();
+  consecutiveTimeouts += 1;
+  // Only the run of failures opens it. A single slow read is logged and otherwise costs nothing:
+  // its own caller already received a DbTimeoutError and will degrade that one panel.
+  const threshold = openAfter();
+  if (consecutiveTimeouts >= threshold) openedAt = Date.now();
   console.error(JSON.stringify({
     ts: new Date().toISOString(), level: 'error', event: 'db.timeout',
-    label, timeouts: timeoutCount, cooldownMs: cooldownMs(),
+    label, timeouts: timeoutCount, consecutive: consecutiveTimeouts,
+    opened: consecutiveTimeouts >= threshold, openAfter: threshold, cooldownMs: cooldownMs(),
   }));
 }
 

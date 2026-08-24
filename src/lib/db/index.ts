@@ -122,9 +122,29 @@ function connect(): any {
   //
   // NOT AN ANSWER TO A SLOW QUERY. If something legitimately needs longer than this, the fix is the
   // query, not this number.
+  // =================================================================================================
+  // AND max:2 WAS TOO FAR THE OTHER WAY. THE THIRD MEASUREMENT BRACKETS IT.
+  // =================================================================================================
+  //
+  //   max:5, idle_timeout:60  ->  the pooler ran out. Each instance HOARDED five connections for a
+  //                               full minute after it stopped needing them.
+  //   max:2, idle_timeout:15  ->  the pooler was fine and the PAGES starved. /admin fans out about a
+  //                               dozen reads and readSetupStatus() fires six at once; through two
+  //                               slots the surplus queued, blew the 8s fuse, and — with the breaker
+  //                               opening on a single timeout — refused everything after it. The site
+  //                               answered "we cannot reach the database" while psql was getting
+  //                               143ms replies from the same database.
+  //
+  // Five slots with a fifteen-second idle is neither: enough concurrency that a page's own queries do
+  // not queue behind each other, and connections handed back four times faster than the setting that
+  // exhausted the pooler. The hoarding was always the idle window, not the count — that is the part
+  // the first measurement got wrong about itself.
+  //
+  // The breaker change in src/lib/db-timeout.ts is the other half and matters more: no pool size is
+  // safe while one slow read can refuse every subsequent read in the instance.
   _client = postgres(connectionString, {
     prepare: false,
-    max: 2,
+    max: 5,
     idle_timeout: 15,
     max_lifetime: 60 * 30,
     connect_timeout: 10,
