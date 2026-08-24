@@ -18,8 +18,29 @@ import { GOVERNANCE_TABLES } from './schema';
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..', '..', '..', '..');
 
+/**
+ * Read a source file with its line endings normalised.
+ *
+ * NOT DEFENSIVE PADDING — THIS TEST WAS RED ON EVERY CLEAN CHECKOUT AND GREEN IN THE TREE THAT
+ * WROTE IT.
+ *
+ * `core.autocrlf` is true here and `.gitattributes` declares only binary types, so git rewrites text
+ * files to CRLF on the way out. A file that an editor just wrote is still LF; the SAME file after a
+ * fresh clone, or in a `git worktree add`, is CRLF. The pattern below anchors on `` ` `` followed by
+ * `\n`, which after checkout is `` ` `` followed by `\r\n` — so it matched nothing, the extractor
+ * threw, and all seven assertions in this file failed with "could not find the DDL template literal
+ * in schema.ts" while `npm test` passed for the person who had just edited it.
+ *
+ * ddlFromSqlFile() below has always done this. Only the TypeScript side was missing it, which is
+ * exactly the kind of asymmetry that survives review: both halves look fine, and only one of them is
+ * wrong.
+ */
+function readNormalised(path: string): string {
+  return readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+}
+
 function ddlFromSchemaModule(): string {
-  const src = readFileSync(resolve(here, 'schema.ts'), 'utf8');
+  const src = readNormalised(resolve(here, 'schema.ts'));
   const match = src.match(/const DDL = `\n([\s\S]*?)\n`;\n/);
   if (!match) throw new Error('could not find the DDL template literal in schema.ts');
   return match[1];

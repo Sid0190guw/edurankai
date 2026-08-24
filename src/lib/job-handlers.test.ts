@@ -43,7 +43,26 @@ function walk(dir: string, out: string[] = []): string[] {
  * interface are covered. A kind built from a variable is invisible here — that is a real limit, and
  * it is why the mp.* handlers also validate their payload rather than trusting the dispatch.
  */
+/**
+ * Memoised, because the scan reads 2,389 files and two tests want the answer.
+ *
+ * THIS TEST TIMED OUT ON A CLEAN CHECKOUT. Vitest's per-test bound is 5s, and walking `src` and
+ * `scripts` and reading every .ts/.tsx/.astro in them takes most of that on a cold filesystem — so
+ * doing it twice put the second test over. It never showed up in a warm working tree, where the OS
+ * cache makes the same walk a few hundred milliseconds, which is why it shipped: the failure needs a
+ * checkout nobody has read yet, and that is precisely what CI and a fresh clone are.
+ *
+ * The scan is pure — same files, same answer — so computing it once is not a behaviour change. It
+ * halves the I/O and takes the whole file comfortably under the bound.
+ */
+let cachedKinds: Map<string, string[]> | null = null;
 function enqueuedKinds(): Map<string, string[]> {
+  if (cachedKinds) return cachedKinds;
+  cachedKinds = scanEnqueuedKinds();
+  return cachedKinds;
+}
+
+function scanEnqueuedKinds(): Map<string, string[]> {
   const found = new Map<string, string[]>();
   const re = /\.?enqueue(?:<[^>]*>)?\s*\(\s*'([^']+)'/g;
   for (const dir of ['src', 'scripts']) {

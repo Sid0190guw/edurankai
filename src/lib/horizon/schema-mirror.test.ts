@@ -16,8 +16,23 @@ import { fileURLToPath } from 'node:url';
 import { HORIZON_TABLES } from './schema';
 
 const ROOT = fileURLToPath(new URL('../../../', import.meta.url));
-const schemaTs = readFileSync(ROOT + 'src/lib/horizon/schema.ts', 'utf8');
-const schemaSql = readFileSync(ROOT + 'db/horizon-schema.sql', 'utf8');
+
+/**
+ * Both sides are read with their line endings normalised, and that is load-bearing.
+ *
+ * THIS TEST WAS RED ON EVERY CLEAN CHECKOUT AND GREEN IN THE TREE THAT WROTE IT. `core.autocrlf` is
+ * true here and `.gitattributes` declares only binary types, so text files come out of a clone — or
+ * out of `git worktree add` — as CRLF, while a file an editor has just written is still LF.
+ * bootstrapDdl() anchors on `` ` `` followed by `\n`, which is `` ` `` followed by `\r\n` after
+ * checkout: it matched nothing, threw, and took all four assertions with it.
+ *
+ * It matters for the comparison as well as the extraction. This file compares the bootstrap's DDL
+ * against the .sql file statement for statement, so if one side kept `\r` and the other did not,
+ * every comparison would fail on invisible characters — the worst possible diff to read.
+ */
+const read = (p: string) => readFileSync(ROOT + p, 'utf8').replace(/\r\n/g, '\n');
+const schemaTs = read('src/lib/horizon/schema.ts');
+const schemaSql = read('db/horizon-schema.sql');
 
 /**
  * The STATEMENTS in the .sql file, without its prose.
