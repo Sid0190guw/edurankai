@@ -375,3 +375,64 @@ describe('the xscale paste files match db/xscale-schema.sql', () => {
     expect(paste2).toContain('/admin/roles/divisions');
   });
 });
+
+// -------------------------------------------------------------------------------------------------
+// The one-paste file is now FOUR copies of the same DDL (this, the original, and the two split
+// files). That is three chances for one of them to be edited and the others not, on a migration
+// nobody re-reads once it has been run. So it is checked against BOTH sources it merges.
+// -------------------------------------------------------------------------------------------------
+describe('db/apply-nano-and-ventures.sql merges its two sources without losing anything', () => {
+  const read = (name: string) =>
+    readFileSync(fileURLToPath(new URL('../../db/' + name, import.meta.url)), 'utf8');
+  const combined = read('apply-nano-and-ventures.sql');
+  const ventures = read('product-domains-schema.sql');
+  const xscale = read('xscale-schema.sql');
+
+  const columnsOf = (s: string) =>
+    new Set((s.match(/ADD COLUMN IF NOT EXISTS\s+(\w+)/g) || []).map((m) => m.split(/\s+/).pop() as string));
+  const indexesOf = (s: string) =>
+    new Set((s.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?IF\s+NOT\s+EXISTS\s+(\w+)/g) || [])
+      .map((m) => m.split(/\s+/).pop() as string));
+
+  it('carries every column from both source files', () => {
+    const want = [...new Set([...columnsOf(ventures), ...columnsOf(xscale)])].sort();
+    const missing = want.filter((c) => !columnsOf(combined).has(c));
+    expect(missing.join(', ')).toBe('');
+    expect(want.length).toBe(19); // 3 venture tag columns + 16 research columns
+  });
+
+  it('carries every index from both source files', () => {
+    const want = [...new Set([...indexesOf(ventures), ...indexesOf(xscale)])].sort();
+    const missing = want.filter((i) => !indexesOf(combined).has(i));
+    expect(missing.join(', ')).toBe('');
+    expect(want.length).toBe(10);
+  });
+
+  it('creates the divisions table and runs the job_status backfill', () => {
+    expect(combined).toContain('CREATE TABLE IF NOT EXISTS divisions');
+    expect(combined).toContain('divisions_department_id_fkey');
+    expect(/UPDATE roles\s+SET job_status/.test(combined)).toBe(true);
+  });
+
+  it('builds no index concurrently — it is written to be pasted into one transaction', () => {
+    const sqlOnly = combined.split('\n').filter((l) => !/^\s*--/.test(l)).join('\n');
+    expect(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY/i.test(sqlOnly)).toBe(false);
+  });
+
+  it('its department list still matches the mapping', () => {
+    const block = combined.slice(combined.indexOf('AND r.department_id IN ('));
+    const listed = new Set(
+      (block.slice(0, block.indexOf(')')).match(/'([a-z0-9-]+)'/g) || []).map((q) => q.slice(1, -1)),
+    );
+    const mapped = new Set(PRODUCT_DOMAINS.flatMap((p) => p.departments));
+    expect([...mapped].filter((d) => !listed.has(d)).join(', ')).toBe('');
+    expect([...listed].filter((d) => !mapped.has(d)).join(', ')).toBe('');
+  });
+
+  it('tells the operator the two clicks that come after it', () => {
+    // The schema publishes nothing. A migration that lands and is never imported or published is
+    // indistinguishable, from the careers site, from one that never ran.
+    expect(combined).toContain('/admin/roles/divisions');
+    expect(combined).toContain('Publish division');
+  });
+});
