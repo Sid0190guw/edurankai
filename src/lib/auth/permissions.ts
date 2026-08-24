@@ -1742,22 +1742,67 @@ export function defaultSectionKeysForRole(role: string): Set<string> | null {
  * Custom-role assignment is the precise override; built-in roles get sane
  * defaults so a Marketing/Recruiter/etc. account no longer sees every tab.
  */
-export async function getViewableSectionKeys(user: { id: string; role: string } | null): Promise<Set<string> | null> {
-  if (!user) return new Set();
-  if (user.role === 'super_admin') return null;
-  const assigns: { roleId: string }[] = await (await database()).select({ roleId: userRoleAssignments.roleId })
-    .from(userRoleAssignments)
-    .where(eq(userRoleAssignments.userId, user.id));
-  if (assigns.length > 0) {
-    const roleIds = assigns.map((r) => r.roleId);
-    const perms = await (await database()).select({ pageKey: rolePermissions.pageKey, canView: rolePermissions.canView })
-      .from(rolePermissions)
-      .where(inArray(rolePermissions.roleId, roleIds));
-    const set = new Set<string>(['dashboard']);
-    for (const p of perms) if (p.canView) set.add(p.pageKey);
-    return set;
-  }
-  return defaultSectionKeysForRole(user.role);
+/**
+ * ONE ANSWER PER USER PER REQUEST, and one round trip to get it.
+ *
+ * TWO THINGS WERE WRONG, both costing connections rather than correctness.
+ *
+ * IT WAS COMPUTED TWICE ON EVERY ADMIN PAGE. src/middleware.ts asks, and then
+ * src/layouts/AdminLayout.astro asks again for the same user in the same request. Neither is wrong
+ * to ask; the answer simply should not cost a second trip to the database. The memo is a WeakMap
+ * keyed on the USER OBJECT, which works because middleware.ts:527 assigns the very object it
+ * validated to context.locals.user — so the layout is holding the same reference, and a different
+ * request has a different object and therefore no entry. Nothing is keyed on a user ID and nothing
+ * is cached at module scope; src/lib/auth/workspace-access.ts states the reason at length, and it is
+ * that a cache in a long-lived server process is how one person's answer gets rendered for another.
+ * A WeakMap on the request's own object cannot outlive the request or be shared between two.
+ *
+ * IT TOOK TWO ROUND TRIPS TO ANSWER. The assignments were read, awaited, and then the permissions
+ * were read with the ids that came back. A LEFT JOIN answers both at once, and the LEFT is what
+ * keeps the distinction the second half of this function depends on: no rows at all means the user
+ * has no custom roles and falls through to their built-in defaults, whereas rows with a null
+ * page_key mean they HAVE roles that grant nothing — which must return an empty set, not the
+ * defaults. An inner join would collapse those two into the same answer and silently hand somebody
+ * their role's default sections after an administrator had deliberately granted them none.
+ *
+ * On this deployment super_admin returns before any of it, so the founder's own pages never paid
+ * either cost. Everybody else did, on every admin page.
+ */
+const sectionKeyMemo = new WeakMap<object, Promise<Set<string> | null>>();
+
+export function getViewableSectionKeys(user: { id: string; role: string } | null): Promise<Set<string> | null> {
+  if (!user) return Promise.resolve(new Set<string>());
+  if (user.role === 'super_admin') return Promise.resolve(null);
+  const hit = sectionKeyMemo.get(user as object);
+  if (hit) return hit;
+  const p = readViewableSectionKeys(user).catch((e) => {
+    // A failure must not be memoised: the next caller in this request should be free to try again
+    // rather than inherit a rejection that has already been handled somewhere else.
+    sectionKeyMemo.delete(user as object);
+    throw e;
+  });
+  sectionKeyMemo.set(user as object, p);
+  return p;
+}
+
+async function readViewableSectionKeys(user: { id: string; role: string }): Promise<Set<string> | null> {
+  const rows: { roleId: string; pageKey: string | null; canView: boolean | null }[] =
+    await (await database())
+      .select({
+        roleId: userRoleAssignments.roleId,
+        pageKey: rolePermissions.pageKey,
+        canView: rolePermissions.canView,
+      })
+      .from(userRoleAssignments)
+      .leftJoin(rolePermissions, eq(rolePermissions.roleId, userRoleAssignments.roleId))
+      .where(eq(userRoleAssignments.userId, user.id));
+
+  // No assignments at all -> the built-in role's defaults, exactly as before.
+  if (rows.length === 0) return defaultSectionKeysForRole(user.role);
+
+  const set = new Set<string>(['dashboard']);
+  for (const r of rows) if (r.pageKey && r.canView) set.add(r.pageKey);
+  return set;
 }
 
 /**
