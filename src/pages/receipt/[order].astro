@@ -3,7 +3,7 @@
 // Access: the signed-in owner, a super admin, or a link carrying ?e=<email>
 // matching the payment (the emailed receipt link uses that form).
 import BaseLayout from '@/layouts/BaseLayout.astro';
-import { db } from '@/lib/db';
+import { db, isDbUnavailable } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
@@ -16,27 +16,67 @@ if (!order) return Astro.redirect('/');
 // timeout therefore answered a request for the record of a payment somebody had just made by quietly
 // dropping them on the marketing site — which reads as "we have no record of your payment", and the
 // reasonable response to that is to pay again. A failed read now says so, and says not to pay again.
+//
+// -------------------------------------------------------------------------------------------------
+// AND THEN THIS PAGE FAILED THAT WAY FOR EVERY ORDER, FOR MONTHS, BECAUSE OF THE COLUMN NAME BELOW
+// -------------------------------------------------------------------------------------------------
+//
+// It selected `payment_id`. The column is `razorpay_payment_id` — that is the name every write uses
+// (`UPDATE payments SET razorpay_payment_id = …` in the verify handlers) and the name every other
+// reader uses (/admin/finance selects it by that name). Nothing on this deployment has ever created
+// a `payment_id` column on `payments`.
+//
+// So the statement did not return "no such order". It threw `column "payment_id" does not exist`,
+// every time, for every order id — measured on the live site 2026-08-24: three different order
+// references, three 503s. The emailed receipt link after a real payment went to this page.
+//
+// AND THE COPY MADE IT WORSE. The block below was written for an unreachable database and says
+// "could not be reached just now" and "please reload in a moment". Reloading could never help: the
+// column was never coming back. A permanent fault was being reported as a passing one, which is the
+// one thing a person deciding whether to pay again must not be told.
+//
+// Hence the split. isDbUnavailable() is exactly the distinction — src/lib/db-timeout.ts exists to
+// tell "the database is unreachable" from "that query is wrong" — and the two get different words,
+// different status codes, and only one of them says "reload in a moment". Both keep "do not pay
+// again", because that is true either way and it is the sentence that protects the reader's money.
 let payReadFailed = false;
+let payReadUnreachable = false;
 const pay = rows(await db.execute(sql`
-  SELECT order_id, payment_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, created_at, notes
+  SELECT order_id, razorpay_payment_id AS payment_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, created_at, notes
   FROM payments WHERE order_id = ${order} LIMIT 1
 `).catch((e: any) => {
   payReadFailed = true;
+  payReadUnreachable = isDbUnavailable(e);
   // The real Postgres reason is on e.cause; e.message is only the failed SQL, and neither goes on screen.
   console.error('[receipt] payment read failed for order', order, '-', e?.cause?.message || e?.message);
   return [] as any;
 }))[0] as any;
 if (payReadFailed) {
+  const orderText = String(order).replace(/[<>&"]/g, '');
+  const body = payReadUnreachable
+    ? '<p style="margin:0 0 .75rem">Our records could not be reached just now. This does <strong>not</strong> mean your payment is missing, and it does not mean it failed.</p>'
+      + '<p style="margin:0 0 .75rem">Please reload in a moment. <strong>Do not pay again.</strong> If it keeps happening, email connect@edurankai.in and quote your order reference.</p>'
+    // No "reload in a moment": the read did not time out, it failed, and it will fail again.
+    : '<p style="margin:0 0 .75rem">Your payment record could not be displayed. This does <strong>not</strong> mean your payment is missing, and it does not mean it failed — the fault is on our side, in this page.</p>'
+      + '<p style="margin:0 0 .75rem"><strong>Do not pay again.</strong> Email connect@edurankai.in with the order reference below and we will send you the receipt.</p>';
   return new Response(
     '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
     + '<title>Receipt unavailable - EduRankAI</title>'
     + '<div style="max-width:34rem;margin:12vh auto;padding:0 1.25rem;font:16px/1.7 system-ui,sans-serif;color:#1a1a1a">'
     + '<h1 style="font-size:1.35rem;margin:0 0 .75rem">This receipt could not be loaded</h1>'
-    + '<p style="margin:0 0 .75rem">Our records could not be reached just now. This does <strong>not</strong> mean your payment is missing, and it does not mean it failed.</p>'
-    + '<p style="margin:0 0 .75rem">Please reload in a moment. <strong>Do not pay again.</strong> If it keeps happening, email connect@edurankai.in and quote your order reference.</p>'
-    + '<p style="margin:0;color:#6b6255;font-family:ui-monospace,monospace;font-size:.85rem">Order ' + String(order).replace(/[<>&"]/g, '') + '</p>'
+    + body
+    + '<p style="margin:0;color:#6b6255;font-family:ui-monospace,monospace;font-size:.85rem">Order ' + orderText + '</p>'
     + '</div>',
-    { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } },
+    {
+      // 503 says "come back"; 500 says "this is broken". A monitor should be able to tell them apart,
+      // and Retry-After belongs only on the one that is worth retrying.
+      status: payReadUnreachable ? 503 : 500,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        ...(payReadUnreachable ? { 'Retry-After': '15' } : {}),
+      },
+    },
   );
 }
 if (!pay) return Astro.redirect('/');
