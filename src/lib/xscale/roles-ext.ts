@@ -226,6 +226,18 @@ export interface OpportunityFilters {
   /** A single skill string, matched against the role's own skills array. */
   skill?: string;
   /**
+   * A product slug, matched against the role's product tags.
+   *
+   * ADDED FOR THE LEGACY LINKS, not for a new surface. /careers?product=<slug> was a real filter on
+   * the old careers page and those links were shared; repairing them by redirect is only honest if
+   * the destination can still answer the question. `products` and the legacy single `product`
+   * column belong to src/lib/role-products.ts and are ADDITIVE — created by
+   * db/product-domains-schema.sql, which is hand-run — so this predicate lives in the main query
+   * only and is dropped by the narrowed retry, where degraded:true already says the filters that
+   * were asked for did not all run.
+   */
+  product?: string;
+  /**
    * ANY-OF over the discipline column, as opposed to `skillCategory`'s single value.
    *
    * Added for Career Intelligence (src/lib/career-intel/retrieve.ts), which reads several
@@ -527,6 +539,7 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
       AND (${f.workMode || null}::text IS NULL OR r.location ILIKE '%' || ${f.workMode || null} || '%')
       AND (${f.classification || null}::text IS NULL OR r.research_classification = ${f.classification || null})
       AND (${f.skillCategory || null}::text IS NULL OR ${f.skillCategory || null} = ANY(COALESCE(r.skill_categories, ARRAY[]::text[])))
+      AND (${f.product || null}::text IS NULL OR ${f.product || null} = ANY(COALESCE(r.products, ARRAY[]::text[])) OR r.product = ${f.product || null})
       AND ${discoveryFragment()}
       AND (${postedSince}::timestamptz IS NULL OR r.created_at >= ${postedSince}::timestamptz)
       AND (${bandLo}::int IS NULL OR (
