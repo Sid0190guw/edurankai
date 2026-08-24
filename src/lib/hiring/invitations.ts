@@ -31,6 +31,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
+import { publicOrigin } from '@/lib/public-origin';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 const fail = (where: string, e: any) => console.error('[invitations] ' + where + ':', e?.cause?.message || e?.message);
@@ -125,9 +126,16 @@ export function isLive(status: InvitationStatus): boolean {
  * page would trade a gate that is deny-by-default for one that is not, over a page that grants
  * nothing. Living outside the prefix is the correct answer, and it costs nothing: the landing page
  * hands off to /apply, which goes through the gate exactly as it should.
+ *
+ * THE ORIGIN IS NOT A PARAMETER, AND THAT IS THE SECOND FIX HERE. It was, and the route passed
+ * `new URL(request.url).origin` — which on a serverless deployment is the address the FUNCTION was
+ * invoked on. Production minted `https://localhost/invite/<token>`: a real token in a link nobody
+ * outside the machine could open, with nothing to log because nothing failed. Resolving it inside
+ * means no caller can get it wrong. See src/lib/public-origin.ts for why the Host header is not the
+ * repair either.
  */
-export function inviteUrl(origin: string, token: string): string {
-  return String(origin || '').replace(/\/+$/, '') + '/invite/' + encodeURIComponent(token);
+export function inviteUrl(token: string): string {
+  return publicOrigin() + '/invite/' + encodeURIComponent(token);
 }
 
 export function ttlDays(input: unknown): number {

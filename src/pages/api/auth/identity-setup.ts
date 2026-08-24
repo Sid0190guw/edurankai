@@ -199,8 +199,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
     // and it is not "this is the account holder": both images came from the caller. So nothing is
     // granted here. A one-time link goes to the address already on the account, and control of that
     // mailbox is what finally binds the request to the account.
-    const origin = new URL(request.url).origin;
-    const outcome = await issueAndMailReset(user, origin, { ip, method: 'id_face_match' });
+    const outcome = await issueAndMailReset(user, { ip, method: 'id_face_match' });
 
     await db.execute(sql`
       INSERT INTO identity_verifications (user_id, email, claimed_name, claimed_dob, id_card_type, id_card_blob_url, face_match_distance, face_match_passed, verdict, reject_reason, metadata, ip_address, user_agent)

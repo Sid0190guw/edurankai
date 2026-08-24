@@ -316,8 +316,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
         return json({ ok: false, error: UNIFORM_FAIL }, 401);
       }
 
-      const origin = new URL(request.url).origin;
-      const outcome = await issueAndMailReset(ctx.usr as any, origin, { ip, method: 'question_set' });
+      const outcome = await issueAndMailReset(ctx.usr as any, { ip, method: 'question_set' });
       await audit(String(ctx.usr.id), 'question_verified', { score: Number(aggregate.toFixed(3)), threshold: PASS_THRESHOLD, asked: askedIds, delivery: outcome });
 
       if (outcome === 'no-address') {

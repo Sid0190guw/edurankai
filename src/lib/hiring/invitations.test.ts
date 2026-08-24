@@ -30,9 +30,34 @@ describe('token', () => {
     expect(t.startsWith(tokenPrefixOf(t))).toBe(true);
   });
 
-  it('builds a link without doubling the slash', () => {
-    expect(inviteUrl('https://www.edurankai.in/', 'tok')).toBe('https://www.edurankai.in/invite/tok');
-    expect(inviteUrl('https://www.edurankai.in', 'tok')).toBe('https://www.edurankai.in/invite/tok');
+  it('builds a link on the configured public origin, without doubling the slash', () => {
+    const prev = process.env.PUBLIC_SITE_URL;
+    try {
+      process.env.PUBLIC_SITE_URL = 'https://www.edurankai.in/';
+      expect(inviteUrl('tok')).toBe('https://www.edurankai.in/invite/tok');
+      process.env.PUBLIC_SITE_URL = 'https://www.edurankai.in';
+      expect(inviteUrl('tok')).toBe('https://www.edurankai.in/invite/tok');
+    } finally {
+      if (prev === undefined) delete process.env.PUBLIC_SITE_URL; else process.env.PUBLIC_SITE_URL = prev;
+    }
+  });
+
+  // THIS ONE SHIPPED BROKEN. The route passed `new URL(request.url).origin`, which on a serverless
+  // deployment is the address the function was invoked on — production minted
+  // https://localhost/invite/<token>. The origin is no longer a parameter, so there is no caller
+  // left that can supply a wrong one; this asserts the result is never loopback.
+  it('never mints a loopback link', () => {
+    const prev = process.env.PUBLIC_SITE_URL;
+    const prevEnv = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = 'production';
+      process.env.PUBLIC_SITE_URL = 'http://localhost:4321';
+      expect(inviteUrl('tok')).not.toContain('localhost');
+      expect(inviteUrl('tok')).toContain('edurankai.in');
+    } finally {
+      if (prev === undefined) delete process.env.PUBLIC_SITE_URL; else process.env.PUBLIC_SITE_URL = prev;
+      process.env.NODE_ENV = prevEnv;
+    }
   });
 
   // THE REGRESSION THIS PINS ACTUALLY HAPPENED. The landing page first lived at
@@ -41,7 +66,7 @@ describe('token', () => {
   // so a path with a token segment can never be exempted there. Asserting against the real gate
   // predicate rather than against the string means moving either one breaks this test.
   it('lands outside the gated apply prefix, or the link never reaches the page', () => {
-    const path = new URL(inviteUrl('https://www.edurankai.in', 'tok')).pathname;
+    const path = new URL(inviteUrl('tok')).pathname;
     expect(isGatedApplyPath(path)).toBe(false);
   });
 });

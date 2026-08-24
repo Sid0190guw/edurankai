@@ -115,8 +115,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
     }
 
     // Matched. Nothing about the credential changes here — a link goes to the address on file.
-    const origin = new URL(request.url).origin;
-    const outcome = await issueAndMailReset(user, origin, { ip, method: 'dob' });
+    const outcome = await issueAndMailReset(user, { ip, method: 'dob' });
 
     if (outcome === 'no-address') {
       return json({

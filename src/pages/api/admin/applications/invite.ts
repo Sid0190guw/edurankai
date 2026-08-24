@@ -110,7 +110,6 @@ function invitationEmail(inv: Invitation, url: string, fromName: string): { subj
 async function issue(
   clean: CleanInvite,
   user: any,
-  origin: string,
   wantEmail: boolean,
 ): Promise<Response> {
   const role = await lookupRole(clean.roleSlug);
@@ -127,7 +126,7 @@ async function issue(
     return json({ ok: false, error: created.error || 'The invitation could not be saved.' }, 500);
   }
 
-  const url = inviteUrl(origin, created.token);
+  const url = inviteUrl(created.token);
 
   // THE SEND IS RECORDED AS WHAT IT ACTUALLY WAS. A failed send still returns ok:true with the link,
   // because the invitation exists and the administrator can pass the link on by hand — but the
@@ -177,7 +176,6 @@ export const POST: APIRoute = async ({ request, locals }) => {
   try { body = await request.json(); } catch { return json({ ok: false, error: 'Bad request body.' }, 400); }
 
   const action = String(body.action || 'create');
-  const origin = new URL(request.url).origin;
 
   // Local development creates the table on demand; production has it from the hand-run .sql. A
   // failure here is not fatal to the request — the query below reports the real problem.
@@ -203,7 +201,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
   if (action === 'create' || action === 'resend') {
     const parsed = parseInvite(body);
     if ('error' in parsed) return json({ ok: false, error: parsed.error }, 400);
-    return issue(parsed.value, user, origin, body.sendEmail !== false);
+    return issue(parsed.value, user, body.sendEmail !== false);
   }
 
   return json({ ok: false, error: 'Unknown action.' }, 400);

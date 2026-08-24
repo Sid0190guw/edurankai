@@ -27,6 +27,7 @@
 // Attempt limiting deliberately REUSES countAttempt()/peekAttempts() from ./two-factor.ts rather
 // than adding a second limiter with its own table. One limiter, one place to raise a threshold.
 import { db } from '@/lib/db';
+import { publicOrigin } from '@/lib/public-origin';
 import { sql } from 'drizzle-orm';
 import { ddlPermitted } from '@/lib/schema-bootstrap';
 import { createHash, randomBytes } from 'node:crypto';
@@ -325,11 +326,16 @@ export async function sendRecoveryMail(
  */
 export async function issueAndMailReset(
   user: { id: string; email?: string | null; name?: string | null },
-  origin: string,
   opts: { ip?: string; method?: string } = {},
 ): Promise<DeliveryOutcome> {
   const token = await issueRecoveryToken(user.id, 'password-reset', opts);
-  return await sendRecoveryMail(user.email || null, user.name || null, recoveryLink(origin, token));
+  // THE ORIGIN USED TO BE A PARAMETER, and all three callers passed
+  // `new URL(request.url).origin` — the address the serverless FUNCTION was invoked on, not the one
+  // the person typed. In production that is `https://localhost`, so every reset mail from every
+  // recovery method carried a link nobody could open, with a valid token inside it and nothing in
+  // any log to say so, because nothing failed. Resolved here now: no caller can get it wrong, and
+  // src/lib/public-origin.ts explains why reading the Host header is not the repair either.
+  return await sendRecoveryMail(user.email || null, user.name || null, recoveryLink(publicOrigin(), token));
 }
 
 /**
