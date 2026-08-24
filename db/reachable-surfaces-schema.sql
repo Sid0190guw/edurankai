@@ -1,5 +1,5 @@
 -- db/reachable-surfaces-schema.sql
--- SEVENTEEN TABLES BEHIND PAGES A REAL PERSON CAN OPEN TODAY, none of which exist in production.
+-- FIFTEEN TABLES BEHIND PAGES A REAL PERSON CAN OPEN TODAY, none of which exist in production.
 --
 -- SAFE TO RUN ON PRODUCTION. Every statement is CREATE TABLE IF NOT EXISTS or CREATE INDEX
 -- IF NOT EXISTS. No ALTER TABLE, nothing dropped, no row rewritten, and nothing here touches a
@@ -20,7 +20,7 @@
 --     subsystems nothing has exercised. A table for a feature no one has opened is not an outage,
 --     and inventing DDL files for three hundred of them would be motion, not repair.
 --
---   * These seventeen are created by a PAGE under src/pages. That is the difference: somebody
+--   * These are created by a PAGE under src/pages. That is the difference: somebody
 --     navigating the site reaches them. Every one of these renders today as an empty list, a failed
 --     save, or a caught error dressed as "nothing here yet" — which is the failure mode this
 --     project keeps finding, an outage that reads as an empty state.
@@ -116,22 +116,8 @@ CREATE TABLE IF NOT EXISTS library_reservations (
   status      VARCHAR(20) DEFAULT 'pending'
 );
 
--- src/pages/api/aquintutor/library/ill-request.ts. BIGSERIAL rather than uuid because that is what
--- the endpoint writes; changing the key here would create a table its own writer cannot use.
-CREATE TABLE IF NOT EXISTS library_ill_requests (
-  id              BIGSERIAL PRIMARY KEY,
-  title           TEXT NOT NULL,
-  author          TEXT,
-  year            TEXT,
-  publisher       TEXT,
-  ident           TEXT,
-  format          TEXT NOT NULL DEFAULT 'any',
-  needed_by       DATE,
-  reason          TEXT,
-  requester_email TEXT NOT NULL,
-  status          TEXT NOT NULL DEFAULT 'received',
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+-- library_ill_requests IS NOT HERE. db/aquintutor-campus-schema.sql owns it, and owning it twice is
+-- how two files drift into two different tables. Run that file too — see the note at the bottom.
 
 -- --------------------------------------------------------------------------------------------
 -- STUDY TOOLS — flashcards, notes, the resume builder. src/pages/portal/*.astro
@@ -200,23 +186,7 @@ CREATE TABLE IF NOT EXISTS user_resumes (
   updated_at     TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS practice_problems (
-  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  slug           VARCHAR(200) UNIQUE,
-  title          TEXT,
-  topic          VARCHAR(80),
-  difficulty     VARCHAR(20),
-  statement      TEXT,
-  constraints    TEXT,
-  sample_input   TEXT,
-  sample_output  TEXT,
-  starter_code   JSONB,
-  test_cases     JSONB,
-  solved_count   INT DEFAULT 0,
-  acceptance_pct INT,
-  is_active      BOOLEAN DEFAULT true,
-  created_at     TIMESTAMPTZ DEFAULT NOW()
-);
+-- practice_problems is likewise owned by db/aquintutor-campus-schema.sql.
 
 -- --------------------------------------------------------------------------------------------
 -- GUARDIAN ACCESS — src/pages/portal/parent.astro
@@ -279,34 +249,11 @@ CREATE TABLE IF NOT EXISTS task_reminder_log (
 -- PUBLIC INTAKE FORMS — three pages that accept a submission from a visitor and, today, drop it.
 -- src/pages/aquintutor/careerflow/placement.astro, /incubation.astro, /products/atlas-proctoring
 -- --------------------------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS senior_placement_requests (
-  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id          UUID,
-  name             VARCHAR(200),
-  email            VARCHAR(200),
-  years_experience INT,
-  current_role     VARCHAR(300),
-  target_role      VARCHAR(300),
-  linkedin_url     TEXT,
-  cv_url           TEXT,
-  status           VARCHAR(20) NOT NULL DEFAULT 'open',
-  created_at       TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS eir_applications (
-  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id        UUID,
-  name           VARCHAR(200),
-  email          VARCHAR(200),
-  education      TEXT,
-  prior_work_url TEXT,
-  prototype_url  TEXT,
-  idea_summary   TEXT,
-  target_market  TEXT,
-  plan_12mo      TEXT,
-  status         VARCHAR(20) NOT NULL DEFAULT 'pending',
-  created_at     TIMESTAMPTZ DEFAULT NOW()
-);
+-- senior_placement_requests and eir_applications are owned by db/aquintutor-campus-schema.sql and
+-- are NOT duplicated here. Both were unreachable for a reason worth knowing: their column was named
+-- current_role, which is a RESERVED word in Postgres (the CURRENT_ROLE function), so the statement
+-- was a syntax error in the page AND in the schema file, and every run of either died on it. The
+-- column is now current_position in both. Nothing had ever been stored, so nothing was migrated.
 
 CREATE TABLE IF NOT EXISTS atlas_partner_leads (
   id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -320,17 +267,19 @@ CREATE TABLE IF NOT EXISTS atlas_partner_leads (
 );
 
 -- ============================================================================================
--- VERIFY (safe, read-only). Expect seventeen rows.
+-- VERIFY (safe, read-only). Expect fifteen rows.
 --
 --   SELECT table_name FROM information_schema.tables
 --    WHERE table_schema = 'public'
 --      AND table_name IN ('doubts','doubt_answers','doubt_answer_votes','library_resources',
---                         'library_loans','library_reservations','library_ill_requests',
---                         'flashcard_decks','flashcards','notes','note_collaborators',
---                         'user_resumes','practice_problems','parent_child_links',
---                         'auth_recovery_challenge','task_reminder_log',
---                         'senior_placement_requests','eir_applications','atlas_partner_leads')
+--                         'library_loans','library_reservations','flashcard_decks','flashcards',
+--                         'notes','note_collaborators','user_resumes','parent_child_links',
+--                         'auth_recovery_challenge','task_reminder_log','atlas_partner_leads')
 --    ORDER BY table_name;
+--
+-- THEN RUN db/aquintutor-campus-schema.sql, which owns library_ill_requests, practice_problems,
+-- senior_placement_requests and eir_applications. It has never run to completion: it died at the
+-- current_role statement described above, so everything below that line in it may be missing too.
 --
 -- WHAT IS STILL MISSING AFTER THIS, AND WHY IT IS NOT HERE. About three hundred more tables are
 -- CREATEd only inside library modules that no shipped page reaches — the mail platform, both

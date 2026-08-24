@@ -288,7 +288,10 @@ CREATE TABLE IF NOT EXISTS practice_problems (
 CREATE TABLE IF NOT EXISTS senior_placement_requests (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID, name VARCHAR(200), email VARCHAR(200), years_experience INT,
-        current_role VARCHAR(300), target_role VARCHAR(300), linkedin_url TEXT, cv_url TEXT,
+        -- NOT current_role: that is a reserved word in Postgres (the CURRENT_ROLE function), and
+        -- this statement was a syntax error from the day it was written. Every run of this file
+        -- died here, which is why senior_placement_requests exists in no database anywhere.
+        current_position VARCHAR(300), target_role VARCHAR(300), linkedin_url TEXT, cv_url TEXT,
         status VARCHAR(20) NOT NULL DEFAULT 'open', created_at TIMESTAMPTZ DEFAULT NOW());
 
 -- ------------------------------------------------------------------------------------------------
