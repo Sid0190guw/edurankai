@@ -54,31 +54,44 @@ async function logOpens(ids: string[], userId: string, ip: string | null, ua: st
   try {
     await ensureMailSchema();
     const g = await geo(ip);
-    for (const id of ids) {
-      try {
-        await db.execute(sql`
-          INSERT INTO mail_reads (message_id, user_id, kind, ip_address, country, region, city, user_agent)
-          SELECT ${id}, ${userId}, 'internal', ${ip || null}, ${g.country || null}, ${g.region || null}, ${g.city || null}, ${ua}
-          -- A READ RECEIPT MAY ONLY BE RECORDED BY SOMEBODY WHO ACTUALLY HAS THE MESSAGE.
-          -- This used to check only that the caller was not the SENDER, so any mailbox holder who
-          -- learned a message id — and every recipient of a tracked message holds one, it is in the
-          -- pixel and link URLs — could insert 'read' rows against a message they were never sent.
-          -- The sender's read receipts were therefore forgeable by anyone. Joining mail_box binds
-          -- the receipt to a copy the caller genuinely owns.
-          WHERE EXISTS (
-            SELECT 1 FROM mail_messages m
-            JOIN mail_box b ON b.message_id = m.id AND b.user_id = ${userId}
-            WHERE m.id = ${id} AND m.from_user_id <> ${userId}
-          )
-            AND NOT EXISTS (
-              SELECT 1 FROM mail_reads WHERE message_id = ${id} AND user_id = ${userId}
-                AND read_at > NOW() - INTERVAL '30 minutes'
-            )
-        `);
-      } catch (e: any) {
-        console.error('[api/mail/open] read receipt not recorded for message', id, '-', reasonOf(e));
-      }
-    }
+    // ONE STATEMENT FOR THE WHOLE READING PANE, NOT ONE PER MESSAGE.
+    //
+    // This looped, and every iteration was an awaited round trip holding a pooler connection for
+    // ~140ms whatever the insert cost — so opening a pane of a hundred messages took a hundred
+    // connections' worth of time on a pool of a few, for receipts nobody is waiting on. On a shared
+    // pooler that is not a slow endpoint, it is other people's pages answering 503.
+    //
+    // The ids arrive already validated as UUIDs and capped at 100 by the handler below, and they go
+    // in as ONE json parameter rather than a hundred placeholders. `= ANY(${jsArray})` is the trap
+    // here and src/lib/pg-array.ts is written about it: the driver sends a JS array as a record
+    // literal, not an array, and Postgres answers "op ANY/ALL (array) requires array on right side".
+    // jsonb_array_elements_text is the form that repo already standardised on.
+    //
+    // BOTH SECURITY PREDICATES ARE UNCHANGED and now correlate on x.id instead of a literal. The
+    // mail_box join is what binds a receipt to a copy the caller genuinely owns — without it any
+    // mailbox holder who learned a message id, and every recipient of a tracked message holds one
+    // because it is in the pixel and link URLs, could forge read rows against mail they were never
+    // sent. The NOT EXISTS keeps the thirty-minute dedupe.
+    //
+    // The per-id catch is gone because it was guarding nothing per-id: the predicates decide each
+    // row on its own, so anything that can actually throw here is statement-level (a missing table,
+    // an unreachable database) and would have failed all hundred iterations anyway. The outer catch
+    // still logs it, and this is still fire-and-forget.
+    await db.execute(sql`
+      INSERT INTO mail_reads (message_id, user_id, kind, ip_address, country, region, city, user_agent)
+      SELECT x.id::uuid, ${userId}, 'internal', ${ip || null}, ${g.country || null}, ${g.region || null}, ${g.city || null}, ${ua}
+        FROM (SELECT jsonb_array_elements_text(${JSON.stringify(ids)}::jsonb) AS id) x
+       WHERE EXISTS (
+         SELECT 1 FROM mail_messages m
+         JOIN mail_box b ON b.message_id = m.id AND b.user_id = ${userId}
+         WHERE m.id = x.id::uuid AND m.from_user_id <> ${userId}
+       )
+         AND NOT EXISTS (
+           SELECT 1 FROM mail_reads
+            WHERE message_id = x.id::uuid AND user_id = ${userId}
+              AND read_at > NOW() - INTERVAL '30 minutes'
+         )
+    `);
   } catch (e: any) {
     console.error('[api/mail/open] read receipts abandoned:', reasonOf(e));
   }

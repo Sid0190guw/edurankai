@@ -60,11 +60,42 @@ export async function resolveInheritedGrants(objectId: string): Promise<Permissi
       const parents = rows(await db.execute(sql`SELECT to_id FROM kernel_edges WHERE from_id IN ${uuidIn(frontier as any)} AND type = 'part_of'`))
         .map((r: any) => r.to_id).filter((pid: string) => !seen.has(pid));
       const next: string[] = [];
-      for (const pid of parents) {
-        seen.add(pid); next.push(pid);
+      for (const pid of parents) { seen.add(pid); next.push(pid); }
+      if (!next.length) { frontier = []; break; }
+
+      // TWO QUERIES PER LEVEL, NOT TWO PER ANCESTOR.
+      //
+      // This ran both reads inside the per-parent loop, so a permission check walked the graph at
+      // two awaited round trips per ancestor, up to eight levels deep. Every one of those holds a
+      // pooler connection for ~140ms whatever it returns, and this is a PERMISSION CHECK — it sits
+      // in front of other work rather than being the work, so its latency is paid before anything
+      // the person asked for even begins.
+      //
+      // The frontier is already a list, so both reads take the whole level at once. uuidIn() is the
+      // house helper for that and it exists because `= ANY(${jsArray})` renders as a record literal
+      // and fails outright — see src/lib/pg-array.ts.
+      const grantRows = rows(await db.execute(sql`
+        SELECT * FROM rbac_permission_grants
+         WHERE resource_ref IN ${uuidIn(next as any)} AND inheritance_policy = 'cascade'`));
+      const aclRows = rows(await db.execute(sql`
+        SELECT id, permissions FROM kernel_objects WHERE id IN ${uuidIn(next as any)}`));
+
+      // REGROUPED SO THE OUTPUT ORDER IS BYTE-FOR-BYTE WHAT THE LOOP PRODUCED. `inherited` is
+      // consumed downstream by an evaluator that breaks priority ties by position, so emitting all
+      // the grants and then all the ACLs would be a different answer, not just a different shape.
+      // Walking `next` in its original order and pushing that parent's grants then its ACL keeps it
+      // identical.
+      const grantsBy = new Map<string, any[]>();
+      for (const r of grantRows) {
+        const k = String((r as any).resource_ref);
+        (grantsBy.get(k) || grantsBy.set(k, []).get(k)!).push(r);
+      }
+      const aclBy = new Map<string, any>();
+      for (const a of aclRows) aclBy.set(String((a as any).id), a);
+
+      for (const pid of next) {
         // central grants on the ancestor marked cascade -> re-pointed at the descendant, one tier lower.
-        const g = rows(await db.execute(sql`SELECT * FROM rbac_permission_grants WHERE resource_ref = ${pid} AND inheritance_policy = 'cascade'`));
-        for (const r of g) {
+        for (const r of grantsBy.get(String(pid)) || []) {
           inherited.push({
             permissionId: r.permission_id, identityRef: r.identity_ref, resourceRef: objectId, operation: r.operation,
             effect: r.effect, state: 'inherited', inheritancePolicy: 'cascade',
@@ -73,7 +104,7 @@ export async function resolveInheritedGrants(objectId: string): Promise<Permissi
           });
         }
         // ancestor ACLs also cascade down (as inherited-tier allows).
-        const ao = rows(await db.execute(sql`SELECT permissions FROM kernel_objects WHERE id = ${pid} LIMIT 1`))[0];
+        const ao = aclBy.get(String(pid));
         for (const ag of aclToGrants(objectId, (ao?.permissions ?? []) as ObjectAclEntry[])) {
           inherited.push({ ...ag, state: 'inherited', priority: 3, flags: [...ag.flags, 'inherited'] });
         }
