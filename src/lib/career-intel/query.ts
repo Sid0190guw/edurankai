@@ -73,25 +73,29 @@ export function compileQuery(profile: CareerProfile, explicit: Partial<Opportuni
   const cappedDisciplines = disciplines.slice(0, 6);
   const cappedTerms = terms.slice(0, 6);
 
-  // BOTH PREDICATES ARE A WIDENING, AND THEY MUST NOT BE AND-ED WITH EACH OTHER. Somebody who says
-  // "AI and Python" wants postings in the AI discipline OR postings naming Python, not only the
-  // intersection — which is frequently empty and reads as "we have nothing for you".
-  // listOpportunities AND-s its filters, so when there are disciplines we pass ONLY those and let
-  // the terms do their work in ranking; when there are none, the terms carry the retrieval.
-  const useDisciplines = cappedDisciplines.length > 0;
-
+  // BOTH ARE SENT, AND listOpportunities OR-s THEM WITH EACH OTHER.
+  //
+  // An earlier version sent one or the other — disciplines when there were any, terms otherwise —
+  // because listOpportunities AND-s its filters and the intersection of "in the AI discipline" and
+  // "mentions Python" is frequently empty. Sending only the disciplines turned out to be the worse
+  // half of that trade on this catalogue: skill_categories is populated on the 179 research
+  // postings and on nothing else, so "I want AI work" would look past every AI-titled role in the
+  // main catalogue and answer with a handful, or with none at all.
+  //
+  // discoveryFragment() in roles-ext.ts now ORs the two, so both go. Everything else in `explicit`
+  // still ANDs, because those are choices the person made and are meant to narrow.
   const filters: OpportunityFilters = {
     ...explicit,
-    skillCategoriesAny: useDisciplines ? cappedDisciplines : undefined,
-    terms: useDisciplines ? undefined : (cappedTerms.length ? cappedTerms : undefined),
+    skillCategoriesAny: cappedDisciplines.length ? cappedDisciplines : undefined,
+    terms: cappedTerms.length ? cappedTerms : undefined,
   };
 
-  const unpersonalised = !useDisciplines && cappedTerms.length === 0 && !explicit.q;
+  const unpersonalised = cappedDisciplines.length === 0 && cappedTerms.length === 0 && !explicit.q;
 
   return {
     filters,
-    disciplines: useDisciplines ? cappedDisciplines : [],
-    terms: useDisciplines ? [] : cappedTerms,
+    disciplines: cappedDisciplines,
+    terms: cappedTerms,
     unpersonalised,
   };
 }

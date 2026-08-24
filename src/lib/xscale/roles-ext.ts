@@ -380,12 +380,59 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
     ? sql`(COALESCE(r.skill_categories, ARRAY[]::text[]) && ${textArray(catsAny)})`
     : sql`TRUE`);
 
+  /**
+   * THE TWO WIDENINGS ARE OR-ED WITH EACH OTHER, NOT AND-ED.
+   *
+   * Somebody who says "AI and Python" wants postings tagged with the AI discipline OR postings
+   * naming Python. AND-ing the two asks for both at once, and on this catalogue that is usually
+   * empty: skill_categories is populated on the 179 research postings imported from
+   * src/data/xscale-catalog.ts and on nothing else, so a discipline predicate alone cannot see the
+   * eight hundred-odd roles in the main catalogue however obviously they match. A search that
+   * answers "nothing" while the answer is on the next page is worse than one that answers widely.
+   *
+   * They still AND with everything else — a department, a level, a search term the person typed.
+   * Those are the person's own explicit choices and are meant to narrow.
+   *
+   * The empty cases are guarded rather than folded together: `cats OR TRUE` is TRUE, so an
+   * unconditional OR would silently discard a discipline filter whenever no terms were supplied.
+   */
+  const discoveryFragment = () => {
+    if (hasCatsAny && hasTerms) return sql`(${catsFragment()} OR ${termsFragment()})`;
+    if (hasCatsAny) return catsFragment();
+    if (hasTerms) return termsFragment();
+    return sql`TRUE`;
+  };
+
+  /**
+   * ONE TERM, MATCHED AGAINST EVERY COLUMN THE BASE SCHEMA GUARANTEES.
+   *
+   * Shared by the retry path's free-text search and its any-of terms, so the two cannot drift.
+   *
+   * NARROW MEANS "ONLY COLUMNS THAT ARE CERTAIN TO EXIST", NOT "AS FEW COLUMNS AS POSSIBLE", and
+   * the difference showed up as a live defect: the retry searched title and function alone, so
+   * /api/careers/search?q=python answered total:0 on production while the catalogue held 1,017
+   * postings and Python appears in the skills array of a great many of them. about, skills and
+   * departments.name are all declared in src/lib/db/schema.ts and exist everywhere; leaving them
+   * out bought no safety and cost most of the search.
+   *
+   * r.tools is NOT here. That one is additive, and it is the whole reason this path exists.
+   *
+   * The jsonb_typeof guard is not optional: jsonb_array_elements_text throws a hard error on any
+   * row whose skills column is not an array, and because it runs per row across the table ONE bad
+   * row silently killed every search on /careers once before.
+   */
+  const narrowMatch = (t: string) => {
+    const lk = '%' + t + '%';
+    return sql`(r.title ILIKE ${lk} OR r.function ILIKE ${lk} OR r.about ILIKE ${lk}
+      OR COALESCE(d.name, '') ILIKE ${lk}
+      OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(
+           CASE WHEN jsonb_typeof(r.skills) = 'array' THEN r.skills ELSE '[]'::jsonb END
+         ) AS s WHERE s ILIKE ${lk}))`;
+  };
+
   // The same widening, narrowed to columns that exist on every database, for the retry path.
   const narrowTerms = () => (hasTerms
-    ? sql`(${sql.join(anyTerms.map((t) => {
-      const lk = '%' + t + '%';
-      return sql`(r.title ILIKE ${lk} OR r.function ILIKE ${lk})`;
-    }), sql` OR `)})`
+    ? sql`(${sql.join(anyTerms.map(narrowMatch), sql` OR `)})`
     : sql`TRUE`);
 
   // The public rule, or the admin one. `includeUnpublished` is set only by an authenticated admin
@@ -427,8 +474,7 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
       AND (${f.workMode || null}::text IS NULL OR r.location ILIKE '%' || ${f.workMode || null} || '%')
       AND (${f.classification || null}::text IS NULL OR r.research_classification = ${f.classification || null})
       AND (${f.skillCategory || null}::text IS NULL OR ${f.skillCategory || null} = ANY(COALESCE(r.skill_categories, ARRAY[]::text[])))
-      AND ${catsFragment()}
-      AND ${termsFragment()}
+      AND ${discoveryFragment()}
       AND (${postedSince}::timestamptz IS NULL OR r.created_at >= ${postedSince}::timestamptz)
       AND (${bandLo}::int IS NULL OR (
             r.scale_min_exp IS NOT NULL AND r.scale_max_exp IS NOT NULL
@@ -531,10 +577,10 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
            AND (r.application_deadline IS NULL OR r.application_deadline > NOW())
            AND (${f.departmentId || null}::text IS NULL OR r.department_id = ${f.departmentId || null})
            AND (${f.level || null}::text IS NULL OR r.level::text = ${f.level || null})
-           AND (${term === ''} OR r.title ILIKE ${like} OR r.function ILIKE ${like})
-           -- The any-of terms survive the narrowing, on the two columns certain to exist on any
-           -- database. The discipline overlap does NOT, which is precisely why degraded stays true
-           -- below: this result was produced without it and must not be presented as though it had it.
+           AND (${term === ''} OR ${narrowMatch(term)})
+           -- The any-of terms survive the narrowing, over every column the base schema guarantees.
+           -- The discipline overlap does NOT, which is precisely why degraded stays true below:
+           -- this result was produced without it and must not be presented as though it had it.
            AND ${narrowTerms()}`;
 
 

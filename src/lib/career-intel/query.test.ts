@@ -28,12 +28,18 @@ describe('a sentence becomes one query, not one per signal', () => {
     expect((q.terms || []).length).toBeGreaterThan(0);
   });
 
-  it('never sends both a discipline predicate and a term predicate at once', () => {
-    // listOpportunities ANDs its filters, and the intersection of "in the AI discipline" and
-    // "mentions Python" is frequently empty — which would read as "we have nothing for you".
+  it('sends BOTH a discipline predicate and a term predicate, for roles-ext to OR', () => {
+    // skill_categories is populated on the 179 research postings and nothing else, so disciplines
+    // alone cannot see an AI-titled role in the main catalogue. Both go; roles-ext ORs them.
     const q = compileQuery(from('I want AI work and I have used Python.'));
-    const both = !!q.filters.skillCategoriesAny && !!q.filters.terms;
-    expect(both).toBe(false);
+    expect((q.filters.skillCategoriesAny || []).length).toBeGreaterThan(0);
+    expect((q.filters.terms || []).length).toBeGreaterThan(0);
+  });
+
+  it('reports both to the surface, so "we looked in" names all of it', () => {
+    const q = compileQuery(from('I want AI work and I have used Python.'));
+    expect(q.disciplines.length).toBeGreaterThan(0);
+    expect(q.terms.length).toBeGreaterThan(0);
   });
 });
 
