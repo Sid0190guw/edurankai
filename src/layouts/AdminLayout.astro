@@ -6,6 +6,19 @@ import { SITE } from '@/lib/site';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { getViewableSectionKeys } from '@/lib/auth/permissions';
+// EVERY /admin/* PAGE RENDERS THROUGH THIS FILE, SO ITS OWN READS DECIDE WHETHER /admin ANSWERS.
+//
+// The 2026-08-24 fix bounded the middleware gates and the dashboard's three queries, and /admin still
+// 504'd, because the three awaits BELOW sit between them and were not bounded. postgres-js has no
+// query timeout: when the transaction pooler accepts the connection and then never answers, the
+// await never settles, the surrounding try/catch never runs — a catch cannot catch a wait that does
+// not end — and the platform kills the invocation. The accent read at line ~41 is the worst of them
+// because it runs for EVERY admin user on EVERY admin page.
+//
+// db-timeout.ts imports nothing, so this adds no weight to the layout bundle, and its circuit
+// breaker means that once one read has timed out the rest are refused instantly rather than each
+// waiting out its own eight seconds.
+import { withDbTimeout } from '@/lib/db-timeout';
 
 interface Props {
   title?: string;
@@ -29,7 +42,11 @@ if (!user) {
 // The guard also demotes the account on the way past, which ends the escalation permanently
 // instead of leaving it to a migration someone has to remember to run.
 const { checkInternAccess } = await import('@/lib/auth/intern-guard');
-const internCheck = await checkInternAccess(user as any);
+// Bounded, and failing OPEN on an unreachable database — which is the direction this guard already
+// chose for itself (src/lib/auth/intern-guard.ts fails open on error, deliberately, so that a
+// database blip cannot bar HR from their own console). A timeout is that same case.
+const internCheck = await withDbTimeout(checkInternAccess(user as any), 'adminLayout.internCheck')
+  .catch(() => ({ isIntern: false, demoted: false }));
 if (internCheck.isIntern) {
   return Astro.redirect('/portal?notice=admin-access-removed');
 }
@@ -38,7 +55,13 @@ if (internCheck.isIntern) {
 // Used as the default when the user hasn't manually picked an accent.
 let autoAccent = 'default';
 try {
-  const gr = await db.execute(sql`SELECT gender FROM hr_employees WHERE user_id = ${user.id} OR personal_email = ${user.email} OR email = ${user.email} LIMIT 1`);
+  // Bounded at 3s, not the 8s default: this is a cosmetic accent colour and it runs on every admin
+  // page for every admin user. Nothing on the screen is wrong without it — the catch below already
+  // leaves autoAccent at 'default' — so it is the one read here that should give up early rather
+  // than spend the page's whole budget deciding a shade.
+  const gr = await withDbTimeout(
+    db.execute(sql`SELECT gender FROM hr_employees WHERE user_id = ${user.id} OR personal_email = ${user.email} OR email = ${user.email} LIMIT 1`),
+    'adminLayout.accent', 3000);
   const g = ((Array.isArray(gr) ? gr : (gr?.rows || []))[0] as any)?.gender;
   if (g) { const gl = String(g).toLowerCase(); if (gl.startsWith('m')) autoAccent = 'amber'; else if (gl.startsWith('f')) autoAccent = 'rose'; }
 } catch (_) {}
@@ -70,7 +93,21 @@ function isGroupActive(group: NavGroup, activeId: string): boolean {
 
 // Permission-gated sidebar: hide links a user can't open. Maps each nav id to a
 // section key in the role-permission registry (src/lib/admin-sections.ts).
-const allowedKeys = await getViewableSectionKeys(user);
+// Bounded, and it needed a try as well as a bound: getViewableSectionKeys has no catch of its own,
+// so an unreadable registry threw straight out of this layout and took every admin page with it.
+//
+// FAILS CLOSED, on purpose and unlike the two reads above. `null` from this function means "no
+// gating" — the super_admin answer — so defaulting to null on failure would hand a restricted admin
+// the entire sidebar. An empty set is the safe unknown: the sidebar renders only the universal
+// entries, the person can still reach the dashboard, and src/middleware.ts remains the gate that
+// actually decides what opens.
+let allowedKeys: Awaited<ReturnType<typeof getViewableSectionKeys>>;
+try {
+  allowedKeys = await withDbTimeout(getViewableSectionKeys(user), 'adminLayout.sectionKeys');
+} catch (e: any) {
+  console.error('[AdminLayout] section permissions could not be read -', e?.cause?.message || e?.message);
+  allowedKeys = new Set<string>();
+}
 // NAV_SECTION IS GONE. It was a second copy of a fact admin-nav.ts already records on every entry,
 // and it had rotted exactly as a second copy does: repeated keys (which TypeScript flags outright),
 // and two rounds of comments recording ids "added later and never mapped" — once fail-open, so
