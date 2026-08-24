@@ -175,30 +175,65 @@ export const POST: APIRoute = async ({ request, locals, cookies, clientAddress }
     // faster duration). Ranks are computed automatically from scores so the
     // ordering is objective; the candidate only sees it once results are
     // released/declared (see the result page + admin declare action).
+    // ONE STATEMENT, NOT ONE PER CANDIDATE.
+    //
+    // This selected every submitted attempt and then issued a separate UPDATE for each one, in a
+    // sequential await loop, on EVERY submission. The cost is not the SQL — each of those updates is
+    // trivial — it is that every awaited round trip holds a pooler connection for ~140ms across the
+    // network. A test with five hundred attempts meant the five-hundredth candidate's submit held a
+    // connection for something like seventy seconds while it rewrote a rank onto every row.
+    //
+    // On a pool of five per instance against a shared pooler, that is not a slow endpoint. It is an
+    // outage: one candidate pressing Submit starves every other page on the site of connections, and
+    // the swallowing catch below meant it never appeared as an error anywhere. This is the largest
+    // single contributor found in the round-trip audit.
+    //
+    // ROW_NUMBER() over the same ORDER BY produces exactly the ranks the loop produced, and the
+    // UPDATE ... FROM applies all of them at once. `IS DISTINCT FROM` skips rows whose rank has not
+    // changed, which on a re-rank is most of them — fewer dead tuples for autovacuum to chase, and
+    // it is null-safe in a way `<>` is not.
     try {
-      const ar = await db.execute(sql`
-        SELECT id FROM test_attempts
-        WHERE test_id = ${attempt.test_id} AND status IN ('submitted','auto_submitted')
-        ORDER BY percentage DESC NULLS LAST, duration_seconds ASC NULLS LAST, submitted_at ASC
+      await db.execute(sql`
+        UPDATE test_attempts t
+           SET rank = r.rn
+          FROM (
+            SELECT id,
+                   ROW_NUMBER() OVER (
+                     ORDER BY percentage DESC NULLS LAST,
+                              duration_seconds ASC NULLS LAST,
+                              submitted_at ASC
+                   )::int AS rn
+              FROM test_attempts
+             WHERE test_id = ${attempt.test_id}
+               AND status IN ('submitted','auto_submitted')
+          ) r
+         WHERE t.id = r.id
+           AND t.rank IS DISTINCT FROM r.rn
       `);
-      const arRows = Array.isArray(ar) ? ar : (ar?.rows || []);
-      for (let i = 0; i < arRows.length; i++) {
-        await db.execute(sql`UPDATE test_attempts SET rank = ${i + 1} WHERE id = ${(arRows[i] as any).id}`);
-      }
     } catch (_) {}
 
     // Calculate percentile against other attempts
+    // Counted in the database instead of shipped to the function and sorted there. This pulled every
+    // percentage on the test across the network to compute one number from them — the transfer is
+    // connection time, and on a popular test it is the whole cohort every time somebody submits.
+    // Same arithmetic: strictly-below over the count of non-null percentages, to two decimals. The
+    // NULLIF keeps a division by zero from turning an empty cohort into an error, and the outer
+    // guard keeps the write off the row entirely when there is nothing to compare against.
     try {
-      const allR = await db.execute(sql`
-        SELECT percentage FROM test_attempts WHERE test_id = ${attempt.test_id} AND status IN ('submitted','auto_submitted') AND percentage IS NOT NULL
+      await db.execute(sql`
+        UPDATE test_attempts SET percentile = sub.pct
+          FROM (
+            SELECT ROUND(
+                     100.0 * COUNT(*) FILTER (WHERE percentage < ${percentage})
+                     / NULLIF(COUNT(*), 0), 2) AS pct
+              FROM test_attempts
+             WHERE test_id = ${attempt.test_id}
+               AND status IN ('submitted','auto_submitted')
+               AND percentage IS NOT NULL
+          ) sub
+         WHERE test_attempts.id = ${attemptId}
+           AND sub.pct IS NOT NULL
       `);
-      const allRows = Array.isArray(allR) ? allR : (allR?.rows || []);
-      const scores = (allRows as any[]).map(r => parseFloat(r.percentage || '0')).sort((a, b) => a - b);
-      if (scores.length > 0) {
-        const below = scores.filter(s => s < percentage).length;
-        const percentile = (below / scores.length) * 100;
-        await db.execute(sql`UPDATE test_attempts SET percentile = ${percentile.toFixed(2)} WHERE id = ${attemptId}`);
-      }
     } catch(e) {}
 
     // Event-series hook: if this test gates one or more event levels and the

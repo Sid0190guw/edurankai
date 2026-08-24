@@ -105,18 +105,48 @@ if (Astro.request.method === 'POST') {
       if (saved.length === 0) {
         gradeErr = 'Nothing was saved: this attempt no longer exists, or it was changed by somebody else while this page was open. Reload before grading again.';
       } else {
-        // ONE TRANSACTION FOR THE RE-RANK. This is a read of the whole cohort followed by a write
-        // per attempt. Two graders finishing at the same moment used to interleave their loops and
-        // leave the cohort holding a mixture of two orderings — duplicate ranks, missing ranks — with
-        // nothing able to say which pass produced which row.
-        const ar = aRows(await db.execute(sql`SELECT id FROM test_attempts WHERE test_id = ${attempt.test_id} AND status IN ('submitted','auto_submitted') ORDER BY percentage DESC NULLS LAST, duration_seconds ASC NULLS LAST, submitted_at ASC`));
+        // ONE STATEMENT FOR THE RE-RANK, WHICH SERVES THE ORIGINAL GOAL BETTER THAN THE TRANSACTION
+        // DID. The note this replaces was right about the hazard — two graders finishing together
+        // used to interleave their loops and leave the cohort holding a mixture of two orderings —
+        // and a transaction did fix that. It just paid for it in the worst possible currency.
+        //
+        // The read of the whole cohort plus one UPDATE per attempt, inside an explicit BEGIN, held a
+        // pooler connection AND a row lock on every attempt of the test for the entire loop. At
+        // ~140ms a round trip and a few hundred candidates that is well over a minute of one pinned
+        // server-side slot on a shared transaction pooler, while a grader waits. Worse, the platform
+        // ends the invocation before the loop finishes, so the realistic outcome was an abandoned
+        // connection sitting idle-in-transaction holding those locks until the reaper took it:
+        // grades committed, ranks never written, and a gateway error instead of the message below.
+        //
+        // ROW_NUMBER() over the same ORDER BY produces exactly the ranks the loop produced, and a
+        // single UPDATE is atomic on its own — so there is no window between statements at all for
+        // two graders to interleave in, which is strictly stronger than the transaction. The cohort
+        // read folds into the subquery, so it is one round trip rather than N+3.
+        //
+        // FOLDING THE READ IN ALSO CORRECTS A LIE. The SELECT used to sit outside this try, so a
+        // failure to read the cohort fell to the outer catch and told the grader "Nothing was saved.
+        // The marks you typed are still in the form" — untrue, because the grade UPDATE above
+        // committed on its own two statements earlier. That failure now lands in this catch and
+        // reports what actually happened: marks saved, ranking stale.
         let rankFailed = '';
         try {
-          await db.transaction(async (tx: any) => {
-            for (let i = 0; i < ar.length; i++) {
-              await tx.execute(sql`UPDATE test_attempts SET rank = ${i + 1} WHERE id = ${(ar[i] as any).id}`);
-            }
-          });
+          await db.execute(sql`
+            UPDATE test_attempts t
+               SET rank = r.rn
+              FROM (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                         ORDER BY percentage DESC NULLS LAST,
+                                  duration_seconds ASC NULLS LAST,
+                                  submitted_at ASC
+                       )::int AS rn
+                  FROM test_attempts
+                 WHERE test_id = ${attempt.test_id}
+                   AND status IN ('submitted','auto_submitted')
+              ) r
+             WHERE t.id = r.id
+               AND t.rank IS DISTINCT FROM r.rn
+          `);
         } catch (e: any) {
           rankFailed = e?.cause?.message || e?.message || 'unknown reason';
           console.error('[admin/tests/attempts] re-rank failed for test', attempt.test_id, '-', rankFailed);
