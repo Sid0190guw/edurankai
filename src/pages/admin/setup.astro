@@ -56,40 +56,18 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 // session, which meant pasting fetch() into DevTools — a step that failed twice on a laptop whose
 // F12 is bound to a vendor utility. A setup action a person cannot reach is not a setup action.
 //
-// Declared here, above the handler, because const is not hoisted.
-const BOOTSTRAP_MODULES: Array<{ name: string; run: () => Promise<unknown> }> = [
-  { name: 'auth-registry', run: async () => (await import('@/lib/auth/registry')).ensureRegistrySchema() },
-  { name: 'rbac', run: async () => (await import('@/lib/rbac/store')).ensureRbacSchema() },
-  { name: 'observability-health', run: async () => (await import('@/lib/observability-health')).ensureObservabilitySchema() },
-  { name: 'feature-flags', run: async () => (await import('@/lib/observability')).ensureFlagSchema() },
-  { name: 'knowledge-sync', run: async () => (await import('@/lib/knowledge-sync')).ensureSyncSchema() },
-  { name: 'mail', run: async () => (await import('@/lib/mail')).ensureMailSchema() },
-  // Discovery. Both its tables are read by /aquintutor/search and /admin/search, and created by
-  // nothing else on this deployment -- see db/search-index-schema.sql.
-  { name: 'search-index', run: async () => (await import('@/lib/search-index')).ensureSearchSchema() },
-  // HIRING DECISION SUPPORT AND THE CAPABILITY SPINE IT READS, ADDED 2026-08-24.
-  //
-  // WHY: /admin/applications/[id]/decision refused to record a real decision in production with
-  // relation "hiring_decisions" does not exist. That table's only creator is
-  // ensureHiringDecisionSchema(), and src/lib/hiring-decision.ts shipped on 2026-08-23, the same day
-  // production stopped running request-path DDL — so it has never been created on the live database
-  // and this button, the one control an operator has for "create what is missing", could not create
-  // it either.
-  //
-  // ORDER MATTERS HERE, WHICH IS UNUSUAL FOR THIS LIST. hr_role_requirements and hr_skill_relations
-  // both REFERENCE hr_skills, and ensureSpineSchema() runs its CREATEs in one sequence that stops at
-  // the first failure — so the skill catalogue is created first, then the spine, then the decision
-  // table. Run the other way round, the spine's later statements fail and the failure is silent.
-  { name: 'capability-catalogue', run: async () => (await import('@/lib/performance-schema')).ensurePerformanceSchema() },
-  { name: 'person-spine', run: async () => (await import('@/lib/person-spine')).ensureSpineSchema() },
-  { name: 'capability-readings', run: async () => (await import('@/lib/match')).ensureMatchSchema() },
-  { name: 'hiring-decision', run: async () => (await import('@/lib/hiring-decision')).ensureHiringDecisionSchema() },
-  { name: 'error-log', run: async () => (await import('@/lib/logger')).recentErrors(1) },
-  { name: 'job-queue', run: async () => (await import('@/lib/job-queue')).claimBatch(0) },
-];
+// THE LIST USED TO BE WRITTEN OUT HERE, AND THAT WAS THE BUG UNDER THE BUG. It was a second copy of
+// the one in POST /api/admin/ops/bootstrap, and copies drift: the endpoint ran twenty-five modules
+// and this button ran thirteen. Everything to do with signing in, the LMS, the daily report,
+// learning progress and the clock-out checks could be created by an API call and not by the console.
+// Both now import src/lib/bootstrap-modules.ts.
 
 let bootstrapOk = '';
 let bootstrapFailed: string[] = [];
+/** Reasons ensureOnce logged and swallowed — the module reported success and created nothing. */
+let bootstrapHidden: string[] = [];
+/** Tables no button here can create: their only definition is a db/*.sql file a human applies. */
+let bootstrapHandRun: string[] = [];
 
 if (Astro.request.method === 'POST') {
   const form = await Astro.request.formData().catch(() => null);
@@ -110,30 +88,51 @@ if (Astro.request.method === 'POST') {
       // Scoped by AsyncLocalStorage to this handler only, and the settings.edit check above is still
       // what decides who gets here.
       const { allowingDdl } = await import('@/lib/schema-bootstrap');
-      let done = 0;
-      await allowingDdl(async () => {
-      for (const m of BOOTSTRAP_MODULES) {
-        try { await m.run(); done++; }
-        catch (e: any) {
-          // The real Postgres reason is on e.cause; e.message is only the failed SQL. Never swallowed.
-          const why = e?.cause?.message || e?.message || 'unknown error';
-          console.error('[setup/bootstrap] ' + m.name + ' failed:', why);
-          bootstrapFailed.push(m.name + ': ' + why);
-        }
+      // A FAILURE ON ONE CONNECTION USED TO BE REPORTED AGAINST EVERY MODULE AFTER IT.
+      //
+      // On 2026-08-24 this panel listed `capability-readings`, `error-log`, `job-queue` and the
+      // verification step as having failed with "current transaction is aborted, commands ignored
+      // until end of transaction block" — and NONE of them had anything wrong. An earlier module's
+      // DDL batch had left its connection inside an aborted transaction (the mechanism, and the
+      // fix, are in src/lib/ensure-once.ts), so everything that drew that connection afterwards was
+      // refused by Postgres before it ran. The module that actually broke reported success, because
+      // ensureOnce swallows.
+      //
+      // So this loop now separates the three things that were being printed as one:
+      //   - a module that failed for its OWN reason                    -> bootstrapFailed
+      //   - a module refused by a connection somebody else poisoned    -> swept, retried once, and
+      //     only counted as failed if it fails again on a clean connection
+      //   - a reason ensureOnce swallowed                              -> bootstrapHidden
+      const { runBootstrapModules } = await import('@/lib/bootstrap-modules');
+      const { forgetEnsureFailures } = await import('@/lib/ensure-once');
+      // Failures from earlier in this instance's life are not this press's answer.
+      forgetEnsureFailures();
+      const results = await allowingDdl(() => runBootstrapModules());
+      for (const r of results) {
+        if (!r.ok) bootstrapFailed.push(r.module + ': ' + (r.error || 'unknown error'));
       }
-      });
+      // WHAT ensureOnce SWALLOWED. Every ensureXSchema() above resolves whether or not its DDL
+      // ran, by design — callers tolerate a missing table, which is why the swallow exists. The cost
+      // is that on 2026-08-24 the module that actually failed was the one module this panel did not
+      // name, while three innocent ones were listed as broken. src/lib/ensure-once.ts now keeps the
+      // reason as well as logging it.
+      const { recentEnsureFailures } = await import('@/lib/ensure-once');
+      for (const f of recentEnsureFailures()) {
+        // 25P02 is not a module's own fault and runBootstrapModules() has already swept and retried
+        // anything that hit it; printing it here would put the cascade back on the screen.
+        if (f.code === '25P02') continue;
+        bootstrapHidden.push(f.key + ': ' + f.message);
+      }
       // VERIFY, do not count. ensureOnce() ends in a catch that swallows, so every ensure above can
       // return cleanly having created nothing — which is exactly what happened: this reported eight
       // modules ready while /api/health went on finding all ten tables missing. Ask the database.
-      const EXPECTED = ['audit_log', 'edu_cron_runs', 'edu_error_log', 'edu_feature_flags',
-        'edu_job_log', 'edu_jobs', 'edu_releases', 'edu_search_index', 'edu_search_queries',
-        'edu_sync_queue', 'mail_config', 'rbac_audit',
-        // The hiring decision stack, added with the three modules above. Without these six names
-        // the panel would report every expected table present while the decision screen went on
-        // refusing to record a decision - a verify step is only worth having over the full list.
-        'hiring_decisions', 'match_evaluations', 'hr_persons', 'hr_person_identities',
-        'hr_role_requirements',
-        'hr_skills', 'hr_employee_skills'];
+      // THE EXPECTED LIST IS NOT HAND-KEPT HERE EITHER. It was a third copy — nineteen names,
+      // against the sixteen the endpoint checked and whatever /api/health reports — and a verify step
+      // reading a stale list reports "verified" over exactly the tables nobody remembered to add.
+      // BOOTSTRAP_MODULES in src/lib/observability-health.ts is what /api/health answers from, so all
+      // three surfaces now agree by construction.
+      const { BOOTSTRAP_MODULES } = await import('@/lib/observability-health');
+      const EXPECTED = BOOTSTRAP_MODULES.map((m) => m.table);
       let present: string[] = [];
       let verified = false;
       try {
@@ -156,9 +155,22 @@ if (Astro.request.method === 'POST') {
       // query that never ran is the same false certainty this whole panel exists to remove — it is
       // what made the first run say eight modules were ready when nothing had been created.
       if (verified) {
-        const missing = EXPECTED.filter((t) => !present.includes(t));
         bootstrapOk = present.length + ' of ' + EXPECTED.length + ' tables exist.';
-        if (missing.length > 0) bootstrapFailed.push('still missing: ' + missing.join(', '));
+        // TWO KINDS OF MISSING, AND TELLING SOMEBODY TO PRESS THE BUTTON AGAIN FOR THE SECOND KIND
+        // IS A LIE THIS PANEL WOULD BE TELLING ITSELF.
+        //
+        // BOOTSTRAP_MODULES is broader than what this button runs, deliberately — a verify step that
+        // over-reports what is missing is safe and one that under-reports is not. But some of those
+        // tables are owned by a db/*.sql file that a human applies with psql, and no button on this
+        // deployment can create them. Listed together they read as "this failed twenty times";
+        // listed apart they read as one thing to press and another thing to run.
+        const missingRows = BOOTSTRAP_MODULES.filter((m) => !present.includes(m.table));
+        const byButton = missingRows.filter((m) => !m.owner.startsWith('db/'));
+        const byHand = missingRows.filter((m) => m.owner.startsWith('db/'));
+        if (byButton.length > 0) {
+          bootstrapFailed.push('still missing after this run: ' + byButton.map((m) => m.table).join(', '));
+        }
+        for (const m of byHand) bootstrapHandRun.push(m.table + ' — ' + m.owner);
       } else {
         bootstrapOk = 'The modules ran. Whether the tables now exist could not be checked.';
       }
@@ -266,13 +278,38 @@ function stepCountWords(s: SetupStatus): string {
       <button type="submit">Create module tables</button>
     </form>
 
-    {bootstrapOk !== '' && bootstrapFailed.length === 0 && (
+    {bootstrapOk !== '' && bootstrapFailed.length === 0 && bootstrapHidden.length === 0 && (
       <div class="setup-alert setup-alert-ok"><p>{bootstrapOk}</p></div>
+    )}
+    {bootstrapHandRun.length > 0 && (
+      <div class="setup-alert setup-alert-todo">
+        <p>
+          These are counted above and this button cannot make them. Their only definition is a SQL
+          file in the repository, which a person applies with
+          <code> psql -v ON_ERROR_STOP=1 -f &lt;file&gt;</code> against the database — statement by
+          statement, so a failure stops there rather than rolling the whole file back:
+        </p>
+        <ul>{bootstrapHandRun.map((t) => (<li>{clip(t, 200)}</li>))}</ul>
+      </div>
     )}
     {bootstrapFailed.length > 0 && (
       <div class="setup-alert setup-alert-bad">
         <p>{bootstrapOk === '' ? 'This did not run.' : bootstrapOk + ' The rest did not:'}</p>
         <ul>{bootstrapFailed.map((f) => (<li>{clip(f, 240)}</li>))}</ul>
+      </div>
+    )}
+    {bootstrapHidden.length > 0 && (
+      <div class="setup-alert setup-alert-bad">
+        <p>
+          These modules reported success and created nothing. Each one is a schema bootstrap whose
+          error is swallowed so that a missing table cannot take a page down, so the reason is
+          printed here rather than only in a log nobody can open:
+        </p>
+        <ul>{bootstrapHidden.map((f) => (<li>{clip(f, 240)}</li>))}</ul>
+        <p>
+          Fix the first one. A table that another table REFERENCES has to exist before it, so one
+          missing dependency at the top of this list is usually every line under it as well.
+        </p>
       </div>
     )}
 

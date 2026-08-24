@@ -148,6 +148,38 @@ export function clearDbFailure(): void {
   lastFailure = null;
 }
 
+// -------------------------------------------------------------------------------------------------
+// THE ONE QUERY ERROR THAT IS NOT ABOUT THE QUERY
+// -------------------------------------------------------------------------------------------------
+//
+// SQLSTATE 25P02, "current transaction is aborted, commands ignored until end of transaction block",
+// is a statement about the CONNECTION, not about the statement that received it. Something left a
+// transaction open on that session and never rolled it back, so Postgres refuses everything on it.
+// A perfectly good SELECT gets this, and the SAME SELECT on any other connection succeeds.
+//
+// It is therefore the exception the rule above names — "a missing table or a bad column will fail
+// identically the second time" — and it fails for a reason of the pool's, not its own. On 2026-08-24
+// one such connection in a five-slot pool made /admin/login answer "Sign-in is temporarily
+// unavailable" to a fifth of attempts while the database was entirely healthy.
+//
+// THE ROLLBACK CANNOT BE SENT FROM HERE. This module imports nothing, deliberately (see the header),
+// so it cannot reach the driver. src/lib/db/index.ts registers its sweep on load; if nothing has,
+// the retry still happens and usually lands on a different connection.
+type AbortedTransactionHealer = () => Promise<unknown>;
+let abortedTxnHealer: AbortedTransactionHealer | null = null;
+
+/** Called once by src/lib/db/index.ts, which owns the pool this recovers. */
+export function registerAbortedTransactionHealer(fn: AbortedTransactionHealer): void {
+  abortedTxnHealer = fn;
+}
+
+/** Is this the error that means the connection is unusable rather than the query wrong? */
+export function isAbortedTransaction(e: any): boolean {
+  const code = String(e?.cause?.code || e?.code || '');
+  if (code === '25P02') return true;
+  return /current transaction is aborted/i.test(String(e?.cause?.message || e?.message || ''));
+}
+
 /** The real Postgres reason lives on `e.cause`; `e.message` is only the statement that failed. */
 function driverReason(e: any): string {
   const code = e?.code || e?.cause?.code || e?.errno;
@@ -165,6 +197,18 @@ function recordDriverFailure(label: string, e: any, afterMs: number, phase: 'rac
   console.error(JSON.stringify({
     ts: lastFailure.at, level: 'error', event: 'db.driver_error', label, phase, afterMs, reason,
   }));
+  // EVERY BOUNDED QUERY IN THIS DEPLOYMENT PASSES THROUGH HERE, WHICH IS WHY THE SWEEP IS TRIGGERED
+  // FROM HERE AND NOT ONLY FROM THE RETRY.
+  //
+  // withDbRetry() can recover its own read; a WRITE cannot be re-run and does not go through it —
+  // startSession() is bounded by withDbTimeout alone, deliberately, because nobody may walk away
+  // holding a cookie for a session we never confirmed. So a poisoned connection would fail that
+  // sign-in AND stay in the pool to fail the next person's. Sweeping on the way past means the
+  // damage stops at one request instead of continuing until the instance is recycled.
+  //
+  // NOT AWAITED, on purpose: this is a failure path and the caller's rejection must not wait on a
+  // recovery. Debounced inside the healer, so a burst of failures costs one sweep.
+  if (abortedTxnHealer && isAbortedTransaction(e)) abortedTxnHealer().catch(() => {});
 }
 
 /** The abandoned attempt answering late. Logged, and deliberately not fed to the breaker. */
@@ -424,11 +468,19 @@ export async function withDbRetry<T>(
     return await withDbTimeout(work(), label, firstMs);
   } catch (e: any) {
     const timedOut = e instanceof DbTimeoutError || e?.name === 'DbTimeoutError';
-    if (!timedOut) throw e;
+    // A poisoned connection is retried, and it is the ONLY query error that is. Swept first, so the
+    // second attempt cannot draw the same aborted session out of the pool again.
+    const poisoned = !timedOut && isAbortedTransaction(e);
+    if (!timedOut && !poisoned) throw e;
     console.warn(JSON.stringify({
       ts: new Date().toISOString(), level: 'warn', event: 'db.retry',
       label, afterMs: firstMs, retryMs: secondMs,
+      reason: poisoned ? 'aborted_transaction' : 'timeout',
     }));
+    if (poisoned && abortedTxnHealer) {
+      // Never let the recovery become the failure: if the sweep cannot run, the plain retry stands.
+      await abortedTxnHealer().catch(() => {});
+    }
     // May itself throw DbCircuitOpenError if the first attempt's timeout was the one that opened the
     // circuit. That is the correct answer and it is passed straight through: three timeouts in a row
     // is a database that has gone away, and this is not the place to argue with the breaker.

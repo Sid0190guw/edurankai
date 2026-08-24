@@ -4,6 +4,7 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import * as schema from './schema';
 import { ddlPermitted, isDdlStatement, noteSuppressedDdl } from '@/lib/schema-bootstrap';
+import { registerAbortedTransactionHealer } from '@/lib/db-timeout';
 
 // Try .env on local dev
 try {
@@ -23,6 +24,15 @@ try {
 // production is the same instant it did before, since the first request queries immediately.
 let _client: ReturnType<typeof postgres> | null = null;
 let _real: any = null;
+
+/**
+ * How many connections this instance's pool may hold. Declared here, above every reader — `const`
+ * is not hoisted and that has taken pages down on this project.
+ *
+ * It is a CONSTANT and not a knob because two things have to agree on it: the postgres() options
+ * below, and healAbortedTransactions(), which has to be able to reach EVERY open connection.
+ */
+export const POOL_MAX = 5;
 
 function connect(): any {
   if (_real) return _real;
@@ -190,7 +200,7 @@ function connect(): any {
   // and it is the only quantity in this file that anything above actually moves.
   _client = postgres(connectionString, {
     prepare: false,
-    max: 5,
+    max: POOL_MAX,
     idle_timeout: 300,
     max_lifetime: 60 * 30,
     connect_timeout: 10,
@@ -271,6 +281,67 @@ export async function getDb(_runtimeEnv?: any) {
   return db;
 }
 
+// -------------------------------------------------------------------------------------------------
+// GETTING A POISONED CONNECTION BACK, BECAUSE ONE OF THEM POISONS A FIFTH OF THE SITE
+// -------------------------------------------------------------------------------------------------
+//
+// SQLSTATE 25P02 — "current transaction is aborted, commands ignored until end of transaction block"
+// — does not describe the query that received it. It describes the CONNECTION: something opened a
+// transaction on it, a statement inside failed, and nothing ever sent ROLLBACK. Postgres will now
+// refuse every statement on that session until one arrives.
+//
+// src/lib/ensure-once.ts records the shape that produced this on 2026-08-24 and closes it: DDL
+// batches no longer write their own BEGIN/COMMIT into a simple-protocol message. This is the net
+// under that fix, for anything else that can leave a session in a transaction — a handler killed
+// mid-transaction, a pooler that hands back a session it had pinned.
+//
+// WHY IT SWEEPS RATHER THAN TARGETS. postgres-js chooses the connection; a caller never learns which
+// one answered, so there is no way to send ROLLBACK to the one that failed. Issuing POOL_MAX
+// ROLLBACKs CONCURRENTLY is what reaches all of them: each concurrent query takes a different free
+// connection, so every open session in the pool gets one. On a healthy session ROLLBACK is a no-op
+// that returns a warning and changes nothing, which is what makes the sweep safe to fire blind.
+//
+// Verified against a real PostgreSQL (PGlite over TCP, never the production database): a connection
+// answering 25P02 answers normally on the query after the ROLLBACK.
+let _healingAt = 0;
+let _healing: Promise<number> | null = null;
+
+/**
+ * Clear any aborted transaction left behind on this instance's pooled connections.
+ *
+ * Never throws and never rejects: it is called from failure paths, and a recovery that can itself
+ * fail a request is worse than the fault it is recovering from. Returns how many ROLLBACKs the
+ * database accepted, for the log.
+ *
+ * DEBOUNCED, and shared. A poisoned connection typically fails several queries in the same second;
+ * one sweep answers all of them, and a second sweep on top of the first would only spend round
+ * trips. Concurrent callers await the sweep already running.
+ */
+export function healAbortedTransactions(): Promise<number> {
+  if (_healing) return _healing;
+  const now = Date.now();
+  if (now - _healingAt < 2000) return Promise.resolve(0);
+  _healingAt = now;
+  _healing = (async () => {
+    if (!_client) return 0;
+    const client = _client;
+    // Fired together, not in sequence: sequential ROLLBACKs would all be served by the FIRST free
+    // connection and never reach the poisoned one.
+    const results = await Promise.all(
+      Array.from({ length: POOL_MAX }, () =>
+        client.unsafe('ROLLBACK').simple().then(() => 1).catch(() => 0)),
+    );
+    const healed = results.reduce((a: number, b: number) => a + b, 0);
+    console.warn(JSON.stringify({
+      ts: new Date().toISOString(), level: 'warn', event: 'db.aborted_txn_swept',
+      rolledBack: healed, poolMax: POOL_MAX,
+      note: 'a connection was left inside an aborted transaction; the pool was swept with ROLLBACK',
+    }));
+    return healed;
+  })().catch(() => 0).finally(() => { _healing = null; });
+  return _healing;
+}
+
 // A DATABASE THAT NEVER ANSWERS MUST NOT BECOME A PAGE THAT NEVER LOADS.
 //
 // On 2026-08-23 at 07:01 UTC every route that queries Postgres stopped responding — not with an
@@ -300,4 +371,13 @@ export {
   dbCircuitOpen,
   dbCircuitState,
   withDbTimeout,
+  isAbortedTransaction,
 } from '@/lib/db-timeout';
+
+// THE SWEEP IS HANDED TO THE MODULE THAT CANNOT IMPORT IT.
+//
+// db-timeout.ts imports nothing on purpose, so withDbRetry() cannot reach the pool it needs to
+// ROLLBACK. Registering it here, at load, is what lets a gate recover from a poisoned connection
+// instead of turning it into "Sign-in is temporarily unavailable". Importing this module is already
+// unavoidable for anything that queries, so there is no path where a query runs and this has not.
+registerAbortedTransactionHealer(() => healAbortedTransactions());

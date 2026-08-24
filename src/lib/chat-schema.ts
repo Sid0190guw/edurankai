@@ -57,9 +57,9 @@
 // archive must keep rendering, and because `chat_channels.is_dm` and `chat_messages.message_code`
 // are written by code and appear in no CREATE TABLE in the repository (only in the manually-run
 // scripts/setup-chat-audit.mjs, which a fresh database would never have had run against it).
-import { db, sqlClient } from '@/lib/db';
+import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { ensureOnce, guardedDdl } from '@/lib/ensure-once';
+import { ensureOnce, runGuardedDdl } from '@/lib/ensure-once';
 import { logEvent } from '@/lib/logger';
 
 // Declared before every function that uses them: `const` is not hoisted, and a handler that reaches
@@ -145,7 +145,7 @@ async function batch(ddl: string): Promise<void> {
   // how the original shape mismatch stayed hidden for eight weeks — so the rejection is left to
   // propagate. Every string passed here is a literal of idempotent DDL, never built from input,
   // which is what makes the simple protocol safe to use.
-  await sqlClient().unsafe(guardedDdl(ddl)).simple();
+  await runGuardedDdl(ddl);
 }
 
 const CHAT_CHANNELS_DDL = `

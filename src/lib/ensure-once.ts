@@ -34,7 +34,7 @@ const cache = new Map<string, Promise<void>>();
 // exclusive lock is granted ahead of the shared locks requested after it. Under continuous traffic
 // the table is readable in the gaps between bootstraps and not otherwise, and every request stuck in
 // that queue is holding a transaction-pooler session it cannot give back. The lock_timeout added in
-// guardedDdl() bounds how long the ALTER WAITS; it does nothing about the readers piled up behind it
+// guardedDdlBody() bounds how long the ALTER WAITS; it does nothing about the readers piled up behind it
 // while it does, and the retry it triggers starts the queue again on the next request.
 //
 // So production stops running DDL where visitors can wait for it. This is not a workaround for one
@@ -77,6 +77,49 @@ function bootstrapDisabled(): boolean {
   return !ddlPermitted();
 }
 
+// -------------------------------------------------------------------------------------------------
+// WHAT ACTUALLY WENT WRONG, KEPT WHERE AN OPERATOR CAN READ IT
+// -------------------------------------------------------------------------------------------------
+//
+// The swallow above is deliberate and stays. Its cost is that the ONE surface built to repair a
+// schema — the "Create module tables" button on /admin/setup — could not see any of it: a module
+// whose ensure went through ensureOnce reported success no matter what the database said, and the
+// only failures the operator was shown belonged to the modules that happen NOT to memoise. On
+// 2026-08-24 that produced a panel listing three innocent modules and the real one nowhere, because
+// the module that actually broke had its reason logged to a console nobody can open in production.
+//
+// So the reason is kept here as well as logged. Bounded by the number of ensure keys (~192), one
+// entry per key, overwritten by the next failure and deleted by the next success — a record of what
+// is wrong NOW, never a growing log.
+export interface EnsureFailure {
+  key: string;
+  /** The real Postgres reason (e.cause.message), never the failed SQL. */
+  message: string;
+  /** SQLSTATE where the driver gave one — '42P01' for a missing table, '25P02' for a poisoned connection. */
+  code: string;
+  at: string;
+}
+const failures = new Map<string, EnsureFailure>();
+
+function recordEnsureFailure(key: string, e: any): void {
+  failures.set(key, {
+    key,
+    message: String(e?.cause?.message || e?.message || e || 'unknown error').slice(0, 400),
+    code: String(e?.cause?.code || e?.code || ''),
+    at: new Date().toISOString(),
+  });
+}
+
+/** Every ensure key that has failed in this process and not since succeeded. */
+export function recentEnsureFailures(): EnsureFailure[] {
+  return Array.from(failures.values());
+}
+
+/** Forget them — for an operator action that is about to re-run the ensures and wants a clean read. */
+export function forgetEnsureFailures(): void {
+  failures.clear();
+}
+
 export function ensureOnce(key: string, fn: () => Promise<void>): Promise<void> {
   if (bootstrapDisabled()) return Promise.resolve();
   let p = cache.get(key);
@@ -95,9 +138,13 @@ export function ensureOnce(key: string, fn: () => Promise<void>): Promise<void> 
   // `ok: true, ran: 8, failed: 0` while the health check said ten tables were missing, because the
   // ensures had all thrown into this catch. The swallow stays (callers depend on it); the SILENCE
   // does not. The real Postgres reason is on e.cause; e.message is just the failed statement.
-  return p.catch((e: any) => {
-    console.error('[ensure-once] ' + key + ' failed:', e?.cause?.message || e?.message || e);
-  });
+  return p.then(
+    () => { failures.delete(key); },
+    (e: any) => {
+      recordEnsureFailure(key, e);
+      console.error('[ensure-once] ' + key + ' failed:', e?.cause?.message || e?.message || e);
+    },
+  );
 }
 
 /**
@@ -122,7 +169,6 @@ export function ensureOnce(key: string, fn: () => Promise<void>): Promise<void> 
  */
 export function ensureBatch(key: string, ddl: string): Promise<void> {
   return ensureOnce(key, async () => {
-    const { sqlClient } = await import('@/lib/db');
     // A BATCH THAT CANNOT GET ITS LOCK MUST GIVE UP, NOT QUEUE.
     //
     // This is the part batching got wrong, and it took the site down on 2026-08-23. Every statement
@@ -146,25 +192,100 @@ export function ensureBatch(key: string, ddl: string): Promise<void> {
     // shorter than a request can afford to spend queuing. On timeout the batch rolls back whole,
     // ensureOnce drops the key, and the next request retries — by which time whoever held the lock
     // has almost certainly finished.
-    await sqlClient().unsafe(guardedDdl(ddl)).simple();
+    await runGuardedDdl(ddl);
   });
 }
 
+// -------------------------------------------------------------------------------------------------
+// THE SEND, AND WHY THE TRANSACTION MAY NOT BE PART OF THE TEXT
+// -------------------------------------------------------------------------------------------------
+//
+// THIS IS THE 2026-08-24 /admin/setup BUG, AND IT WAS NOT A BUG IN ANY BOOTSTRAP.
+//
+// The wrapper below used to emit the transaction as text — `BEGIN; SET LOCAL ...; <ddl>; COMMIT;` —
+// and every batch in this repository sent it through `sqlClient().unsafe(...).simple()`, one simple
+// -protocol message. That is correct exactly as long as nothing fails.
+//
+// When a statement in a multi-statement simple query fails, PostgreSQL ABANDONS THE REST OF THE
+// MESSAGE. The COMMIT at the end is one of the statements it abandons. The explicit BEGIN, however,
+// has already run, so the connection is left sitting inside an ABORTED TRANSACTION — and postgres-js
+// hands that connection straight back to the pool. Every later query that lands on it, in this
+// request or anybody else's, is answered with
+//
+//     25P02  current transaction is aborted, commands ignored until end of transaction block
+//
+// until something sends ROLLBACK or the session is closed. That is not a 15-second window either:
+// idle_in_transaction_session_timeout measures time spent IDLE, and a poisoned connection under
+// traffic is never idle for long — each new query fails instantly and restarts the clock.
+//
+// WHAT IT LOOKED LIKE FROM OUTSIDE. On /admin/setup, one module's DDL failed for its own ordinary
+// reason and then THREE more modules, the verification query and all six checklist counts reported
+// `current transaction is aborted` — a screen full of errors with the real cause nowhere on it. Off
+// that page it was worse: /admin/login answered "Sign-in is temporarily unavailable" for anyone
+// whose request happened to draw the poisoned connection out of a five-slot pool.
+//
+// Reproduced and fixed against a real PostgreSQL (PGlite over TCP, never the production database):
+// the old shape leaves 25P02 behind on the next two queries; the shape below rolls back, reports the
+// REAL error (42P01 relation does not exist), and the very next query succeeds.
+//
+// SO THE DRIVER OWNS THE TRANSACTION NOW. postgres-js's begin() sends BEGIN on a reserved connection
+// and, on any rejection from the callback, sends ROLLBACK on that same connection before rethrowing.
+// The statements still travel as ONE simple-protocol message inside it, so the round-trip saving
+// that batching exists for is unchanged, and SET LOCAL still runs inside a real transaction block.
+
 /**
- * Wrap a block of idempotent DDL so it cannot hold a table — or a pooler session — indefinitely.
+ * Send a block of idempotent DDL as one round trip, inside a transaction the DRIVER owns.
  *
- * Exported because several bootstraps send their DDL through sqlClient().unsafe().simple() directly
- * rather than through ensureBatch(), and a guard that only half the batches use is not a guard.
+ * The only sender in this repository. Nothing else may call `.simple()` on DDL: see the reckoning
+ * above, and src/lib/ddl-transaction.test.ts, which fails the build if a second one appears.
  *
- * An EXPLICIT transaction, not the implicit one a multi-statement simple query already creates:
- * SET LOCAL has no effect outside a transaction block, and being certain of that is the whole point
- * of the statement.
+ * WHY THE TRANSACTION AT ALL — the lock argument, which has not changed. Every statement here is
+ * idempotent and nearly all are no-ops in production, but ALTER TABLE takes its ACCESS EXCLUSIVE
+ * lock BEFORE it evaluates IF NOT EXISTS, and a PENDING exclusive lock is granted ahead of shared
+ * locks requested after it: every SELECT on that table queues behind a no-op ALTER. A deploy makes
+ * every instance cold at once, so they all run these bootstraps together and contend on the same
+ * tables — which is how a schema bootstrap became an empty connection pool on 2026-08-23. SET LOCAL
+ * lock_timeout bounds the wait at 3 seconds; on timeout the batch rolls back whole, ensureOnce drops
+ * the key, and the next request retries by which time the holder has almost certainly finished.
+ *
+ * Rejects with the real Postgres error. Callers decide whether that is fatal; this only guarantees
+ * that a failure cannot be left behind on the connection.
  */
-export function guardedDdl(ddl: string): string {
+export async function runGuardedDdl(ddl: string): Promise<void> {
+  const { sqlClient, healAbortedTransactions } = await import('@/lib/db');
+  try {
+    await sqlClient().begin(async (tx: any) => {
+      await tx.unsafe(guardedDdlBody(ddl)).simple();
+    });
+  } catch (e: any) {
+    // begin() has already sent ROLLBACK by the time this runs. The sweep is for the one case it
+    // cannot cover — a connection that dropped, or a ROLLBACK that itself failed — and it is cheap
+    // and debounced. Never let the recovery replace the real error.
+    await healAbortedTransactions().catch(() => {});
+    throw e;
+  }
+}
+
+/**
+ * The guarded DDL body: bounded locks, no transaction control.
+ *
+ * NO BEGIN AND NO COMMIT, and that absence is the fix. Whoever sends this must open the transaction
+ * through the driver so that a failure is rolled back rather than left on the connection.
+ */
+export function guardedDdlBody(ddl: string): string {
   const body = ddl.trim().replace(/;[ \t\r\n]*$/, '');
-  return `BEGIN;
-SET LOCAL lock_timeout = '3s';
+  return `SET LOCAL lock_timeout = '3s';
 SET LOCAL statement_timeout = '20s';
-${body};
-COMMIT;`;
+${body};`;
+}
+
+/**
+ * The same block as a script for a human to run — `psql -v ON_ERROR_STOP=1 -f`.
+ *
+ * This is the ONLY caller of BEGIN/COMMIT as text left in the repository, and it must never be sent
+ * through `.simple()`: psql executes a file statement by statement and stops on the first error with
+ * ON_ERROR_STOP, which is a different mechanism entirely from the one that poisoned the pool.
+ */
+export function guardedDdlScript(ddl: string): string {
+  return `BEGIN;\n${guardedDdlBody(ddl)}\nCOMMIT;`;
 }

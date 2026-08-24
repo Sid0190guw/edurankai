@@ -10,69 +10,16 @@
 import type { APIRoute } from 'astro';
 import { can } from '@/lib/auth/permissions';
 import { allowingDdl } from '@/lib/schema-bootstrap';
+import { runBootstrapModules } from '@/lib/bootstrap-modules';
 
 function j(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 
-// Declared before the handler that reads it — `const` is not hoisted, and that has taken pages down
-// on this project. Each entry is one module and the import that triggers its bootstrap.
-const MODULES: Array<{ name: string; run: () => Promise<unknown> }> = [
-  { name: 'auth-registry', run: async () => (await import('@/lib/auth/registry')).ensureRegistrySchema() },
-  { name: 'rbac', run: async () => (await import('@/lib/rbac/store')).ensureRbacSchema() },
-  { name: 'observability-health', run: async () => (await import('@/lib/observability-health')).ensureObservabilitySchema() },
-  { name: 'feature-flags', run: async () => (await import('@/lib/observability')).ensureFlagSchema() },
-  { name: 'knowledge-sync', run: async () => (await import('@/lib/knowledge-sync')).ensureSyncSchema() },
-  { name: 'mail', run: async () => (await import('@/lib/mail')).ensureMailSchema() },
-  // Discovery. Both its tables are read by /aquintutor/search and /admin/search, and created by
-  // nothing else on this deployment -- see db/search-index-schema.sql.
-  { name: 'search-index', run: async () => (await import('@/lib/search-index')).ensureSearchSchema() },
-  // AUTHENTICATION. Added 2026-08-24, when registering these tables in BOOTSTRAP_MODULES turned
-  // "we cannot tell" into `/api/health` reporting three module tables not yet created. The whole
-  // sign-in subsystem was outside this list, so the one button an operator has for "create what is
-  // missing" could not create any of it.
-  //
-  // Each of these four memoises its own bootstrap in a module-level flag, and that flag used to be
-  // set even when production had refused the DDL — so this endpoint would call them, get an instant
-  // return, and report ok:true over tables that were never created. They now latch only on a run
-  // that was permitted to create something, which is what makes pressing this button mean anything.
-  { name: 'auth-totp', run: async () => (await import('@/lib/auth/twofactor')).ensureTwoFactorSchema() },
-  { name: 'auth-second-step', run: async () => (await import('@/lib/auth/two-factor')).ensureSecondStepSchema() },
-  { name: 'auth-passkeys', run: async () => (await import('@/lib/auth/webauthn')).ensurePasskeySchema() },
-  { name: 'auth-recovery', run: async () => (await import('@/lib/auth/recovery')).ensureRecoverySchema() },
-  // The erasure RECORD, not the erasure. Its table had no exported ensure until now, so its only
-  // creator was somebody's first face deletion — the one moment you least want to find it missing.
-  { name: 'face-erasure-log', run: async () => (await import('@/lib/auth/face-erasure')).ensureFaceErasureSchema() },
-  // THE FOUR THAT WERE MONITORED BUT NOT CREATABLE. /api/health has reported on these for a while
-  // and this endpoint could not make any of them, so the button's own label - "create the missing
-  // tables now" - was a promise it could not keep for a quarter of the list it verifies against. A
-  // label that overpromises is the same defect as an empty state that overclaims.
-  { name: 'daily-report', run: async () => (await import('@/lib/daily-report')).ensureDailyReportSchema() },
-  { name: 'learning-progress', run: async () => (await import('@/lib/learning-progress')).ensureLearningProgressSchema() },
-  { name: 'clock-out-checks', run: async () => (await import('@/lib/attendance-verify-clockout')).ensureClockOutSchema() },
-  { name: 'lms', run: async () => (await import('@/lib/lms/schema')).ensureLmsSchema() },
-  // HIRING DECISION SUPPORT AND THE CAPABILITY SPINE IT READS, ADDED 2026-08-24.
-  //
-  // WHY: /admin/applications/[id]/decision refused to record a real decision in production with
-  // relation "hiring_decisions" does not exist. That table's only creator is
-  // ensureHiringDecisionSchema(), and src/lib/hiring-decision.ts shipped on 2026-08-23, the same day
-  // production stopped running request-path DDL — so it has never been created on the live database
-  // and this button, the one control an operator has for "create what is missing", could not create
-  // it either.
-  //
-  // ORDER MATTERS HERE, WHICH IS UNUSUAL FOR THIS LIST. hr_role_requirements and hr_skill_relations
-  // both REFERENCE hr_skills, and ensureSpineSchema() runs its CREATEs in one sequence that stops at
-  // the first failure — so the skill catalogue is created first, then the spine, then the decision
-  // table. Run the other way round, the spine's later statements fail and the failure is silent.
-  { name: 'capability-catalogue', run: async () => (await import('@/lib/performance-schema')).ensurePerformanceSchema() },
-  { name: 'person-spine', run: async () => (await import('@/lib/person-spine')).ensureSpineSchema() },
-  { name: 'capability-readings', run: async () => (await import('@/lib/match')).ensureMatchSchema() },
-  { name: 'hiring-decision', run: async () => (await import('@/lib/hiring-decision')).ensureHiringDecisionSchema() },
-  // These two have no exported ensure; a harmless READ triggers the same internal bootstrap.
-  { name: 'error-log', run: async () => (await import('@/lib/logger')).recentErrors(1) },
-  { name: 'job-queue', run: async () => (await import('@/lib/job-queue')).claimBatch(0) },
-];
-
+// THE LIST IS NOT WRITTEN OUT HERE ANY MORE. It lived in this file AND in the frontmatter of
+// /admin/setup, and the two had drifted: twenty-five modules here, thirteen on the page. Both now
+// import src/lib/bootstrap-modules.ts, which also owns the loop — including the part that stops one
+// poisoned connection being reported as twenty broken modules.
 export const POST: APIRoute = async ({ locals }) => {
   const user = (locals as any)?.user;
   if (!user) return j({ ok: false, error: 'sign in required' }, 401);
@@ -91,22 +38,7 @@ export const POST: APIRoute = async ({ locals }) => {
   //
   // Scoped to this handler by AsyncLocalStorage, so nothing else in the process is affected while
   // it runs, and the permission checks above still decide who may reach it.
-  const results = await allowingDdl(async () => {
-  const results: Array<{ module: string; ok: boolean; error?: string }> = [];
-  for (const m of MODULES) {
-    try {
-      await m.run();
-      results.push({ module: m.name, ok: true });
-    } catch (e: any) {
-      // The real Postgres reason is on e.cause; e.message is only the failed SQL. Never swallowed —
-      // one module failing must not hide behind the seven that worked.
-      const why = e?.cause?.message || e?.message || 'unknown error';
-      console.error('[ops/bootstrap] ' + m.name + ' failed:', why);
-      results.push({ module: m.name, ok: false, error: why });
-    }
-  }
-  return results;
-  });
+  const results = await allowingDdl(() => runBootstrapModules());
 
   // VERIFY, do not trust the return. ensureOnce() ends in `p.catch(() => {})`, so a DDL statement
   // that threw still resolves and every ensure above reports success. The first run of this endpoint

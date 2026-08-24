@@ -53,9 +53,9 @@
 // people typing the SAME code each got their OWN empty room and never met. `room_code` is the
 // additive column that fixes it: it is the handle in the URL, it is UNIQUE, and it exists under
 // either id type. Look a room up with roomLookupSql(); never compare the URL segment to `id` alone.
-import { db, sqlClient } from '@/lib/db';
+import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { ensureOnce, guardedDdl } from '@/lib/ensure-once';
+import { ensureOnce, runGuardedDdl } from '@/lib/ensure-once';
 import { logEvent } from '@/lib/logger';
 
 // Declared before every function that uses them: `const` is not hoisted, and a handler that reaches
@@ -166,7 +166,7 @@ async function detectRooms(): Promise<{ present: Map<string, string>; notNull: S
 // ensure-once.ts was commented to prevent. So this uses the same one-round-trip mechanism directly
 // and leaves the error to propagate into run()'s catch, where the flag, the log and the rethrow are.
 const batch = async (ddl: string): Promise<void> => {
-  await sqlClient().unsafe(guardedDdl(ddl)).simple();
+  await runGuardedDdl(ddl);
 };
 
 // Whichever half is missing is added. No column is dropped, no type is altered and no row is
