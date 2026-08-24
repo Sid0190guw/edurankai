@@ -84,6 +84,29 @@ const UNKNOWN: FaceHoldings = Object.freeze({
  * "nothing is stored" when the truth is "we could not check" is the worst possible answer to a
  * privacy question, because they will stop asking.
  */
+/**
+ * The erasure record's table, exported so it can be created deliberately rather than only as a side
+ * effect of somebody's first erasure.
+ *
+ * It had no exported ensure at all, so POST /api/admin/ops/bootstrap could not reach it and the
+ * table's only creator was the erasure path itself — which is the one moment you least want to
+ * discover it missing, because by then the facial data is already gone and only the evidence that it
+ * was deleted is at stake. The catch at the call site says exactly that.
+ *
+ * No memo: this runs once per erasure and once per operator bootstrap, and a CREATE TABLE IF NOT
+ * EXISTS that production refuses costs no round trip at all (guardedExecute in src/lib/db/index.ts).
+ */
+export async function ensureFaceErasureSchema(): Promise<void> {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS face_erasure_log (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      actor_user_id UUID,
+      reason TEXT,
+      photo_cleared BOOLEAN NOT NULL DEFAULT false,
+      at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+}
+
 export async function faceHoldings(userId: string): Promise<FaceHoldings> {
   if (!isUuid(userId)) return { ...UNKNOWN, error: 'That account id is not valid.' };
   try {
@@ -196,14 +219,7 @@ export async function eraseFaceData(
     // The erasure itself is recorded — WITHOUT any facial data in it. An audit row that quoted the
     // template would defeat the erasure it was recording.
     try {
-      await db.execute(sql`
-        CREATE TABLE IF NOT EXISTS face_erasure_log (
-          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-          user_id UUID NOT NULL,
-          actor_user_id UUID,
-          reason TEXT,
-          photo_cleared BOOLEAN NOT NULL DEFAULT false,
-          at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+      await ensureFaceErasureSchema();
       await db.execute(sql`
         INSERT INTO face_erasure_log (user_id, actor_user_id, reason, photo_cleared)
         VALUES (${userId}, ${opts.actorUserId && isUuid(opts.actorUserId) ? opts.actorUserId : null},

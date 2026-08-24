@@ -10,11 +10,25 @@
 // so a deploy never needs a manual migration to start working.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ddlPermitted } from '@/lib/schema-bootstrap';
 import { createHmac, createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
 function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
 // ── schema bootstrap ───────────────────────────────────────────────────────
+// THE MEMO MUST NOT RECORD "DONE" FOR WORK PRODUCTION WAS FORBIDDEN TO DO.
+//
+// `ensured = true` was set whether or not anything was created. In production db.execute REFUSES
+// DDL (src/lib/db/index.ts) and returns the same empty result a real CREATE gives, so the very first
+// call on every instance sailed through, created nothing, and latched the flag — which then made the
+// one call that IS allowed to create things a no-op. That is why /admin/ops and /admin/setup could
+// press "run every bootstrap" on a warm instance and honestly report success over a table that still
+// did not exist.
+//
+// So the flag is set only when the run could actually have created something. While DDL is
+// suppressed the statements are re-issued on each call and cost NOTHING — guardedExecute returns a
+// resolved empty array without touching the network — and the moment an operator opens the escape
+// hatch with allowingDdl(), the next call does the real work.
 let ensured = false;
 export async function ensureTwoFactorSchema(): Promise<void> {
   if (ensured) return;
@@ -33,7 +47,8 @@ export async function ensureTwoFactorSchema(): Promise<void> {
     created_at timestamptz NOT NULL DEFAULT now()
   )`);
   await db.execute(sql`CREATE INDEX IF NOT EXISTS user_backup_codes_user_idx ON user_backup_codes(user_id)`);
-  ensured = true;
+  // Only a run that was PERMITTED to create anything may record that it did.
+  if (ddlPermitted()) ensured = true;
 }
 
 // ── base32 (RFC 4648, no padding) ──────────────────────────────────────────

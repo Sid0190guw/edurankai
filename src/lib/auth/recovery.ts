@@ -28,6 +28,7 @@
 // than adding a second limiter with its own table. One limiter, one place to raise a threshold.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ddlPermitted } from '@/lib/schema-bootstrap';
 import { createHash, randomBytes } from 'node:crypto';
 import { countAttempt, peekAttempts, clearAttempts } from '@/lib/auth/two-factor';
 
@@ -99,6 +100,19 @@ export async function recoveryAttemptsUsed(identityKey: string, purpose: Recover
 }
 
 // ── schema ──────────────────────────────────────────────────────────────────
+// THE MEMO MUST NOT RECORD "DONE" FOR WORK PRODUCTION WAS FORBIDDEN TO DO.
+//
+// `ensured = true` was set whether or not anything was created. In production db.execute REFUSES
+// DDL (src/lib/db/index.ts) and returns the same empty result a real CREATE gives, so the very first
+// call on every instance sailed through, created nothing, and latched the flag — which then made the
+// one call that IS allowed to create things a no-op. That is why /admin/ops and /admin/setup could
+// press "run every bootstrap" on a warm instance and honestly report success over a table that still
+// did not exist.
+//
+// So the flag is set only when the run could actually have created something. While DDL is
+// suppressed the statements are re-issued on each call and cost NOTHING — guardedExecute returns a
+// resolved empty array without touching the network — and the moment an operator opens the escape
+// hatch with allowingDdl(), the next call does the real work.
 let ensured = false;
 export async function ensureRecoverySchema(): Promise<void> {
   if (ensured) return;
@@ -115,7 +129,8 @@ export async function ensureRecoverySchema(): Promise<void> {
   )`);
   await db.execute(sql`CREATE INDEX IF NOT EXISTS auth_recovery_token_user_idx ON auth_recovery_token(user_id, purpose)`);
   await db.execute(sql`CREATE INDEX IF NOT EXISTS auth_recovery_token_expiry_idx ON auth_recovery_token(expires_at)`);
-  ensured = true;
+  // Only a run that was PERMITTED to create anything may record that it did.
+  if (ddlPermitted()) ensured = true;
 }
 
 const hashToken = (t: string): string => createHash('sha256').update(t).digest('hex');

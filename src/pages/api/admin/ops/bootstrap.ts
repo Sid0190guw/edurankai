@@ -27,6 +27,22 @@ const MODULES: Array<{ name: string; run: () => Promise<unknown> }> = [
   // Discovery. Both its tables are read by /aquintutor/search and /admin/search, and created by
   // nothing else on this deployment -- see db/search-index-schema.sql.
   { name: 'search-index', run: async () => (await import('@/lib/search-index')).ensureSearchSchema() },
+  // AUTHENTICATION. Added 2026-08-24, when registering these tables in BOOTSTRAP_MODULES turned
+  // "we cannot tell" into `/api/health` reporting three module tables not yet created. The whole
+  // sign-in subsystem was outside this list, so the one button an operator has for "create what is
+  // missing" could not create any of it.
+  //
+  // Each of these four memoises its own bootstrap in a module-level flag, and that flag used to be
+  // set even when production had refused the DDL — so this endpoint would call them, get an instant
+  // return, and report ok:true over tables that were never created. They now latch only on a run
+  // that was permitted to create something, which is what makes pressing this button mean anything.
+  { name: 'auth-totp', run: async () => (await import('@/lib/auth/twofactor')).ensureTwoFactorSchema() },
+  { name: 'auth-second-step', run: async () => (await import('@/lib/auth/two-factor')).ensureSecondStepSchema() },
+  { name: 'auth-passkeys', run: async () => (await import('@/lib/auth/webauthn')).ensurePasskeySchema() },
+  { name: 'auth-recovery', run: async () => (await import('@/lib/auth/recovery')).ensureRecoverySchema() },
+  // The erasure RECORD, not the erasure. Its table had no exported ensure until now, so its only
+  // creator was somebody's first face deletion — the one moment you least want to find it missing.
+  { name: 'face-erasure-log', run: async () => (await import('@/lib/auth/face-erasure')).ensureFaceErasureSchema() },
   // These two have no exported ensure; a harmless READ triggers the same internal bootstrap.
   { name: 'error-log', run: async () => (await import('@/lib/logger')).recentErrors(1) },
   { name: 'job-queue', run: async () => (await import('@/lib/job-queue')).claimBatch(0) },
@@ -72,9 +88,20 @@ export const POST: APIRoute = async ({ locals }) => {
   // answered ok:true, ran:8, failed:0 while /api/health went on reporting all ten tables missing.
   // A green result from a call is not evidence the call did anything; the only evidence is the
   // database itself, so ask it.
-  const EXPECTED = ['audit_log', 'edu_cron_runs', 'edu_error_log', 'edu_feature_flags', 'edu_job_log',
-    'edu_jobs', 'edu_releases', 'edu_search_index', 'edu_search_queries', 'edu_sync_queue',
-    'mail_config', 'rbac_audit'];
+  //
+  // THE LIST IS NOT WRITTEN OUT HERE ANY MORE. It was a hand-kept copy of a fact
+  // src/lib/observability-health.ts already records, and it had already drifted: twelve names here
+  // against sixteen there, and neither of the two search tables another session added the same day.
+  // A verify step that checks a stale list is worse than none — it reports "verified" over exactly
+  // the tables nobody remembered to add.
+  //
+  // BOOTSTRAP_MODULES is what /api/health reports on, so this endpoint and that endpoint now answer
+  // the same question from the same source and cannot come to disagree. It is broader than what the
+  // modules above create — a few of its tables belong to bootstraps this endpoint does not run — and
+  // that is the right direction for a verify step: it can only over-report what is still missing,
+  // never under-report it.
+  const { BOOTSTRAP_MODULES } = await import('@/lib/observability-health');
+  const EXPECTED = BOOTSTRAP_MODULES.map((m) => m.table);
   let present: string[] = [];
   let verifyError = '';
   try {
