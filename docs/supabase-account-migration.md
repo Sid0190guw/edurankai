@@ -33,20 +33,76 @@ fails on the surfaces nobody tested that week.
 
 ---
 
-## 1. Get both connection strings — the DIRECT one, not the pooler
+## 0. The tools, on Windows, without admin
 
-In each Supabase project: **Settings → Database → Connection string → URI**.
+There was no PostgreSQL client on this machine and no Docker, and `winget install` wants elevation.
+The client tools ship as a plain zip that needs neither:
 
-You need the **direct connection on port 5432**, not the transaction pooler on **6543**.
-`pg_dump` and `pg_restore` hold session state and use prepared statements; a transaction pooler
-gives neither, and the dump will fail partway or, worse, come back short.
+```powershell
+mkdir C:\Users\user\pgtools
+curl.exe -sL -o C:\Users\user\pgtools\pg.zip `
+  https://get.enterprisedb.com/postgresql/postgresql-17.6-1-windows-x64-binaries.zip
+Expand-Archive C:\Users\user\pgtools\pg.zip -DestinationPath C:\Users\user\pgtools -Force
+$env:PATH = 'C:\Users\user\pgtools\pgsql\bin;' + $env:PATH
+psql --version   # psql (PostgreSQL) 17.6
+```
+
+Already done on 2026-08-24 — `psql`, `pg_dump` and `pg_restore` 17.6 are at
+`C:\Users\user\pgtools\pgsql\bin`. The `$env:PATH` line is per-shell and has to be repeated in each
+new terminal. A 17.x client dumps from a 15.x or 17.x server; the rule is client major ≥ server
+major, never the reverse.
+
+Two PowerShell notes, because this cost several rounds: `OLD="..."` is bash — PowerShell needs
+`$OLD = "..."`; and `grep`, `tee` and `head` do not exist there, so use `Select-String`,
+`Tee-Object` and `Select-Object -First`.
+
+## 1. Get both connection strings — the SESSION POOLER, not the direct one
+
+Corrected on 2026-08-24 after this failed in practice. The first version of this section said to use
+the direct connection and avoid the pooler. That is the standard Postgres advice and it is wrong for
+Supabase now.
+
+**`db.<ref>.supabase.co` has no A record. It is IPv6 only.** Supabase moved direct IPv4 behind a
+paid add-on, so on any IPv4-only machine or network every tool resolves nothing and reports it
+confusingly:
 
 ```
-OLD=postgresql://postgres:<pw>@db.<old-ref>.supabase.co:5432/postgres
-NEW=postgresql://postgres:<pw>@db.<new-ref>.supabase.co:5432/postgres
+psql: error: could not translate host name "db.<ref>.supabase.co" to address: Name or service not known
 ```
 
-The app keeps using the **pooler** URL (`:6543`) in `DATABASE_URL` — that part does not change.
+Measured on this machine: `Resolve-DnsName db.<ref>.supabase.co` returns AAAA
+`2406:da12:...` and no A, and a TCP test to that address fails — there is no IPv6 route out. The
+pooler host, by contrast, answers on IPv4.
+
+**So use the Session pooler.** Supabase runs two, and the distinction is the one that matters:
+
+| | port | holds a session | usable for `pg_dump` |
+|---|---|---|---|
+| Transaction pooler | 6543 | no | **no** |
+| **Session pooler** | **5432** | **yes** | **yes** |
+
+Only the *transaction* pooler breaks `pg_dump`. The session pooler is a full session and dumps
+fine. The original warning conflated the two.
+
+Copy both strings verbatim from **Settings → Database → Connection string → Session pooler** in each
+project. Do not hand-build them: the username is `postgres.<PROJECT_REF>`, not `postgres`, and the
+host carries a region and a generation prefix (`aws-0-…` on older projects, `aws-1-…` on newer) that
+cannot be guessed. Guessing it returns a misleading error that looks like a credentials problem:
+
+```
+FATAL: (ENOTFOUND) tenant/user postgres.<ref> not found
+```
+
+That message means the pooler in *that region* has never heard of the project — wrong host, not
+wrong password.
+
+```
+OLD=postgresql://postgres.<old-ref>:<pw>@aws-<n>-<region>.pooler.supabase.com:5432/postgres
+NEW=postgresql://postgres.<new-ref>:<pw>@aws-<n>-<region>.pooler.supabase.com:5432/postgres
+```
+
+The app's own `DATABASE_URL` keeps using the **transaction** pooler (`:6543`) — that is correct for
+short web requests and does not change.
 
 ## 2. Record what the old database has, so you can prove the new one matches
 
