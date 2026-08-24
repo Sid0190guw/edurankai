@@ -118,6 +118,30 @@ if (-not $url) {
     exit 1
 }
 
+# A placeholder pasted with its angle brackets still on is a real and repeated mistake, and psql
+# does not reject it: anything that is not a URI is taken as a DATABASE NAME, so
+# `<postgresql://host/db>` becomes dbname="<postgresql://host/db>" against the default host, and the
+# error you get is the same "localhost ... Connection refused" as passing nothing at all. Two
+# different mistakes with one indistinguishable symptom is how this went round in circles, so the
+# shape is checked here instead of being handed to psql to misread.
+$url = $url.Trim()
+if ($url.StartsWith('<') -and $url.EndsWith('>')) {
+    $url = $url.Substring(1, $url.Length - 2).Trim()
+    Write-Host "Stripped the angle brackets - those are placeholder punctuation, not part of the URL." -ForegroundColor Yellow
+}
+if ($url -notmatch '^postgres(ql)?://') {
+    Write-Host "That is not a PostgreSQL connection URI." -ForegroundColor Red
+    Write-Host ("  it came from : {0}" -f $source)
+    Write-Host ("  it starts    : {0}" -f $url.Substring(0, [Math]::Min(12, $url.Length)))
+    Write-Host ""
+    Write-Host "It must begin postgresql:// or postgres://. Anything else is passed to psql as a"
+    Write-Host "database NAME, which is why the failure reads 'localhost port 5432 Connection refused'"
+    Write-Host "even though a value was supplied. Set it without the surrounding < >:"
+    Write-Host ""
+    Write-Host "    `$env:DATABASE_URL = 'postgresql://USER:PASSWORD@HOST:5432/postgres'"
+    exit 1
+}
+
 if (-not (Get-Command psql -ErrorAction SilentlyContinue)) {
     Write-Host "psql is not on PATH. Add the PostgreSQL client bin directory, e.g." -ForegroundColor Red
     Write-Host '    $env:PATH += ";C:\Program Files\PostgreSQL\16\bin"'
