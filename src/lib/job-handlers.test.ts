@@ -52,8 +52,9 @@ function walk(dir: string, out: string[] = []): string[] {
  * cache makes the same walk a few hundred milliseconds, which is why it shipped: the failure needs a
  * checkout nobody has read yet, and that is precisely what CI and a fresh clone are.
  *
- * The scan is pure — same files, same answer — so computing it once is not a behaviour change. It
- * halves the I/O and takes the whole file comfortably under the bound.
+ * The scan is pure — same files, same answer — so computing it once is not a behaviour change, and
+ * it halves the I/O. It was NOT sufficient on its own: the one remaining walk still measured 5,635ms
+ * cold, which only moved the timeout from the second test to the first. See SCAN_TIMEOUT_MS below.
  */
 let cachedKinds: Map<string, string[]> | null = null;
 function enqueuedKinds(): Map<string, string[]> {
@@ -91,6 +92,21 @@ function scanEnqueuedKinds(): Map<string, string[]> {
   return found;
 }
 
+/**
+ * A REPOSITORY SCAN IS NOT A UNIT TEST, AND VITEST'S DEFAULT BOUND IS FOR UNIT TESTS.
+ *
+ * Memoising the scan halved the work and was still not enough: on a genuinely cold checkout the ONE
+ * remaining walk of 2,389 files measured 5,635ms against the 5,000ms default, so the failure simply
+ * moved from the second test to the first. The honest answer is not to keep shaving the scan — it
+ * reads every source file in the repository because that is the only way to know that no enqueue()
+ * call site was missed, and that cost is the price of the guarantee.
+ *
+ * So the bound is set to what this kind of test actually is. Thirty seconds is not a licence to be
+ * slow: warm, the whole file runs in well under a second, and if it ever approaches this number the
+ * scan itself has gone wrong.
+ */
+const SCAN_TIMEOUT_MS = 30_000;
+
 describe('every enqueued job kind has a worker', () => {
   it('finds the enqueue call sites at all', () => {
     const kinds = enqueuedKinds();
@@ -99,7 +115,7 @@ describe('every enqueued job kind has a worker', () => {
     for (const k of ['mp.send_message', 'mp.campaign_batch', 'mp.webhook_delivery', 'mp.workflow_step']) {
       expect([...kinds.keys()], `${k} is no longer detected as enqueued`).toContain(k);
     }
-  });
+  }, SCAN_TIMEOUT_MS);
 
   it('NO kind is enqueued without a handler', () => {
     const kinds = enqueuedKinds();
@@ -114,7 +130,7 @@ describe('every enqueued job kind has a worker', () => {
       );
     }
     expect(orphaned).toEqual([]);
-  });
+  }, SCAN_TIMEOUT_MS);
 
   it('the four mail-platform kinds are registered', () => {
     for (const k of ['mp.send_message', 'mp.campaign_batch', 'mp.webhook_delivery', 'mp.workflow_step']) {
