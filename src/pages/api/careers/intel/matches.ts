@@ -37,7 +37,7 @@ import { json, toMatchCard } from '@/lib/career-intel/wire';
 import { parseProfile } from '@/lib/career-intel/profile';
 import { retrieveForProfile } from '@/lib/career-intel/retrieve';
 import { rankAll, TIERS, type MatchableRole } from '@/lib/career-intel/rank';
-import { NOT_PERSONALISED } from '@/lib/career-intel/explain';
+import { NOT_PERSONALISED, UNPERSONALISED_GROUP_LABEL, UNPERSONALISED_GROUP_MEANING } from '@/lib/career-intel/explain';
 import { profileReadiness } from '@/lib/career-intel/dimensions';
 import { shouldOfferResume } from '@/lib/career-intel/questions';
 import { domainLabel, DOMAIN_BY_KEY } from '@/lib/career-intel/ontology';
@@ -128,14 +128,29 @@ export const POST: APIRoute = async ({ request }) => {
 
   // Grouped by tier, in the tiers' own order, and empty groups are dropped rather than rendered as
   // a heading with nothing under it.
-  const groups = TIERS
-    .map((t) => ({
-      tier: t.key,
-      label: t.label,
-      meaning: t.meaning,
-      matches: cards.filter((c) => c.tier === t.key),
-    }))
-    .filter((g) => g.matches.length > 0);
+  //
+  // A TIER IS A CLAIM ABOUT OVERLAP, SO IT NEEDS SOMETHING TO OVERLAP WITH. With no personalisation
+  // the ranker still assigns every posting a tier — everything lands in 'explore' — and rendering
+  // that tier's label put "Worth a look: matched on part of what you said" above a list built from
+  // nothing the person had said, four lines under this endpoint's own "these are not personalised".
+  // One unpersonalised group, named for what it actually is.
+  const groups = personalised
+    ? TIERS
+      .map((t) => ({
+        tier: t.key,
+        label: t.label,
+        meaning: t.meaning,
+        matches: cards.filter((c) => c.tier === t.key),
+      }))
+      .filter((g) => g.matches.length > 0)
+    : (cards.length
+      ? [{
+        tier: 'explore',
+        label: UNPERSONALISED_GROUP_LABEL,
+        meaning: UNPERSONALISED_GROUP_MEANING,
+        matches: cards,
+      }]
+      : []);
 
   const nextOffset = offset + pool.rows.length;
 

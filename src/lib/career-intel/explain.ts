@@ -115,3 +115,17 @@ export const NOT_PERSONALISED =
  */
 export const MATCHED_NOTHING =
   'Nothing you have told us so far lines up with this one. It is here so the list is not narrower than you are.';
+
+/**
+ * The heading for an UNPERSONALISED result set, and why it cannot be a tier label.
+ *
+ * The tiers are claims about overlap: "Worth a look — matched on part of what you said" is true
+ * only if the person said something. Rendered above a list produced from nobody's words it is a
+ * plain falsehood, and the page was already printing NOT_PERSONALISED four lines above it — so it
+ * contradicted itself as well.
+ *
+ * When nothing personalised the list, the results get this heading instead and no tier is named.
+ */
+export const UNPERSONALISED_GROUP_LABEL = 'Current openings';
+export const UNPERSONALISED_GROUP_MEANING =
+  'Newest first. Nothing here has been matched to you, because you have not told us anything yet.';

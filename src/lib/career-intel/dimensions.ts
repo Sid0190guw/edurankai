@@ -44,8 +44,11 @@
 //                          system is capable of producing, because the rhythm group is not
 //                          readable by the ranker.
 //
-//   C. REFLECTION          the optional astrology layer (src/lib/career-intel/reflection.ts). Same
-//                          rule as B, enforced harder: rank.ts does not import that module at all.
+//   C. PERSONAL            the optional block in src/lib/career-intel/personal.ts — when their day
+//                          starts, how they describe their own nature, height and weight. Same rule
+//                          as B, enforced harder: rank.ts does not import that module at all. It is
+//                          where height and weight are kept precisely BECAUSE the ranker cannot
+//                          reach it. (This was an astrology layer. It is not one any more.)
 //
 // The enforcement is RELEVANCE_GROUPS below plus relevanceDimensions(), which is the ONLY way the
 // ranker is allowed to read dimensions. A group added to the vocabulary is exploration-only until
@@ -212,10 +215,26 @@ export interface ContextDependency {
 
 export type CareerStage = 'student' | 'early' | 'experienced' | 'senior' | 'unknown';
 
-export interface ReflectionBlock {
-  /** What they gave us. Only ever a date, and only when they typed one. */
-  birthDate: string | null;
-  sign: string | null;
+/**
+ * THE OPTIONAL PERSONAL BLOCK. Held for the person, and read by nothing that decides anything.
+ *
+ * It replaced a birth date and a star sign. Every field is something the person picked or typed,
+ * nothing in it is derived, and the module that builds it (personal.ts) is unreachable from the
+ * ranker by construction rather than by a flag — see the separation tests.
+ *
+ * HEIGHT AND WEIGHT ARE HERE AND NOWHERE ELSE. They are exactly the kind of attribute a hiring
+ * system can discriminate with, so they live in the block the ranking code cannot read, and the
+ * panel tells the person plainly that they are used for nothing.
+ */
+export interface PersonalBlock {
+  /** One of personal.ts WAKE_CHOICES, or null. */
+  wake: string | null;
+  /** Ids from personal.ts NATURE_CHOICES. Several may be true at once. */
+  nature: string[];
+  heightCm: number | null;
+  weightKg: number | null;
+  /** Anything else they wanted written down, verbatim. */
+  note: string;
   /** Always true. Present so a reader of a stored profile cannot mistake this for a match input. */
   excludedFromMatching: true;
   at: string;
@@ -238,8 +257,15 @@ export interface CareerProfile {
   asked: string[];
   /** Questions they chose to skip. Never re-asked. */
   skipped: string[];
-  /** Set only when they explicitly opted into the reflection layer. */
-  reflection: ReflectionBlock | null;
+  /**
+   * Set only when they explicitly filled in the optional personal layer.
+   *
+   * A profile stored by an older build carried a `reflection` block holding a birth date and a star
+   * sign. parseProfile does not read that key, so it is dropped the first time an old profile is
+   * loaded — which is the intended migration: that data disappears rather than being carried
+   * forward into a field nothing reads.
+   */
+  personal: PersonalBlock | null;
 }
 
 /* ------------------------------------------------------------------------------- construction */
@@ -259,7 +285,7 @@ export function emptyProfile(now = new Date().toISOString()): CareerProfile {
     stageConfidence: 0,
     asked: [],
     skipped: [],
-    reflection: null,
+    personal: null,
   };
 }
 

@@ -189,6 +189,70 @@ export const QUESTIONS: Question[] = [
     valueFor: (p) => ((p.skills || []).length > 0 ? 0 : interestCount(p) > 0 ? 0.8 : 0.3),
   },
   {
+    // THE SUBJECT SOMEBODY LIKED IS EVIDENCE, AND IT RANKS.
+    //
+    // It sits here rather than in the optional personal block for one reason: it changes what we
+    // should show. A person who enjoyed chemistry and a person who enjoyed law are owed different
+    // pages, and every option below carries a real domain key straight into retrieval — so the
+    // answer is visible in the results rather than collected and filed.
+    id: 'direction.subject',
+    layer: 'direction',
+    prompt: 'Which subjects have you genuinely enjoyed?',
+    whyAsked: 'What somebody liked studying points at work they will like, and it is often a better guide than a job title.',
+    multi: true,
+    placeholder: 'Any subject at all, including ones not on this list...',
+    optional: false,
+    options: [
+      { id: 'maths', label: 'Mathematics', domains: ['MATHEMATICS'], dims: { analytical: 0.8, abstraction: 0.72 } },
+      { id: 'physics', label: 'Physics', domains: ['PHYSICS'], dims: { analytical: 0.75, research_orientation: 0.6 } },
+      { id: 'chemistry', label: 'Chemistry', domains: ['CHEMISTRY'], dims: { experimental: 0.75 } },
+      { id: 'biology', label: 'Biology and life sciences', domains: ['BIOLOGY'], dims: { experimental: 0.7 } },
+      { id: 'computing', label: 'Computing and programming', domains: ['COMPUTER_SCIENCE'], dims: { implementation: 0.8, systems_thinking: 0.6 } },
+      { id: 'electronics', label: 'Electronics and hardware', domains: ['ELECTRONICS'], dims: { experimental: 0.72, implementation: 0.7 } },
+      { id: 'environment', label: 'Environment and energy', domains: ['ENVIRONMENT'], dims: { systems_thinking: 0.65 } },
+      { id: 'teaching', label: 'Teaching and how people learn', domains: ['EDUCATION'], dims: { social_energy: 0.7 } },
+      { id: 'language', label: 'Languages, writing and the humanities', domains: ['CREATING'], dims: { creativity: 0.72 } },
+      { id: 'business', label: 'Economics, business and finance', domains: ['FINANCE'], dims: { analytical: 0.6, goal_clarity: 0.6 } },
+      { id: 'law', label: 'Law, policy and governance', domains: ['POLICY'], dims: { detail_orientation: 0.7 } },
+      { id: 'art', label: 'Art and design', domains: ['CREATING'], dims: { creativity: 0.85 } },
+      ESCAPE,
+    ],
+    valueFor: (p) => (interestCount(p) === 0 ? 0.9 : interestCount(p) < 3 ? 0.5 : 0),
+  },
+  {
+    // WHAT SOMEBODY CAN DO, ASKED SEPARATELY FROM WHAT THEY HAVE DONE.
+    //
+    // experience.what asks what they have worked with; this asks what they can actually do now.
+    // They are not the same answer, and asking both at once produces the vaguer of the two — so
+    // this one stays silent until the first has been put to them, and never repeats it.
+    id: 'experience.skills',
+    layer: 'experience',
+    prompt: 'Which of these can you actually do today?',
+    whyAsked: 'Named abilities decide which level of posting is worth putting in front of you. They never decide what you are allowed to see.',
+    multi: true,
+    placeholder: 'Name the ones you would be comfortable being asked to do on day one...',
+    optional: false,
+    options: [
+      { id: 'program', label: 'Write and debug code', domains: ['COMPUTER_SCIENCE'], dims: { implementation: 0.82 } },
+      { id: 'data', label: 'Analyse data and statistics', domains: ['DATA'], dims: { analytical: 0.82 } },
+      { id: 'model', label: 'Build a mathematical or physical model', domains: ['MATHEMATICS'], dims: { abstraction: 0.78, analytical: 0.75 } },
+      { id: 'lab', label: 'Run an experiment or use lab instruments', dims: { experimental: 0.85 } },
+      { id: 'hardware', label: 'Build or repair physical or electronic things', domains: ['ELECTRONICS'], dims: { implementation: 0.78, experimental: 0.6 } },
+      { id: 'write', label: 'Write clearly for other people to read', domains: ['CREATING'], dims: { creativity: 0.6, detail_orientation: 0.6 } },
+      { id: 'teach', label: 'Explain something difficult out loud', domains: ['EDUCATION'], dims: { social_energy: 0.78 } },
+      { id: 'design', label: 'Design how something looks and works', domains: ['CREATING'], dims: { creativity: 0.82 } },
+      { id: 'organise', label: 'Organise people, events or logistics', domains: ['PRODUCT'], dims: { goal_clarity: 0.75, collaboration: 0.6 } },
+      { id: 'money', label: 'Keep accounts, budgets or records straight', domains: ['FINANCE'], dims: { detail_orientation: 0.78 } },
+      { id: 'learning', label: 'None of these yet, but I learn quickly', dims: { ambiguity_tolerance: 0.6 } },
+      ESCAPE,
+    ],
+    valueFor: (p) => {
+      const put = new Set([...(p.asked || []), ...(p.skipped || [])]);
+      if (!put.has('experience.what')) return 0;   // never both at once
+      return (p.skills || []).length >= 3 ? 0 : 0.72;
+    },
+  },
+  {
     id: 'workstyle.environment',
     layer: 'workstyle',
     prompt: 'How do you work best?',

@@ -101,7 +101,7 @@ describe('removing something really removes it', () => {
     expect(p.rawResponses).toEqual([]);
     expect(p.dimensions).toEqual({});
     expect(p.interests).toEqual([]);
-    expect(p.reflection).toBeNull();
+    expect(p.personal).toBeNull();
   });
 });
 
@@ -187,9 +187,28 @@ describe('parseProfile treats an incoming document as hostile', () => {
     expect(p.dimensions.autonomy.source).toBe('inferred');
   });
 
-  it('always marks a reflection block excluded from matching, whatever arrives', () => {
-    const p = parseProfile({ reflection: { birthDate: '1999-07-14', sign: 'cancer', excludedFromMatching: false } });
-    expect(p.reflection!.excludedFromMatching).toBe(true);
+  it('always marks the personal block excluded from matching, whatever arrives', () => {
+    const p = parseProfile({ personal: { wake: 'before5', heightCm: 175, excludedFromMatching: false } });
+    expect(p.personal!.excludedFromMatching).toBe(true);
+  });
+
+  it('bounds a measurement that arrived out of range rather than storing it', () => {
+    // It comes off a public endpoint carrying whatever a browser sent. A number outside human
+    // range is not a value to correct towards — it is a value to refuse.
+    const p = parseProfile({ personal: { heightCm: 9000, weightKg: -4, note: 'x' } });
+    expect(p.personal!.heightCm).toBeNull();
+    expect(p.personal!.weightKg).toBeNull();
+  });
+
+  it('drops the birth date and star sign an older build stored', () => {
+    // THE MIGRATION, AND IT IS A DELETION. A profile written before the astrology layer was
+    // removed carries `reflection: { birthDate, sign }`. parseProfile does not read that key, so
+    // the first load after this change forgets it rather than carrying a birth date forward into
+    // a field nothing reads.
+    const p = parseProfile({ reflection: { birthDate: '1999-07-14', sign: 'cancer', excludedFromMatching: true } });
+    expect(p.personal).toBeNull();
+    expect(JSON.stringify(p)).not.toContain('1999-07-14');
+    expect(JSON.stringify(p)).not.toContain('cancer');
   });
 
   it('round-trips a real profile through JSON without losing a verdict', () => {

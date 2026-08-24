@@ -89,12 +89,15 @@ describe('the map cannot become the back door for the exploration-only layers', 
     expect(buildCareerMap(withRhythm).nodes.length).toBe(buildCareerMap(withoutRhythm).nodes.length);
   });
 
-  it('ignores a birth date entirely', () => {
+  it('ignores the optional personal block entirely', () => {
     const base = from('I like artificial intelligence, mathematics and research.');
-    const withReflection = {
+    const withPersonal = {
       ...base,
-      reflection: { birthDate: '1999-07-14', sign: 'cancer', excludedFromMatching: true as const, at: base.updatedAt },
+      personal: {
+        wake: 'before5', nature: ['calm'], heightCm: 175, weightKg: 68, note: 'anything',
+        excludedFromMatching: true as const, at: base.updatedAt,
+      },
     };
-    expect(JSON.stringify(buildCareerMap(withReflection))).toBe(JSON.stringify(buildCareerMap(base)));
+    expect(JSON.stringify(buildCareerMap(withPersonal))).toBe(JSON.stringify(buildCareerMap(base)));
   });
 });

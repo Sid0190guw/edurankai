@@ -6,13 +6,19 @@
 //
 // The three promises:
 //
-//   1. An optional self-reflection layer never affects which opportunities somebody is shown.
+//   1. The optional personal layer (when their day starts, their own description of their nature,
+//      height and weight) never affects which opportunities somebody is shown.
 //   2. Self-reported behavioural tendencies and energy rhythm are not ranking inputs.
 //   3. Nothing about a person makes a posting unreachable.
 //
-// A behaviour test for #1 would assert that one particular profile with a birth date ranks the same
-// as one without. That passes right up until somebody adds a second code path. Reading the imports
-// is the only check that stays true.
+// A behaviour test for #1 would assert that one particular profile with a height on it ranks the
+// same as one without. That passes right up until somebody adds a second code path. Reading the
+// imports is the only check that stays true.
+//
+// BOTH MODULE NAMES ARE CHECKED. This layer used to be reflection.ts and held a star sign; it is
+// now personal.ts and holds height and weight, which is a MORE dangerous thing for a ranker to be
+// able to read, not a less dangerous one. The old name is still asserted against so that a restored
+// file or a stale import cannot reopen the door under a name nobody is watching.
 
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -22,32 +28,42 @@ import {
   explorationDimensions, emptyProfile, isRelevanceDimension,
 } from './dimensions';
 import { evaluate, type MatchableRole } from './rank';
-import { buildReflection } from './reflection';
+import { buildPersonal } from './personal';
 import { recordAnswer } from './profile';
 
 const HERE = join(process.cwd(), 'src', 'lib', 'career-intel');
 const read = (f: string) => readFileSync(join(HERE, f), 'utf8');
 
-describe('the reflection layer is unreachable from matching', () => {
+const PERSONAL_IMPORT = /from\s+['"]\.\/(personal|reflection)['"]/;
+
+describe('the optional personal layer is unreachable from matching', () => {
   it('is not imported by the ranker', () => {
-    expect(read('rank.ts')).not.toMatch(/from\s+['"]\.\/reflection['"]/);
+    expect(read('rank.ts')).not.toMatch(PERSONAL_IMPORT);
   });
 
   it('is not imported by retrieval either', () => {
-    expect(read('retrieve.ts')).not.toMatch(/from\s+['"]\.\/reflection['"]/);
+    expect(read('retrieve.ts')).not.toMatch(PERSONAL_IMPORT);
   });
 
   it('is not imported by the explanation builder', () => {
-    expect(read('explain.ts')).not.toMatch(/from\s+['"]\.\/reflection['"]/);
+    expect(read('explain.ts')).not.toMatch(PERSONAL_IMPORT);
   });
 
   it('is not imported by the career map either', () => {
     // The map is the newest thing that reads a profile and puts domains in front of somebody. It is
-    // exactly the kind of surface an optional reflection layer drifts into, so it is named here.
-    expect(read('map.ts')).not.toMatch(/from\s+['"]\.\/reflection['"]/);
+    // exactly the kind of surface an optional personal layer drifts into, so it is named here.
+    expect(read('map.ts')).not.toMatch(PERSONAL_IMPORT);
   });
 
-  it('produces an identical ranking with and without a birth date', () => {
+  it('never lets a body measurement reach the ranking code at all', () => {
+    // The named check, because this is the field that would do real harm. A ranker that can read a
+    // weight is one line away from preferring a body over a person.
+    for (const f of ['rank.ts', 'retrieve.ts', 'explain.ts', 'map.ts']) {
+      expect(read(f), f).not.toMatch(/heightCm|weightKg|profile\.personal/);
+    }
+  });
+
+  it('produces an identical ranking with and without the personal block', () => {
     const role: MatchableRole = {
       id: 'r1', slug: 'r1', title: 'Research Engineer', level: 'Mid',
       functionText: 'AI research systems', engagementType: 'Full-Time',
@@ -55,13 +71,33 @@ describe('the reflection layer is unreachable from matching', () => {
       researchClassification: 'APPLIED_ENGINEERING', careerLevel: 4,
     };
     const base = recordAnswer(emptyProfile(), { text: 'I want AI work with Python.' }).profile;
-    const withReflection = { ...base, reflection: buildReflection('1999-07-14') };
-    expect(withReflection.reflection).not.toBeNull();
-    expect(evaluate(withReflection, role).total).toBe(evaluate(base, role).total);
+    const personal = buildPersonal({ wake: 'before5', nature: ['calm'], heightCm: 175, weightKg: 68 });
+    const withPersonal = { ...base, personal };
+    expect(withPersonal.personal).not.toBeNull();
+    expect(evaluate(withPersonal, role).total).toBe(evaluate(base, role).total);
   });
 
   it('marks itself excluded from matching in the stored document', () => {
-    expect(buildReflection('1999-07-14')!.excludedFromMatching).toBe(true);
+    expect(buildPersonal({ heightCm: 175 })!.excludedFromMatching).toBe(true);
+  });
+
+  it('stores nothing at all when the form was left empty', () => {
+    // An empty block would render as a heading with nothing under it, and would also read as
+    // "we hold something about you" when we hold nothing.
+    expect(buildPersonal({ wake: '', nature: [], heightCm: '', weightKg: '', note: '  ' })).toBeNull();
+  });
+
+  it('refuses a measurement that is not one', () => {
+    expect(buildPersonal({ heightCm: 9000 })).toBeNull();
+    expect(buildPersonal({ weightKg: 'tall' })).toBeNull();
+  });
+
+  it('holds no birth date, and no star sign, anywhere in the layer', () => {
+    // What this layer replaced. A careers page has no use for a date of birth, and the answer it
+    // gave back was decided by the calendar rather than by anything the person said.
+    const src = read('personal.ts');
+    expect(src).not.toMatch(/birthDate/);
+    expect(src).not.toMatch(/capricorn|aquarius|scorpio|zodiac/i);
   });
 });
 

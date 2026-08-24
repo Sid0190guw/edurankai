@@ -24,7 +24,7 @@ import { parseProfile, recordAnswer, skipQuestion, confirmDimension, confirmTag,
 import { dimsForOptions, domainsForOptions, stageForOption, nextQuestion, shouldOfferResume, QUESTION_BY_ID } from '@/lib/career-intel/questions';
 import { DOMAIN_BY_KEY } from '@/lib/career-intel/ontology';
 import { profileReadiness, uncertainties, heldDimensions, DIMENSION_BY_KEY, explorationDimensions, type CareerProfile } from '@/lib/career-intel/dimensions';
-import { buildReflection, reflectionFor, REFLECTION_DISCLAIMER } from '@/lib/career-intel/reflection';
+import { buildPersonal, personalFor, PERSONAL_DISCLAIMER } from '@/lib/career-intel/personal';
 
 export const prerender = false;
 
@@ -58,8 +58,8 @@ function state(profile: CareerProfile, extra: Record<string, unknown> = {}) {
       })),
       explorationOnly: Object.keys(explorationDimensions(profile)),
       contexts: (profile.contextDependencies || []).map((c) => ({ context: c.context, label: c.label, quote: c.quote })),
-      reflection: reflectionFor(profile.reflection),
-      reflectionDisclaimer: REFLECTION_DISCLAIMER,
+      personal: personalFor(profile.personal),
+      personalDisclaimer: PERSONAL_DISCLAIMER,
       responses: (profile.rawResponses || []).map((r) => ({ id: r.id, at: r.at, questionId: r.questionId, text: r.text })),
     },
     next: nq ? {
@@ -175,19 +175,25 @@ export const POST: APIRoute = async ({ request }) => {
     return state(removeResponse(profile, id));
   }
 
-  // -------------------------------------------------------- the optional reflection layer, opt-in
-  if (action === 'reflect') {
-    const birthDate = String(body?.birthDate || '').slice(0, 10);
-    if (!birthDate) return state({ ...profile, reflection: null });
-    const block = buildReflection(birthDate);
-    if (!block) return json({ ok: false, error: 'That date could not be read. Use YYYY-MM-DD.' }, 400);
+  // --------------------------------------------------------- the optional personal layer, opt-in
+  //
+  // Saving an empty form CLEARS the block rather than storing an empty one, which is also what
+  // makes "remove this" work without a second action: it posts the form with nothing in it.
+  if (action === 'personal') {
+    const block = buildPersonal({
+      wake: body?.wake,
+      nature: Array.isArray(body?.nature) ? body.nature.slice(0, 12) : [],
+      heightCm: body?.heightCm,
+      weightKg: body?.weightKg,
+      note: body?.note,
+    });
     // Stored on the profile document with excludedFromMatching baked in. Nothing in ranking or
-    // retrieval imports the module that produced it — see src/lib/career-intel/reflection.ts.
-    return state({ ...profile, reflection: block });
+    // retrieval imports the module that produced it — see src/lib/career-intel/personal.ts.
+    return state({ ...profile, personal: block });
   }
 
-  if (action === 'forget-reflection') {
-    return state({ ...profile, reflection: null });
+  if (action === 'forget-personal') {
+    return state({ ...profile, personal: null });
   }
 
   // -------------------------------------------------------------------------------- starting over

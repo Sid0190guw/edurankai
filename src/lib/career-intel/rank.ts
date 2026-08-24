@@ -11,10 +11,11 @@
 //    the person in one click ("show everything"); a hidden posting is not.
 //
 // 2. IT CANNOT READ THE EXPLORATION LAYERS. Energy rhythm, self-reported behavioural tendencies and
-//    the optional reflection layer are collected for the person's own picture. The only door into
+//    the optional personal layer are collected for the person's own picture. The only door into
 //    the dimensions is relevanceDimensions(), which returns the workstyle and cognitive groups and
-//    nothing else. reflection.ts is not imported by this file at all, and separation.test.ts reads
-//    this file's own source to prove it stays that way.
+//    nothing else. personal.ts — which is where a height and a weight are held — is not imported by
+//    this file at all, and separation.test.ts reads this file's own source to prove it stays that
+//    way, under that module name and under the old one it replaced.
 //
 // 3. IT CANNOT PRINT A NUMBER AND CALL IT A MATCH. There is a score in here — ordering a thousand
 //    postings requires one — but it is never returned to a surface as "94%". What comes out is a

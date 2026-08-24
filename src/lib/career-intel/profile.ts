@@ -274,7 +274,7 @@ export function rebuild(
     rawResponses: responses,
     asked: profile.asked || [],
     skipped: profile.skipped || [],
-    reflection: profile.reflection || null,
+    personal: profile.personal || null,
   };
 
   for (const r of responses) {
@@ -398,12 +398,29 @@ export function parseProfile(input: unknown): CareerProfile {
   const stage: CareerStage = (['student', 'early', 'experienced', 'senior'] as const)
     .includes(stageIn as any) ? (stageIn as CareerStage) : 'unknown';
 
-  const reflection = o.reflection && typeof o.reflection === 'object'
+  // THE OPTIONAL PERSONAL BLOCK, RE-VALIDATED RATHER THAN TRUSTED. It arrives from a public
+  // endpoint carrying whatever a browser sent, so every field is bounded here as well as in
+  // personal.ts.
+  //
+  // `o.reflection` — the birth date and star sign an older build stored — is deliberately NOT read.
+  // An old profile loses that block the first time it is parsed, which is the migration.
+  const num = (v: any, min: number, max: number): number | null => {
+    const n = typeof v === 'number' ? v : Number(String(v ?? '').trim());
+    if (!Number.isFinite(n)) return null;
+    const r = Math.round(n * 10) / 10;
+    return r < min || r > max ? null : r;
+  };
+  const personal = o.personal && typeof o.personal === 'object'
     ? {
-      birthDate: typeof o.reflection.birthDate === 'string' ? o.reflection.birthDate.slice(0, 10) : null,
-      sign: typeof o.reflection.sign === 'string' ? o.reflection.sign.slice(0, 20) : null,
+      wake: typeof o.personal.wake === 'string' ? o.personal.wake.slice(0, 20) : null,
+      nature: Array.isArray(o.personal.nature)
+        ? o.personal.nature.slice(0, 12).map((x: any) => str(x, 20)).filter(Boolean)
+        : [],
+      heightCm: num(o.personal.heightCm, 50, 260),
+      weightKg: num(o.personal.weightKg, 20, 400),
+      note: str(o.personal.note, 600),
       excludedFromMatching: true as const,
-      at: iso(o.reflection.at),
+      at: iso(o.personal.at),
     }
     : null;
 
@@ -421,6 +438,6 @@ export function parseProfile(input: unknown): CareerProfile {
     stageConfidence: num01(o.stageConfidence),
     asked: Array.isArray(o.asked) ? o.asked.slice(0, 40).map((x: any) => str(x, 60)).filter(Boolean) : [],
     skipped: Array.isArray(o.skipped) ? o.skipped.slice(0, 40).map((x: any) => str(x, 60)).filter(Boolean) : [],
-    reflection,
+    personal,
   };
 }
