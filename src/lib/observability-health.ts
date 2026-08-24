@@ -409,16 +409,31 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
 
   // THE CAPABILITY SPINE THE SAME REPORT READS. Named per FAILURE rather than per module, following
   // the two-factor precedent above, because each of these is a separately worded panel on that
-  // screen: an unresolved person, unreadable job requirements, and no evidence to compare. All four
-  // are created only by ensureSpineSchema() / ensurePerformanceSchema(); no db/*.sql creates any of
-  // them. They predate the DDL guard, so they are probably present — "probably" is precisely what
-  // this list exists to replace with an answer, and ensureSpineSchema() creates its tables in one
-  // sequence where a single failure skips every CREATE after it.
+  // screen: an unresolved person, unreadable job requirements, and no evidence to compare.
+  //
+  // NONE OF THEM EXISTED IN PRODUCTION until db/capability-spine-schema.sql was run by hand on
+  // 2026-08-24, and that was measured rather than assumed. A full table enumeration of the live
+  // database that morning contained none of them, and neither did one of the database the site was
+  // migrated FROM the same day — so it was not something the migration dropped, they had never been
+  // created anywhere. All nine are confirmed present as of that run; these entries are what keeps
+  // the answer current instead of remembered.
+  //
+  // A first pass here guessed the opposite: these modules shipped on 2026-08-04 and 2026-08-09,
+  // before production stopped running request-path DDL, so "they predate the guard, they are
+  // probably present" looked sound. It was wrong, and the reason is worth keeping. Both ensures run
+  // their statements as ONE SEQUENCE that stops at the first failure, inside an ensureOnce() that
+  // swallows — and the live database shows exactly that shape: hr_goal_key_results, the second
+  // statement of the performance batch, exists; hr_feedback and everything after it, hr_skills
+  // included, does not. Shipping before the guard buys you the statements up to the first failure
+  // and nothing after it. db/capability-spine-schema.sql is the file that creates these.
   { module: 'Person spine', table: 'hr_persons', owner: 'src/lib/person-spine.ts' },
   { module: 'Person identity links', table: 'hr_person_identities', owner: 'src/lib/person-spine.ts' },
   { module: 'Role requirements', table: 'hr_role_requirements', owner: 'src/lib/person-spine.ts' },
   { module: 'Skill catalogue', table: 'hr_skills', owner: 'src/lib/performance-schema.ts' },
   { module: 'Evidenced skills', table: 'hr_employee_skills', owner: 'src/lib/performance-schema.ts' },
+  // The stored capability reading and what a human did about it. Third unreadable panel on the same
+  // screen, third table absent from the live database, same single creator behind an ensure.
+  { module: 'Capability readings', table: 'match_evaluations', owner: 'src/lib/match.ts' },
 ];
 
 // ============================================================================================

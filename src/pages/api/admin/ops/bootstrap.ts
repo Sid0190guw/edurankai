@@ -66,6 +66,7 @@ const MODULES: Array<{ name: string; run: () => Promise<unknown> }> = [
   // table. Run the other way round, the spine's later statements fail and the failure is silent.
   { name: 'capability-catalogue', run: async () => (await import('@/lib/performance-schema')).ensurePerformanceSchema() },
   { name: 'person-spine', run: async () => (await import('@/lib/person-spine')).ensureSpineSchema() },
+  { name: 'capability-readings', run: async () => (await import('@/lib/match')).ensureMatchSchema() },
   { name: 'hiring-decision', run: async () => (await import('@/lib/hiring-decision')).ensureHiringDecisionSchema() },
   // These two have no exported ensure; a harmless READ triggers the same internal bootstrap.
   { name: 'error-log', run: async () => (await import('@/lib/logger')).recentErrors(1) },
