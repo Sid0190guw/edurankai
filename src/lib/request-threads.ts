@@ -3,10 +3,26 @@
 // indexed by (request_type, request_id).
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+// ONCE PER PROCESS, AND NOT AT ALL IN PRODUCTION.
+//
+// This was the one bootstrap in the codebase with real reach and NO memo of any kind. Nine DDL
+// round trips ran at the top of every exported function here -- postMessage(), the thread reader
+// and the unread counter -- and this module is imported by ten pages and API routes, including
+// src/pages/portal/index.astro, which is the landing page every applicant sees. A page that reads a
+// thread and then posts to it paid eighteen round trips of no-op ALTER TABLE before doing any work.
+//
+// ensureOnce and NOT ensureBatch, deliberately. src/lib/ensure-once.ts sets out the rule: a batch is
+// one transaction and rolls back whole, which is the wrong shape wherever a statement is ALLOWED to
+// fail on its own. Every ALTER below is wrapped in its own try/catch precisely because
+// visvambhara_access_requests is created nowhere in this repository and a missing TABLE is the
+// expected outcome on a deployment that never shipped that feature. Batching them would let one
+// missing table roll back the columns for the other.
+import { ensureOnce } from '@/lib/ensure-once';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
 async function ensureSchema() {
+  return ensureOnce('request_threads_v1', async () => {
   try {
     await db.execute(sql`CREATE TABLE IF NOT EXISTS request_messages (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -48,6 +64,7 @@ async function ensureSchema() {
       console.error('[request-threads] thread bookkeeping column could not be added:', e?.cause?.message || e?.message);
     }
   }
+  });
 }
 
 // EXTENDED, NOT FORKED. `request_messages` is already keyed by (request_type, request_id) and is

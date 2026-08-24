@@ -49,12 +49,16 @@ const cache = new Map<string, Promise<void>>();
 //
 // Read per call, not once at module scope, so the value is whatever the environment says NOW rather
 // than whatever it said when this instance happened to boot.
+//
+// THE PREDICATE ITSELF MOVED TO src/lib/schema-bootstrap.ts, unchanged, and this is now one of two
+// callers. The other is the DDL guard on db.execute(), which exists because this kill switch only
+// ever covered the bootstraps that went THROUGH ensureOnce -- about forty modules run their ALTER
+// TABLEs from a page's frontmatter without it, and were never switched off at all. Two enforcement
+// points asking the same question is fine; two definitions of the answer would have drifted.
+import { schemaBootstrapEnabled } from '@/lib/schema-bootstrap';
+
 function bootstrapDisabled(): boolean {
-  const v = String(process.env.SCHEMA_BOOTSTRAP || '').toLowerCase();
-  if (v === 'on') return false;
-  if (v === 'off') return true;
-  // Local dev and the test suite create their schema as they go and depend on it.
-  return process.env.NODE_ENV === 'production';
+  return !schemaBootstrapEnabled();
 }
 
 export function ensureOnce(key: string, fn: () => Promise<void>): Promise<void> {

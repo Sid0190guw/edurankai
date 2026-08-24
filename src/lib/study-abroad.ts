@@ -123,7 +123,34 @@ async function reconcileStudyAbroadRequestColumns(): Promise<void> {
   // Last, and only once the column is certain to exist: a public enquiry has no account behind it,
   // so applicant_user_id cannot stay NOT NULL. Ordered after the ADD above because ALTER COLUMN on
   // a column that does not exist is an error, and it would abort the rest of this reconciliation.
-  await db.execute(sql`ALTER TABLE study_abroad_requests ALTER COLUMN applicant_user_id DROP NOT NULL`);
+  //
+  // ASKED FIRST, BECAUSE THE UNCONDITIONAL FORM FIRES A POSTGREST SCHEMA-CACHE RELOAD EVERY TIME.
+  //
+  // `ALTER COLUMN ... DROP NOT NULL` has no IF NOT EXISTS form. Postgres executes it whether or not
+  // the column is already nullable, so it is a real DDL command on every run -- and Supabase installs
+  // an event trigger (extensions.pgrst_ddl_watch on ddl_command_end) that answers any ALTER TABLE
+  // with a schema-reload notification to PostgREST. On this database, with 500+ relations, each
+  // reload is an introspection query expensive enough to hit PostgREST's own statement timeout
+  // (57014), and a failed load retries with 1-2-4-8-16s backoff. That is the reload storm in the
+  // 2026-08-24 logs, and this was one of the statements feeding it: this module is outside
+  // ensureOnce, so the production kill switch never covered it, and it is reached from five pages
+  // including the public /aquintutor/careerflow/study-abroad.
+  //
+  // Asking information_schema first costs one cheap catalog read and fires nothing. The ALTER runs
+  // exactly once in the life of the database -- when the column is genuinely still NOT NULL -- which
+  // is the only time it was ever doing anything.
+  await db.execute(sql`
+    DO $sa$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'study_abroad_requests'
+           AND column_name = 'applicant_user_id' AND is_nullable = 'NO'
+      ) THEN
+        ALTER TABLE study_abroad_requests ALTER COLUMN applicant_user_id DROP NOT NULL;
+      END IF;
+    END
+    $sa$`);
 }
 
 /**

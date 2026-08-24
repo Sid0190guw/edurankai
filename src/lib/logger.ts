@@ -41,9 +41,37 @@ const ERR_DDL_EXTRA = [
   `CREATE INDEX IF NOT EXISTS edu_error_log_created_idx ON edu_error_log (created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS edu_error_log_fp_idx ON edu_error_log (fingerprint)`,
 ];
-let _ready = false;
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
-async function ctx() { const { db } = await import('@/lib/db'); const { sql } = await import('drizzle-orm'); if (!_ready) { await db.execute(sql.raw(ERR_DDL)); for (const d of ERR_DDL_EXTRA) await db.execute(sql.raw(d)); _ready = true; } return { db, sql }; }
+
+// FIVE ROUND TRIPS, NO LOCK TIMEOUT, AND OUTSIDE THE KILL SWITCH -- ON THE ERROR PATH.
+//
+// This was `let _ready = false` with the five statements issued one at a time on the first log write
+// of every serverless instance. Three things were wrong with that, and all three matter most exactly
+// when something is already going wrong:
+//
+//   * It did not go through ensureOnce, so the production SCHEMA_BOOTSTRAP kill switch -- added after
+//     request-time DDL took the site down on 2026-08-23 -- never covered the error logger at all.
+//   * It did not go through guardedDdl, so the two ALTER TABLEs had no lock_timeout. ALTER TABLE takes
+//     ACCESS EXCLUSIVE before it evaluates IF NOT EXISTS, and a pending exclusive lock is granted
+//     ahead of every read requested after it. An error logger that can queue readers behind itself is
+//     a fault amplifier: the first failure makes the next one more likely.
+//   * Five separate statements is five round trips (~135ms each from bom1) before a single error row
+//     could be written, paid by whichever unlucky request was the first to fail on that instance.
+//
+// ensureBatch gives all three: the kill switch, an explicit transaction with lock_timeout 3s, and one
+// round trip instead of five. It is the right shape here -- unlike src/lib/request-threads.ts -- because
+// every statement targets the SAME table this module owns, so there is no case where one is
+// deliberately allowed to fail while the others should stand.
+//
+// The table's definition now also lives in db/incident-2026-08-24-observability.sql, because a table
+// that only a suppressed bootstrap could create is a table an operator has no way to create.
+async function ctx() {
+  const { db } = await import('@/lib/db');
+  const { sql } = await import('drizzle-orm');
+  const { ensureBatch } = await import('@/lib/ensure-once');
+  await ensureBatch('edu_error_log_v2', [ERR_DDL, ...ERR_DDL_EXTRA].join(';\n'));
+  return { db, sql };
+}
 
 /** Record an error durably (redacted) + emit a structured log + fire the external hook if present. */
 export async function trackError(event: string, e: any, context: Record<string, any> = {}): Promise<void> {

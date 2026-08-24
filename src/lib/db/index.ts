@@ -3,6 +3,7 @@
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import * as schema from './schema';
+import { ddlPermitted, isDdlStatement, noteSuppressedDdl } from '@/lib/schema-bootstrap';
 
 // Try .env on local dev
 try {
@@ -117,9 +118,37 @@ function connect(): any {
 // A Proxy so every existing call site keeps working untouched: db.select(...), db.execute(...) and
 // the rest all reach the real handle, which is built the first time any property is read.
 type RealDb = ReturnType<typeof drizzle<typeof schema>>;
+
+// REQUEST-TIME DDL IS REFUSED HERE, AT THE ONE CHOKEPOINT EVERY BOOTSTRAP SHARES.
+//
+// src/lib/ensure-once.ts turned schema bootstrapping off in production after 2026-08-23, and that
+// covered the ~192 modules that go through ensureOnce(). About forty others never did: they await an
+// exported ensureXSchema() straight from a page's frontmatter, with no memo, so their ALTER TABLEs
+// ran on EVERY request. src/lib/schema-bootstrap.ts sets out the full reckoning, including why that
+// is what fires Supabase's pgrst_ddl_watch event trigger and produces the schema-cache reload storm.
+//
+// Whatever the statement was, the caller gets the same empty result postgres-js gives for DDL, so
+// nothing downstream has to change. Everything is logged and counted; /api/health reports it.
+//
+// FAILS OPEN BY DESIGN. If the statement text cannot be recovered, or the guard itself throws, the
+// statement is EXECUTED. A guard that silently drops a write it merely failed to classify would be a
+// far worse outage than the one it is here to prevent.
+function guardedExecute(real: any, query: any): Promise<any> {
+  try {
+    if (ddlPermitted()) return real.execute(query);
+    const text = typeof query === 'string' ? query : String(real.dialect.sqlToQuery(query).sql || '');
+    if (!isDdlStatement(text)) return real.execute(query);
+    noteSuppressedDdl(text);
+    return Promise.resolve([]);
+  } catch {
+    return real.execute(query);
+  }
+}
+
 export const db = new Proxy({} as any, {
   get(_target, prop) {
     const real = connect();
+    if (prop === 'execute') return (query: any) => guardedExecute(real, query);
     const value = real[prop];
     return typeof value === 'function' ? value.bind(real) : value;
   },
@@ -154,32 +183,21 @@ export async function getDb(_runtimeEnv?: any) {
 // connect_timeout does not cover this case. The transaction pooler accepts the TCP connection and
 // completes authentication perfectly well; it is the QUERY that never comes back, because the
 // pooler has no upstream session to hand it to. From the client's side the connection looks
-// healthy, so postgres-js waits — and it has no query timeout of its own to wait against. With
-// max:1, the invocation behind it waits too.
+// healthy, so postgres-js waits — and it has no query timeout of its own to wait against.
 //
-// This bounds the wait. It does NOT make queries succeed and it is not a fix for the database being
-// down; it converts an infinite hang into a rejected promise, which the caller can already handle —
-// most of them are wrapped in a try/catch with a fallback that has never had the chance to run.
+// THE PRIMITIVE NOW LIVES IN src/lib/db-timeout.ts, which imports nothing.
 //
-// Deliberately shorter than any gateway timeout, so the page decides what a visitor sees rather
-// than the platform.
-export const DB_TIMEOUT_MS = Number(process.env.DB_TIMEOUT_MS || 8000);
-
-export class DbTimeoutError extends Error {
-  constructor(label: string, ms: number) {
-    super('database did not answer within ' + ms + 'ms (' + label + ')');
-    this.name = 'DbTimeoutError';
-  }
-}
-
-export function withDbTimeout<T>(work: Promise<T>, label: string, ms: number = DB_TIMEOUT_MS): Promise<T> {
-  let timer: ReturnType<typeof setTimeout>;
-  return Promise.race([
-    work,
-    new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new DbTimeoutError(label, ms)), ms);
-    }),
-    // The losing promise keeps running; only the waiting stops. Clearing the timer matters because
-    // a pending timeout keeps the serverless instance's event loop alive after the response is sent.
-  ]).finally(() => clearTimeout(timer!)) as Promise<T>;
-}
+// It was defined here, next to `postgres`, `drizzle` and `dotenv`, and that is precisely why it was
+// used in ONE file on the whole deployment: a module that documents itself as touching no database
+// (src/lib/page-safety.ts, where every guarded read on this site actually goes) cannot import the
+// driver just to get a Promise.race. Moving it makes the bound available to the code that needs it;
+// re-exporting it here keeps every existing import working unchanged.
+export {
+  DB_TIMEOUT_MS,
+  DbTimeoutError,
+  DbCircuitOpenError,
+  isDbUnavailable,
+  dbCircuitOpen,
+  dbCircuitState,
+  withDbTimeout,
+} from '@/lib/db-timeout';
