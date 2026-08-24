@@ -498,31 +498,78 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
     // been applied. Retry WITHOUT any of them rather than reporting "no opportunities match", which
     // is indistinguishable from a genuinely empty result and is the worse of the two lies.
     try {
+      // ===========================================================================================
+      // THE NARROWED RETRY MUST TOUCH NOTHING BUT THE BASE SCHEMA. IT DID NOT, AND IT COST THE
+      // WHOLE CATALOGUE IN PRODUCTION.
+      // ===========================================================================================
+      //
+      // Measured on the live site, 2026-08-24: /api/careers/search answered
+      // {readable:false, degraded:true, total:0} for every query, and /careers/opportunities
+      // reported "The division register could not be read". One cause behind both — db/xscale-schema.sql
+      // has never been applied there, so the divisions table does not exist and neither do the
+      // sixteen additive columns. The main query above therefore fails, exactly as designed, and
+      // hands over to this retry.
+      //
+      // And this retry carried a predicate on r.career_level, which is one of those sixteen
+      // columns. So the fallback failed on precisely the databases it exists to serve, the catch
+      // below returned readable:false, and every surface built on listOpportunities showed nothing
+      // at all: no featured postings on /careers, nothing from the search endpoint, nothing from
+      // the personalised one. The catalogue had 1,017 open postings the whole time.
+      //
+      // A predicate for a column that may not exist does not belong in the statement whose entire
+      // job is to survive that column not existing. The careerLevel filter is DROPPED here rather
+      // than applied, which is what degraded:true below already tells every caller to say.
+      //
+      // COUNTED IN SQL, NOT MEASURED OFF THE ARRAY. total was list.length — at most one page — so a
+      // degraded database reported "24 openings match" while 1,017 did. That is the same defect
+      // this rebuild was written to remove, sitting in the path taken when things go wrong.
+      //
+      // A FACTORY, AND THE TWO STATEMENTS RUN IN SEQUENCE. One shared sql fragment across two
+      // statements under prepare:false is the parameter mis-bind documented above whereClause().
+      const narrowWhere = () => sql`
+         WHERE r.is_open = TRUE
+           AND (r.application_deadline IS NULL OR r.application_deadline > NOW())
+           AND (${f.departmentId || null}::text IS NULL OR r.department_id = ${f.departmentId || null})
+           AND (${f.level || null}::text IS NULL OR r.level::text = ${f.level || null})
+           AND (${term === ''} OR r.title ILIKE ${like} OR r.function ILIKE ${like})
+           -- The any-of terms survive the narrowing, on the two columns certain to exist on any
+           -- database. The discipline overlap does NOT, which is precisely why degraded stays true
+           -- below: this result was produced without it and must not be presented as though it had it.
+           AND ${narrowTerms()}`;
+
+
       const fallback = await db.execute(sql`
         SELECT r.id, r.slug, r.title, r.level, r.function, r.engagement_type, r.location,
                r.department_id, r.is_featured, r.is_open, r.application_deadline, r.created_at,
                r.skills, d.name AS department_name
           FROM roles r
           LEFT JOIN departments d ON d.id = r.department_id
-         WHERE r.is_open = TRUE
-           AND (${f.departmentId || null}::text IS NULL OR r.department_id = ${f.departmentId || null})
-           AND (${f.level || null}::text IS NULL OR r.level::text = ${f.level || null})
-      AND (${f.careerLevel ?? null}::int IS NULL OR r.career_level = ${f.careerLevel ?? null}::int)
-           AND (${term === ''} OR r.title ILIKE ${like} OR r.function ILIKE ${like})
-           -- 'terms' survives the narrowing, on the two columns certain to exist on any database.
-           -- The discipline overlap does NOT, which is precisely why 'degraded' stays true below:
-           -- this result was produced without it and must not be presented as though it had it.
-           AND ${narrowTerms()}
+        ${narrowWhere()}
          ORDER BY r.is_featured DESC, r.sort_order ASC, r.title ASC
          LIMIT ${limit} OFFSET ${offset}`);
       const list = rowsOf(fallback).map(mapOpportunity);
+
+      let narrowTotal = list.length;
+      try {
+        const nc = await db.execute(sql`
+          SELECT COUNT(*)::int AS n
+            FROM roles r
+            LEFT JOIN departments d ON d.id = r.department_id
+          ${narrowWhere()}`);
+        narrowTotal = Number(rowsOf(nc)[0]?.n ?? list.length);
+      } catch (e3: any) {
+        // The rows came back, so the page is usable; only the number is unknown. Reporting the page
+        // size as the total would be a confident wrong answer, so the honest floor is returned and
+        // the failure is logged rather than swallowed in silence.
+        console.error('[xscale/roles-ext] narrowed count failed:', reasonOf(e3));
+      }
       console.error('[xscale/roles-ext] retried without the extended columns and succeeded');
       // `degraded: true` IS NOT COSMETIC. This result was produced WITHOUT the division,
       // classification, scale-band and discipline predicates, so it is not the answer that was
       // asked for — it is every open posting. Any surface rendering this must say so, which is what
       // the degraded banner on /careers/opportunities exists for. Returning it as though it were
       // filtered is how a search comes to lie about what matched.
-      return { rows: list, total: list.length, readable: true, degraded: true };
+      return { rows: list, total: narrowTotal, readable: true, degraded: true };
     } catch (e2: any) {
       console.error('[xscale/roles-ext] narrowed listing also failed:', reasonOf(e2));
       return { rows: [], total: 0, readable: false, degraded: true };
