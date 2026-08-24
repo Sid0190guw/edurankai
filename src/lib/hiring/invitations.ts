@@ -448,6 +448,12 @@ export interface Resolution {
   invitation: Invitation | null;
   /** True when the caller has spent their allowance. The surface says so instead of INVALID_CODE. */
   rateLimited: boolean;
+  /**
+   * Whether the input was code-shaped, so the refusal can be worded as the person experienced it.
+   * Telling somebody who carefully typed ERA-INV-... that their LINK has expired reads as a bug on
+   * our side, and sends them looking for a link they may not have.
+   */
+  wasCode: boolean;
 }
 
 /**
@@ -467,24 +473,24 @@ export interface Resolution {
  */
 export async function resolveInvitation(input: string, ip: string): Promise<Resolution> {
   const raw = String(input || '').trim();
-  if (!raw) return { invitation: null, rateLimited: false };
+  if (!raw) return { invitation: null, rateLimited: false, wasCode: false };
 
   const byToken = await findByToken(raw);
-  if (byToken) return { invitation: byToken, rateLimited: false };
+  if (byToken) return { invitation: byToken, rateLimited: false, wasCode: false };
 
   const body = normaliseCode(raw);
-  if (!body) return { invitation: null, rateLimited: false };
+  if (!body) return { invitation: null, rateLimited: false, wasCode: false };
 
   const bucket = 'invitecode:ip:' + createHash('sha256').update(String(ip || 'unknown')).digest('hex').slice(0, 32);
   try {
     const used = await countAttempt(bucket, CODE_ATTEMPT_WINDOW_SECONDS);
-    if (used > CODE_ATTEMPTS_PER_IP) return { invitation: null, rateLimited: true };
+    if (used > CODE_ATTEMPTS_PER_IP) return { invitation: null, rateLimited: true, wasCode: true };
   } catch (e: any) {
     fail('resolveInvitation limiter', e);
-    return { invitation: null, rateLimited: true };
+    return { invitation: null, rateLimited: true, wasCode: true };
   }
 
-  return { invitation: await findByCode(body), rateLimited: false };
+  return { invitation: await findByCode(body), rateLimited: false, wasCode: true };
 }
 
 export async function markOpened(id: string): Promise<void> {

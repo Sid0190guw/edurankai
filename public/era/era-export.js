@@ -11,6 +11,19 @@
   function escapeCSV(val) {
     if (val == null) return '';
     var s = String(val);
+    // FORMULA GUARD, mirroring src/lib/csv.ts. A spreadsheet reads a cell beginning with = + - or @
+    // as a FORMULA, and quoting does NOT help: CSV quotes are stripped when the file is parsed, so
+    // "=cmd|' /C calc'!A0" still reaches the cell as an expression. The leading apostrophe is what
+    // makes a spreadsheet treat the rest as text. It is visible in the cell, which is the honest
+    // trade — the alternative is silently deleting characters out of somebody's data.
+    //
+    // A value that is a plain NUMBER is written through untouched. That is not a compromise: a
+    // formula needs an operator, a function name or a bang, and every one of those makes Number()
+    // return NaN. It matters because these exports carry money and scores, and prefixing -1500 with
+    // an apostrophe turns a column of numbers into text and breaks the total under it.
+    if (/^[=+\-@\t\r]/.test(s) && !(s.trim() !== '' && isFinite(Number(s)))) {
+      s = "'" + s;
+    }
     // Quote if contains comma, quote, or newline
     if (/[",\n\r]/.test(s)) {
       s = '"' + s.replace(/"/g, '""') + '"';
