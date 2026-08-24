@@ -142,10 +142,56 @@ function connect(): any {
   //
   // The breaker change in src/lib/db-timeout.ts is the other half and matters more: no pool size is
   // safe while one slow read can refuse every subsequent read in the instance.
+  // =================================================================================================
+  // FOURTH MEASUREMENT, 2026-08-24. IT WAS NEVER `max`. IT IS THE HANDSHAKE.
+  // =================================================================================================
+  //
+  // Everything above tunes how many connections an instance may hold. Measured against the live site
+  // with the burst this file keeps prescribing, the answers separate on a different axis entirely —
+  // whether the instance had to OPEN one:
+  //
+  //   /api/health, two statements, bounded at 5s:
+  //     latencyMs 132-154   connection reused        every single one answered
+  //     latencyMs 950-991   connection opened        answered, ~810ms of it the handshake alone
+  //     no answer at 5000ms                          about a QUARTER of the ones that had to open
+  //
+  //   Concurrency ladder, same endpoint:  N=2 -> 1 failed.  N=6 -> 0.  N=8 -> 0.  N=10 -> 0.
+  //   N=14 -> 3.  A single sequential request answered in 132ms throughout.
+  //
+  // TWO PARALLEL REQUESTS FAILING WHILE TEN SUCCEED IS NOT POOL EXHAUSTION. Queueing and pooler
+  // saturation are load-proportional by definition; this is not proportional to anything. It is a
+  // roughly fixed failure rate per CONNECTION ATTEMPT. That is why three rounds of tuning this
+  // number — 1, then 5/60, then 2/15, then 5/15 — each looked reasonable, shipped, and changed
+  // nothing: every one of them was tuning the wrong variable, and each was diagnosed from the same
+  // 5s-timeout symptom that all four settings produce.
+  //
+  // WHICH MAKES idle_timeout:15 THE ACTIVE MISTAKE, not a neutral one. It was lowered from 300 on
+  // the reasoning quoted above — "The functions now run in bom1, next to the database (19e34eb), so
+  // that handshake is local and cheap". The handshake is 810ms. It is not cheap, and a warm instance
+  // was throwing away a connection that works every time, fifteen seconds after its last request, to
+  // re-roll a one-in-four chance of a multi-second stall on the next one. An admin opening a page a
+  // minute apart paid that gamble on every single navigation, which is exactly the report this is
+  // being fixed for.
+  //
+  // So: 300, back where it was, for the reason that was true then and is still true now. `max` stays
+  // at 5 — the hoarding argument against it was the misdiagnosis above, and five is what keeps a
+  // page's own reads from queueing behind each other.
+  //
+  // WHAT WOULD ACTUALLY REMOVE THE REMAINING FAILURES, in order, none of them this number:
+  //   1. The handshake itself. 810ms to a pooler in the same AWS region as the functions is not a
+  //      network distance, it is the pooler's per-connection cost. Fewer connections is the only
+  //      lever this file has over it; the rest is a Supabase-side setting.
+  //   2. src/lib/db-timeout.ts withDbRetry(), which asks a second time instead of waiting longer.
+  //      That is what turns the remaining quarter into a slower page instead of a dead one.
+  //
+  // RE-MEASURE BEFORE CHANGING THIS AGAIN, and measure the right thing. Not "how many 503s" — that
+  // number is the same for every setting here. Read `database.latencyMs` out of /api/health across a
+  // burst and count how many are in the ~950ms population: that is how many connections were opened,
+  // and it is the only quantity in this file that anything above actually moves.
   _client = postgres(connectionString, {
     prepare: false,
     max: 5,
-    idle_timeout: 15,
+    idle_timeout: 300,
     max_lifetime: 60 * 30,
     connect_timeout: 10,
     connection: {

@@ -31,11 +31,17 @@
 // refused IMMEDIATELY rather than waited out. The dozen reads then cost one timeout plus eleven
 // instant refusals, and the page renders its "we could not read this" states instead of dying.
 //
-// DELIBERATELY NOT A RETRY MECHANISM. Nothing here re-runs anything, so there is no backoff to get
-// wrong and no loop to run away: it only ever converts a wait into a fast, loggable refusal. The
-// cooldown is short because a serverless instance may live for minutes and the pooler usually
-// recovers in seconds — and the FIRST call after the cooldown is allowed through to find out, which
-// is what closes the circuit again.
+// THE BREAKER RE-RUNS NOTHING. withDbTimeout() only ever converts a wait into a fast, loggable
+// refusal, so there is no backoff in it to get wrong and no loop to run away. The cooldown is short
+// because a serverless instance may live for minutes and the pooler usually recovers in seconds —
+// and the FIRST call after the cooldown is allowed through to find out, which is what closes the
+// circuit again.
+//
+// withDbRetry() at the bottom of this file is the one thing here that does re-run work, and it is a
+// SINGLE second attempt on a timeout only. Its own header sets out the measurement that justifies
+// it — briefly: what fails on this deployment is opening a connection, not answering a query, so a
+// second ask succeeds where a longer wait does not. It never retries an open circuit and never
+// retries an ordinary query error, which is what keeps the two mechanisms from fighting.
 //
 // ONLY TIMEOUTS OPEN IT. An ordinary query error — a missing table, a bad column — is information
 // about the statement, not about the database's ability to answer, and tripping on those would take
@@ -193,4 +199,85 @@ export function withDbTimeout<T>(work: Promise<T>, label: string, ms: number = D
       }, ms);
     }),
   ]).finally(() => clearTimeout(timer!)) as Promise<T>;
+}
+
+// -------------------------------------------------------------------------------------------------
+// ONE RETRY, BECAUSE THE MEASURED FAILURE IS OPENING A CONNECTION AND NOT ANSWERING A QUERY
+// -------------------------------------------------------------------------------------------------
+//
+// MEASURED ON THE LIVE SITE, 2026-08-24. /api/health runs exactly two statements and bounds them at
+// 5s. Requests to it fall into two clean populations and nothing in between:
+//
+//   latencyMs = 132-154   ->  the instance already had a connection. 100% of these answered.
+//   latencyMs = 950-991   ->  the instance had to OPEN one. ~810ms of that is the handshake alone.
+//   no answer at 5000ms   ->  roughly a QUARTER of the attempts that had to open one.
+//
+// The failure rate does not rise with concurrency — two parallel requests produced one failure while
+// ten produced none, and fourteen produced three. That rules out pool exhaustion and pooler
+// queueing, which are load-proportional by definition, and it is why three rounds of tuning `max`
+// in src/lib/db/index.ts never fixed this: every one of them was tuning the wrong variable. What
+// actually fails is each individual attempt to establish a connection, at a roughly fixed rate,
+// whatever else is happening.
+//
+// So the honest bound for a gate is not "wait longer". Waiting longer on a connection that is not
+// coming just moves the gateway timeout. It is: ask again, quickly.
+//
+// THE RETRY IS NEARLY FREE, AND THAT IS THE POINT. withDbTimeout sheds the WAIT and not the WORK —
+// it says so itself above: "The losing promise keeps running". The connection the abandoned attempt
+// was opening therefore still lands in the pool, so the second attempt usually finds it already
+// there and answers in the 132ms population rather than paying another handshake.
+//
+// ONLY A TIMEOUT IS RETRIED.
+//   - DbCircuitOpenError is NOT: the circuit is open precisely because the database has already
+//     failed repeatedly, and retrying into that is how a retry becomes an outage amplifier.
+//   - An ordinary query error is NOT: a missing table or a bad column will fail identically the
+//     second time, and this must never re-run a statement that failed for a reason of its own.
+//
+// TWO SHORTER BOUNDS, NOT TWO EIGHT-SECOND ONES. Nothing healthy on this deployment takes longer
+// than about a second — 154ms warm, 991ms cold — so three seconds is already generous for the first
+// attempt, and the pair costs less wall-clock than the single DB_TIMEOUT_MS wait it replaces at the
+// gates. That keeps the whole gate inside a serverless invocation's budget with room for the page
+// behind it.
+
+/** First attempt's bound. Generous against a measured worst healthy case of ~1s. */
+export const DB_TRY_MS = Number(process.env.DB_TRY_MS || 3000);
+/** Second attempt's bound. Longer, because by now a connection is usually in flight for it to reuse. */
+export const DB_RETRY_MS = Number(process.env.DB_RETRY_MS || 4000);
+
+/**
+ * Bound a database read, and if it TIMES OUT, run it once more.
+ *
+ * Takes a FACTORY, not a promise: a promise cannot be re-awaited into a second attempt, and a
+ * signature that took one would silently retry nothing. Every call site therefore passes `() => …`.
+ *
+ * The work must be idempotent. Every current caller is a read or an idempotent upsert
+ * (validateSessionToken's sliding renewal writes the same expiry twice; canOpenAdmin and
+ * getViewableSectionKeys are pure reads), and that is a condition of using this rather than an
+ * incidental fact — do not reach for it around an INSERT.
+ */
+export async function withDbRetry<T>(
+  work: () => Promise<T>,
+  label: string,
+  firstMs: number = DB_TRY_MS,
+  secondMs: number = DB_RETRY_MS,
+): Promise<T> {
+  // REFUSED BEFORE THE WORK IS STARTED, which withDbTimeout cannot do for itself: by the time it is
+  // handed a promise its caller has already sent the statement, so all it can refuse is the WAIT. A
+  // factory can do the thing the breaker is actually for — while the circuit is open the right
+  // number of statements to send is zero.
+  if (dbCircuitOpen()) return Promise.reject(new DbCircuitOpenError(label));
+  try {
+    return await withDbTimeout(work(), label, firstMs);
+  } catch (e: any) {
+    const timedOut = e instanceof DbTimeoutError || e?.name === 'DbTimeoutError';
+    if (!timedOut) throw e;
+    console.warn(JSON.stringify({
+      ts: new Date().toISOString(), level: 'warn', event: 'db.retry',
+      label, afterMs: firstMs, retryMs: secondMs,
+    }));
+    // May itself throw DbCircuitOpenError if the first attempt's timeout was the one that opened the
+    // circuit. That is the correct answer and it is passed straight through: three timeouts in a row
+    // is a database that has gone away, and this is not the place to argue with the breaker.
+    return await withDbTimeout(work(), label + '.retry', secondMs);
+  }
 }

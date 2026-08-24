@@ -15,7 +15,12 @@ import { sql } from 'drizzle-orm';
 // who you are, so nothing is served and nothing is assumed. Deliberately not a redirect: sending an
 // unverifiable session to /admin/login would sign people out over a five-second blip, and the login
 // page needs the same database to do anything useful anyway.
-import { withDbTimeout, isDbUnavailable } from '@/lib/db-timeout';
+// withDbRetry, not withDbTimeout, at the five gates below. What fails on this deployment is
+// OPENING a connection and not answering a query — measured, with the numbers, in the header of
+// src/lib/db-timeout.ts — and a gate that waits longer on a connection that is not coming just
+// moves the gateway timeout. Asking a second time is what actually gets an answer, and it is nearly
+// free because the abandoned attempt's connection lands in the pool for the retry to reuse.
+import { withDbRetry, isDbUnavailable } from '@/lib/db-timeout';
 import { getViewableSectionKeys, can } from '@/lib/auth/permissions';
 import { canOpenAdmin } from '@/lib/auth/admin-access';
 import { logEvent } from '@/lib/logger';
@@ -243,8 +248,10 @@ function isGatedLab(path: string): boolean {
 type FaceState = 'enrolled' | 'absent' | 'unknown';
 async function hasFaceEnrolled(userId: string): Promise<FaceState> {
   try {
-    const r = await withDbTimeout(
-      db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${userId} AND is_active = true LIMIT 1`),
+    // Retried, like the other gates: 'unknown' from here returns dbUnavailable('face-2fa'), which is
+    // the same full-page refusal, so a single stalled connection must not be allowed to produce it.
+    const r = await withDbRetry(
+      () => db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${userId} AND is_active = true LIMIT 1`),
       'middleware.faceEnrolled');
     const rows = Array.isArray(r) ? r : ((r as any)?.rows || []);
     return rows.length > 0 ? 'enrolled' : 'absent';
@@ -423,7 +430,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
     if (tokenEarly) {
       // Bounded like the main path below. A timeout here redirects to the access page rather than
       // hanging; this branch already fails closed on every other error.
-      const v = await withDbTimeout(validateSessionToken(tokenEarly), 'middleware.session.visvambhara')
+      const v = await withDbRetry(() => validateSessionToken(tokenEarly), 'middleware.session.visvambhara')
         .catch(() => null);
       if (v) userEarly = v.user;
     }
@@ -485,7 +492,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // a pooler hiccup, so the two outcomes are kept apart: no session is a redirect, no answer is a 503.
   let result: Awaited<ReturnType<typeof validateSessionToken>>;
   try {
-    result = await withDbTimeout(validateSessionToken(token), 'middleware.session');
+    result = await withDbRetry(() => validateSessionToken(token), 'middleware.session');
   } catch (e: any) {
     if (isDbUnavailable(e)) {
       // A PAGE THAT NEEDS NO USER MUST STAY REACHABLE WHILE THE DATABASE IS NOT.
@@ -602,7 +609,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
     // could not do is fail closed on NO ANSWER, and a deny-by-default gate that hangs is not a gate.
     let verdict: Awaited<ReturnType<typeof canOpenAdmin>>;
     try {
-      verdict = await withDbTimeout(canOpenAdmin(result.user as any), 'middleware.canOpenAdmin');
+      verdict = await withDbRetry(() => canOpenAdmin(result.user as any), 'middleware.canOpenAdmin');
     } catch (e: any) {
       if (isDbUnavailable(e)) return dbUnavailable('admin-gate');
       throw e;
@@ -633,7 +640,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
       // returns null for "no gating"), and must not hang either. 503 on no answer.
       let allowed: Awaited<ReturnType<typeof getViewableSectionKeys>>;
       try {
-        allowed = await withDbTimeout(getViewableSectionKeys(result.user), 'middleware.sectionKeys');
+        allowed = await withDbRetry(() => getViewableSectionKeys(result.user), 'middleware.sectionKeys');
       } catch (e: any) {
         if (isDbUnavailable(e)) return dbUnavailable('section-gate');
         throw e;
