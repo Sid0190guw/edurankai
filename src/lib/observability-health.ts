@@ -397,6 +397,48 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   { module: 'Career profiles', table: 'career_profiles', owner: 'src/lib/career-intel/store.ts' },
   { module: 'Career recommendation feedback', table: 'career_feedback_events', owner: 'src/lib/career-intel/store.ts' },
 
+  // ============================================================================================
+  // THE PAGES A PERSON CAN ACTUALLY OPEN, ADDED 2026-08-24 AFTER A REPO-WIDE SWEEP
+  // ============================================================================================
+  //
+  // Every CREATE TABLE IF NOT EXISTS in src/ was collected and diffed against a full enumeration of
+  // the production database: 736 statements, 325 of them naming a table the live database does not
+  // have. That number is not the emergency it looks like. Around three hundred belong to library
+  // modules nothing has exercised — the mail platform alone owns 47, the two unreconciled
+  // recruitment stacks another 57 — and a table for a feature no one has opened is not an outage.
+  //
+  // THESE ARE THE ONES A PAGE UNDER src/pages CREATES, which is the difference that matters:
+  // somebody navigating the site reaches them, and every one renders today as an empty list or a
+  // failed save rather than an error. db/reachable-surfaces-schema.sql creates them.
+  //
+  // NONE OF THEM CAN BE FIXED BY THE REPAIR BUTTON. That registry calls exported ensure functions;
+  // page-owned DDL is inline in a page's frontmatter with no function to call. The hand-run file is
+  // the only path, which is exactly why they need to be visible here.
+  { module: 'Ask a doubt', table: 'doubts', owner: 'src/pages/portal/doubts/index.astro' },
+  { module: 'Library catalogue', table: 'library_resources', owner: 'src/pages/portal/library.astro' },
+  { module: 'Flashcards', table: 'flashcard_decks', owner: 'src/pages/portal/flashcards.astro' },
+  { module: 'Notes', table: 'notes', owner: 'src/pages/portal/notes.astro' },
+  { module: 'Resume builder', table: 'user_resumes', owner: 'src/pages/portal/resume-builder.astro' },
+  // Not a feature table: this is the record that decides whether one account may see another
+  // person's progress. Its absence is an access-control record with nowhere to live.
+  { module: 'Guardian links', table: 'parent_child_links', owner: 'src/pages/portal/parent.astro' },
+  // The most consequential of the set. Without it recovery-by-questions cannot issue a challenge,
+  // so a locked-out person cannot be let back in by the path built for exactly that.
+  { module: 'Recovery challenge', table: 'auth_recovery_challenge', owner: 'src/pages/api/auth/verify-by-questions.ts' },
+  // The idempotency record for candidate reminders. Absent, the endpoint has no memory of what it
+  // already sent, and the failure mode is a person emailed the same reminder repeatedly.
+  { module: 'Task reminder log', table: 'task_reminder_log', owner: 'src/pages/api/hiring/task-reminders.ts' },
+
+  // The half of PERFORMANCE_DDL that the aborted batch never reached, beyond the two tables
+  // db/capability-spine-schema.sql already recovered. db/performance-remainder-schema.sql.
+  { module: 'Continuous feedback', table: 'hr_feedback', owner: 'src/lib/performance-schema.ts' },
+
+  // PRESENT, AND LISTED ANYWAY. application_stage_events exists — it carries the funnel history the
+  // hiring decision report reads — but it was unmonitored, and /api/health reports four suppressed
+  // DDL statements from its module on every cold start. A table nothing says anything about is one
+  // whose absence would read as health. db/application-stages-schema.sql now records its shape.
+  { module: 'Application stage history', table: 'application_stage_events', owner: 'src/lib/application-stages.ts' },
+
   // HIRING DECISION SUPPORT, ADDED 2026-08-24 AFTER A REAL DECISION WAS REFUSED IN PRODUCTION.
   //
   // /admin/applications/[id]/decision answered a recorded hire with: relation "hiring_decisions"
