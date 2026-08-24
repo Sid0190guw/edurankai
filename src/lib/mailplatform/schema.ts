@@ -23,6 +23,7 @@
 
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ddlPermitted } from '@/lib/schema-bootstrap';
 
 /** Bumped whenever MP_DDL changes. Stored in mp_schema_migrations so a cold start can skip work. */
 export const SCHEMA_VERSION = 2;
@@ -927,6 +928,29 @@ async function applySchema(): Promise<{ ok: boolean; error?: string }> {
       if (r.length > 0) return { ok: true };
     } catch {
       // mp_schema_migrations does not exist yet. That is the expected first-run path, not an error.
+    }
+
+    // A SUPPRESSED MIGRATION MUST NOT BE ABLE TO RECORD ITSELF AS DONE.
+    //
+    // src/lib/db/index.ts refuses DDL at db.execute when SCHEMA_BOOTSTRAP is off — the production
+    // default — and a refused statement RESOLVES rather than throwing, by design, so the loops below
+    // complete without error having executed nothing. The marker INSERT at the foot of this function
+    // is not DDL and is therefore NOT suppressed, so it would write version=N while none of the
+    // version-N statements ran.
+    //
+    // That is worse than a failed migration, because it is permanent: the probe above short-circuits
+    // on the marker row forever after, so every caller is told { ok: true } while the tables do not
+    // exist, and the documented remedy of turning SCHEMA_BOOTSTRAP back on can no longer help — the
+    // function returns before it reaches the DDL. The honest answer is to refuse up front and say
+    // which lever fixes it.
+    if (!ddlPermitted()) {
+      return {
+        ok: false,
+        error: 'The mail platform schema is not applied and cannot be applied from a request: '
+          + 'request-time DDL is disabled on this deployment (SCHEMA_BOOTSTRAP is off). Apply '
+          + 'db/mail-platform-schema.sql by hand, or set SCHEMA_BOOTSTRAP=on and redeploy. Nothing '
+          + 'was written, including the migration marker, so this stays repairable.',
+      };
     }
 
     for (const stmt of MP_DDL) await db.execute(sql.raw(stmt));

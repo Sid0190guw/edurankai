@@ -129,11 +129,35 @@ export function withDbTimeout<T>(work: Promise<T>, label: string, ms: number = D
     Promise.resolve(work).catch(() => {});
     return Promise.reject(new DbCircuitOpenError(label));
   }
+  // ONLY THE WINNER OF THE RACE MAY RECORD ANYTHING.
+  //
+  // Promise.race settles on the first promise, but the other one KEEPS RUNNING — that is stated two
+  // comments up and its consequence was missed. Without this flag, a query that finally came back at
+  // twelve seconds still ran noteSuccess() and CLOSED the circuit that its own eight-second timeout
+  // had opened four seconds earlier, after the caller had already been handed a DbTimeoutError.
+  //
+  // That defeats the breaker in precisely the condition it exists for. On a degraded database
+  // queries do not fail, they crawl — so every straggler reopened the gate, the next read blew its
+  // fuse again, and the circuit flapped instead of holding. The whole point is that ONE timeout
+  // makes the next reads instant refusals; a breaker that a latecomer can reset is just a slower
+  // timeout.
+  //
+  // Both sides check and set the same flag, so whichever settles first claims the outcome and the
+  // loser becomes a no-op. `settled` is per-call, not shared.
+  let settled = false;
   let timer: ReturnType<typeof setTimeout>;
   return Promise.race([
-    Promise.resolve(work).then((v) => { noteSuccess(); return v; }),
+    Promise.resolve(work).then((v) => {
+      if (!settled) { settled = true; noteSuccess(); }
+      return v;
+    }),
     new Promise<never>((_, reject) => {
-      timer = setTimeout(() => { noteTimeout(label); reject(new DbTimeoutError(label, ms)); }, ms);
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        noteTimeout(label);
+        reject(new DbTimeoutError(label, ms));
+      }, ms);
     }),
   ]).finally(() => clearTimeout(timer!)) as Promise<T>;
 }
