@@ -1,4 +1,5 @@
 import { defineMiddleware } from 'astro:middleware';
+import type { AstroCookies } from 'astro';
 import { validateSessionToken } from '@/lib/auth/session';
 import { readSessionCookie, setSessionCookie, clearSessionCookie } from '@/lib/auth/cookie';
 import { db } from '@/lib/db';
@@ -21,6 +22,10 @@ import { sql } from 'drizzle-orm';
 // moves the gateway timeout. Asking a second time is what actually gets an answer, and it is nearly
 // free because the abandoned attempt's connection lands in the pool for the retry to reuse.
 import { withDbRetry, withDbTimeout, isDbUnavailable } from '@/lib/db-timeout';
+import {
+  unavailableMode, unavailableBody, unavailableRetryAfter, factsFromRequest,
+  DB_RETRY_COOKIE, DB_RETRY_COOKIE_MAX_AGE,
+} from '@/lib/db-unavailable';
 import { getViewableSectionKeys, can } from '@/lib/auth/permissions';
 import { canOpenAdmin } from '@/lib/auth/admin-access';
 import { logEvent } from '@/lib/logger';
@@ -270,23 +275,60 @@ async function hasFaceEnrolled(userId: string): Promise<FaceState> {
  * a database outage becomes ERR_TOO_MANY_REDIRECTS on top of an outage. no-store so a CDN cannot pin
  * it after the database recovers. The text says what is actually true, because "something went wrong"
  * has cost this project hours before.
+ *
+ * =================================================================================================
+ * AND IT NOW RECOVERS BY ITSELF, BECAUSE THE FAILURE IT REPORTS IS USUALLY ALREADY OVER
+ * =================================================================================================
+ *
+ * This returned one dead page to everything. Measured on the live site on 2026-08-24 — a burst of
+ * fourteen requests to /api/health — the population is bimodal and completely lopsided: thirteen
+ * reused a connection and answered in 128-134ms, one had to OPEN a connection and took 951ms, and
+ * per src/lib/db/index.ts's own fourth measurement about a QUARTER of the ones that have to open
+ * never finish inside the five-second bound at all.
+ *
+ * So this page was being shown for a stalled connection handshake on ONE request, on ONE serverless
+ * instance, while the database was answering everybody else in 130ms. That is exactly the report
+ * this is being changed for: an admin whose /admin/applications page rendered perfectly, opening one
+ * more thing, and getting this instead — with a working database the whole time.
+ *
+ * The decision of what to send is in src/lib/db-unavailable.ts, where it can be tested; three
+ * answers, not one:
+ *
+ *   - a prefetch, a fetch(), a sub-resource or a POST gets the status and NO BODY, so a speculative
+ *     request can never paint an apology over a screen somebody is reading, and a POST is never
+ *     answered with a page that would re-submit it by reloading;
+ *   - a real navigation, first failure, gets a page that reloads itself once after two seconds;
+ *   - the same navigation after that retry gets the honest dead end, naming the gate, and stops.
+ *
+ * ONE RETRY, AND IT CANNOT LOOP: the retry is marked by a ten-second cookie, so the second failure
+ * inside that window always falls through to the manual page. A reload storm during a real outage is
+ * the obvious way to make this worse, and the marker is what makes it impossible.
  */
-function dbUnavailable(where: string): Response {
+function dbUnavailable(where: string, context: { request: Request; cookies: AstroCookies }): Response {
+  const retried = context.cookies.get(DB_RETRY_COOKIE)?.value === '1';
+  const mode = unavailableMode(factsFromRequest(context.request, retried));
+
   console.error(JSON.stringify({
     ts: new Date().toISOString(), level: 'error', event: 'middleware.db_unavailable', gate: where,
+    mode, retried,
   }));
-  return new Response(
-    '<!doctype html><meta charset="utf-8"><title>Temporarily unavailable</title>'
-    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
-    + '<style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#0b0b0f;color:#e7e7ea;'
-    + 'display:grid;place-items:center;min-height:100vh;margin:0;padding:24px}div{max-width:34rem}'
-    + 'h1{font-size:1.25rem;margin:0 0 .75rem}p{line-height:1.6;color:#9aa6b6;margin:0 0 .75rem}'
-    + 'a{color:#FF7040}</style>'
-    + '<div><h1>We cannot reach the database right now</h1>'
-    + '<p>Your sign-in could not be verified, so nothing is being shown rather than something wrong. '
-    + 'This is a database problem on our side, not a problem with your account.</p>'
-    + '<p><a href="">Try again</a></p></div>',
-    { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Retry-After': '15', 'cache-control': 'no-store' } });
+
+  const headers: Record<string, string> = {
+    'Retry-After': String(unavailableRetryAfter(mode)),
+    'cache-control': 'no-store',
+  };
+  // Set on the way OUT of the first failure, so the request it triggers carries it and lands on
+  // 'manual'. Nothing has to clear it: it expires on its own ten seconds later, whether the retry
+  // succeeded or not.
+  if (mode === 'retry') {
+    headers['Set-Cookie'] = DB_RETRY_COOKIE + '=1; Path=/; Max-Age=' + DB_RETRY_COOKIE_MAX_AGE
+      + '; SameSite=Lax; HttpOnly' + (import.meta.env.PROD ? '; Secure' : '');
+  }
+
+  const body = unavailableBody(mode, where);
+  if (!body) return new Response(null, { status: 503, headers });
+  headers['Content-Type'] = 'text/html; charset=utf-8';
+  return new Response(body, { status: 503, headers });
 }
 
 // Public pages safe to edge-cache for ANONYMOUS visitors so repeat hits are served
@@ -521,7 +563,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
         context.locals.session = null;
         return next();
       }
-      return dbUnavailable('session');
+      return dbUnavailable('session', context);
     }
     // Any other failure is treated as it always was: no valid session.
     console.error('[middleware] session validation failed', e?.cause?.message || e?.message);
@@ -644,7 +686,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
     try {
       verdict = await withDbRetry(() => canOpenAdmin(result.user as any), 'middleware.canOpenAdmin');
     } catch (e: any) {
-      if (isDbUnavailable(e)) return dbUnavailable('admin-gate');
+      if (isDbUnavailable(e)) return dbUnavailable('admin-gate', context);
       throw e;
     }
     if (!verdict.allowed) {
@@ -675,7 +717,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
       try {
         allowed = await withDbRetry(() => getViewableSectionKeys(result.user), 'middleware.sectionKeys');
       } catch (e: any) {
-        if (isDbUnavailable(e)) return dbUnavailable('section-gate');
+        if (isDbUnavailable(e)) return dbUnavailable('section-gate', context);
         throw e;
       }
       if (allowed && !allowed.has(sectionKey)) {
@@ -693,7 +735,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
     // 'unknown' means the database did not answer. Bouncing to face enrollment on that would send
     // every signed-in person to a page that cannot enroll anything, which is a dead end dressed up as
     // a security step.
-    if (faceState === 'unknown') return dbUnavailable('face-2fa');
+    if (faceState === 'unknown') return dbUnavailable('face-2fa', context);
     if (faceState === 'absent') {
       // For applicants, route them through the portal-styled face-setup
       // page so the back-link goes back to /portal. Staff use /enroll-face.
