@@ -235,7 +235,53 @@ export const SETUP_STEPS: SetupStep[] = [
  *
  * Never throws. A step whose count fails is 'unknown' and says why; it is never silently 'todo'.
  */
+/**
+ * The six counts as ONE round trip, or null if the combined statement could not run.
+ *
+ * WHY. Each awaited db.execute() holds a pooler connection for a full ~140ms network round trip
+ * whatever the SQL costs, and this function ran six of them through Promise.all — which does not
+ * help, it takes six connections instead of one. On a max:5 pool that is the whole pool for one
+ * panel, and it is what produced "4 first-run setup steps could not be checked" on a dashboard whose
+ * six tables all answered psql in 143ms individually.
+ *
+ * NULL RATHER THAN THROWING, because the fallback below is not a worse version of this — it is the
+ * only version that keeps the per-step semantics when a table is genuinely absent. A scalar subquery
+ * naming a missing relation fails the WHOLE statement at parse time, so one missing table here would
+ * report all six steps as unknown, when the honest answer for that one is "nothing configured yet".
+ * So: one round trip when every table exists, which is the ordinary case, and the original six only
+ * when something is actually wrong.
+ */
+async function combinedCounts(): Promise<number[] | null> {
+  const read = await safeRows('[day-one] combined setup counts', () =>
+    db.execute(sql`
+      SELECT
+        (SELECT COUNT(*) FROM departments)::int AS a,
+        (SELECT COUNT(*) FROM hr_employees WHERE is_active = true)::int AS b,
+        (SELECT COUNT(*) FROM org_relationships WHERE status = 'active')::int AS c,
+        (SELECT COUNT(*) FROM payroll_components WHERE is_active = true)::int AS d,
+        (SELECT COUNT(*) FROM hr_holidays
+          WHERE holiday_date >= date_trunc('year', (NOW() AT TIME ZONE 'Asia/Kolkata')::date)
+            AND holiday_date <  date_trunc('year', (NOW() AT TIME ZONE 'Asia/Kolkata')::date) + INTERVAL '1 year')::int AS e,
+        (SELECT COUNT(*) FROM training_courses WHERE is_published = true)::int AS f`));
+  if (!read.ok) return null;
+  const r = read.rows[0] as any;
+  if (!r) return null;
+  const out = ['a', 'b', 'c', 'd', 'e', 'f'].map((k) => Number(r[k] ?? 0) || 0);
+  return out.length === SETUP_STEPS.length ? out : null;
+}
+
 export async function readSetupStatus(): Promise<SetupStatus[]> {
+  // THE FAST PATH. One connection, one round trip, and every step answered.
+  const combined = await combinedCounts();
+  if (combined) {
+    return SETUP_STEPS.map((step, i) => {
+      const n = combined[i];
+      return { step, state: n > 0 ? ('done' as const) : ('todo' as const), count: n, error: null };
+    });
+  }
+
+  // THE HONEST PATH, unchanged. Reached only when the combined statement could not run, which on
+  // this schema means a table is missing — and then each step deserves its own answer.
   const reads = await Promise.all([
     safeRows('[day-one] department count', () =>
       db.execute(sql`SELECT COUNT(*)::int AS n FROM departments`)),
