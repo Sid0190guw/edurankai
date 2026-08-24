@@ -1,0 +1,581 @@
+---
+// /admin/talent/codes — THE ONBOARDING CODE REGISTER.
+//
+// Spec: docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md section 16.7.
+//
+// THIS PAGE WAS LINKED FROM THE SIDEBAR AND DID NOT EXIST. src/lib/admin-nav.ts:196 has offered
+// "Onboarding codes" at this path, and src/middleware.ts:84 has been gating it, since the talent
+// console shipped — so every HR account that clicked it got a 404 at the exact moment they were
+// trying to answer a candidate's question about their code. codes.ts has had listCodes() described
+// in its own comments as "the admin register" the whole time, with no register to read it.
+//
+// WHAT AN OPERATOR CAN AND CANNOT DO HERE, AND WHY.
+//
+// CANNOT: read a code back. tal_onboarding_code stores sha256 of the body and nothing else, so the
+// secret is genuinely gone the moment the issuing screen is closed — not hidden behind a permission,
+// GONE. No page, no super admin, and no database dump can recover it. Every other design decision on
+// this screen follows from that one fact, and the copy says it plainly rather than leaving an
+// operator to discover it while a candidate waits on the phone.
+//
+// CAN: find WHICH code a person holds (by the five-character handle they can read out, by their
+// email, by name or by the ERAI reference), see whether it is still live, when it expires, how many
+// times it has been tried, whether anybody recorded sending it — and, when it is lost, REISSUE:
+// mint a fresh one, which revokes the old one in the same act because the database permits exactly
+// one active code per selection.
+//
+// WHO. `onboarding.code.issue` acts; `talent.view` reads. Both super_admin and hr hold the issuing
+// key (src/lib/auth/permissions.ts) and both hold the `talent_onboarding` section the middleware
+// checks, so the whole people desk reaches this — recruiter, reviewer and department_head do not,
+// which is spec 35's separation and not an oversight.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { logAudit } from '@/lib/audit';
+import {
+  codeRegister, codeCounts, markCodeDelivered, revokeCode, issueCode, expireStaleCodes,
+  DELIVERY_CHANNELS, DELIVERY_CHANNEL_LABELS,
+  type CodeRegisterRow, type CodeCounts,
+} from '@/lib/talent/codes';
+
+// EVERY const IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted, and a handler reaching a
+// later declaration threw on its first line every time while the page reported success — that is a
+// recorded outage on this project, not a style preference.
+const user = Astro.locals.user!;
+
+const mayIssue = can(user, 'onboarding.code.issue');
+const mayView = can(user, 'talent.view') || mayIssue;
+if (!mayView) return Astro.redirect('/admin');
+
+const STATUS_TABS = [
+  { key: 'active', label: 'Live' },
+  { key: 'consumed', label: 'Used' },
+  { key: 'revoked', label: 'Revoked' },
+  { key: 'expired', label: 'Expired' },
+  { key: 'all', label: 'Everything' },
+];
+
+// Typed lookup maps live in the frontmatter and are never indexed inside JSX: a
+// `Record<string,string>` used from a template breaks .astro parsing on this project.
+const STATUS_LABELS: Record<string, string> = {
+  active: 'Live',
+  consumed: 'Used',
+  revoked: 'Revoked',
+  expired: 'Expired',
+};
+
+const CHANNEL_OPTIONS = DELIVERY_CHANNELS.map((c) => ({
+  value: String(c),
+  label: DELIVERY_CHANNEL_LABELS[String(c)] || String(c),
+}));
+
+const fmtDate = (iso: string | null): string => {
+  if (!iso) return '';
+  try { return new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }); }
+  catch { return ''; }
+};
+const fmtDateTime = (iso: string | null): string => {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString('en-GB', {
+      day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+    });
+  } catch { return ''; }
+};
+
+const origin = Astro.url.origin;
+
+let msg = '';
+let err = '';
+let issuedSecret = '';
+let issuedFor = '';
+let issuedEmail = '';
+let issuedOpportunity = '';
+let issuedUntil = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+  const codeRowId = String(fd.get('codeRowId') || '');
+  try {
+    if (!mayIssue) {
+      // One refusal for every write on this page. A read-only holder of `talent.view` sees the
+      // register and no buttons, so reaching this branch means a hand-made POST.
+      err = 'You do not hold the authority to act on onboarding codes.';
+    } else if (action === 'mark_shared') {
+      const channel = String(fd.get('channel') || '');
+      const r = await markCodeDelivered(codeRowId, channel);
+      if (r.ok) {
+        msg = 'Recorded as sent. That is your note that it went out, not a delivery receipt.';
+        await logAudit({
+          userId: user.id, action: 'onboarding.code.marked_sent',
+          entity: 'tal_onboarding_code', entityId: codeRowId,
+          diff: { channel }, ipAddress: Astro.clientAddress,
+        });
+      } else {
+        err = r.error || 'Could not record that.';
+      }
+    } else if (action === 'revoke') {
+      const reason = String(fd.get('reason') || '').trim();
+      if (!reason) {
+        err = 'A revocation needs a written reason.';
+      } else {
+        const r = await revokeCode(codeRowId, user.id, reason);
+        if (r.ok) { msg = r.changed ? 'Code revoked. It will not open onboarding again.' : 'That code was already inactive.'; }
+        else { err = r.error || 'Could not revoke the code.'; }
+      }
+    } else if (action === 'reissue') {
+      const selectionId = String(fd.get('selectionId') || '');
+      const reason = String(fd.get('reason') || '').trim();
+      if (!reason) {
+        err = 'A reissue needs a written reason. It revokes the previous code, and the register has to say why.';
+      } else {
+        const days = parseInt(String(fd.get('validityDays') || '14'), 10) || 14;
+        const r = await issueCode({ selectionId, issuedByUserId: user.id, validityDays: days, replaceReason: reason });
+        if (r.ok && r.secret) {
+          issuedSecret = r.secret;
+          issuedFor = String(fd.get('personName') || '');
+          issuedEmail = r.code ? r.code.boundEmailNorm : String(fd.get('boundEmail') || '');
+          issuedOpportunity = String(fd.get('opportunityTitle') || '');
+          issuedUntil = r.code ? fmtDate(r.code.validUntil) : '';
+          msg = 'New code issued. It is shown once, below. Any previous code for this person is now revoked.';
+          await logAudit({
+            userId: user.id, action: 'onboarding.code.reissued_from_register',
+            entity: 'tal_onboarding_code', entityId: r.code ? r.code.id : '',
+            diff: { selectionId, reason, replaced: r.replacedCodeRef || null },
+            ipAddress: Astro.clientAddress,
+          });
+        } else {
+          err = r.error || 'Could not issue a code.';
+        }
+      }
+    } else if (action === 'sweep') {
+      const n = await expireStaleCodes();
+      msg = n === 1 ? 'One code past its validity was marked expired.' : n + ' codes past their validity were marked expired.';
+      await logAudit({
+        userId: user.id, action: 'onboarding.code.expiry_sweep',
+        entity: 'tal_onboarding_code', diff: { expired: n }, ipAddress: Astro.clientAddress,
+      });
+    }
+  } catch (e: any) {
+    // The REAL Postgres reason lives on e.cause; e.message is only the failed statement.
+    err = e?.cause?.message || e?.message || 'Something went wrong.';
+  }
+}
+
+// Filters are read AFTER the POST so the screen reflects what just happened.
+const statusParam = Astro.url.searchParams.get('status') || 'active';
+const status = STATUS_TABS.some((t) => t.key === statusParam) ? statusParam : 'active';
+const q = (Astro.url.searchParams.get('q') || '').trim().slice(0, 120);
+
+// A THROW HERE IS NOT AN EMPTY REGISTER. codeRegister() and codeCounts() rethrow precisely so this
+// page can tell "no codes match" apart from "the register could not be read" — they render as the
+// same empty table otherwise, and they mean opposite things.
+let counts: CodeCounts | null = null;
+let register: CodeRegisterRow[] = [];
+let registerFailed = false;
+
+try {
+  counts = await codeCounts();
+} catch { /* the tiles simply do not render; the table below reports its own failure */ }
+
+try {
+  register = await codeRegister({ status, q, limit: 200 });
+} catch (e: any) {
+  registerFailed = true;
+  err = err || ('The code register could not be read: ' + (e?.cause?.message || e?.message || 'unknown error'));
+}
+
+// Every comparison is finished in the frontmatter: `<` inside a JSX expression breaks .astro parsing
+// on this project, so the template only ever reads booleans and strings.
+const now = Date.now();
+const rows = register.map((c) => {
+  const expiresAt = new Date(c.validUntil).getTime();
+  const overdue = c.status === 'active' && expiresAt < now;
+  const daysLeft = Math.ceil((expiresAt - now) / 86400000);
+  const expiringSoon = c.status === 'active' && !overdue && daysLeft <= 3;
+
+  let stateLabel = STATUS_LABELS[c.status] || c.status;
+  let stateClass = 'pill';
+  if (c.status === 'active') stateClass = 'pill pill--live';
+  if (c.status === 'consumed') stateClass = 'pill pill--used';
+  if (c.status === 'revoked' || c.status === 'expired') stateClass = 'pill pill--off';
+  if (overdue) { stateLabel = 'Past expiry'; stateClass = 'pill pill--off'; }
+
+  let expiryNote = '';
+  if (overdue) expiryNote = 'Expired ' + fmtDate(c.validUntil) + ', not yet swept';
+  else if (expiringSoon) expiryNote = daysLeft === 1 ? 'Expires tomorrow' : 'Expires in ' + daysLeft + ' days';
+  else if (c.status === 'active') expiryNote = 'Valid to ' + fmtDate(c.validUntil);
+  else expiryNote = 'Was valid to ' + fmtDate(c.validUntil);
+
+  const sharedNote = c.deliveredAt
+    ? (DELIVERY_CHANNEL_LABELS[String(c.deliveryChannel || '')] || 'Sent') + ', ' + fmtDate(c.deliveredAt)
+    : '';
+
+  return {
+    id: c.id,
+    codeId: c.codeId,
+    handle: c.codePrefix,
+    selectionId: c.selectionId,
+    selectionCode: c.selectionCode,
+    personName: c.personName || 'Unnamed',
+    personCode: c.personCode,
+    boundEmail: c.boundEmailNorm,
+    opportunityTitle: c.opportunityTitle,
+    stateLabel,
+    stateClass,
+    expiryNote,
+    sharedNote,
+    usesNote: c.usedCount + ' of ' + c.maxUses + ' uses',
+    failedNote: c.failedAttempts > 0 ? c.failedAttempts + ' failed attempts' : '',
+    issuedNote: 'Issued ' + fmtDateTime(c.issuedAt) + (c.issuedByName ? ' by ' + c.issuedByName : ''),
+    revokedNote: c.revokedAt
+      ? 'Revoked ' + fmtDate(c.revokedAt) + (c.revokedByName ? ' by ' + c.revokedByName : '') + (c.revokedReason ? ': ' + c.revokedReason : '')
+      : '',
+    multiUseNote: c.maxUses > 1 && c.multiUseReason ? 'Multi-use: ' + c.multiUseReason : '',
+    isLive: c.status === 'active' && !overdue,
+    canMarkSent: mayIssue && c.status === 'active' && !c.deliveredAt,
+    canRevoke: mayIssue && c.status === 'active',
+    canReissue: mayIssue,
+  };
+});
+
+const overdueCount = counts ? counts.overdue : 0;
+const showSweep = mayIssue && overdueCount > 0;
+const overduePhrase = overdueCount === 1
+  ? 'One code is still marked live although its validity has passed.'
+  : overdueCount + ' codes are still marked live although their validity has passed.';
+const hasRows = rows.length > 0;
+const isFiltered = q.length > 0 || status !== 'active';
+
+// The message an operator sends. Built here so the code appears in it EXACTLY as the candidate must
+// type it, and so the gateway URL and the bound email are the real ones rather than remembered.
+// The email address matters as much as the code: the gate checks both, and "it says invalid" is
+// almost always somebody entering a different address from the one the code was bound to.
+const shareMessage = issuedSecret
+  ? [
+      'Dear ' + (issuedFor || 'candidate') + ',',
+      '',
+      'You have been selected' + (issuedOpportunity ? ' for ' + issuedOpportunity : '') + '. Your onboarding authorization code is:',
+      '',
+      issuedSecret,
+      '',
+      'To use it, go to ' + origin + '/apply/gateway , choose "I have an authorization code", and enter',
+      'the code together with this email address: ' + issuedEmail,
+      '',
+      'The code can be used once and it expires on ' + issuedUntil + '. Please do not forward it to anyone,',
+      'and do not send it in the same message as any other document.',
+      '',
+      'EduRankAI People Operations',
+    ].join('\n')
+  : '';
+---
+
+<AdminLayout title="Onboarding codes" activeNav="talent-codes">
+  <div class="wrap">
+    <header class="head">
+      <h1>Onboarding codes</h1>
+      <p class="sub">
+        Every authorization code that has been issued, and exactly what state it is in. A code is
+        issued against a selected candidate on
+        <a href="/admin/talent/selected">Selected candidates</a>; this is where you look one up
+        afterwards, record that you sent it, revoke it, or replace one that has been lost.
+      </p>
+    </header>
+
+    <div class="explain">
+      <p class="explain__title">The code itself cannot be looked up here, or anywhere</p>
+      <p>
+        Only a one-way hash of it is stored, so the code is unrecoverable the moment the screen that
+        issued it is closed. That is true for a super admin and for the founder, and it is what makes
+        a stolen database dump useless for getting somebody into onboarding.
+      </p>
+      <p>
+        What you can do is find a candidate's code by the first five characters they can read out to
+        you, by their email address, or by name, and check whether it is still live. If it has been
+        lost, use <strong>Reissue</strong>: it mints a new code and revokes the old one in the same
+        act, because a selection may hold only one live code at a time.
+      </p>
+    </div>
+
+    {msg && <div class="note note--ok">{msg}</div>}
+    {err && <div class="note note--err">{err}</div>}
+
+    {issuedSecret && (
+      <div class="secret">
+        <p class="secret__eyebrow">New onboarding code{issuedFor ? ' for ' + issuedFor : ''}</p>
+        <p class="secret__code" id="secret-code">{issuedSecret}</p>
+        <div class="secret__acts">
+          <button type="button" class="btn" data-copy="#secret-code">Copy code</button>
+          <button type="button" class="btn" data-copy="#share-message">Copy the whole message</button>
+        </div>
+        <p class="secret__note">
+          Shown once. It is stored only as a hash, so nobody can read it back later, including from
+          the database. Send it now, through the official channel, and never in the same message as
+          an offer letter. Valid until {issuedUntil}. The candidate must enter it together with
+          {' '}<strong>{issuedEmail}</strong> — the gate checks both.
+        </p>
+        <label class="share">
+          <span class="share__label">Ready to send</span>
+          <textarea id="share-message" readonly rows="14">{shareMessage}</textarea>
+        </label>
+      </div>
+    )}
+
+    {counts && (
+      <div class="tiles">
+        <div class="tile"><span class="tile__n">{counts.active}</span><span class="tile__l">Live codes</span></div>
+        <div class="tile"><span class="tile__n">{counts.unshared}</span><span class="tile__l">Live, not marked sent</span></div>
+        <div class="tile"><span class="tile__n">{counts.overdue}</span><span class="tile__l">Past expiry</span></div>
+        <div class="tile"><span class="tile__n">{counts.consumed}</span><span class="tile__l">Used</span></div>
+        <div class="tile"><span class="tile__n">{counts.total}</span><span class="tile__l">Issued in total</span></div>
+      </div>
+    )}
+
+    {showSweep && (
+      <form method="POST" class="sweep">
+        <input type="hidden" name="_action" value="sweep" />
+        <span>
+          {overduePhrase} They already refuse at the gate, so nobody can use one; the sweep only
+          makes the register say what the gate already does.
+        </span>
+        <button type="submit" class="btn">Run the expiry sweep</button>
+      </form>
+    )}
+
+    <form method="GET" class="filters">
+      <div class="tabs">
+        {STATUS_TABS.map((t) => (
+          <a
+            href={'/admin/talent/codes?status=' + t.key + (q ? '&q=' + encodeURIComponent(q) : '')}
+            class={t.key === status ? 'tab tab--on' : 'tab'}
+          >{t.label}</a>
+        ))}
+      </div>
+      <div class="search">
+        <input type="hidden" name="status" value={status} />
+        <input
+          type="text"
+          name="q"
+          value={q}
+          placeholder="First five characters, email, name or ERAI reference"
+        />
+        <button type="submit" class="btn">Search</button>
+        {q && <a class="btn" href={'/admin/talent/codes?status=' + status}>Clear</a>}
+      </div>
+    </form>
+
+    {registerFailed && (
+      <p class="empty">
+        The register could not be read just now. This is not the same as no codes existing, and
+        nothing has been changed. Reload; if it persists, the reason is in the message above.
+      </p>
+    )}
+
+    {!registerFailed && !hasRows && isFiltered && (
+      <p class="empty">
+        No code matches that filter. If you are searching by the characters a candidate read out to
+        you, enter only the first group of five — the rest of a code is not stored in a form anything
+        can search.
+      </p>
+    )}
+
+    {!registerFailed && !hasRows && !isFiltered && (
+      <p class="empty">
+        No live codes. A code appears here once it has been issued against a selected candidate on
+        {' '}<a href="/admin/talent/selected">Selected candidates</a>.
+      </p>
+    )}
+
+    {hasRows && (
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Candidate</th>
+              <th>Code</th>
+              <th>State</th>
+              <th>Sent</th>
+              <th>History</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr>
+                <td>
+                  <strong>{r.personName}</strong>
+                  <span class="mono">{r.boundEmail}</span>
+                  {r.personCode && <span class="mono">{r.personCode}</span>}
+                  {r.opportunityTitle && <span class="mono">{r.opportunityTitle}</span>}
+                </td>
+                <td>
+                  <strong class="handle">{r.handle}</strong>
+                  <span class="mono">{r.codeId}</span>
+                  {r.selectionCode && <span class="mono">{r.selectionCode}</span>}
+                  <span class="mono">{r.usesNote}</span>
+                  {r.failedNote && <span class="mono warn">{r.failedNote}</span>}
+                </td>
+                <td>
+                  <span class={r.stateClass}>{r.stateLabel}</span>
+                  <span class="mono">{r.expiryNote}</span>
+                  {r.multiUseNote && <span class="mono">{r.multiUseNote}</span>}
+                </td>
+                <td>
+                  {r.sharedNote && <span class="mono">{r.sharedNote}</span>}
+                  {!r.sharedNote && r.isLive && <span class="mono warn">Not recorded as sent</span>}
+                  {r.canMarkSent && (
+                    <form method="POST" class="mark">
+                      <input type="hidden" name="_action" value="mark_shared" />
+                      <input type="hidden" name="codeRowId" value={r.id} />
+                      <select name="channel">
+                        {CHANNEL_OPTIONS.map((c) => <option value={c.value}>{c.label}</option>)}
+                      </select>
+                      <button type="submit" class="btn">Mark as sent</button>
+                    </form>
+                  )}
+                </td>
+                <td>
+                  <span class="mono">{r.issuedNote}</span>
+                  {r.revokedNote && <span class="mono">{r.revokedNote}</span>}
+                </td>
+                <td class="acts">
+                  {r.canRevoke && (
+                    <form method="POST" class="revoke">
+                      <input type="hidden" name="_action" value="revoke" />
+                      <input type="hidden" name="codeRowId" value={r.id} />
+                      <input type="text" name="reason" placeholder="Reason" required />
+                      <button type="submit" class="btn btn--warn">Revoke</button>
+                    </form>
+                  )}
+                  {r.canReissue && (
+                    <form method="POST" class="reissue">
+                      <input type="hidden" name="_action" value="reissue" />
+                      <input type="hidden" name="selectionId" value={r.selectionId} />
+                      <input type="hidden" name="personName" value={r.personName} />
+                      <input type="hidden" name="boundEmail" value={r.boundEmail} />
+                      <input type="hidden" name="opportunityTitle" value={r.opportunityTitle} />
+                      <input type="text" name="reason" placeholder="Why a new code" required />
+                      <label class="days">
+                        Valid
+                        <input type="number" name="validityDays" value="14" min="1" max="60" />
+                        days
+                      </label>
+                      <button type="submit" class="btn btn--go">Reissue</button>
+                    </form>
+                  )}
+                  {!r.canRevoke && !r.canReissue && (
+                    <span class="muted">No action available to you</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+  </div>
+</AdminLayout>
+
+<script is:inline>
+  // Delegated, and outside every conditional block: a <script> nested inside a JSX conditional
+  // breaks .astro parsing on this project, and the banner it serves is conditional.
+  document.addEventListener('click', function (ev) {
+    var t = ev.target;
+    if (!t || typeof t.getAttribute !== 'function') return;
+    var sel = t.getAttribute('data-copy');
+    if (!sel) return;
+    var el = document.querySelector(sel);
+    if (!el) return;
+    var text = typeof el.value === 'string' ? el.value : (el.textContent || '');
+    var label = t.textContent;
+    var done = function (word) {
+      t.textContent = word;
+      setTimeout(function () { t.textContent = label; }, 1600);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(String(text).trim()).then(function () { done('Copied'); },
+        function () { done('Select it and press Ctrl+C'); });
+    } else {
+      done('Select it and press Ctrl+C');
+    }
+  });
+</script>
+
+<style>
+  .wrap { padding: 20px; max-width: 1400px; }
+  .head h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #9aa0aa; font-size: 13px; margin: 0 0 16px; max-width: 80ch; line-height: 1.6; }
+  .sub a, .empty a { color: inherit; }
+  .explain {
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px 14px;
+    margin-bottom: 18px; max-width: 90ch;
+  }
+  .explain__title { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  .explain p { font-size: 12px; color: #9aa0aa; line-height: 1.6; margin: 0 0 6px; }
+  .explain p:last-child { margin-bottom: 0; }
+  .note { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; }
+  .note--ok { background: rgba(46,160,90,0.12); border: 1px solid rgba(46,160,90,0.4); }
+  .note--err { background: rgba(200,60,60,0.12); border: 1px solid rgba(200,60,60,0.4); }
+  .secret {
+    border: 1px solid rgba(255,190,80,0.5); background: rgba(255,190,80,0.08);
+    border-radius: 8px; padding: 14px 16px; margin-bottom: 18px;
+  }
+  .secret__eyebrow { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 6px; color: #d9b169; }
+  .secret__code {
+    font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 22px; letter-spacing: 0.06em;
+    margin: 0 0 10px; user-select: all; word-break: break-all;
+  }
+  .secret__acts { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .secret__note { font-size: 12px; color: #b9bec7; margin: 0 0 10px; max-width: 80ch; line-height: 1.5; }
+  .share { display: block; }
+  .share__label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; margin-bottom: 4px; }
+  .share textarea {
+    width: 100%; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.14);
+    color: inherit; border-radius: 5px; padding: 8px 10px; font-size: 12px; line-height: 1.55;
+    font-family: ui-monospace, monospace; resize: vertical;
+  }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .tile { border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .tile__n { font-size: 22px; font-weight: 600; }
+  .tile__l { font-size: 11px; color: #9aa0aa; text-transform: uppercase; letter-spacing: 0.06em; }
+  .sweep {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 12px; color: #9aa0aa;
+    border: 1px solid rgba(255,190,80,0.35); background: rgba(255,190,80,0.06);
+    border-radius: 8px; padding: 10px 12px; margin-bottom: 16px;
+  }
+  .sweep span { max-width: 70ch; line-height: 1.5; }
+  .filters { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-bottom: 12px; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tab {
+    font-size: 12px; padding: 5px 10px; border-radius: 999px; text-decoration: none; color: #9aa0aa;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .tab--on { color: inherit; border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.06); }
+  .search { display: flex; gap: 6px; align-items: center; }
+  .search input[type=text] { min-width: 300px; }
+  .tablewrap { overflow-x: auto; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 1050px; }
+  th { text-align: left; padding: 10px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; border-bottom: 1px solid rgba(255,255,255,0.1); }
+  td { padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.06); vertical-align: top; }
+  td strong { display: block; }
+  .handle { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 14px; letter-spacing: 0.08em; }
+  .mono { display: block; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #8b919b; margin-top: 2px; }
+  .mono.warn { color: #d9a05b; }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.18); }
+  .pill--live { border-color: rgba(46,160,90,0.55); color: #7fd6a0; }
+  .pill--used { border-color: rgba(120,150,220,0.5); color: #a8bdf0; }
+  .pill--off { border-color: rgba(200,60,60,0.5); color: #e08b8b; }
+  .acts { display: flex; flex-direction: column; gap: 8px; min-width: 240px; }
+  form.mark, form.revoke, form.reissue { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+  .btn { border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.06); color: inherit; padding: 6px 10px; border-radius: 5px; font-size: 12px; cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn--go { border-color: rgba(46,160,90,0.5); }
+  .btn--warn { border-color: rgba(200,60,60,0.5); }
+  .days { font-size: 11px; color: #9aa0aa; display: flex; align-items: center; gap: 4px; }
+  .days input { width: 54px; }
+  input[type=text], input[type=number], select {
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.14); color: inherit;
+    padding: 5px 7px; border-radius: 4px; font-size: 12px;
+  }
+  .revoke input[type=text], .reissue input[type=text] { width: 150px; }
+  .muted { color: #6f757e; font-size: 12px; }
+  .empty { color: #9aa0aa; font-size: 13px; max-width: 70ch; line-height: 1.6; }
+</style>

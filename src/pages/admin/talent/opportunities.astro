@@ -1,0 +1,1121 @@
+---
+// /admin/talent/opportunities — THE OPPORTUNITY DESK.
+//
+// Spec: docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md sections 5, 5A, 19, 21.1, 26.3 and 27.
+//
+// THIS PAGE WAS LINKED FROM THE SIDEBAR AND DID NOT EXIST. src/lib/admin-nav.ts:192 has offered
+// "Opportunities" at this path, and src/middleware.ts has been gating the /admin/talent subtree,
+// since the talent console shipped — so every recruiter who clicked the first entry under Talent
+// got a 404. tal_opportunity is the row the whole platform hangs off: an application belongs to an
+// opportunity, a selection belongs to an application, an onboarding code belongs to a selection.
+// There was no screen that could create one.
+//
+// WHAT AN OPPORTUNITY IS, AND WHAT IT IS NOT. It is a hiring EVENT: it opens, it runs a pipeline,
+// it closes, it archives. The POSITION it advertises outlives it. Closing an opportunity does not
+// close its applications — the people already in it continue to a decision (spec 5A rule 4) — and
+// it does not touch the seat.
+//
+// THE FIVE STATES ARE A LATTICE, NOT A DROPDOWN. draft, published, unpublished, closed, archived.
+// Which moves are legal is decided by decideTransition() in src/lib/talent/opportunities.ts, and
+// this page asks it TWICE for different reasons: once per row to decide which buttons to render,
+// and once inside the write path, which is the one that actually decides. A button that will be
+// refused is worse than no button, and a hidden button is not a lock.
+//
+// WHO. `talent.view` reads; every write needs `talent.manage`, re-checked inside the POST handler.
+// super_admin, hr and recruiter hold both; reviewer and department_head hold only the read — which
+// is spec 35's separation and not an oversight.
+//
+// WHICH ROWS. Never decided by the capability key. A talent.manage holder sees the whole desk; a
+// read-only viewer sees the departments they head (from the Organization Graph, resolved per row)
+// plus any opportunity they are the named hiring manager of. The narrowing happens in the WHERE
+// clause, not during render — spec 21.3.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { logAudit } from '@/lib/audit';
+import { userHeadedDepartmentIds, readEmployeeIdForUser } from '@/lib/org-graph';
+import { engagementKeys, engagementLabelFor } from '@/lib/onboarding-packs';
+import { compensationLine, IDENTITY_TYPES, IDENTITY_TYPE_LABELS, COMPENSATION_KINDS } from '@/lib/talent/types';
+import {
+  listOpportunities, opportunityCounts,
+  createOpportunity, updateOpportunity, transitionOpportunity,
+  assignEvaluator, removeEvaluator, listEvaluators,
+  listDepartmentOptions, listAssignableUsers,
+  legalTransitionsFrom, opportunityStatusLabel, employmentTypeLabel, assignRoleLabel,
+  EMPLOYMENT_TYPES, ASSIGN_ROLES,
+  type OpportunityRow, type OpportunityCounts, type EvaluatorAssignment,
+  type OpportunityScope, type DepartmentOption, type AssignableUser,
+} from '@/lib/talent/opportunities';
+
+// EVERY const IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted, and a handler reaching a
+// later declaration threw on its first line every time while the page reported success — that is a
+// recorded outage on this project, not a style preference.
+const user = Astro.locals.user!;
+
+// Server-side gate, before any query runs. The middleware section gate stands in front of this path
+// too; this is the page's own lock and the one that actually decides.
+const mayManage = can(user, 'talent.manage');
+const mayView = can(user, 'talent.view') || mayManage;
+if (!mayView) return Astro.redirect('/admin');
+
+const STATUS_TABS = [
+  { key: 'all', label: 'Everything' },
+  { key: 'draft', label: 'Drafts' },
+  { key: 'published', label: 'Published' },
+  { key: 'unpublished', label: 'Unpublished' },
+  { key: 'closed', label: 'Closed' },
+  { key: 'archived', label: 'Archived' },
+];
+
+// Typed lookup maps are indexed HERE and never inside JSX: a `Record<string,string>` used from a
+// template breaks .astro parsing on this project.
+const COMPENSATION_LABELS: Record<string, string> = {
+  unpaid: 'Unpaid',
+  stipend: 'Stipend',
+  salary: 'Salary',
+  grant: 'Grant',
+};
+
+const EMPLOYMENT_OPTIONS = EMPLOYMENT_TYPES.map((t) => ({
+  value: String(t), label: employmentTypeLabel(String(t)),
+}));
+const COMPENSATION_OPTIONS = COMPENSATION_KINDS.map((k) => ({
+  value: String(k), label: COMPENSATION_LABELS[String(k)] || String(k),
+}));
+const IDENTITY_OPTIONS = IDENTITY_TYPES.map((t) => ({
+  value: String(t), label: (IDENTITY_TYPE_LABELS as Record<string, string>)[String(t)] || String(t),
+}));
+const ASSIGN_ROLE_OPTIONS = ASSIGN_ROLES.map((r) => ({
+  value: String(r), label: assignRoleLabel(String(r)),
+}));
+
+// The onboarding packages this installation actually has. Passed INTO the validator rather than
+// imported by it, because the rules in opportunities.ts are meant to run without a connection.
+const PACK_KEYS: readonly string[] = engagementKeys().map((k) => String(k));
+const PACK_OPTIONS = engagementKeys().map((k) => ({ value: String(k), label: engagementLabelFor(k) }));
+
+// EVERY TIME ON THIS SCREEN IS UTC, AND IT IS RENDERED THAT WAY ON PURPOSE.
+//
+// This frontmatter runs on the server, so an unqualified toLocaleString() formats in whatever zone
+// the NODE PROCESS happens to be in — UTC on the deployment, the developer's zone locally — and
+// never in the reader's. The deadline is the one of these an operator TYPES BACK IN, through a
+// `datetime-local` box that has no zone of its own; if the box is filled from a UTC instant and
+// read back as local time, every save silently moves the deadline by the offset. Pinning the
+// display to UTC and saying so on the field makes the round trip lossless and the number checkable.
+const fmtDate = (iso: string | null): string => {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleDateString('en-GB', {
+      day: '2-digit', month: 'short', year: 'numeric', timeZone: 'UTC',
+    });
+  } catch { return ''; }
+};
+const fmtDateTime = (iso: string | null): string => {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString('en-GB', {
+      day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+      timeZone: 'UTC',
+    }) + ' UTC';
+  } catch { return ''; }
+};
+/**
+ * What a datetime-local input wants: the first sixteen characters of an ISO string.
+ *
+ * The ISO string is UTC, so the value in the box is a UTC wall clock and the label beside it says
+ * so. normaliseDeadlineInput() in the module appends the Z on the way back, which is what stops the
+ * database session's TimeZone deciding what the operator meant.
+ */
+const forInput = (iso: string | null): string => (iso ? String(iso).slice(0, 16) : '');
+
+// ROW SCOPE, resolved before the POST handler runs because `const` is not hoisted.
+//
+// A talent.manage holder is unrestricted. Everybody else is narrowed to the departments they head
+// plus their own opportunities. userHeadedDepartmentIds() reads the `department_head` edge from the
+// Organization Graph per row — never users.role, which is a per-user label that would make every
+// head a head of everything.
+//
+// AND `[]` OUT OF THAT FUNCTION IS TWO DIFFERENT ANSWERS. getHeadedDepartmentIds() logs its failure
+// and returns an empty array (src/lib/org-graph.ts), which is the identical value it returns for
+// somebody who genuinely heads nothing — so a scoped viewer whose org-graph read failed would see
+// an empty desk that means "you head no department", which is a claim about them and not about the
+// read. org-graph.ts belongs to another module and is not edited from here; what IS resolvable from
+// this side is the step before it. readEmployeeIdForUser() keeps "this account has no employee
+// record" apart from "the lookup did not answer", so at least the half of the ambiguity that can be
+// resolved is resolved, and the half that cannot is stated on screen rather than implied away.
+const unrestricted = mayManage;
+let headedDepartmentIds: string[] = [];
+let employeeLookupFailed = false;
+let hasEmployeeRecord = true;
+if (!unrestricted) {
+  const emp = await readEmployeeIdForUser(user.id);
+  employeeLookupFailed = !emp.ok;
+  hasEmployeeRecord = !!emp.employeeId;
+  headedDepartmentIds = await userHeadedDepartmentIds(user.id);
+}
+const scope: OpportunityScope | null = unrestricted
+  ? null
+  : { departmentIds: headedDepartmentIds, hiringManagerUserId: user.id };
+// Which sentence the scope note carries. Only ONE of these is a statement about the viewer.
+const scopeNoDepartments = !unrestricted && headedDepartmentIds.length === 0;
+const scopeLookupBroken = !unrestricted && employeeLookupFailed;
+const scopeNotAnEmployee = !unrestricted && !employeeLookupFailed && !hasEmployeeRecord;
+
+// Writes are unrestricted among talent.manage holders, and that is a deliberate, stated choice
+// rather than an omission: the capability is held by super_admin, hr and recruiter, all of whom
+// work the whole desk. Nobody without it reaches a write path at all — the refusal below is the
+// single gate every action passes through.
+/**
+ * The moves that will not accept a bare button press. Both are irreversible in the lattice: a
+ * closed opportunity is never re-opened and an archived one never comes back, so the audit entry
+ * is the last chance to record why. Declared HERE, above the POST handler that reads it, because
+ * `const` is not hoisted and a handler reaching a later declaration has taken pages down here.
+ */
+const REASON_REQUIRED_MOVES: readonly string[] = ['closed', 'archived'];
+
+let msg = '';
+let err = '';
+
+/**
+ * WRITE THE AUDIT ENTRY, AND SAY SO WHEN IT DID NOT LAND.
+ *
+ * logAudit() returns `{ ok, error }` and never throws. Every call on this page used to be a bare
+ * `await`, so a failed audit write was invisible — and this page tells an operator, in the same
+ * breath, that closing an opportunity "cannot be taken back, and the register has to say why".
+ * That sentence is only true if the row reached `audit_log`. When it did not, the reason they
+ * typed exists nowhere at all, and the success message would have been the only trace of an act
+ * whose entire justification was just lost.
+ *
+ * It does NOT throw and it does NOT turn the message red: the state change already happened and
+ * succeeded, and reporting it as a failure would send somebody to press the button again on an
+ * opportunity that has already moved. The move is reported as done, and the missing register entry
+ * is reported beside it as the separate fact it is.
+ *
+ * Declared HERE, above the POST handler that calls it. `const` is not hoisted.
+ */
+const auditOrSay = async (args: Parameters<typeof logAudit>[0]): Promise<void> => {
+  const r = await logAudit(args);
+  if (r.ok) return;
+  msg += ' The change was applied, but it could NOT be written to the audit register ('
+    + (r.error || 'no reason given') + '). Anything you typed as a reason is not recorded anywhere. '
+    + 'Report this: the register is the only place this act would otherwise be explained from.';
+};
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+  const opportunityId = String(fd.get('opportunityId') || '');
+  try {
+    if (!mayManage) {
+      // One refusal for every write on this page. A read-only holder of `talent.view` sees the desk
+      // and no buttons, so reaching this branch means a hand-made POST.
+      err = 'You do not hold the authority to change an opportunity. This desk is readable to you and not writable.';
+    } else if (action === 'create') {
+      const r = await createOpportunity({
+        createdByUserId: user.id,
+        title: fd.get('title'),
+        departmentId: fd.get('departmentId'),
+        employmentType: fd.get('employmentType'),
+        level: fd.get('level'),
+        headcount: fd.get('headcount'),
+        eligibleIdentityTypes: fd.getAll('eligibleIdentityTypes').map((x) => String(x)),
+        internalVisibleToManager: fd.get('internalVisibleToManager') === 'on',
+        hiringManagerRef: fd.get('hiringManagerRef'),
+        compensationKind: fd.get('compensationKind'),
+        compensationNote: fd.get('compensationNote'),
+        onboardingPack: fd.get('onboardingPack'),
+        deadlineAt: String(fd.get('deadlineAt') || '') || null,
+        knownPacks: PACK_KEYS,
+      });
+      if (r.ok && r.data) {
+        msg = 'Draft opportunity ' + r.data.opportunityCode + ' created. It is not public: publishing is '
+          + 'a separate act, and it checks its own preconditions.';
+        await auditOrSay({
+          userId: user.id, action: 'opportunity.created',
+          entity: 'tal_opportunity', entityId: r.data.id,
+          diff: {
+            opportunityCode: r.data.opportunityCode,
+            title: r.data.title,
+            departmentId: r.data.departmentId,
+            employmentType: r.data.employmentType,
+            compensationKind: r.data.compensationKind,
+          },
+          ipAddress: Astro.clientAddress,
+        });
+      } else {
+        err = r.error || 'The opportunity could not be created.';
+      }
+    } else if (action === 'edit') {
+      const r = await updateOpportunity(opportunityId, {
+        title: fd.get('title'),
+        level: fd.get('level'),
+        headcount: fd.get('headcount'),
+        hiringManagerRef: String(fd.get('hiringManagerRef') || ''),
+        compensationKind: fd.get('compensationKind'),
+        compensationNote: fd.get('compensationNote'),
+        deadlineAt: String(fd.get('deadlineAt') || '') || null,
+        knownPacks: PACK_KEYS,
+      });
+      if (r.ok && r.data) {
+        msg = 'Updated ' + r.data.opportunityCode + '.';
+        await auditOrSay({
+          userId: user.id, action: 'opportunity.updated',
+          entity: 'tal_opportunity', entityId: r.data.id,
+          diff: {
+            title: r.data.title,
+            headcount: r.data.headcount,
+            deadlineAt: r.data.deadlineAt,
+            compensationKind: r.data.compensationKind,
+            hiringManagerId: r.data.hiringManagerId,
+          },
+          ipAddress: Astro.clientAddress,
+        });
+      } else {
+        err = r.error || 'The opportunity could not be updated.';
+      }
+    } else if (action === 'transition') {
+      const to = String(fd.get('to') || '');
+      const reason = String(fd.get('reason') || '').trim().slice(0, 300);
+      // A WRITTEN REASON FOR THE MOVES THAT CANNOT BE TAKEN BACK. Closing ends a hiring event and
+      // archiving is terminal in the lattice; six months later the audit entry is the only thing
+      // that can say why, and an entry that records only "closed" answers nothing. This mirrors the
+      // onboarding-code desk, which refuses a revocation without one for the same reason.
+      if (REASON_REQUIRED_MOVES.includes(to) && !reason) {
+        err = to === 'closed'
+          ? 'Closing an opportunity needs a written reason. It cannot be re-opened, and the register has to say why it ended.'
+          : 'Archiving an opportunity needs a written reason. Nothing comes back from archived, and the register has to say why it was tidied away.';
+      } else {
+        const r = await transitionOpportunity(opportunityId, to, { knownPacks: PACK_KEYS });
+        if (r.ok && r.data) {
+          if (to === 'published') {
+            // NOT "it is world-readable from now on". Nothing outside the admin console reads
+            // tal_opportunity today: `role_id`, the projection into the public `roles` advertisement,
+            // is never written by this desk. Publishing is an internal state change, and saying more
+            // than that would tell a recruiter their vacancy is live when no candidate can see it.
+            msg = r.data.opportunityCode + ' is marked published. That is a state inside this console: '
+              + 'no public page reads it yet, so nothing has appeared on the careers site.';
+          } else if (to === 'unpublished') {
+            msg = r.data.opportunityCode + ' is marked unpublished. Its published date is kept.';
+          } else if (to === 'closed') {
+            msg = r.data.opportunityCode + ' is marked closed. Its applications are untouched: '
+              + 'everybody already in it continues to a decision.';
+          } else {
+            msg = r.data.opportunityCode + ' is archived. It is a record now and does not come back.';
+          }
+          // The spec's audit vocabulary, one action per move: opportunity.published, .unpublished,
+          // .closed, .archived.
+          await auditOrSay({
+            userId: user.id, action: 'opportunity.' + to,
+            entity: 'tal_opportunity', entityId: r.data.id,
+            diff: {
+              opportunityCode: r.data.opportunityCode,
+              status: r.data.status,
+              publishedAt: r.data.publishedAt,
+              closedAt: r.data.closedAt,
+              reason: reason || null,
+            },
+            ipAddress: Astro.clientAddress,
+          });
+        } else {
+          err = r.error || 'That move was not applied.';
+        }
+      }
+    } else if (action === 'assign_evaluator') {
+      const r = await assignEvaluator({
+        opportunityId,
+        userRef: fd.get('userRef'),
+        assignRole: String(fd.get('assignRole') || 'evaluator'),
+      });
+      if (r.ok && r.data) {
+        const who = r.data.userName || r.data.userEmail;
+        // NOT "can now see this opportunity and its candidates". tal_opportunity_evaluator is read
+        // by nothing in this codebase, so the assignment grants no sight of anything today. Saying
+        // it does would tell an operator that an access control had been applied when none had.
+        msg = r.data.changed
+          ? who + ' is recorded against this opportunity. This is a record of who was asked, not a '
+            + 'grant of access: nothing reads it yet to decide who may open an applicant.'
+          : who + ' was already recorded against this opportunity in that capacity. Nothing changed.';
+        if (r.data.changed) {
+          await auditOrSay({
+            userId: user.id, action: 'opportunity.evaluator_assigned',
+            entity: 'tal_opportunity_evaluator', entityId: r.data.id,
+            diff: {
+              opportunityId,
+              assignedUserId: r.data.userId,
+              assignedEmail: r.data.userEmail,
+              assignRole: String(fd.get('assignRole') || 'evaluator'),
+            },
+            ipAddress: Astro.clientAddress,
+          });
+        }
+      } else {
+        err = r.error || 'Nobody was assigned.';
+      }
+    } else if (action === 'remove_evaluator') {
+      const assignmentId = String(fd.get('assignmentId') || '');
+      const reason = String(fd.get('reason') || '').trim().slice(0, 300);
+      if (!reason) {
+        err = 'Removing somebody from an opportunity needs a written reason. The row is deleted, so '
+          + 'the audit entry is the only thing left that can say why they were taken off it.';
+      } else {
+        const r = await removeEvaluator(assignmentId);
+        if (r.ok && r.data) {
+          msg = 'That record was removed. It was not granting access, so nothing that person can '
+            + 'currently open has changed.';
+          await auditOrSay({
+            userId: user.id, action: 'opportunity.evaluator_removed',
+            entity: 'tal_opportunity_evaluator', entityId: assignmentId,
+            diff: {
+              opportunityId: r.data.opportunityId,
+              removedUserId: r.data.userId,
+              assignRole: r.data.assignRole,
+              reason,
+            },
+            ipAddress: Astro.clientAddress,
+          });
+        } else {
+          err = r.error || 'That assignment was not removed.';
+        }
+      }
+    }
+  } catch (e: any) {
+    // The REAL Postgres reason lives on e.cause; e.message is only the failed statement.
+    err = e?.cause?.message || e?.message || 'Something went wrong.';
+  }
+}
+
+// Filters are read AFTER the POST so the screen reflects what just happened.
+const statusParam = Astro.url.searchParams.get('status') || 'all';
+const status = STATUS_TABS.some((t) => t.key === statusParam) ? statusParam : 'all';
+const q = (Astro.url.searchParams.get('q') || '').trim().slice(0, 120);
+
+// A THROW HERE IS NOT AN EMPTY DESK. listOpportunities() and opportunityCounts() rethrow precisely
+// so this page can tell "no opportunity matches" apart from "the desk could not be read" — they
+// render as the same empty table otherwise, and they mean opposite things.
+let counts: OpportunityCounts | null = null;
+let countsFailed = false;
+try {
+  counts = await opportunityCounts(scope);
+} catch {
+  // NOT SILENT. Tiles that simply vanish read as a page with no header, and the deadline warning
+  // below is derived from these same numbers — so a swallowed failure here would also withdraw a
+  // safety warning without saying it had. The flag is rendered.
+  countsFailed = true;
+}
+
+// The desk reads at most LIST_LIMIT rows. There is no pagination on this screen yet, so a full
+// page must SAY it is full: a table that stops at two hundred without a word reads as "these are
+// all the opportunities there are", which is the same lie as an empty state that means a failure.
+const LIST_LIMIT = 200;
+let list: OpportunityRow[] = [];
+let listFailed = false;
+try {
+  list = await listOpportunities({ status, q, scope, limit: LIST_LIMIT });
+} catch (e: any) {
+  listFailed = true;
+  err = err || ('The opportunity desk could not be read: ' + (e?.cause?.message || e?.message || 'unknown error'));
+}
+
+// Assignments are read separately so an evaluator failure cannot blank the desk — but a failure is
+// REPORTED rather than rendered as "nobody is assigned", which is the opposite claim.
+let evaluators: EvaluatorAssignment[] = [];
+let evaluatorsFailed = false;
+try {
+  evaluators = await listEvaluators(list.map((o) => o.id));
+} catch { evaluatorsFailed = true; }
+
+let departments: DepartmentOption[] = [];
+let departmentsFailed = false;
+let people: AssignableUser[] = [];
+let peopleFailed = false;
+if (mayManage) {
+  try { departments = await listDepartmentOptions(); } catch { departmentsFailed = true; }
+  try { people = await listAssignableUsers(300); } catch { peopleFailed = true; }
+}
+
+const peopleOptions = people.map((p) => ({
+  email: p.email,
+  label: (p.name || p.email) + ' (' + p.email + ')',
+}));
+
+const evaluatorsByOpportunity = new Map<string, EvaluatorAssignment[]>();
+for (const e of evaluators) {
+  const bucket = evaluatorsByOpportunity.get(e.opportunityId) || [];
+  bucket.push(e);
+  evaluatorsByOpportunity.set(e.opportunityId, bucket);
+}
+
+// Every comparison is finished in the frontmatter: `<` inside a JSX expression breaks .astro
+// parsing on this project, so the template only ever reads booleans and strings.
+const nowMs = Date.now();
+const rows = list.map((o) => {
+  const legal = legalTransitionsFrom(o.status);
+  const deadlineMs = o.deadlineAt ? new Date(o.deadlineAt).getTime() : 0;
+  const deadlinePassed = !!o.deadlineAt && deadlineMs < nowMs;
+
+  let statusClass = 'pill';
+  if (o.status === 'published') statusClass = 'pill pill--live';
+  if (o.status === 'draft') statusClass = 'pill pill--draft';
+  if (o.status === 'unpublished') statusClass = 'pill pill--off';
+  if (o.status === 'closed' || o.status === 'archived') statusClass = 'pill pill--off';
+
+  let deadlineNote = 'No deadline set';
+  if (o.deadlineAt && deadlinePassed) deadlineNote = 'Deadline passed ' + fmtDate(o.deadlineAt);
+  else if (o.deadlineAt) deadlineNote = 'Applications until ' + fmtDate(o.deadlineAt);
+
+  const eligible = o.eligibleIdentityTypes
+    .map((t) => (IDENTITY_TYPE_LABELS as Record<string, string>)[String(t)] || String(t));
+
+  const assigned = evaluatorsByOpportunity.get(o.id) || [];
+  const editable = mayManage && o.status !== 'archived';
+
+  return {
+    id: o.id,
+    code: o.opportunityCode,
+    title: o.title,
+    statusLabel: opportunityStatusLabel(o.status),
+    statusClass,
+    departmentLabel: o.departmentName || o.departmentId,
+    employmentLabel: employmentTypeLabel(o.employmentType),
+    levelNote: o.level || '',
+    headcountNote: o.headcount === null
+      ? 'Seats not set'
+      : (o.headcount === 1 ? 'One seat' : o.headcount + ' seats'),
+    compensationNote: compensationLine(o.compensationKind, o.compensationNote),
+    eligibilityNote: eligible.length ? eligible.join(', ') : 'External applicants only',
+    internalNote: o.internalVisibleToManager ? "Visible to an internal applicant's manager" : '',
+    packNote: o.onboardingPack || '',
+    deadlineNote,
+    deadlineWarn: deadlinePassed && o.status === 'published',
+    publishedNote: o.publishedAt ? 'Published ' + fmtDateTime(o.publishedAt) : '',
+    closedNote: o.closedAt ? 'Closed ' + fmtDateTime(o.closedAt) : '',
+    createdNote: 'Created ' + fmtDate(o.createdAt),
+    applicationsNote: o.applicationCount === 1 ? 'One application' : o.applicationCount + ' applications',
+    // "No hiring manager named" and "a manager is recorded whose account did not come back from the
+    // join" are different facts, and the edit form below is prefilled from the EMAIL — so conflating
+    // them would let an unrelated edit silently clear a hiring manager that is actually set.
+    hiringManagerNote: o.hiringManagerName || o.hiringManagerEmail
+      || (o.hiringManagerId
+        ? 'A hiring manager is recorded, but their account did not come back'
+        : 'No hiring manager named'),
+    hiringManagerUnresolved: !!o.hiringManagerId && !o.hiringManagerEmail,
+    hiringManagerValue: o.hiringManagerEmail,
+    pipelineNote: 'Pipeline version ' + o.pipelineVersion,
+    canPublish: mayManage && legal.includes('published'),
+    canUnpublish: mayManage && legal.includes('unpublished'),
+    canClose: mayManage && legal.includes('closed'),
+    canArchive: mayManage && legal.includes('archived'),
+    hasAnyAction: mayManage && legal.length > 0,
+    stuckNote: legal.length === 0 ? 'Archived. Nothing moves from here.' : '',
+    editable,
+    titleValue: o.title,
+    levelValue: o.level || '',
+    headcountValue: o.headcount === null ? '' : String(o.headcount),
+    deadlineValue: forInput(o.deadlineAt),
+    compensationNoteValue: o.compensationNote || '',
+    compensationOptions: COMPENSATION_OPTIONS.map((c) => ({
+      value: c.value, label: c.label, selected: c.value === o.compensationKind,
+    })),
+    assigned: assigned.map((a) => ({
+      id: a.id,
+      who: (a.userName || a.userEmail || 'Unknown account'),
+      email: a.userEmail,
+      roleLabel: a.assignRoleLabel,
+      since: fmtDate(a.createdAt),
+    })),
+    // TWO COUNTS, DELIBERATELY. `assigned` is the detail read (listEvaluators), which can fail on
+    // its own; `o.evaluatorCount` is a COUNT taken inside the desk query that produced this row, so
+    // it is present whenever the row is. When the detail read failed, the panel says so and quotes
+    // the count it still has, instead of rendering an empty list that reads as "nobody is assigned".
+    assignedCount: evaluatorsFailed ? o.evaluatorCount : assigned.length,
+    assignedNote: evaluatorsFailed
+      ? ('Who is assigned could not be read just now. The desk query counted '
+         + (o.evaluatorCount === 1 ? 'one assignment' : o.evaluatorCount + ' assignments')
+         + ' on this opportunity; the names below are missing because of that failure and not '
+         + 'because nobody is recorded.')
+      : (assigned.length === 0
+        ? 'Nobody is recorded against this opportunity.'
+        : (assigned.length === 1 ? 'One person is recorded.' : assigned.length + ' people are recorded.')),
+    canAssign: mayManage && o.status !== 'archived' && !evaluatorsFailed,
+  };
+});
+
+const hasRows = rows.length > 0;
+const listTruncated = list.length >= LIST_LIMIT;
+const truncationPhrase = 'This desk shows the ' + LIST_LIMIT + ' most recently created opportunities '
+  + 'and there are at least that many, so older ones are not on this page. Narrow it with a status '
+  + 'tab or a search until the table is short enough to be the whole answer.';
+const isFiltered = q.length > 0 || status !== 'all';
+const showCreate = mayManage && !departmentsFailed && departments.length > 0;
+// TWO REASONS THE FORM IS MISSING, AND THEY ARE NOT THE SAME REASON. "The department list could not
+// be read" and "this installation has no departments" produce the identical blank select, and the
+// first is a fault to chase while the second is a setup step to take. Telling an operator the wrong
+// one sends them to the wrong screen.
+const createBlockedByFailure = mayManage && departmentsFailed;
+const createBlockedByNone = mayManage && !departmentsFailed && departments.length === 0;
+const deadlinePassedCount = counts ? counts.deadlinePassed : 0;
+const deadlinePhrase = deadlinePassedCount === 1
+  ? 'One opportunity is marked published and is past its deadline.'
+  : deadlinePassedCount + ' opportunities are marked published and are past their deadline.';
+const showDeadlineWarning = deadlinePassedCount > 0;
+---
+
+<AdminLayout title="Opportunities" activeNav="talent-opportunities">
+  <div class="wrap">
+    <header class="head">
+      <h1>Opportunities</h1>
+      <p class="sub">
+        Every hiring event this organization is running, and exactly what state it is in. An
+        opportunity opens, runs a pipeline, closes and archives; the seat it advertises outlives it.
+        Applications land against the opportunity, decisions against the application, and onboarding
+        codes against the decision on <a href="/admin/talent/selected">Selected candidates</a>.
+      </p>
+    </header>
+
+    <div class="explain">
+      <p class="explain__title">Publishing is a separate act from writing one</p>
+      <p>
+        A new opportunity is always a draft. Publishing is checked before it is allowed: a deadline
+        that has not passed, a named hiring manager, an employment type this system recognises, and
+        compensation copy that is honest for the engagement. Every failing condition is listed at
+        once rather than one at a time.
+      </p>
+      <p class="truthbar">
+        <strong>Published is a state in this console, not a live advertisement.</strong> No public
+        page reads these rows yet: the projection that would put an opportunity on the careers site
+        writes a row in <code>roles</code>, and this desk does not write one. Marking something
+        published records the decision and changes nothing a candidate can see. Publishing it for
+        real is still done on the roles desk.
+      </p>
+      <p>
+        Internships and apprenticeships here are <strong>unpaid unless a stipend is recorded</strong>.
+        An opportunity marked as paying with nothing written down about what it pays is refused,
+        because the advertisement would otherwise promise money nobody has agreed.
+      </p>
+      <p>
+        A closed opportunity is not re-opened and an archived one is not brought back. Publish a
+        successor instead, so that everybody already in the old one keeps the process they applied
+        under. Closing does not close the applications already in flight.
+      </p>
+      <p>
+        Every date and time on this desk, including the deadline you type, is <strong>UTC</strong>.
+        The deadline box has no time zone of its own, so it is filled from and read back as UTC:
+        that is what stops a saved deadline from drifting by the offset of whichever machine handled
+        the request.
+      </p>
+    </div>
+
+    <div class="explain">
+      <p class="explain__title">Who is recorded against each opportunity</p>
+      <p>
+        The panel on each row records who is meant to evaluate, interview or sit on the panel for
+        this opportunity, per opportunity rather than by the role an account happens to hold. That
+        per-row shape is what an access rule would eventually be built from.
+      </p>
+      <p class="truthbar">
+        <strong>It does not yet grant or withhold any access.</strong> Nothing in this codebase
+        reads these rows to decide who may open an applicant, so adding somebody here does not let
+        them see a candidate, and removing somebody does not stop them. Treat it as the record of
+        who was asked, and keep using whatever gates the applicant desk actually applies today.
+      </p>
+      <p>
+        Anything an evaluator records is <strong>advisory</strong>. Scores and recommendations inform
+        a human decision and never make one: a selection is written by a person, against a reason,
+        on the selection desk.
+      </p>
+    </div>
+
+    {!unrestricted && (
+      <p class="scopenote">
+        You are seeing the opportunities owned by the departments you head, together with any
+        opportunity you are named the hiring manager of. If a department you head is missing from
+        this list, its relationship could not be read from the organization graph, which is not the
+        same as your not heading one.
+      </p>
+    )}
+
+    {scopeLookupBroken && (
+      <p class="warnbar">
+        Your employee record could not be read, so the departments you head could not be resolved.
+        Everything below is narrowed to opportunities that name you as hiring manager and to nothing
+        else. That is a failed read: it is not a statement that you head no department.
+      </p>
+    )}
+
+    {scopeNotAnEmployee && (
+      <p class="warnbar">
+        This account is not attached to an employee record, so no department can be resolved for it
+        from the organization graph. You are seeing only the opportunities that name you as hiring
+        manager. The people desk attaches the record; nothing on this screen can.
+      </p>
+    )}
+
+    {scopeNoDepartments && !scopeLookupBroken && !scopeNotAnEmployee && (
+      <p class="scopenote">
+        The organization graph answered, and it records you as heading no department. You are
+        therefore seeing only the opportunities that name you as hiring manager.
+      </p>
+    )}
+
+    {msg && <div class="note note--ok">{msg}</div>}
+    {err && <div class="note note--err">{err}</div>}
+
+    {countsFailed && (
+      <p class="warnbar">
+        The header counts could not be read, so no tile is shown and the past-deadline warning is
+        not being calculated. That is a failed read, not a desk with nothing in it: do not conclude
+        from a missing tile that there are no opportunities in that state.
+      </p>
+    )}
+
+    {counts && (
+      <div class="tiles">
+        <div class="tile"><span class="tile__n">{counts.draft}</span><span class="tile__l">Drafts</span></div>
+        <div class="tile"><span class="tile__n">{counts.published}</span><span class="tile__l">Published</span></div>
+        <div class="tile"><span class="tile__n">{counts.unpublished}</span><span class="tile__l">Unpublished</span></div>
+        <div class="tile"><span class="tile__n">{counts.closed}</span><span class="tile__l">Closed</span></div>
+        <div class="tile"><span class="tile__n">{counts.archived}</span><span class="tile__l">Archived</span></div>
+        <div class="tile"><span class="tile__n">{counts.total}</span><span class="tile__l">In total</span></div>
+      </div>
+    )}
+
+    {showDeadlineWarning && (
+      <p class="warnbar">
+        {deadlinePhrase} A past deadline does not stop an application arriving; it only tells a
+        candidate they are too late. Close it, or move the deadline.
+      </p>
+    )}
+
+    {evaluatorsFailed && (
+      <p class="warnbar">
+        The evaluator records could not be read. The panels below are empty because of that failure
+        and not because nobody is recorded, so adding and removing are switched off on every row
+        until the read works again. Each panel quotes the count the desk query still returned.
+      </p>
+    )}
+
+    {createBlockedByFailure && (
+      <p class="warnbar">
+        The department list could not be read, so the create form is not being offered. That is a
+        failed read and not a statement that there are no departments. An opportunity must be owned
+        by one, and offering a form that cannot record it would produce a refusal at the last step
+        instead of a working screen.
+      </p>
+    )}
+
+    {createBlockedByNone && (
+      <p class="warnbar">
+        The department list read correctly and came back empty: this installation has no departments
+        yet. Every opportunity is owned by one, and access to its candidates is decided from it, so
+        the create form is not offered until at least one exists.
+      </p>
+    )}
+
+    {showCreate && (
+      <details class="panel">
+        <summary>Create an opportunity</summary>
+        <form method="POST" class="createform">
+          <input type="hidden" name="_action" value="create" />
+          <div class="grid">
+            <label class="field field--wide">
+              <span>Title</span>
+              <input type="text" name="title" required maxlength="200" placeholder="The seat, as a candidate would read it" />
+            </label>
+            <label class="field">
+              <span>Department</span>
+              <select name="departmentId" required>
+                <option value="">Choose a department</option>
+                {departments.map((d) => <option value={d.id}>{d.name}</option>)}
+              </select>
+            </label>
+            <label class="field">
+              <span>Employment type</span>
+              <select name="employmentType" required>
+                {EMPLOYMENT_OPTIONS.map((t) => <option value={t.value}>{t.label}</option>)}
+              </select>
+            </label>
+            <label class="field">
+              <span>Level</span>
+              <input type="text" name="level" maxlength="80" placeholder="Optional" />
+            </label>
+            <label class="field">
+              <span>Headcount</span>
+              <input type="number" name="headcount" min="1" step="1" placeholder="Leave empty if undecided" />
+            </label>
+            <label class="field">
+              <span>Deadline (UTC)</span>
+              <input type="datetime-local" name="deadlineAt" />
+            </label>
+            <label class="field">
+              <span>Compensation</span>
+              <select name="compensationKind">
+                {COMPENSATION_OPTIONS.map((c) => <option value={c.value}>{c.label}</option>)}
+              </select>
+            </label>
+            <label class="field field--wide">
+              <span>What the compensation actually is</span>
+              <input type="text" name="compensationNote" maxlength="200" placeholder="Required if this is a paid internship or apprenticeship" />
+            </label>
+            <label class="field">
+              <span>Hiring manager</span>
+              <input type="text" name="hiringManagerRef" list="people-list" placeholder="Work email address" />
+            </label>
+            <label class="field">
+              <span>Onboarding package</span>
+              <select name="onboardingPack">
+                <option value="">Not decided</option>
+                {PACK_OPTIONS.map((p) => <option value={p.value}>{p.label}</option>)}
+              </select>
+            </label>
+          </div>
+
+          <fieldset class="checks">
+            <legend>Who may apply from inside the organization</legend>
+            <p class="hint">
+              Leave every box clear for an externally advertised opportunity. Ticking a type opens it
+              to people who already hold that identity here.
+            </p>
+            <div class="checkrow">
+              {IDENTITY_OPTIONS.map((t) => (
+                <label class="check">
+                  <input type="checkbox" name="eligibleIdentityTypes" value={t.value} />
+                  <span>{t.label}</span>
+                </label>
+              ))}
+            </div>
+            <label class="check">
+              <input type="checkbox" name="internalVisibleToManager" />
+              <span>Let an internal applicant's reporting manager see that they have applied</span>
+            </label>
+          </fieldset>
+
+          <p class="hint">
+            It will be created as a draft, with its own permanent reference and the standard
+            evaluation pipeline pinned to it at the version it is created against.
+          </p>
+          <button type="submit" class="btn btn--go">Create draft</button>
+        </form>
+      </details>
+    )}
+
+    <form method="GET" class="filters">
+      <div class="tabs">
+        {STATUS_TABS.map((t) => (
+          <a
+            href={'/admin/talent/opportunities?status=' + t.key + (q ? '&q=' + encodeURIComponent(q) : '')}
+            class={t.key === status ? 'tab tab--on' : 'tab'}
+          >{t.label}</a>
+        ))}
+      </div>
+      <div class="search">
+        <input type="hidden" name="status" value={status} />
+        <input type="text" name="q" value={q} placeholder="Title or opportunity reference" />
+        <button type="submit" class="btn">Search</button>
+        {q && <a class="btn" href={'/admin/talent/opportunities?status=' + status}>Clear</a>}
+      </div>
+    </form>
+
+    {listFailed && (
+      <p class="empty">
+        The desk could not be read just now. This is not the same as there being no opportunities,
+        and nothing has been changed. Reload; if it persists, the reason is in the message above.
+      </p>
+    )}
+
+    {!listFailed && !hasRows && isFiltered && (
+      <p class="empty">
+        No opportunity matches that filter. The search looks at the title and the opportunity
+        reference only.
+      </p>
+    )}
+
+    {!listFailed && !hasRows && !isFiltered && !unrestricted && (
+      <p class="empty">
+        No opportunity is owned by a department you head, and none names you as its hiring manager.
+        That is what this desk can show you; it is not a statement about how many opportunities
+        exist.
+      </p>
+    )}
+
+    {!listFailed && !hasRows && !isFiltered && unrestricted && (
+      <p class="empty">
+        No opportunities yet. Create one above: it starts as a draft, and publishing is a separate
+        act with its own checks.
+      </p>
+    )}
+
+    {listTruncated && <p class="warnbar">{truncationPhrase}</p>}
+
+    {hasRows && (
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Opportunity</th>
+              <th>Where</th>
+              <th>Terms</th>
+              <th>State</th>
+              <th>Moves</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr>
+                <td>
+                  <strong>{r.title}</strong>
+                  <span class="mono">{r.code}</span>
+                  <span class="mono">{r.applicationsNote}</span>
+                  <span class="mono">{r.createdNote}</span>
+                </td>
+                <td>
+                  {r.departmentLabel}
+                  <span class="mono">{r.employmentLabel}</span>
+                  {r.levelNote && <span class="mono">{r.levelNote}</span>}
+                  <span class="mono">{r.hiringManagerNote}</span>
+                  <span class="mono">{r.pipelineNote}</span>
+                </td>
+                <td>
+                  {r.compensationNote}
+                  <span class="mono">{r.headcountNote}</span>
+                  <span class="mono">{r.eligibilityNote}</span>
+                  {r.internalNote && <span class="mono">{r.internalNote}</span>}
+                  {r.packNote && <span class="mono">{r.packNote}</span>}
+                </td>
+                <td>
+                  <span class={r.statusClass}>{r.statusLabel}</span>
+                  {r.deadlineWarn && <span class="mono warn">{r.deadlineNote}</span>}
+                  {!r.deadlineWarn && <span class="mono">{r.deadlineNote}</span>}
+                  {r.publishedNote && <span class="mono">{r.publishedNote}</span>}
+                  {r.closedNote && <span class="mono">{r.closedNote}</span>}
+                </td>
+                <td class="acts">
+                  {r.canPublish && (
+                    <form method="POST">
+                      <input type="hidden" name="_action" value="transition" />
+                      <input type="hidden" name="opportunityId" value={r.id} />
+                      <input type="hidden" name="to" value="published" />
+                      <button type="submit" class="btn btn--go">Publish</button>
+                    </form>
+                  )}
+                  {r.canUnpublish && (
+                    <form method="POST">
+                      <input type="hidden" name="_action" value="transition" />
+                      <input type="hidden" name="opportunityId" value={r.id} />
+                      <input type="hidden" name="to" value="unpublished" />
+                      <button type="submit" class="btn">Unpublish</button>
+                    </form>
+                  )}
+                  {r.canClose && (
+                    <form method="POST">
+                      <input type="hidden" name="_action" value="transition" />
+                      <input type="hidden" name="opportunityId" value={r.id} />
+                      <input type="hidden" name="to" value="closed" />
+                      <input type="text" name="reason" maxlength="300" placeholder="Why it is ending" required />
+                      <button type="submit" class="btn btn--warn">Close</button>
+                    </form>
+                  )}
+                  {r.canArchive && (
+                    <form method="POST">
+                      <input type="hidden" name="_action" value="transition" />
+                      <input type="hidden" name="opportunityId" value={r.id} />
+                      <input type="hidden" name="to" value="archived" />
+                      <input type="text" name="reason" maxlength="300" placeholder="Why it is being tidied away" required />
+                      <button type="submit" class="btn btn--warn">Archive</button>
+                    </form>
+                  )}
+                  {!r.hasAnyAction && <span class="muted">{r.stuckNote || 'No move available to you'}</span>}
+
+                  <details class="rowpanel">
+                    <summary>Recorded evaluators ({r.assignedCount})</summary>
+                    <p class="hint">{r.assignedNote}</p>
+                    {r.assigned.map((a) => (
+                      <div class="assigned">
+                        <span class="assigned__who">
+                          <strong>{a.who}</strong>
+                          <span class="mono">{a.roleLabel}{a.since ? ', since ' + a.since : ''}</span>
+                        </span>
+                        {r.canAssign && (
+                          <form method="POST">
+                            <input type="hidden" name="_action" value="remove_evaluator" />
+                            <input type="hidden" name="assignmentId" value={a.id} />
+                            <input type="text" name="reason" maxlength="300" placeholder="Why" required />
+                            <button type="submit" class="btn btn--warn">Remove</button>
+                          </form>
+                        )}
+                      </div>
+                    ))}
+                    {r.canAssign && (
+                      <form method="POST" class="assignform">
+                        <input type="hidden" name="_action" value="assign_evaluator" />
+                        <input type="hidden" name="opportunityId" value={r.id} />
+                        <input type="text" name="userRef" list="people-list" placeholder="Work email address" required />
+                        <select name="assignRole">
+                          {ASSIGN_ROLE_OPTIONS.map((o) => <option value={o.value}>{o.label}</option>)}
+                        </select>
+                        <button type="submit" class="btn btn--go">Record against this opportunity</button>
+                      </form>
+                    )}
+                  </details>
+
+                  {r.editable && (
+                    <details class="rowpanel">
+                      <summary>Edit</summary>
+                      <form method="POST" class="editform">
+                        <input type="hidden" name="_action" value="edit" />
+                        <input type="hidden" name="opportunityId" value={r.id} />
+                        <label class="field">
+                          <span>Title</span>
+                          <input type="text" name="title" value={r.titleValue} required maxlength="200" />
+                        </label>
+                        <label class="field">
+                          <span>Level</span>
+                          <input type="text" name="level" value={r.levelValue} maxlength="80" />
+                        </label>
+                        <label class="field">
+                          <span>Headcount</span>
+                          <input type="number" name="headcount" min="1" step="1" value={r.headcountValue} />
+                        </label>
+                        <label class="field">
+                          <span>Deadline (UTC)</span>
+                          <input type="datetime-local" name="deadlineAt" value={r.deadlineValue} />
+                        </label>
+                        <label class="field">
+                          <span>Compensation</span>
+                          <select name="compensationKind">
+                            {r.compensationOptions.map((c) => <option value={c.value} selected={c.selected}>{c.label}</option>)}
+                          </select>
+                        </label>
+                        <label class="field">
+                          <span>What it actually pays</span>
+                          <input type="text" name="compensationNote" value={r.compensationNoteValue} maxlength="200" />
+                        </label>
+                        <label class="field">
+                          <span>Hiring manager (clear to remove)</span>
+                          <input type="text" name="hiringManagerRef" value={r.hiringManagerValue} list="people-list" />
+                        </label>
+                        {r.hiringManagerUnresolved && (
+                          <p class="hint warn">
+                            A hiring manager is recorded on this opportunity but their account did not
+                            come back, so this box could not be prefilled. Saving it empty will clear
+                            the hiring manager. Type the correct work email address first.
+                          </p>
+                        )}
+                        <p class="hint">
+                          The department, the employment type and the pipeline are not edited here. A
+                          published opportunity is re-checked against the publish conditions before
+                          any edit is accepted.
+                        </p>
+                        <button type="submit" class="btn">Save</button>
+                      </form>
+                    </details>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+
+    {peopleFailed && mayManage && (
+      <p class="warnbar">
+        The list of accounts could not be read, so the email suggestions are missing. A full work
+        email address typed in by hand still works.
+      </p>
+    )}
+
+    <datalist id="people-list">
+      {peopleOptions.map((p) => <option value={p.email}>{p.label}</option>)}
+    </datalist>
+  </div>
+</AdminLayout>
+
+<style>
+  .wrap { padding: 20px; max-width: 1400px; }
+  .head h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #9aa0aa; font-size: 13px; margin: 0 0 16px; max-width: 80ch; line-height: 1.6; }
+  .sub a, .empty a { color: inherit; }
+  .explain {
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px 14px;
+    margin-bottom: 14px; max-width: 90ch;
+  }
+  .explain__title { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  .explain p { font-size: 12px; color: #9aa0aa; line-height: 1.6; margin: 0 0 6px; }
+  .explain p:last-child { margin-bottom: 0; }
+  /* The sentence that says what this screen does NOT do. Set apart deliberately: it is the one
+     paragraph an operator must not skim past, because everything above it reads like a promise. */
+  .explain p.truthbar {
+    border-left: 2px solid rgba(255,190,80,0.55); padding-left: 10px; color: #c9ceD6;
+  }
+  .explain code { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; }
+  .scopenote {
+    font-size: 12px; color: #9aa0aa; line-height: 1.6; max-width: 90ch;
+    border-left: 2px solid rgba(255,255,255,0.18); padding-left: 10px; margin: 0 0 14px;
+  }
+  .note { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; }
+  .note--ok { background: rgba(46,160,90,0.12); border: 1px solid rgba(46,160,90,0.4); }
+  .note--err { background: rgba(200,60,60,0.12); border: 1px solid rgba(200,60,60,0.4); }
+  .warnbar {
+    font-size: 12px; color: #9aa0aa; line-height: 1.55; max-width: 90ch;
+    border: 1px solid rgba(255,190,80,0.35); background: rgba(255,190,80,0.06);
+    border-radius: 8px; padding: 10px 12px; margin: 0 0 14px;
+  }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .tile { border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .tile__n { font-size: 22px; font-weight: 600; }
+  .tile__l { font-size: 11px; color: #9aa0aa; text-transform: uppercase; letter-spacing: 0.06em; }
+  .panel {
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 10px 14px; margin-bottom: 16px;
+  }
+  .panel > summary { font-size: 13px; font-weight: 600; cursor: pointer; }
+  .createform { padding-top: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field--wide { grid-column: span 2; }
+  .field > span { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; }
+  .checks { border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 10px 12px; margin: 14px 0; }
+  .checks legend { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; padding: 0 4px; }
+  .checkrow { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; }
+  .check { display: flex; align-items: center; gap: 5px; font-size: 12px; }
+  .hint { font-size: 12px; color: #8b919b; line-height: 1.55; max-width: 80ch; margin: 6px 0; }
+  .filters { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-bottom: 12px; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tab {
+    font-size: 12px; padding: 5px 10px; border-radius: 999px; text-decoration: none; color: #9aa0aa;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .tab--on { color: inherit; border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.06); }
+  .search { display: flex; gap: 6px; align-items: center; }
+  .search input[type=text] { min-width: 280px; }
+  .tablewrap { overflow-x: auto; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 1100px; }
+  th { text-align: left; padding: 10px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; border-bottom: 1px solid rgba(255,255,255,0.1); }
+  td { padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.06); vertical-align: top; }
+  td strong { display: block; }
+  .mono { display: block; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #8b919b; margin-top: 2px; }
+  .mono.warn, .hint.warn { color: #d9a05b; }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.18); }
+  .pill--live { border-color: rgba(46,160,90,0.55); color: #7fd6a0; }
+  .pill--draft { border-color: rgba(120,150,220,0.5); color: #a8bdf0; }
+  .pill--off { border-color: rgba(200,60,60,0.5); color: #e08b8b; }
+  .acts { display: flex; flex-direction: column; gap: 8px; min-width: 280px; }
+  .acts > form { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .rowpanel { border-top: 1px solid rgba(255,255,255,0.08); padding-top: 8px; margin-top: 4px; }
+  .rowpanel > summary { font-size: 12px; color: #9aa0aa; cursor: pointer; }
+  .assigned { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+  .assigned__who strong { font-size: 12px; }
+  .assignform { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+  .editform { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; max-width: 340px; }
+  .btn { border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.06); color: inherit; padding: 6px 10px; border-radius: 5px; font-size: 12px; cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn--go { border-color: rgba(46,160,90,0.5); }
+  .btn--warn { border-color: rgba(200,60,60,0.5); }
+  input[type=text], input[type=number], input[type=datetime-local], select {
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.14); color: inherit;
+    padding: 5px 7px; border-radius: 4px; font-size: 12px; width: 100%;
+  }
+  .assignform input[type=text] { width: 210px; }
+  .acts > form input[type=text] { width: 150px; }
+  .assigned form input[type=text] { width: 110px; }
+  .assignform select { width: auto; }
+  .muted { color: #6f757e; font-size: 12px; }
+  .empty { color: #9aa0aa; font-size: 13px; max-width: 70ch; line-height: 1.6; }
+</style>

@@ -55,6 +55,7 @@ import { allocateCode } from './ids';
 import {
   rowsOf, reasonOf,
   CODE_ALPHABET, CODE_GROUP_LEN, CODE_GROUPS, CODE_BODY_LEN, CODE_LIMITS, UNIFORM_REJECTION,
+  CODE_DISPLAY_PREFIX,
   type OnboardingCode, type OnboardingCodeStatus, type RedeemOutcome, type IssuedCode,
 } from './types';
 
@@ -62,12 +63,27 @@ import {
 // DEFINED in types.ts. Nothing in this file may shadow it.
 export {
   CODE_ALPHABET, CODE_GROUP_LEN, CODE_GROUPS, CODE_BODY_LEN, CODE_LIMITS, UNIFORM_REJECTION,
+  CODE_DISPLAY_PREFIX,
 };
 export type { OnboardingCode, OnboardingCodeStatus, RedeemOutcome, IssuedCode };
 
 // ---------------------------------------------------------------------------------------------
 // FORMAT — 32 symbols, 15 characters, ~75 bits. Spec 16.1.
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * Remove the ERA-SEL display prefix if the caller pasted it, and only then.
+ *
+ * THE LENGTH TEST IS THE WHOLE SAFETY ARGUMENT. A blanket "strip ERASEL wherever it starts a code"
+ * would eat six REAL characters out of a body that happens to begin with them — E, R, A, S and L
+ * are every one of them in CODE_ALPHABET, so such a body is perfectly issuable. Stripping only when
+ * what remains is exactly CODE_BODY_LEN makes the two cases distinguishable with no ambiguity left.
+ */
+function stripDisplayPrefix(stripped: string): string {
+  const p = CODE_DISPLAY_PREFIX.replace(/[^A-Z0-9]/g, '');
+  if (stripped.length === p.length + CODE_BODY_LEN && stripped.startsWith(p)) return stripped.slice(p.length);
+  return stripped;
+}
 
 /**
  * Normalise anything a human might paste into the canonical 15-character body.
@@ -80,7 +96,7 @@ export type { OnboardingCode, OnboardingCodeStatus, RedeemOutcome, IssuedCode };
  * guess — which is both a worse error message and, at scale, free extra attempts against the limiter.
  */
 export function normaliseCode(input: string): string | null {
-  const s = String(input || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const s = stripDisplayPrefix(String(input || '').toUpperCase().replace(/[^A-Z0-9]/g, ''));
   if (s.length !== CODE_BODY_LEN) return null;
   for (const ch of s) if (!CODE_ALPHABET.includes(ch)) return null;
   return s;
@@ -97,7 +113,10 @@ export function formatSecret(body: string): string {
   const b = String(body || '');
   const groups: string[] = [];
   for (let i = 0; i < CODE_GROUPS; i++) groups.push(b.slice(i * CODE_GROUP_LEN, (i + 1) * CODE_GROUP_LEN));
-  return groups.filter(Boolean).join('-');
+  const grouped = groups.filter(Boolean).join('-');
+  // An empty body must stay empty rather than becoming a bare "ERA-SEL", which would look to an
+  // operator like a code that had been issued.
+  return grouped ? CODE_DISPLAY_PREFIX + '-' + grouped : '';
 }
 
 /**
@@ -110,7 +129,12 @@ export function formatSecret(body: string): string {
 export function formatProblem(input: string): string | null {
   const raw = String(input || '').trim();
   if (!raw) return 'Enter the onboarding code you were sent.';
-  const stripped = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  // The COUNT is taken after a lenient prefix strip, unlike normaliseCode's strict one: this
+  // function only produces an error message, so counting "ERA-SEL-ABCD-EFGH" as 12 characters and
+  // not 18 is what makes the message act on the part the candidate can actually fix.
+  const bare = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const pfx = CODE_DISPLAY_PREFIX.replace(/[^A-Z0-9]/g, '');
+  const stripped = bare.startsWith(pfx) && bare.length !== CODE_BODY_LEN ? bare.slice(pfx.length) : bare;
   if (stripped.length !== CODE_BODY_LEN) {
     return `An onboarding code has ${CODE_BODY_LEN} characters, shown in three groups of ${CODE_GROUP_LEN}. This one has ${stripped.length}.`;
   }
@@ -647,5 +671,198 @@ export async function listCodes(filter: { status?: string; limit?: number; offse
   } catch (e: any) {
     console.error('[talent-codes] listCodes: ' + reasonOf(e));
     return [];
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE REGISTER — what /admin/talent/codes reads. Spec 16.7.
+// ---------------------------------------------------------------------------------------------
+//
+// WHY THESE RETHROW WHEN listCodes() ABOVE DOES NOT. listCodes() swallows its error and returns [],
+// which is survivable on /admin/talent/selected because there it is a side lookup beside a board
+// that fails honestly — a missing revoke button is a visible degradation, not a false statement.
+// It is the wrong contract for a page whose ENTIRE content is this list: "no code has ever been
+// issued" and "the register could not be read" would render as the same empty screen and mean
+// opposite things, and the second one wearing the first one's clothes is how somebody issues a
+// second code to a person who already holds a live one. Same queries, two contracts, per surface.
+//
+// NOTHING HERE CAN REBUILD A SECRET. code_hash is not selected, and code_prefix is the deliberate
+// five-character handle documented on codePrefixOf(). A register that could show the code back would
+// defeat the one property that makes this whole feature safe.
+
+/** One row of the register: the code, plus the names an operator needs to recognise it by. */
+export interface CodeRegisterRow extends OnboardingCode {
+  personName: string;
+  personCode: string;
+  personEmail: string;
+  opportunityTitle: string;
+  selectionCode: string;
+  issuedByName: string;
+  revokedByName: string;
+}
+
+export interface RegisterFilter {
+  /** 'all', or any OnboardingCodeStatus. */
+  status?: string;
+  /** Matches the code reference, the five-character handle, the bound email, the name or person code. */
+  q?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** The columns of tal_onboarding_code, qualified for the joined query below. */
+const CODE_COLUMNS_C = CODE_COLUMNS.split(',').map((c) => 'c.' + c.trim()).join(', ');
+
+/** Delivery routes an operator may record. Free text would not be countable. */
+export const DELIVERY_CHANNELS = ['email', 'phone', 'secure_message', 'in_person', 'post'] as const;
+export type DeliveryChannel = (typeof DELIVERY_CHANNELS)[number];
+
+export const DELIVERY_CHANNEL_LABELS: Record<string, string> = {
+  email: 'Email',
+  phone: 'Read out by phone',
+  secure_message: 'Secure message',
+  in_person: 'In person',
+  post: 'Post',
+};
+
+/**
+ * The register. RETHROWS — see the note at the top of this section.
+ *
+ * The search term is matched against code_prefix by EQUALITY as well as by ILIKE on the other
+ * columns, because tal_onbcode_prefix_idx makes that comparison indexed and it is the lookup an
+ * operator actually performs: a candidate reads the first group of their code down the phone, and
+ * the desk has to find which code that is without ever seeing the rest of it.
+ */
+export async function codeRegister(filter: RegisterFilter = {}): Promise<CodeRegisterRow[]> {
+  try {
+    const { db, sql } = await ctx();
+    const limit = Math.min(200, Math.max(1, Number(filter.limit) || 100));
+    const offset = Math.max(0, Number(filter.offset) || 0);
+    const status = filter.status && filter.status !== 'all' ? String(filter.status) : null;
+    const q = String(filter.q || '').trim();
+    const term = q || null;
+    const handle = q.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, CODE_GROUP_LEN);
+    // LIKE metacharacters are escaped, so a term containing a per-cent sign does not silently become
+    // a match-everything scan — which on a search box reads as "the filter is broken".
+    const like = '%' + q.replace(/[\\%_]/g, (m) => '\\' + m) + '%';
+    const rows = rowsOf(await db.execute(sql`
+      SELECT ${sql.raw(CODE_COLUMNS_C)},
+             COALESCE(p.display_name, '')   AS person_name,
+             COALESCE(p.person_code, '')    AS person_code,
+             COALESCE(p.primary_email, '')  AS person_email,
+             COALESCE(o.title, '')          AS opportunity_title,
+             COALESCE(s.selection_code, '') AS selection_code,
+             COALESCE(iu.name, '')          AS issued_by_name,
+             COALESCE(ru.name, '')          AS revoked_by_name
+        FROM tal_onboarding_code c
+        LEFT JOIN tal_person p              ON p.id = c.person_id
+        LEFT JOIN tal_opportunity o         ON o.id = c.opportunity_id
+        LEFT JOIN tal_selection_decision s  ON s.id = c.selection_id
+        LEFT JOIN users iu                  ON iu.id = c.issued_by
+        LEFT JOIN users ru                  ON ru.id = c.revoked_by
+       WHERE (${status}::text IS NULL OR c.status = ${status})
+         AND (${term}::text IS NULL
+              OR c.code_prefix = ${handle}
+              OR c.code_id ILIKE ${like}
+              OR c.bound_email_norm ILIKE ${like}
+              OR p.display_name ILIKE ${like}
+              OR p.person_code ILIKE ${like})
+       ORDER BY c.issued_at DESC
+       LIMIT ${limit} OFFSET ${offset}`));
+    return rows.map((x: any) => ({
+      ...toCode(x),
+      personName: String(x.person_name || ''),
+      personCode: String(x.person_code || ''),
+      personEmail: String(x.person_email || ''),
+      opportunityTitle: String(x.opportunity_title || ''),
+      selectionCode: String(x.selection_code || ''),
+      issuedByName: String(x.issued_by_name || ''),
+      revokedByName: String(x.revoked_by_name || ''),
+    }));
+  } catch (e: any) {
+    console.error('[talent-codes] codeRegister: ' + reasonOf(e));
+    throw e;
+  }
+}
+
+export interface CodeCounts {
+  total: number;
+  active: number;
+  consumed: number;
+  revoked: number;
+  expired: number;
+  /** Still marked active but already past valid_until — the expiry sweep has not caught it yet. */
+  overdue: number;
+  /** Active, and nobody has recorded sending it to the candidate. */
+  unshared: number;
+}
+
+/** Counts for the register header. RETHROWS, for the same reason codeRegister() does. */
+export async function codeCounts(): Promise<CodeCounts> {
+  try {
+    const { db, sql } = await ctx();
+    // ONE round trip, seven numbers. Seven COUNT queries against one table is the shape that made
+    // page latency on this project a function of how many tiles a header happened to have.
+    const rows = rowsOf(await db.execute(sql`
+      SELECT COUNT(*)                                                          AS total,
+             COUNT(*) FILTER (WHERE status = 'active')                         AS active,
+             COUNT(*) FILTER (WHERE status = 'consumed')                       AS consumed,
+             COUNT(*) FILTER (WHERE status = 'revoked')                        AS revoked,
+             COUNT(*) FILTER (WHERE status = 'expired')                        AS expired,
+             COUNT(*) FILTER (WHERE status = 'active' AND valid_until < NOW()) AS overdue,
+             COUNT(*) FILTER (WHERE status = 'active' AND delivered_at IS NULL) AS unshared
+        FROM tal_onboarding_code`));
+    const r = (rows[0] || {}) as any;
+    return {
+      total: Number(r.total || 0),
+      active: Number(r.active || 0),
+      consumed: Number(r.consumed || 0),
+      revoked: Number(r.revoked || 0),
+      expired: Number(r.expired || 0),
+      overdue: Number(r.overdue || 0),
+      unshared: Number(r.unshared || 0),
+    };
+  } catch (e: any) {
+    console.error('[talent-codes] codeCounts: ' + reasonOf(e));
+    throw e;
+  }
+}
+
+/**
+ * Record that a code was handed to the candidate, and by which route.
+ *
+ * WHAT THIS IS AND IS NOT. It is the operator's note that they sent it. This product has no delivery
+ * pipeline for onboarding codes, so there is no receipt to record and nothing here claims one. It
+ * exists because the register's most useful question is "was this ever actually sent?", and a code
+ * issued three weeks ago that nobody remembers sending is exactly the situation that ends with a
+ * second code being minted for somebody who is already holding a working one.
+ *
+ * WHO recorded it goes to the audit log at the call site, not here: tal_onboarding_code has no
+ * delivered_by column, and inventing one by packing a name into delivery_channel would make the
+ * channel uncountable, which is the only thing that column is good for.
+ */
+export async function markCodeDelivered(
+  codeRowId: string,
+  channel: string,
+): Promise<{ ok: boolean; error?: string; changed: boolean }> {
+  const ch = String(channel || '');
+  if (!(DELIVERY_CHANNELS as readonly string[]).includes(ch)) {
+    return { ok: false, error: 'Choose how the code was sent.', changed: false };
+  }
+  try {
+    const { db, sql } = await ctx();
+    // Only a code that could still be used. Putting a reassuring "sent" tick beside a revoked or
+    // expired code would describe a message that cannot let anybody in.
+    const r = rowsOf(await db.execute(sql`
+      UPDATE tal_onboarding_code
+         SET delivered_at = NOW(), delivery_channel = ${ch}, delivery_error = NULL
+       WHERE id = ${codeRowId}::uuid AND status = 'active'
+       RETURNING id`));
+    if (!r.length) {
+      return { ok: false, error: 'That code is no longer active, so it was not marked as sent.', changed: false };
+    }
+    return { ok: true, changed: true };
+  } catch (e: any) {
+    return { ok: false, error: reasonOf(e), changed: false };
   }
 }

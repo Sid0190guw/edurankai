@@ -1065,3 +1065,166 @@ export async function listSourceKeys(sourceId: string): Promise<Array<{
     return [];
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// THE SOURCE DESK — /admin/talent/sources. ADDITIVE TO THE CONTRACT.
+//
+// WHY THESE EXIST BESIDE listSources(), sourceCounts(), listSourceKeys() AND listQuarantine().
+// Those four are the ingest path's readers, and every one of them answers a failed read with an
+// empty list. That is right for a background caller and WRONG FOR A SCREEN: "no source is
+// registered", "this source has no keys" and "nothing is quarantined" are exactly the sentences an
+// operator acts on, and a swallowed connection error renders all three as confident facts. A
+// quarantined payload is a real person who applied and is sitting in nobody's queue; a screen that
+// reports zero of them because the database was unreachable is worse than a screen that fails.
+//
+// So the desk readers RETHROW, and the page catches once and prints the real Postgres reason. They
+// restate no RULE — refusal, validation and key issuance stay where they already live above.
+// ---------------------------------------------------------------------------------------------
+
+/** All keys the console will draw in one read. Far above any plausible registry; a bound, not a page. */
+const DESK_KEY_LIMIT = 500;
+
+export interface SourceKeyRow {
+  id: string;
+  /** The stored head of the key. There is no other form of it anywhere — see issueSourceKey. */
+  keyPrefix: string;
+  scopes: string[];
+  revokedAt: string | null;
+  createdAt: string;
+  isLive: boolean;
+}
+
+export interface SourceDeskRow extends RecruitmentSource {
+  /** Provenance rows in tal_external_application_ref. NOT comparable with attribution counts. */
+  candidateCount: number;
+  liveKeyCount: number;
+  keys: SourceKeyRow[];
+}
+
+/**
+ * The whole registry as the console needs it: every source, its provenance count, and its keys.
+ *
+ * THIS THROWS ON A FAILED READ, deliberately. Callers that would rather have an empty list already
+ * have listSources() and sourceCounts().
+ */
+export async function sourceDesk(opts?: { includeInactive?: boolean }): Promise<SourceDeskRow[]> {
+  const includeInactive = opts?.includeInactive === true;
+
+  await ensureTalent();
+  await ensureSeedSources();
+
+  // The same LEFT JOIN aggregation sourceCounts() runs, so the two never disagree: a source nobody
+  // has arrived through counts 0 rather than vanishing. AN INACTIVE SOURCE KEEPS ITS COUNT —
+  // deactivation stops new arrivals, it does not rewrite where the people who already arrived came
+  // from, and a registry that hid those rows would silently shrink every historical report.
+  const sources = rowsOf(await db.execute(sql`
+    SELECT s.id, s.slug, s.name, s.category, s.ingest_mode, s.is_active,
+           COUNT(r.id)::int AS candidate_count
+    FROM tal_recruitment_source s
+    LEFT JOIN tal_external_application_ref r ON r.source_id = s.id
+    WHERE (${includeInactive}::boolean OR s.is_active = TRUE)
+    GROUP BY s.id, s.slug, s.name, s.category, s.ingest_mode, s.is_active
+    ORDER BY s.is_active DESC, s.name ASC`));
+
+  // Every key in ONE read rather than one read per source. An N+1 over a registry that grows with
+  // each integration makes the page slower for precisely the reason it is being opened.
+  const keys = rowsOf(await db.execute(sql`
+    SELECT id, source_id, key_prefix, scopes, revoked_at, created_at
+    FROM tal_source_key
+    ORDER BY revoked_at IS NOT NULL, created_at DESC
+    LIMIT ${DESK_KEY_LIMIT}`));
+
+  const bySource = new Map<string, SourceKeyRow[]>();
+  for (const k of keys) {
+    const sourceId = String(k.source_id);
+    const list = bySource.get(sourceId) || [];
+    list.push({
+      id: String(k.id),
+      keyPrefix: String(k.key_prefix),
+      scopes: Array.isArray(k.scopes) ? k.scopes.map((s: any) => String(s)) : [],
+      revokedAt: k.revoked_at ? String(k.revoked_at) : null,
+      createdAt: String(k.created_at),
+      isLive: !k.revoked_at,
+    });
+    bySource.set(sourceId, list);
+  }
+
+  return sources.map((r: any) => {
+    const base = mapSource(r);
+    const rowKeys = bySource.get(base.id) || [];
+    return {
+      ...base,
+      candidateCount: Number(r.candidate_count) || 0,
+      liveKeyCount: rowKeys.filter((k) => k.isLive).length,
+      keys: rowKeys,
+    };
+  });
+}
+
+export interface QuarantineRow {
+  id: string;
+  sourceId: string | null;
+  sourceName: string | null;
+  sourceSlug: string | null;
+  reason: string;
+  replayedAt: string | null;
+  createdAt: string;
+  payloadBytes: number;
+  /** Still nobody's: arrived, could not be understood, and has not been dealt with. */
+  isOpen: boolean;
+}
+
+/**
+ * The quarantine queue for the console. RETHROWS, for the same reason sourceDesk() does — and here
+ * it matters most: an empty quarantine is the state an administrator is entitled to trust, and a
+ * swallowed read renders "we could not tell" as "nothing arrived that we failed to understand".
+ *
+ * `raw_payload` is not selected, exactly as listQuarantine() declines to: a payload can be a
+ * quarter of a megabyte and fifty of them is a page nobody can load. getQuarantineItem() fetches one.
+ */
+export async function quarantineQueue(limit = 50): Promise<QuarantineRow[]> {
+  const lim = clampLimit(limit, 50);
+  await ensureTalent();
+  return rowsOf(await db.execute(sql`
+    SELECT q.id, q.source_id, s.name AS source_name, s.slug AS source_slug,
+           q.reason, q.replayed_at, q.created_at,
+           pg_column_size(q.raw_payload) AS payload_bytes
+    FROM tal_ingest_quarantine q
+    LEFT JOIN tal_recruitment_source s ON s.id = q.source_id
+    ORDER BY q.replayed_at IS NOT NULL, q.created_at DESC
+    LIMIT ${lim}`))
+    .map((r: any) => ({
+      id: String(r.id),
+      sourceId: r.source_id ? String(r.source_id) : null,
+      sourceName: r.source_name ? String(r.source_name) : null,
+      sourceSlug: r.source_slug ? String(r.source_slug) : null,
+      reason: String(r.reason),
+      replayedAt: r.replayed_at ? String(r.replayed_at) : null,
+      createdAt: String(r.created_at),
+      payloadBytes: Number(r.payload_bytes) || 0,
+      isOpen: !r.replayed_at,
+    }));
+}
+
+/**
+ * PURE. Which acts a viewer may be OFFERED on one source row.
+ *
+ * IT DECIDES WHAT A BUTTON LOOKS LIKE AND NOTHING ELSE. Every refusal is still owned and re-decided
+ * by createSource / updateSource / deactivateSource / issueSourceKey when the POST arrives, because
+ * a hidden button is not a lock. This exists so a template does not grow its own second copy of
+ * "a key cannot be issued against an inactive source" (issueSourceKey refuses on is_active) or
+ * "deactivating an inactive source is a no-op" (deactivateSource says so and does not pretend).
+ */
+export function sourceActions(
+  row: { isActive?: boolean } | null | undefined,
+  mayManage: boolean,
+): { canEdit: boolean; canDeactivate: boolean; canReactivate: boolean; canIssueKey: boolean } {
+  const manage = mayManage === true;
+  const active = row?.isActive === true;
+  return {
+    canEdit: manage,
+    canDeactivate: manage && active,
+    canReactivate: manage && !active,
+    canIssueKey: manage && active,
+  };
+}

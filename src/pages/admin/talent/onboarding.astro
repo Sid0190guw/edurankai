@@ -1,0 +1,971 @@
+---
+// /admin/talent/onboarding — THE ONBOARDING REVIEW DESK.
+//
+// Spec: docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md sections 7, 11, 33 and 26.5.
+//
+// THIS PAGE WAS LINKED FROM THE SIDEBAR AND DID NOT EXIST. src/lib/admin-nav.ts:197 has offered
+// "Onboarding review" at this path, and src/middleware.ts:83 has been gating it, since the talent
+// console shipped. Meanwhile /onboarding has been accepting submissions the whole time: a candidate
+// could redeem a code, fill in the form, link their documents, press submit — and land in a queue
+// with no screen in front of it. Every one of them sat at 'submitted' with nobody able to look.
+//
+// WHAT HAPPENS HERE, AND WHAT IT COSTS.
+//
+// APPROVE is the heaviest act in the talent platform. It closes the admission AND creates the
+// organizational identity, and it is the only thing in the product that makes somebody a member of
+// this organisation. approveOnboarding() does both halves and refuses to report success unless both
+// happened — the identity is created first, so a failure leaves the submission untouched and still
+// in this queue rather than showing "Approved" over a person who does not exist.
+//
+// REQUEST CHANGES and REJECT are NOT the same act, and the whole layout of the decision panel exists
+// to make that unmistakable. Requesting changes reopens the form and expects the candidate back.
+// Rejection closes the admission. An operator who confuses them has either stranded somebody who was
+// going to join, or admitted somebody they meant to turn away.
+//
+// DOCUMENTS ARE LINKS, NEVER FILES. This platform stores a URL the candidate shared; it has not
+// opened a registrar's records and it has not authenticated anything. The panel says so, and it is
+// gated: `onboarding.approve` alone sees that documents exist and how many, and the link itself
+// needs `document.view_sensitive` — with the audit row written and CONFIRMED before anything is
+// revealed, which is the legal-hold pattern already in this codebase (src/lib/legal-hold.ts).
+//
+// WHO. `onboarding.approve` reads this queue and makes every decision; both super_admin and hr hold
+// it, and both hold the `talent_onboarding` section the middleware checks. recruiter, reviewer and
+// department_head hold neither, which is spec 35's separation of the hiring desk from the desk that
+// admits people, and not an oversight.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { logAudit, logAuditOrThrow } from '@/lib/audit';
+import { docTypeLabel, ACCESS_FORMAT } from '@/lib/hr-onboarding';
+import { reasonOf, type DocumentRef } from '@/lib/talent/types';
+import {
+  reviewQueue, reviewCounts, reviewDetail, reviewDocuments,
+  approveOnboarding, rejectOnboarding, requestChanges,
+  decideReview, documentSummary, documentStatusLabel, onboardingStatusLabel, isReviewFilter,
+  isApplicationRef, identityRegistryStatus, REVIEW_FILTERS,
+  type ReviewQueueRow, type ReviewCounts, type ReviewDetail,
+} from '@/lib/talent/onboarding-review';
+
+// EVERY const IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted, and a handler reaching a
+// later declaration threw on its first line every time while the page reported success — that is a
+// recorded outage on this project, not a style preference.
+const user = Astro.locals.user!;
+
+// Server-side gate, before any query runs. The middleware section gate ('talent_onboarding') stands
+// in front of this path too; this is the page's own lock and the one that actually decides.
+const mayReview = can(user, 'onboarding.approve');
+if (!mayReview) return Astro.redirect('/admin');
+
+// A SECOND, NARROWER KEY. Holding the review desk does not open a candidate's identity documents —
+// spec 33.2 rule 4. A holder of onboarding.approve alone is told how many documents exist, because
+// "none linked" is a reason not to approve and that judgement must not require this key.
+const mayViewDocs = can(user, 'document.view_sensitive');
+
+// Typed lookup maps live in the frontmatter and are never indexed inside JSX: a
+// `Record<string,string>` used from a template breaks .astro parsing on this project.
+const STATUS_CLASS: Record<string, string> = {
+  submitted: 'pill pill--wait',
+  in_progress: 'pill',
+  changes_requested: 'pill pill--warn',
+  approved: 'pill pill--ok',
+  rejected: 'pill pill--off',
+  suspended: 'pill pill--off',
+  expired: 'pill pill--off',
+};
+
+const fmtDate = (iso: string | null): string => {
+  if (!iso) return '';
+  try { return new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }); }
+  catch { return ''; }
+};
+const fmtDateTime = (iso: string | null): string => {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString('en-GB', {
+      day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+    });
+  } catch { return ''; }
+};
+
+// The most rows this screen asks for in one read. reviewQueue() caps at the same number, so asking
+// for more would silently return this many anyway — and a table that stops at a cap without saying
+// so is a count the operator cannot trust against the tiles above it.
+const QUEUE_LIMIT = 200;
+
+// ONE COLUMN HOLDS TWO DIFFERENT SENTENCES. tal_onboarding_application.review_note is written by
+// requestChanges() (what the candidate must fix) AND by rejectOnboarding() (why the admission was
+// closed), and there is no column separating them — the status is the only thing that says which it
+// is, so a reader of the note alone cannot tell a request from a refusal. Printing it bare, as this
+// screen did, hands the reviewer a sentence with no idea which act it belongs to.
+//
+// Approval does not touch the column at all, so on an approved or resubmitted record the note is
+// LEFTOVER from an earlier decision. That case is labelled as leftover rather than dressed up as a
+// note about the decision that is actually showing.
+const reviewNoteLabel = (status: string): string => {
+  if (status === 'rejected') return 'Reason recorded for not approving';
+  if (status === 'changes_requested') return 'What the candidate was asked to change';
+  return 'Last note recorded, carried over from an earlier decision';
+};
+
+let msg = '';
+let err = '';
+let warn = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+  const applicationId = String(fd.get('applicationId') || '');
+  try {
+    if (!mayReview) {
+      // Unreachable through the UI — a viewer without the key was redirected above. Kept because a
+      // hidden button is not a lock and a hand-made POST is not a hypothetical.
+      err = 'You do not hold the onboarding review desk.';
+    } else if (!isApplicationRef(applicationId)) {
+      // Checked once, for all three acts. Without it a hand-made POST reaches Postgres as a cast
+      // that cannot work, and the operator is shown a type error where a refusal belongs.
+      err = 'That is not an onboarding reference, so nothing has been changed.';
+    } else if (action === 'approve') {
+      // Checked SERVER-SIDE. A `required` checkbox is a request to a browser; this is the refusal.
+      if (String(fd.get('confirm') || '') !== 'yes') {
+        err = 'Approval was not recorded: confirm that you have read the submission first.';
+      } else {
+        const r = await approveOnboarding(applicationId, user.id);
+        if (r.ok) {
+          // Named by its code where there is one; a registry that returned no code is not papered
+          // over with an empty gap in the sentence.
+          const named = r.identityCode ? 'the identity ' + r.identityCode : 'the identity record';
+          msg = r.reusedIdentity
+            ? 'Approved. ' + (r.identityCode ? 'The identity ' + r.identityCode : 'The identity record')
+              + ' already existed from an earlier attempt that stopped half way, so it was reused '
+              + 'rather than duplicated, and this onboarding is now marked approved.'
+            : 'Approved, and ' + named + ' has been created. Access is a separate act on a separate '
+              + 'desk and has not been granted by this.';
+          if (r.auditWarning) warn = r.auditWarning;
+        } else {
+          err = r.error || 'Could not approve this onboarding.';
+        }
+      }
+    } else if (action === 'reject') {
+      const reason = String(fd.get('reason') || '').trim();
+      const r = await rejectOnboarding(applicationId, user.id, reason);
+      if (r.ok) {
+        msg = 'Recorded as not approved. This closes the admission; it does not reopen the form.';
+        if (r.auditWarning) warn = r.auditWarning;
+      } else {
+        err = r.error || 'Could not record that decision.';
+      }
+    } else if (action === 'request_changes') {
+      const note = String(fd.get('note') || '').trim();
+      // requestChanges() is onboarding.ts's own function, imported rather than rewritten. It asserts
+      // status = 'submitted' inside its own WHERE clause, so two reviewers acting at once cannot
+      // both send the same submission back, and no pre-read here could make that safer.
+      const r = await requestChanges(applicationId, user.id, note);
+      if (r.ok) {
+        msg = 'Sent back to the candidate. The form is open for them to edit again and nothing has '
+          + 'been refused.';
+        // THE RESULT IS READ. logAudit() reports a failed write as a value rather than throwing, so
+        // ignoring what it returns is how a state change ends up with no record of who made it and
+        // nobody knowing. Approve and reject surface the same warning from inside the module; this
+        // act writes its audit here, so it surfaces it here.
+        const audit = await logAudit({
+          userId: user.id, action: 'onboarding.changes_requested',
+          entity: 'tal_onboarding_application', entityId: applicationId,
+          diff: {
+            note: note.slice(0, 2000),
+            reason: 'Onboarding sent back to the candidate for changes.',
+          },
+          ipAddress: Astro.clientAddress,
+        });
+        if (!audit.ok) {
+          warn = 'This was sent back to the candidate, but the audit entry for it was not recorded: '
+            + (audit.error || 'unknown reason');
+        }
+      } else {
+        err = r.error || 'Could not send this back.';
+      }
+    }
+  } catch (e: any) {
+    // The REAL Postgres reason lives on e.cause; e.message is only the failed statement.
+    err = reasonOf(e);
+  }
+}
+
+// Filters are read AFTER the POST so the screen reflects what just happened.
+const openId = (Astro.url.searchParams.get('id') || '').trim();
+const filterParam = Astro.url.searchParams.get('filter') || 'submitted';
+const filter = isReviewFilter(filterParam) ? filterParam : 'submitted';
+const q = (Astro.url.searchParams.get('q') || '').trim().slice(0, 120);
+const listHref = '/admin/talent/onboarding?filter=' + filter + (q ? '&q=' + encodeURIComponent(q) : '');
+
+// A THROW HERE IS NOT AN EMPTY QUEUE. reviewQueue(), reviewCounts() and reviewDetail() rethrow
+// precisely so this page can tell "nothing is waiting for review" apart from "we could not read what
+// is waiting" — they render as the same empty table otherwise, and they mean opposite things.
+let counts: ReviewCounts | null = null;
+let countsProblem = '';
+try {
+  counts = await reviewCounts();
+} catch (e: any) {
+  // The tiles do not render, and the screen SAYS they do not. Tiles that quietly vanish read as a
+  // layout choice, and the repair banner below is driven from these numbers — an unread count would
+  // otherwise be indistinguishable from a zero.
+  countsProblem = 'The header counts could not be read, so no totals are shown and the repair banner '
+    + 'below cannot be trusted to be absent: ' + reasonOf(e);
+}
+
+let detail: ReviewDetail | null = null;
+let detailFailed = false;
+let detailMissing = false;
+let queue: ReviewQueueRow[] = [];
+let queueFailed = false;
+
+if (openId) {
+  try {
+    detail = await reviewDetail(openId);
+    if (!detail) detailMissing = true;
+  } catch (e: any) {
+    detailFailed = true;
+    err = err || ('This onboarding could not be read: ' + reasonOf(e));
+  }
+} else {
+  try {
+    queue = await reviewQueue({ filter, q, limit: QUEUE_LIMIT });
+  } catch (e: any) {
+    queueFailed = true;
+    err = err || ('The review queue could not be read: ' + reasonOf(e));
+  }
+}
+
+// -------------------------------------------------------------------------------------------
+// DOCUMENTS. The audit row is written and CONFIRMED BEFORE the links are read, never after — spec
+// 33.2 rule 5, and the same order src/lib/legal-hold.ts uses. logAuditOrThrow() is the honest fit:
+// if the access cannot be recorded, the access does not happen.
+// -------------------------------------------------------------------------------------------
+let docs: DocumentRef[] = [];
+let docsRead = false;
+let docsProblem = '';
+
+if (detail && mayViewDocs) {
+  let audited = false;
+  try {
+    await logAuditOrThrow({
+      userId: user.id,
+      action: 'onboarding.documents_viewed',
+      entity: 'tal_onboarding_application',
+      entityId: detail.row.id,
+      diff: {
+        personId: detail.row.personId,
+        personCode: detail.row.personCode,
+        documentCount: detail.row.documentCount,
+        sensitiveCount: detail.row.sensitiveCount,
+        reason: 'Onboarding review before an admission decision.',
+      },
+      ipAddress: Astro.clientAddress,
+    });
+    audited = true;
+  } catch (e: any) {
+    docsProblem = 'The documents are not shown because this access could not be recorded: '
+      + reasonOf(e) + '. Reading identity documents without an audit entry is not something this '
+      + 'screen will do.';
+  }
+  if (audited) {
+    try {
+      docs = await reviewDocuments(detail.row.id);
+      docsRead = true;
+    } catch (e: any) {
+      docsProblem = 'The document references could not be read: ' + reasonOf(e)
+        + '. This is not the same as there being none.';
+    }
+  }
+}
+
+// -------------------------------------------------------------------------------------------
+// EVERY comparison is finished in the frontmatter. `<` and `<=` inside a JSX expression break
+// .astro parsing on this project, so the template only ever reads booleans and strings.
+// -------------------------------------------------------------------------------------------
+const rows = queue.map((r) => {
+  const gate = decideReview(r.status, 'approve');
+  return {
+    id: r.id,
+    href: '/admin/talent/onboarding?id=' + encodeURIComponent(r.id) + '&filter=' + filter
+      + (q ? '&q=' + encodeURIComponent(q) : ''),
+    personName: r.personName || 'Unnamed',
+    personCode: r.personCode,
+    personEmail: r.personEmail,
+    opportunityTitle: r.opportunityTitle,
+    employmentType: r.employmentType || '',
+    codeRef: r.codeRef,
+    selectionCode: r.selectionCode,
+    statusLabel: onboardingStatusLabel(r.status),
+    statusClass: STATUS_CLASS[r.status] || 'pill',
+    submittedNote: r.submittedAt ? 'Submitted ' + fmtDateTime(r.submittedAt) : 'Not submitted yet',
+    reviewedNote: r.reviewedAt
+      ? 'Last decided ' + fmtDate(r.reviewedAt) + (r.reviewedByName ? ' by ' + r.reviewedByName : '')
+      : '',
+    reviewNote: r.reviewNote ? reviewNoteLabel(r.status) + ': ' + r.reviewNote : '',
+    docNote: documentSummary(r.documentCount, r.sensitiveCount),
+    identityNote: r.identityCode ? 'Identity ' + r.identityCode : '',
+    // The two directions read differently because only one of them can be mended from this screen.
+    needsIdentity: r.status === 'approved' && !r.identityId,
+    halfDone: r.status !== 'approved' && !!r.linkedIdentityId,
+    withdrawnNote: r.selectionWithdrawnAt
+      ? 'The selection behind this was withdrawn on ' + fmtDate(r.selectionWithdrawnAt)
+      : '',
+    decidable: gate.allowed,
+  };
+});
+
+const hasRows = rows.length > 0;
+// A LIST THAT STOPS AT A CAP HAS TO SAY SO. This screen reads at most QUEUE_LIMIT rows while the
+// tiles above it count every record there is, so on a busy queue the table would quietly show 200
+// of 340 and the two numbers would contradict each other with nothing on the page to explain it.
+const queueCapped = rows.length >= QUEUE_LIMIT;
+const queueCappedPhrase = 'This is the first ' + QUEUE_LIMIT + ' records of this queue, which is as '
+  + 'many as one read returns — not the whole of it. The counts above are the true totals. Narrow it '
+  + 'with the search box, or by tab, to see the rest.';
+const isFiltered = q.length > 0 || filter !== 'submitted';
+const filterLabel = REVIEW_FILTERS.find((f) => f.key === filter)?.label || 'Awaiting review';
+// TWO DIFFERENT HALF-DONE STATES, AND ONLY ONE OF THEM IS REPAIRABLE HERE.
+//   halfDone      — an identity exists against an application that was never marked approved. This
+//                   is what a failed approval leaves behind, the record is still 'submitted', and
+//                   pressing Approve again finishes it by REUSING that identity.
+//   orphanApproved— marked approved with no identity recorded. decideReview() refuses to re-decide
+//                   an approved record, so this desk cannot mend it and must not pretend it can.
+const halfDoneCount = counts ? counts.identityWithoutApproval : 0;
+const orphanApprovedCount = counts ? counts.approvedWithoutIdentity : 0;
+const showHalfDone = halfDoneCount > 0;
+const showOrphanApproved = orphanApprovedCount > 0;
+const halfDonePhrase = halfDoneCount === 1
+  ? 'One onboarding has an identity in the registry but was never marked approved.'
+  : halfDoneCount + ' onboardings have an identity in the registry but were never marked approved.';
+const orphanApprovedPhrase = orphanApprovedCount === 1
+  ? 'One onboarding is marked approved with no identity recorded against it.'
+  : orphanApprovedCount + ' onboardings are marked approved with no identity recorded against them.';
+
+// ---- Detail view models ----------------------------------------------------------------------
+const d = detail;
+// ONE gate decides whether the decision panel renders at all, and it is asked AGAIN inside each of
+// the three module functions when the form comes back — because a hidden button is not a lock. Only
+// the approve gate is read here: all three acts require the same status today, and asking for three
+// identical refusals would put three copies of one sentence on the screen.
+const approveGate = d ? decideReview(d.row.status, 'approve') : null;
+const canDecide = !!(approveGate && approveGate.allowed);
+const decideRefusal = approveGate && !approveGate.allowed ? approveGate.reason : '';
+
+const detailStatusLabel = d ? onboardingStatusLabel(d.row.status) : '';
+const detailNoteLabel = d ? reviewNoteLabel(d.row.status) : '';
+const detailStatusClass = d ? (STATUS_CLASS[d.row.status] || 'pill') : 'pill';
+const detailTitle = d ? (d.row.personName || 'Unnamed candidate') : 'Onboarding review';
+const detailDocNote = d ? documentSummary(d.row.documentCount, d.row.sensitiveCount) : '';
+const gapCount = d ? d.gaps.total : 0;
+const hasGaps = gapCount > 0;
+const gapList: string[] = d ? d.gaps.fields.concat(d.gaps.declarations).concat(d.gaps.documents) : [];
+const identityLine = d && d.row.identityCode
+  ? 'Identity ' + d.row.identityCode + (d.row.identityStatus ? ' (' + d.row.identityStatus + ')' : '')
+  : '';
+const selectionWithdrawn = !!(d && d.row.selectionWithdrawnAt);
+// An identity already sits in the registry against a record that was never marked approved: the
+// half-done approval. Approving completes it and reuses that identity; the reviewer is told so
+// before they press, not afterwards in the success message.
+const detailHalfDone = !!(d && d.row.status !== 'approved' && d.row.linkedIdentityId);
+const detailOrphanApproved = !!(d && d.row.status === 'approved' && !d.row.identityId);
+
+// THE JOINS ARE LEFT JOINS ON PURPOSE, so a broken record reaches this desk instead of disappearing
+// from it — but then the desk has to SAY it is broken. Without this, a missing selection row renders
+// as "nothing is recorded on the selection" and a missing person row as "Unnamed candidate", and
+// both read as thin data rather than as a link that does not resolve.
+const selectionMissing = !!(d && !d.row.selectionCode);
+const personMissing = !!(d && !d.row.personCode && !d.row.personName);
+const brokenLinks: string[] = [];
+if (selectionMissing) brokenLinks.push('the selection this onboarding was issued against');
+if (personMissing) brokenLinks.push('the person record this onboarding belongs to');
+const showBrokenLinks = brokenLinks.length > 0;
+const brokenLinkPhrase = brokenLinks.join(', and ');
+
+// The organisation's own snapshot, rendered as facts we supplied rather than answers to check.
+//
+// THE DEPARTMENT IS NAMED, NOT NUMBERED. department_id is an identifier and was being printed under
+// the word "Department"; the name is resolved from `departments` and the id is shown only when it
+// resolves to nothing, labelled as the identifier it is — so a reviewer is never left reading a key
+// as though it were a place.
+//
+// AND "Nothing recorded" IS ONLY SAID WHERE THERE IS A RECORD TO BE EMPTY. That fallback used to be
+// unconditional, which meant an onboarding whose selection row could not be found still rendered
+// "Compensation recorded: Nothing recorded" — a statement about a record that is not there. It also
+// made the list non-empty in every case, so the "the selection could not be found" branch below
+// could never render. Where the selection is missing, nothing is claimed about its contents.
+const departmentFact = d && d.org.departmentName
+  ? { label: 'Department', value: d.org.departmentName }
+  : { label: 'Department identifier (it names no department record)', value: d ? (d.org.departmentId || '') : '' };
+const orgFacts = d ? [
+  { label: 'Opportunity', value: d.org.opportunityTitle },
+  { label: 'Engagement', value: d.org.employmentType || '' },
+  departmentFact,
+  { label: 'Position', value: d.org.positionTitle },
+  { label: 'Level', value: d.org.level || '' },
+  { label: 'Reporting manager', value: d.org.reportingManagerName },
+  { label: 'Proposed joining date', value: d.org.proposedJoiningDate ? fmtDate(d.org.proposedJoiningDate) : '' },
+  // Never invented. An engagement with nothing recorded says nothing recorded, because an internship
+  // is unpaid unless a stipend is explicitly written down.
+  { label: 'Compensation recorded', value: selectionMissing ? '' : (d.org.compensationNote || 'Nothing recorded') },
+  { label: 'Selection', value: d.row.selectionCode },
+  { label: 'Decided', value: d.org.decidedAt ? fmtDate(d.org.decidedAt) + (d.org.decidedByName ? ' by ' + d.org.decidedByName : '') : '' },
+].filter((f) => f.value) : [];
+const hasOrgFacts = orgFacts.length > 0;
+
+const sectionViews = d ? d.sections.filter((s) => !s.orgControlled).map((s) => ({
+  key: s.key,
+  label: s.label,
+  answers: s.answers.map((a) => ({
+    key: a.key,
+    label: a.label,
+    value: a.value || 'Not answered',
+    missing: a.missing,
+  })),
+})) : [];
+
+const declarationRows = d ? d.declarations.map((v) => ({
+  key: v.key,
+  label: v.label,
+  note: v.accepted ? 'Accepted' : (v.required ? 'NOT accepted, and it is required' : 'Not accepted'),
+  bad: v.required && !v.accepted,
+})) : [];
+
+const docRows = docs.map((doc) => ({
+  kind: docTypeLabel(doc.docType),
+  // The candidate's own label for it, shown only when it says something the kind does not.
+  titleNote: doc.title && doc.title !== docTypeLabel(doc.docType) ? doc.title : '',
+  url: doc.driveUrl,
+  statusLabel: documentStatusLabel(doc.status),
+  sensitive: doc.isSensitive,
+  versionNote: doc.version > 1 ? 'Version ' + doc.version : '',
+  expiryNote: doc.expiresOn ? 'Expires ' + fmtDate(doc.expiresOn) : '',
+  reviewNote: doc.reviewNote || '',
+}));
+const hasDocRows = docRows.length > 0;
+
+const identityTypeLine = d
+  ? 'Approving this creates an identity of type "' + d.identityType + '", derived from the '
+    + 'engagement recorded on the selection.'
+  : '';
+
+// ASKED BEFORE THE BUTTON IS DRAWN, not after it is pressed. The identity registry is a separate
+// module; where it cannot create an identity, approval is refused by approveOnboarding() and the
+// reviewer would otherwise learn that only after reading a whole submission. Touches no database —
+// it is a resolved import or the absence of one.
+//
+// AND THE REASON IS CARRIED, not flattened to a boolean. A registry that is PRESENT AND BROKEN is
+// not a registry that was never shipped, and telling an operator the second when it is the first
+// sends them to write a file that already exists instead of to the error stopping them.
+const registry = canDecide ? await identityRegistryStatus() : { available: true, problem: '' };
+const identityRegistryReady = registry.available;
+const identityRegistryProblem = registry.problem;
+---
+
+<AdminLayout title="Onboarding review" activeNav="talent-onboarding">
+  <div class="wrap">
+    <header class="head">
+      <h1>Onboarding review</h1>
+      <p class="sub">
+        Everyone who has submitted their onboarding, and the three decisions this desk can take on
+        one. Codes are issued on <a href="/admin/talent/selected">Selected candidates</a> and looked
+        up on <a href="/admin/talent/codes">Onboarding codes</a>; this is what happens after the
+        candidate has filled the form in.
+      </p>
+    </header>
+
+    {msg && <div class="note note--ok">{msg}</div>}
+    {warn && <div class="note note--warn">{warn}</div>}
+    {err && <div class="note note--err">{err}</div>}
+
+    {countsProblem && <div class="note note--warn">{countsProblem}</div>}
+
+    {counts && (
+      <div class="tiles">
+        <div class="tile"><span class="tile__n">{counts.awaitingReview}</span><span class="tile__l">Awaiting review</span></div>
+        <div class="tile"><span class="tile__n">{counts.changesRequested}</span><span class="tile__l">Sent back</span></div>
+        <div class="tile"><span class="tile__n">{counts.inProgress}</span><span class="tile__l">Being filled in</span></div>
+        <div class="tile"><span class="tile__n">{counts.approved}</span><span class="tile__l">Approved</span></div>
+        <div class="tile"><span class="tile__n">{counts.rejected}</span><span class="tile__l">Not approved</span></div>
+        <div class="tile"><span class="tile__n">{counts.total}</span><span class="tile__l">All onboardings</span></div>
+      </div>
+    )}
+
+    {showHalfDone && (
+      <div class="banner">
+        <p class="banner__title">An approval stopped half way</p>
+        <p>
+          {halfDonePhrase} That is what an approval leaves behind when the identity was created and
+          the record could not then be moved. Open the
+          {' '}<a href="/admin/talent/onboarding?filter=needs_identity">Decision and identity disagree</a>
+          {' '}queue and approve again: the record is still awaiting review, so the decision is open,
+          and the identity that already exists is reused rather than duplicated.
+        </p>
+      </div>
+    )}
+
+    {showOrphanApproved && (
+      <div class="banner">
+        <p class="banner__title">Approved, with no identity recorded</p>
+        <p>
+          {orphanApprovedPhrase} Nothing on this desk produces that state — an approval here creates
+          the identity first — so it comes from an earlier approval or from another writer. This
+          screen cannot mend it: a decided onboarding is not re-decided here, and pressing Approve on
+          one is refused. It is listed in the
+          {' '}<a href="/admin/talent/onboarding?filter=needs_identity">Decision and identity disagree</a>
+          {' '}queue so that it can be put right on the identity registry.
+        </p>
+      </div>
+    )}
+
+    {!openId && (
+      <form method="GET" class="filters">
+        <div class="tabs">
+          {REVIEW_FILTERS.map((t) => (
+            <a
+              href={'/admin/talent/onboarding?filter=' + t.key + (q ? '&q=' + encodeURIComponent(q) : '')}
+              class={t.key === filter ? 'tab tab--on' : 'tab'}
+            >{t.label}</a>
+          ))}
+        </div>
+        <div class="search">
+          <input type="hidden" name="filter" value={filter} />
+          <input
+            type="text"
+            name="q"
+            value={q}
+            placeholder="Name, email, person code, onboarding reference or selection reference"
+          />
+          <button type="submit" class="btn">Search</button>
+          {q && <a class="btn" href={'/admin/talent/onboarding?filter=' + filter}>Clear</a>}
+        </div>
+      </form>
+    )}
+
+    {!openId && queueFailed && (
+      <p class="empty">
+        The queue could not be read just now. This is not the same as nobody waiting for review, and
+        nothing has been changed. Reload; if it persists, the reason is in the message above.
+      </p>
+    )}
+
+    {!openId && !queueFailed && !hasRows && isFiltered && (
+      <p class="empty">
+        Nothing matches "{filterLabel}" with that search. The queue this desk works from is
+        {' '}<a href="/admin/talent/onboarding?filter=submitted">Awaiting review</a>.
+      </p>
+    )}
+
+    {!openId && !queueFailed && !hasRows && !isFiltered && (
+      <p class="empty">
+        Nothing is waiting for review. A candidate appears here when they submit their onboarding
+        form, which they can only do after redeeming a code issued on
+        {' '}<a href="/admin/talent/selected">Selected candidates</a>.
+      </p>
+    )}
+
+    {!openId && hasRows && (
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Candidate</th>
+              <th>Engagement</th>
+              <th>State</th>
+              <th>Documents</th>
+              <th>History</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr>
+                <td>
+                  <strong>{r.personName}</strong>
+                  <span class="mono">{r.personEmail}</span>
+                  {r.personCode && <span class="mono">{r.personCode}</span>}
+                  {r.codeRef && <span class="mono">{r.codeRef}</span>}
+                </td>
+                <td>
+                  {r.opportunityTitle}
+                  {r.employmentType && <span class="mono">{r.employmentType}</span>}
+                  {r.selectionCode && <span class="mono">{r.selectionCode}</span>}
+                </td>
+                <td>
+                  <span class={r.statusClass}>{r.statusLabel}</span>
+                  <span class="mono">{r.submittedNote}</span>
+                  {r.identityNote && <span class="mono">{r.identityNote}</span>}
+                  {r.needsIdentity && <span class="mono warn">Approved, no identity recorded. Not repairable from this screen.</span>}
+                  {r.halfDone && <span class="mono warn">An identity already exists for this. Approving finishes the job and reuses it.</span>}
+                  {r.withdrawnNote && <span class="mono warn">{r.withdrawnNote}</span>}
+                </td>
+                <td><span class="mono">{r.docNote}</span></td>
+                <td>
+                  {r.reviewedNote && <span class="mono">{r.reviewedNote}</span>}
+                  {r.reviewNote && <span class="mono">{r.reviewNote}</span>}
+                </td>
+                <td class="acts">
+                  <a class="btn" href={r.href}>{r.decidable ? 'Review and decide' : 'Open'}</a>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+
+    {!openId && queueCapped && <p class="empty">{queueCappedPhrase}</p>}
+
+    {openId && detailFailed && (
+      <p class="empty">
+        This onboarding could not be read just now, and nothing has been changed. Reload; if it
+        persists, the reason is in the message above. <a href={listHref}>Back to the queue</a>.
+      </p>
+    )}
+
+    {openId && detailMissing && (
+      <p class="empty">
+        No onboarding with that reference exists. <a href={listHref}>Back to the queue</a>.
+      </p>
+    )}
+
+    {d && (
+      <article class="detail">
+        <div class="detail__head">
+          <div>
+            <p class="crumb"><a href={listHref}>Back to the queue</a></p>
+            <h2>{detailTitle}</h2>
+            <p class="mono">{d.row.personEmail}</p>
+            {d.row.personCode && <p class="mono">{d.row.personCode}</p>}
+            {d.row.codeRef && <p class="mono">{d.row.codeRef}</p>}
+          </div>
+          <div class="detail__state">
+            <span class={detailStatusClass}>{detailStatusLabel}</span>
+            {d.row.submittedAt && <span class="mono">Submitted {fmtDateTime(d.row.submittedAt)}</span>}
+            {identityLine && <span class="mono">{identityLine}</span>}
+          </div>
+        </div>
+
+        {showBrokenLinks && (
+          <div class="note note--err">
+            This onboarding points at {brokenLinkPhrase}, and that record could not be found. What is
+            shown below is only what the application row itself holds. Nobody should be admitted on a
+            record whose own references do not resolve: find out why before deciding.
+          </div>
+        )}
+
+        {detailHalfDone && (
+          <div class="note note--warn">
+            An identity already exists in the registry for this onboarding, but the record was never
+            marked approved. An earlier approval stopped between its two halves. Approving now
+            completes it and reuses the identity that exists; it does not create a second one.
+          </div>
+        )}
+
+        {detailOrphanApproved && (
+          <div class="note note--warn">
+            This is marked approved and no identity is recorded against it. This desk does not
+            re-decide an approved onboarding, so it cannot be put right from here: the identity
+            registry is where that record belongs.
+          </div>
+        )}
+
+        {selectionWithdrawn && (
+          <div class="note note--err">
+            The selection behind this onboarding has been withdrawn. Nobody can be admitted on a
+            withdrawn selection, and approval will be refused until it is reinstated.
+          </div>
+        )}
+
+        {hasGaps && (
+          <div class="banner">
+            <p class="banner__title">This submission has gaps</p>
+            <p>
+              The checks below are advisory. They are a list of what is empty, not a judgement, and a
+              human decides what to do about them — you may still approve, send it back, or refuse.
+            </p>
+            <ul class="gaps">
+              {gapList.map((g) => <li>{g}</li>)}
+            </ul>
+          </div>
+        )}
+
+        <section class="panel">
+          <h3>From the organisation</h3>
+          <p class="panel__note">
+            These came from the selection record and were never writable by the candidate. There is
+            nothing here to check against them: it is our own data being read back.
+          </p>
+          {!hasOrgFacts && !selectionMissing && (
+            <p class="mono">Nothing is recorded on the selection for this engagement.</p>
+          )}
+          {!hasOrgFacts && selectionMissing && (
+            <p class="mono warn">
+              The selection record this onboarding names could not be found, which is not the same as
+              a selection with nothing filled in.
+            </p>
+          )}
+          {hasOrgFacts && (
+            <dl class="facts">
+              {orgFacts.map((f) => (
+                <div class="fact">
+                  <dt>{f.label}</dt>
+                  <dd>{f.value}</dd>
+                </div>
+              ))}
+            </dl>
+          )}
+        </section>
+
+        {sectionViews.map((s) => (
+          <section class="panel">
+            <h3>{s.label}</h3>
+            <p class="panel__note">Answered by the candidate.</p>
+            <dl class="facts">
+              {s.answers.map((a) => (
+                <div class={a.missing ? 'fact fact--bad' : 'fact'}>
+                  <dt>{a.label}</dt>
+                  <dd>{a.value}</dd>
+                </div>
+              ))}
+            </dl>
+          </section>
+        ))}
+
+        <section class="panel">
+          <h3>Declarations</h3>
+          <p class="panel__note">Every declaration the form asked for, and whether it was accepted.</p>
+          <ul class="decls">
+            {declarationRows.map((v) => (
+              <li class={v.bad ? 'decl decl--bad' : 'decl'}>
+                <span class="decl__state">{v.note}</span>
+                <span>{v.label}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+
+        <section class="panel">
+          <h3>Documents</h3>
+          <p class="panel__note">{detailDocNote}</p>
+          <p class="panel__note">
+            This platform stores a link, not a file. The candidate was asked to share each document
+            as "{ACCESS_FORMAT}"; nothing here can confirm they did, and a link that does not open is
+            a question for them. This platform has not opened a registrar's records and has not
+            authenticated anything: a status of "checked by a reviewer" means a person on this desk
+            looked at it. Anyone holding the link can open it, including after a decision, and only
+            the candidate can change that from their own drive.
+          </p>
+
+          {!mayViewDocs && (
+            <p class="mono">
+              You hold the review desk but not the key that reveals identity documents, so the links
+              are not shown to you. The count above is what this screen may tell you. If you need to
+              read them, that is a separate authority.
+            </p>
+          )}
+
+          {mayViewDocs && docsProblem && <p class="mono warn">{docsProblem}</p>}
+
+          {mayViewDocs && docsRead && !hasDocRows && (
+            <p class="mono">
+              No document link has been provided with this onboarding. This read succeeded, so that
+              is a fact and not a failure.
+            </p>
+          )}
+
+          {mayViewDocs && docsRead && hasDocRows && (
+            <ul class="docs">
+              {docRows.map((doc) => (
+                <li class="doc">
+                  <span class="doc__kind">{doc.kind}</span>
+                  {doc.sensitive && <span class="pill pill--warn">Identity class</span>}
+                  {doc.titleNote && <span class="mono">{doc.titleNote}</span>}
+                  <span class="mono">{doc.statusLabel}</span>
+                  {doc.versionNote && <span class="mono">{doc.versionNote}</span>}
+                  {doc.expiryNote && <span class="mono">{doc.expiryNote}</span>}
+                  {doc.reviewNote && <span class="mono">{doc.reviewNote}</span>}
+                  <a class="doc__link" href={doc.url} target="_blank" rel="noopener noreferrer">
+                    Open the link the candidate shared
+                  </a>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        {!canDecide && (
+          <section class="panel">
+            <h3>No decision is open on this</h3>
+            <p class="panel__note">{decideRefusal}</p>
+            {d.row.reviewNote && <p class="mono">{detailNoteLabel}: {d.row.reviewNote}</p>}
+          </section>
+        )}
+
+        {canDecide && (
+          <section class="decide">
+            <h3>The three decisions, and they are three different things</h3>
+
+            <div class="act act--send">
+              <p class="act__title">Send it back for changes</p>
+              <p class="act__body">
+                The candidate is still being admitted. This reopens their form so they can fix what
+                you name, and they come back to this queue when they resubmit. It is not a refusal
+                and they are not being turned away.
+              </p>
+              <form method="POST">
+                <input type="hidden" name="_action" value="request_changes" />
+                <input type="hidden" name="applicationId" value={d.row.id} />
+                <label class="field">
+                  <span>What they need to change</span>
+                  <textarea name="note" rows="3" required
+                    placeholder="Name the specific thing. This sentence is what they will read."></textarea>
+                </label>
+                <button type="submit" class="btn">Send back for changes</button>
+              </form>
+            </div>
+
+            <div class="act act--reject">
+              <p class="act__title">Do not approve</p>
+              <p class="act__body">
+                This closes the admission. The form does not reopen, no identity is created, and the
+                reason you write is the record of why. It is not the same as sending it back, and
+                there is no way to undo it from this screen.
+              </p>
+              <form method="POST">
+                <input type="hidden" name="_action" value="reject" />
+                <input type="hidden" name="applicationId" value={d.row.id} />
+                <label class="field">
+                  <span>Why this admission is being closed</span>
+                  <textarea name="reason" rows="3" required
+                    placeholder="A reason somebody could be told and that you could defend later."></textarea>
+                </label>
+                <button type="submit" class="btn btn--warn">Record as not approved</button>
+              </form>
+            </div>
+
+            <div class="act act--approve">
+              <p class="act__title">Approve and admit</p>
+              <p class="act__body">
+                This is the heaviest act on this screen. It marks the onboarding approved AND creates
+                the organizational identity in one decision. {identityTypeLine} If the identity cannot
+                be created, nothing is approved and you will be told so plainly rather than shown a
+                green message over half a job.
+              </p>
+              <p class="act__body">
+                It does not grant access to anything. Access is derived from the identity on a
+                separate desk, which is deliberate.
+              </p>
+              {!identityRegistryReady && (
+                <p class="act__body warn">
+                  {identityRegistryProblem} Nothing here can create an identity, so an approval would
+                  be refused rather than half done, and the button is not offered. Sending the
+                  submission back or refusing it still works; admitting somebody does not until this
+                  is put right.
+                </p>
+              )}
+              {identityRegistryReady && (
+                <form method="POST">
+                  <input type="hidden" name="_action" value="approve" />
+                  <input type="hidden" name="applicationId" value={d.row.id} />
+                  <label class="check">
+                    <input type="checkbox" name="confirm" value="yes" required />
+                    <span>I have read this submission and I am admitting this person.</span>
+                  </label>
+                  <button type="submit" class="btn btn--go">Approve and create the identity</button>
+                </form>
+              )}
+            </div>
+          </section>
+        )}
+      </article>
+    )}
+  </div>
+</AdminLayout>
+
+<style>
+  .wrap { padding: 20px; max-width: 1400px; }
+  .head h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #9aa0aa; font-size: 13px; margin: 0 0 16px; max-width: 80ch; line-height: 1.6; }
+  .sub a, .empty a, .banner a, .crumb a { color: inherit; }
+  .note { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; line-height: 1.55; }
+  .note--ok { background: rgba(46,160,90,0.12); border: 1px solid rgba(46,160,90,0.4); }
+  .note--err { background: rgba(200,60,60,0.12); border: 1px solid rgba(200,60,60,0.4); }
+  .note--warn { background: rgba(255,190,80,0.1); border: 1px solid rgba(255,190,80,0.45); }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .tile { border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .tile__n { font-size: 22px; font-weight: 600; }
+  .tile__l { font-size: 11px; color: #9aa0aa; text-transform: uppercase; letter-spacing: 0.06em; }
+  .banner {
+    border: 1px solid rgba(255,190,80,0.4); background: rgba(255,190,80,0.07);
+    border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; max-width: 90ch;
+  }
+  .banner__title { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  .banner p { font-size: 12px; color: #b9bec7; line-height: 1.6; margin: 0 0 6px; }
+  .banner p:last-child { margin-bottom: 0; }
+  .gaps { margin: 6px 0 0; padding-left: 18px; }
+  .gaps li { font-size: 12px; color: #d9a05b; line-height: 1.6; }
+  .filters { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-bottom: 12px; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tab {
+    font-size: 12px; padding: 5px 10px; border-radius: 999px; text-decoration: none; color: #9aa0aa;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .tab--on { color: inherit; border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.06); }
+  .search { display: flex; gap: 6px; align-items: center; }
+  .search input[type=text] { min-width: 320px; }
+  .tablewrap { overflow-x: auto; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 1050px; }
+  th { text-align: left; padding: 10px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; border-bottom: 1px solid rgba(255,255,255,0.1); }
+  td { padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.06); vertical-align: top; }
+  td strong { display: block; }
+  .mono { display: block; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #8b919b; margin-top: 2px; line-height: 1.55; }
+  .mono.warn { color: #d9a05b; }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.18); }
+  .pill--ok { border-color: rgba(46,160,90,0.55); color: #7fd6a0; }
+  .pill--wait { border-color: rgba(120,150,220,0.5); color: #a8bdf0; }
+  .pill--warn { border-color: rgba(255,190,80,0.5); color: #d9b169; }
+  .pill--off { border-color: rgba(200,60,60,0.5); color: #e08b8b; }
+  .acts { min-width: 150px; }
+  .detail { border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 16px 18px; max-width: 100ch; }
+  .detail__head { display: flex; gap: 16px; justify-content: space-between; flex-wrap: wrap; margin-bottom: 14px; }
+  .detail__head h2 { font-size: 18px; margin: 0 0 4px; }
+  .detail__state { text-align: right; display: flex; flex-direction: column; gap: 4px; align-items: flex-end; }
+  .crumb { font-size: 12px; margin: 0 0 8px; }
+  .panel { border-top: 1px solid rgba(255,255,255,0.08); padding-top: 14px; margin-top: 14px; }
+  .panel h3 { font-size: 13px; margin: 0 0 4px; }
+  .panel__note { font-size: 12px; color: #9aa0aa; line-height: 1.6; margin: 0 0 10px; max-width: 80ch; }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin: 0; }
+  .fact { border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; padding: 8px 10px; }
+  .fact--bad { border-color: rgba(200,60,60,0.45); }
+  .fact dt { font-size: 11px; color: #9aa0aa; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
+  .fact dd { margin: 0; font-size: 13px; word-break: break-word; }
+  .decls { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .decl { font-size: 12px; line-height: 1.55; display: flex; gap: 10px; align-items: baseline; }
+  .decl__state { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #7fd6a0; min-width: 190px; }
+  .decl--bad .decl__state { color: #e08b8b; }
+  .docs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .doc { border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; padding: 8px 10px; }
+  .doc__kind { font-size: 13px; display: inline-block; margin-right: 8px; }
+  .doc__link { display: inline-block; margin-top: 6px; font-size: 12px; color: inherit; }
+  .decide { border-top: 1px solid rgba(255,255,255,0.08); padding-top: 14px; margin-top: 14px; }
+  .decide h3 { font-size: 13px; margin: 0 0 10px; }
+  .act { border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+  .act--send { border-color: rgba(120,150,220,0.35); }
+  .act--reject { border-color: rgba(200,60,60,0.35); }
+  .act--approve { border-color: rgba(46,160,90,0.4); }
+  .act__title { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  .act__body { font-size: 12px; color: #9aa0aa; line-height: 1.6; margin: 0 0 8px; max-width: 80ch; }
+  .act__body.warn { color: #d9a05b; }
+  .field { display: block; margin-bottom: 8px; }
+  .field span { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; margin-bottom: 4px; }
+  .check { display: flex; gap: 8px; align-items: baseline; font-size: 12px; color: #b9bec7; margin-bottom: 8px; }
+  textarea, input[type=text] {
+    width: 100%; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.14);
+    color: inherit; border-radius: 5px; padding: 7px 9px; font-size: 12px; line-height: 1.55;
+    font-family: inherit; resize: vertical;
+  }
+  .search input[type=text] { width: auto; }
+  .btn { border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.06); color: inherit; padding: 6px 10px; border-radius: 5px; font-size: 12px; cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn--go { border-color: rgba(46,160,90,0.5); }
+  .btn--warn { border-color: rgba(200,60,60,0.5); }
+  .empty { color: #9aa0aa; font-size: 13px; max-width: 70ch; line-height: 1.6; }
+</style>

@@ -1,0 +1,326 @@
+---
+// /admin/talent — THE TALENT CONSOLE FRONT PAGE.
+//
+// Spec: docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md sections 8, 14, 14A and 43.
+//
+// THIS PAGE WAS LINKED FROM THE SIDEBAR AND DID NOT EXIST. src/lib/admin-nav.ts:191 has offered
+// "Talent console" at this path, and src/middleware.ts:86 has been gating it, since the console
+// shipped — so the first entry in the group, the one an operator clicks to find out what the group
+// even is, was a 404. Every desk under it hangs off this page.
+//
+// IT DECIDES NOTHING. No POST handler, no form, no write, and therefore no audit entry: there is no
+// state change here to record. It is a hub — a card per desk, each with one live number and a link.
+//
+// WHAT IT MUST NOT DO, AND WHY EACH RULE IS HERE.
+//
+//   1. NEVER RENDER A ZERO IT DID NOT MEASURE. talentOverview() rethrows, so "there is nothing
+//      waiting" and "we could not ask" arrive here as different events. A hub is the worst place in
+//      the product to confuse them: somebody reads "0 submitted for review" and closes the tab.
+//      When the read fails the cards still work as links and each one says the number is unread.
+//   2. NEVER OFFER A DOOR THAT BOUNCES. Two gates stand in front of every desk — the capability
+//      (can(), below) and the middleware section key. They do not admit the same people:
+//      `talent.view` is held by recruiter, reviewer and department_head, and the `talent_onboarding`
+//      section is not. offeredCards() checks BOTH, so a recruiter is never handed a card that
+//      redirects them to /admin?denied=talent_onboarding. Spec 14: a section an administrator
+//      cannot reach is ABSENT, not disabled.
+//   3. NEVER SHOW A SCOPED ADMINISTRATOR A PLATFORM TOTAL. Spec 43 rule 4 calls that a leaked
+//      aggregate, and overviewScope() refuses it BEFORE the query runs, which is rule 5 as well —
+//      no loader above the authorization boundary. Recruiter, reviewer and department_head get the
+//      cards and one sentence saying why the numbers are not theirs to read here.
+//   4. NEVER PRESENT A DESK THAT HAS NO PAGE AS AN OPENABLE ONE. Five of the nine paths below are
+//      named in src/lib/admin-nav.ts and gated by src/middleware.ts and have no file in
+//      src/pages/admin/talent at all — which is the very fault this page was written to repair, one
+//      level out. The set of routes that exist is read from the pages directory at BUILD time
+//      (import.meta.glob, below), never hand-listed, so a desk another agent ships tomorrow becomes
+//      a working link here with no edit to this file and no stale "coming soon" left behind.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can, getViewableSectionKeys, defaultSectionKeysForRole } from '@/lib/auth/permissions';
+import {
+  offeredCards, overviewScope, talentOverview, eventBacklogNote,
+  type TalentOverview,
+} from '@/lib/talent/overview';
+
+// EVERY const IS DECLARED ABOVE EVERYTHING THAT READS IT. `const` is not hoisted, and a handler
+// reaching a later declaration threw on its first line every time while the page reported success —
+// that is a recorded outage on this project, not a style preference.
+const user = Astro.locals.user!;
+
+// The server-side gate, before the first query. The middleware section gate ('talent') stands in
+// front of this path too; this is the page's own lock and it is the one that actually decides.
+const mayView = can(user, 'talent.view');
+if (!mayView) return Astro.redirect('/admin');
+
+// WHICH SECTIONS THIS VIEWER MAY PASS. Free: getViewableSectionKeys() memoises on the request's own
+// user object, and the middleware already asked it for this very request before routing here. null
+// means "unrestricted role, no filtering" and must not be read as an empty set.
+let sections: ReadonlySet<string> | null = null;
+let sectionsUnknown = false;
+try {
+  sections = await getViewableSectionKeys(user);
+} catch {
+  // The middleware answers this question first and 503s when it cannot, so reaching here means the
+  // grants became unreadable between two calls in one request.
+  //
+  // FALL BACK TO THE ROLE'S OWN DEFAULTS, NOT TO "NO FILTERING". defaultSectionKeysForRole() is
+  // pure — the same ROLE_SECTIONS table getViewableSectionKeys() would have ended at, with no
+  // database in it — so the both-doors rule survives a failed read for every built-in role instead
+  // of being abandoned at the first error. `null` here would have handed a recruiter the two
+  // onboarding cards that middleware bounces, which is precisely the bounce this page exists to
+  // stop, appearing only on the day the grants table is unwell. It returns null itself for a role
+  // it has no line for, which is the pre-existing behaviour for exactly those roles and no wider.
+  sections = defaultSectionKeysForRole(String(user.role || ''));
+  sectionsUnknown = true;
+}
+
+const cards = offeredCards((p) => can(user, p), sections);
+const scope = overviewScope(user.role);
+
+// THE NUMBERS, AND ONLY FOR THE VIEWER THEY BELONG TO. Nothing is queried for a scoped viewer at
+// all — a total that is not theirs is not computed and then hidden, it is not asked for.
+let counts: TalentOverview | null = null;
+let countsError = '';
+if (scope.mayReadTotals) {
+  try {
+    counts = await talentOverview();
+  } catch (e: any) {
+    // The REAL Postgres reason lives on e.cause; e.message is only the failed statement.
+    countsError = e?.cause?.message || e?.message || 'unknown error';
+  }
+}
+
+// THE OUTBOX BACKLOG, out of the SAME read as everything else and therefore under the same honesty.
+// It used to come from undeliveredEventCount(), which catches its own failure and answers zero: an
+// unreadable outbox and an empty one were the same silence on this banner, and the thing being
+// silently under-reported is "a downstream system was never told that somebody was hired". Now a
+// failed read raises the banner below instead of quietly showing nothing.
+const backlogNote: string | null = counts === null
+  ? null
+  : eventBacklogNote(counts.eventsPending, counts.eventsAbandoned);
+
+const countsFailed = scope.mayReadTotals && counts === null;
+
+// THE SCOPE SENTENCE MUST NOT ASSERT A READ THAT DID NOT HAPPEN. overviewScope() has no way of
+// knowing whether the query then succeeded, so its platform note ends "...read live when the page
+// loaded" unconditionally. Printed above a console whose every tile says "Number could not be
+// read", that half-sentence is the page telling the operator it measured something it did not —
+// the same class of untruth as a rendered zero, one paragraph up from the tiles. countsFailed is
+// only ever true for a viewer who WAS allowed a total, so this branch cannot swallow the scoped
+// refusal, which must always be shown.
+const scopeNote = countsFailed
+  ? 'Numbers on this page would be platform-wide totals, and this time they could not be read. '
+    + 'Nothing shown below is a measured zero.'
+  : scope.note;
+
+const fmt = (n: number): string => {
+  try { return Number(n).toLocaleString('en-GB'); } catch { return String(n); }
+};
+
+// Every comparison and every map lookup is finished HERE. A `<` inside a JSX expression and a
+// `Record<string,string>` indexed from a template both break .astro parsing on this project, so the
+// markup below only ever reads strings and booleans.
+// Taken as a const before the map: narrowing a mutable `let` from inside a callback is exactly the
+// kind of thing that survives locally and then reads as `possibly null` under the typecheck gate.
+const read: TalentOverview | null = counts;
+
+// WHICH OF THESE DESKS ACTUALLY HAS A PAGE.
+//
+// import.meta.glob is resolved by Vite at BUILD time and only its KEYS are read here — nothing is
+// imported, nothing runs, and there is no round trip. It is deliberately not a hand-written list:
+// this tree gains talent pages while it is being worked on, and a list would go on calling a
+// shipped desk "not built" long after it was, which is a new untruth in place of the old one.
+//
+// FAILS OPEN. If the glob ever resolves to nothing — a bundler change, a move of this file — the
+// self-check below fails and every card is rendered exactly as it was before: a working link. A
+// wrong "not built yet" on nine live desks is a far worse page than five links that 404.
+const talentPageFiles = { ...import.meta.glob('./*.astro'), ...import.meta.glob('./*/index.astro') };
+const routeOfFile = (p: string): string => {
+  const rel = String(p).replace(/^\.\//, '').replace(/\.astro$/, '').replace(/\/index$/, '');
+  return rel === 'index' ? '/admin/talent' : '/admin/talent/' + rel;
+};
+const builtRoutes = new Set<string>(Object.keys(talentPageFiles).map(routeOfFile));
+// The glob must at least have found the file it is written in. If it did not, it is not answering
+// this question and its answer is not used.
+const routeCheckWorks = builtRoutes.has('/admin/talent');
+
+const rows = cards.map((c) => {
+  const key = c.countKey;
+  const subKey = c.subCountKey;
+  const hasNumber = read !== null && key !== null;
+  const numberText = read !== null && key !== null ? fmt(read[key]) : '';
+  const subText = read !== null && subKey !== null
+    ? fmt(read[subKey]) + ' ' + c.subCountLabel
+    : '';
+
+  // The opportunities card carries a third figure, because "published" alone tells you nothing
+  // about whether the desk has a backlog of unfinished drafts behind it.
+  let extraText = '';
+  if (read !== null && c.id === 'opportunities') {
+    extraText = fmt(read.opportunitiesClosed) + ' closed';
+  }
+
+  return {
+    id: c.id,
+    title: c.title,
+    href: c.href,
+    blurb: c.blurb,
+    hasNumber,
+    numberText,
+    countLabel: c.countLabel,
+    subText,
+    extraText,
+    // Only a card that WOULD have shown a number says the number is missing. "Recruitment sources"
+    // has no number by design and must not report a failure it never had.
+    unreadable: countsFailed && c.countKey !== null,
+    // A desk with no page is still shown, with its real number, because the number is real and the
+    // count is the answer to "is anything waiting there". It is simply not dressed as a door.
+    built: !routeCheckWorks || builtRoutes.has(c.href),
+  };
+});
+
+const hasUnbuilt = rows.some((r) => !r.built);
+
+const hasCards = rows.length > 0;
+const showCountsNote = scope.mayReadTotals && counts !== null;
+---
+
+<AdminLayout title="Talent console" activeNav="talent">
+  <div class="wrap">
+    <header class="head">
+      <h1>Talent console</h1>
+      <p class="sub">
+        Recruitment, selection, onboarding, identity and access — the whole path from an application
+        to somebody holding an identity issued by this platform. Each desk below is a separate
+        surface with its own authority; this page only shows you where they are and how much is
+        waiting on each.
+      </p>
+    </header>
+
+    <div class="explain">
+      <p class="explain__title">What the numbers on this page are</p>
+      <p>{scopeNote}</p>
+      <p>
+        A desk you are not entitled to open is not listed at all, rather than shown greyed out, so
+        this page is a shorter list for some accounts than for others.
+      </p>
+      {showCountsNote && (
+        <p>
+          Nothing here is cached: every figure was read once when this page loaded and is not
+          refreshed until you reload it.
+        </p>
+      )}
+      {sectionsUnknown && (
+        <p>
+          Your section grants could not be read just now, so this list was built from the default
+          sections for your role rather than from your own grants. If an administrator has narrowed
+          them, a desk you can no longer open may still be shown here — and it will refuse you when
+          you open it, exactly as it would have anyway.
+        </p>
+      )}
+    </div>
+
+    {countsFailed && (
+      <div class="note note--err">
+        The numbers could not be read: {countsError}. That covers the delivery backlog too, so treat
+        the absence of a backlog warning below as unknown rather than as clear. Every desk that has a
+        page still opens normally — this is a failed read of the totals, not an empty console, and
+        the two must never look alike.
+      </div>
+    )}
+
+    {backlogNote && (
+      <div class="note note--warn">{backlogNote}</div>
+    )}
+
+    {!hasCards && (
+      <p class="empty">
+        Your account holds no desk in this console. That is a permission state and not a fault: the
+        talent desks are granted separately from one another, and an administrator can hold the
+        console itself without holding any surface inside it. Ask a super admin which desk you need.
+      </p>
+    )}
+
+    {hasUnbuilt && (
+      <div class="note note--warn">
+        Some desks below have no page yet. They are still listed, and their numbers are read from
+        the same tables as everything else, but they are not links: the sidebar offers those same
+        entries and they do not open. Nothing is missing from the records; the screen for reading
+        them has not been built.
+      </div>
+    )}
+
+    {hasCards && (
+      <div class="cards">
+        {rows.map((r) => (r.built ? (
+          <a class="card" href={r.href}>
+            <span class="card__title">{r.title}</span>
+            {r.hasNumber && <span class="card__n">{r.numberText}</span>}
+            {r.hasNumber && <span class="card__l">{r.countLabel}</span>}
+            {r.unreadable && <span class="card__unread">Number could not be read</span>}
+            <span class="card__blurb">{r.blurb}</span>
+            {r.subText && <span class="mono">{r.subText}</span>}
+            {r.extraText && <span class="mono">{r.extraText}</span>}
+          </a>
+        ) : (
+          <div class="card card--unbuilt">
+            <span class="card__title">{r.title}</span>
+            {r.hasNumber && <span class="card__n">{r.numberText}</span>}
+            {r.hasNumber && <span class="card__l">{r.countLabel}</span>}
+            {r.unreadable && <span class="card__unread">Number could not be read</span>}
+            <span class="card__blurb">{r.blurb}</span>
+            {r.subText && <span class="mono">{r.subText}</span>}
+            {r.extraText && <span class="mono">{r.extraText}</span>}
+            <span class="card__unbuilt">This desk has no page yet, so there is nothing to open.</span>
+          </div>
+        )))}
+      </div>
+    )}
+
+    <div class="explain explain--foot">
+      <p class="explain__title">Two things this console will not do</p>
+      <p>
+        Nothing here selects, scores or admits anybody automatically. Assessment scores, evaluation
+        recommendations and any detection signal are advisory: a named person makes every decision
+        and their name is on the record with a written reason.
+      </p>
+      <p>
+        EduRankAI is the technology platform. Accredited partners award credentials; nothing issued
+        through these desks is a degree, and an internship is unpaid unless a stipend is explicitly
+        recorded against the opportunity.
+      </p>
+    </div>
+  </div>
+</AdminLayout>
+
+<style>
+  .wrap { padding: 20px; max-width: 1400px; }
+  .head h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #9aa0aa; font-size: 13px; margin: 0 0 16px; max-width: 80ch; line-height: 1.6; }
+  .sub a, .empty a { color: inherit; }
+  .explain {
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px 14px;
+    margin-bottom: 18px; max-width: 90ch;
+  }
+  .explain--foot { margin-top: 22px; margin-bottom: 0; }
+  .explain__title { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  .explain p { font-size: 12px; color: #9aa0aa; line-height: 1.6; margin: 0 0 6px; }
+  .explain p:last-child { margin-bottom: 0; }
+  .note { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; max-width: 90ch; line-height: 1.55; }
+  .note--err { background: rgba(200,60,60,0.12); border: 1px solid rgba(200,60,60,0.4); }
+  .note--warn { background: rgba(255,190,80,0.08); border: 1px solid rgba(255,190,80,0.4); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px; }
+  .card {
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 14px 16px;
+    display: flex; flex-direction: column; gap: 4px; text-decoration: none; color: inherit;
+  }
+  .card:hover { border-color: rgba(255,255,255,0.32); background: rgba(255,255,255,0.04); }
+  .card--unbuilt { border-style: dashed; opacity: 0.72; }
+  .card--unbuilt:hover { border-color: rgba(255,255,255,0.1); background: none; }
+  .card__unbuilt { font-size: 11px; color: #d9a05b; margin-top: 8px; }
+  .card__title { font-size: 14px; font-weight: 600; }
+  .card__n { font-size: 26px; font-weight: 600; line-height: 1.15; margin-top: 6px; }
+  .card__l { font-size: 11px; color: #9aa0aa; text-transform: uppercase; letter-spacing: 0.06em; }
+  .card__unread { font-size: 11px; color: #d9a05b; margin-top: 6px; }
+  .card__blurb { font-size: 12px; color: #9aa0aa; line-height: 1.55; margin-top: 8px; }
+  .mono { display: block; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #8b919b; margin-top: 2px; }
+  .empty { color: #9aa0aa; font-size: 13px; max-width: 70ch; line-height: 1.6; }
+</style>

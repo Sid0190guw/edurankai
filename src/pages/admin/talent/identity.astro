@@ -1,0 +1,653 @@
+---
+// /admin/talent/identity — THE ORGANIZATIONAL IDENTITY REGISTRY.
+//
+// Spec: docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md sections 17, 25 and 26.6.
+//
+// THIS PAGE WAS LINKED FROM THE SIDEBAR AND DID NOT EXIST. src/lib/admin-nav.ts:198 has offered
+// "Identity registry" at this path, and src/middleware.ts:87 has been gating it behind the
+// `talent_identity` section, since the talent console shipped — so the one screen that answers
+// "who is actually part of this organisation, and in what state" was a 404, while the onboarding
+// review desk was already creating the rows it lists.
+//
+// WHAT THIS SCREEN IS FOR. One registry of every human EduRankAI recognises organizationally, keyed
+// by something that never changes. The code on a row was allocated once and is never reused and
+// never renumbered (spec 17.4 rule 3): a mistaken identity is voided, not renumbered, so a letter
+// or a certificate bearing the code still resolves to the thing it was issued against.
+//
+// THREE ACTS, AND WHY THEY ARE THREE.
+//  - CHANGE STATUS moves an identity through the lattice in spec 25, and every move carries a
+//    written reason that is stored on the row. A terminated identity is not brought back to life;
+//    somebody returning needs a NEW identity, and no screen issues a LINKED one yet — they are
+//    admitted through onboarding again and the chain does not join up. The copy says that rather
+//    than describing the reinstate action somebody would then go looking for.
+//  - TRANSFER is a new department or a new position with the SAME code — spec 17.6 rule 5. A
+//    promotion is the same act.
+//  - CONVERT is a new identity, a new code from the new series, and the old one closed and linked
+//    in the same transaction — spec 17.6 rule 6. An intern who becomes an employee has not stopped
+//    having been an intern, and the chain in the last column is the answer to "how long has this
+//    person been with us".
+//
+// WHAT IS DELIBERATELY NOT HERE. No identity documents, no government identifiers, nothing
+// health-related: those are a separate key and a separate desk (spec 32.2). Reporting manager and
+// access groups are not shown or edited, because neither is a column on this table — the first is a
+// relationship in the org graph and the second is derived by the access desk (spec 17.3, 23.2).
+// work_email and username are organizational facts and are shown.
+//
+// WHO. `identity.manage` for everything, READ INCLUDED. This registry says who holds access to
+// what, so reading it is not a lesser act than writing it. Super admin and hr hold the key
+// (src/lib/auth/permissions.ts); recruiter, reviewer and department_head do not, which is spec 35's
+// separation and not an oversight.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { logAudit } from '@/lib/audit';
+import {
+  listIdentities, identityCounts, identityLineage, transferTargets,
+  changeIdentityStatus, transferIdentity, convertIdentity,
+  legalNextStatuses, isClosedStatus,
+  IDENTITY_TYPES, IDENTITY_TYPE_LABELS, IDENTITY_STATUS_LABELS,
+  type IdentityRow, type IdentityCounts, type LineageEntry, type TransferTargets,
+} from '@/lib/talent/identity';
+
+// EVERY const IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted, and a handler reaching a
+// later declaration threw on its first line every time while the page reported success — that is a
+// recorded outage on this project, not a style preference.
+const user = Astro.locals.user!;
+
+// Server-side gate, before the first query runs. The middleware section gate stands in front of
+// this path too; this is the page's own lock and the one that actually decides.
+const mayManage = can(user, 'identity.manage');
+if (!mayManage) return Astro.redirect('/admin');
+
+const STATUS_TABS = [
+  { key: 'live', label: 'Live' },
+  { key: 'onboarding', label: 'In onboarding' },
+  { key: 'restricted', label: 'Suspended' },
+  { key: 'closed', label: 'Closed' },
+  { key: 'converted', label: 'Converted' },
+  { key: 'all', label: 'Everything' },
+];
+
+// Typed lookup maps live in the frontmatter and are NEVER indexed from inside JSX: a
+// `Record<string,string>` used from a template breaks .astro parsing on this project.
+const TYPE_OPTIONS = IDENTITY_TYPES.map((t) => ({
+  value: String(t),
+  label: IDENTITY_TYPE_LABELS[t],
+}));
+
+const STATUS_CLASS: Record<string, string> = {
+  active: 'pill pill--live',
+  on_leave: 'pill pill--soft',
+  notice: 'pill pill--soft',
+  verification: 'pill pill--soft',
+  invited_for_onboarding: 'pill',
+  onboarding_started: 'pill',
+  onboarding_pending: 'pill',
+  suspended: 'pill pill--off',
+  terminated: 'pill pill--off',
+  exited: 'pill pill--muted',
+  archived: 'pill pill--muted',
+  converted: 'pill pill--used',
+};
+
+const fmtDate = (iso: string | null): string => {
+  if (!iso) return '';
+  try { return new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }); }
+  catch { return ''; }
+};
+
+let msg = '';
+let err = '';
+let auditWarn = '';
+
+// EVERY ACT ON THIS PAGE IS AUDITED, AND A FAILED AUDIT IS SAID OUT LOUD.
+//
+// logAudit() answers a result and never throws — which is right, because an audit failure must not
+// undo a status change that already succeeded — but it means an ignored result is an act that
+// happened with no record that it happened, reported to the operator as an unqualified success.
+// This registry decides who holds access, so "who changed this, and why" is the whole point of the
+// row. The change stands; the operator is told the trail did not.
+const noteAudit = async (entry: {
+  action: string; entityId: string; diff: Record<string, unknown>;
+}): Promise<void> => {
+  const r = await logAudit({
+    userId: user.id, action: entry.action,
+    entity: 'tal_identity', entityId: entry.entityId,
+    diff: entry.diff, ipAddress: Astro.clientAddress,
+  });
+  if (!r || !r.ok) {
+    auditWarn = 'The change above WAS applied, but the audit entry recording who made it could not '
+      + 'be written' + (r && r.error ? ': ' + r.error : '.')
+      + ' Note it somewhere else before you rely on the trail.';
+  }
+};
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+  const identityId = String(fd.get('identityId') || '');
+  const reason = String(fd.get('reason') || '').trim();
+  try {
+    if (!mayManage) {
+      // Re-checked inside the handler. A hidden button is not a lock, and reaching this branch
+      // means a hand-made POST rather than a click.
+      err = 'You do not hold the authority to act on organizational identities.';
+    } else if (action === 'status') {
+      const status = String(fd.get('status') || '');
+      const r = await changeIdentityStatus(identityId, status, reason, user.id);
+      if (r.ok && r.data) {
+        msg = r.data.identityCode + ' is now ' + (IDENTITY_STATUS_LABELS[r.data.status] || r.data.status).toLowerCase() + '.';
+        await noteAudit({
+          action: 'identity.status_changed',
+          entityId: r.data.id,
+          diff: { identityCode: r.data.identityCode, status: r.data.status, reason },
+        });
+      } else {
+        err = r.error || 'The status could not be changed.';
+      }
+    } else if (action === 'transfer') {
+      const departmentId = String(fd.get('departmentId') || '').trim();
+      const positionId = String(fd.get('positionId') || '').trim();
+      const r = await transferIdentity(identityId, { departmentId, positionId }, reason, user.id);
+      if (r.ok && r.data) {
+        msg = r.data.identityCode + ' has been transferred. The code is unchanged, which is the point of a transfer.';
+        await noteAudit({
+          action: 'identity.transferred',
+          entityId: r.data.id,
+          diff: {
+            identityCode: r.data.identityCode,
+            departmentId: r.data.departmentId, positionId: r.data.positionId, reason,
+          },
+        });
+      } else {
+        err = r.error || 'The transfer could not be made.';
+      }
+    } else if (action === 'convert') {
+      const newType = String(fd.get('newType') || '');
+      const r = await convertIdentity(identityId, newType, reason, user.id);
+      if (r.ok && r.data) {
+        msg = 'New identity ' + r.data.identityCode + ' issued. The previous identity is closed and linked to it, '
+          + 'so both codes still resolve and the chain shows the whole history.';
+        await noteAudit({
+          action: 'identity.converted',
+          entityId: r.data.id,
+          diff: {
+            identityCode: r.data.identityCode, identityType: r.data.identityType,
+            previousIdentityId: r.data.previousIdentityId, reason,
+          },
+        });
+      } else {
+        err = r.error || 'The conversion could not be made.';
+      }
+    }
+  } catch (e: any) {
+    // The REAL Postgres reason lives on e.cause; e.message is only the failed statement.
+    err = e?.cause?.message || e?.message || 'Something went wrong.';
+  }
+}
+
+// Filters are read AFTER the POST so the screen reflects what just happened.
+const statusParam = Astro.url.searchParams.get('status') || 'live';
+const status = STATUS_TABS.some((t) => t.key === statusParam) ? statusParam : 'live';
+const typeParam = (Astro.url.searchParams.get('type') || '').trim();
+const typeFilter = TYPE_OPTIONS.some((t) => t.value === typeParam) ? typeParam : '';
+const q = (Astro.url.searchParams.get('q') || '').trim().slice(0, 120);
+
+// A THROW HERE IS NOT AN EMPTY REGISTRY. listIdentities() rethrows precisely so this page can tell
+// "nobody matches that filter" apart from "the registry could not be read" — they render as the
+// same empty table otherwise, and they mean opposite things.
+let counts: IdentityCounts | null = null;
+let countsFailed = false;
+let registry: IdentityRow[] = [];
+let registryFailed = false;
+let readErr = '';
+let lineage = new Map<string, LineageEntry[]>();
+let lineageFailed = false;
+let targets: TransferTargets | null = null;
+let targetsFailed = false;
+
+try {
+  counts = await identityCounts();
+} catch {
+  // SAID OUT LOUD, not left to absent tiles. A header that simply does not draw is indistinguishable
+  // from a header nobody built, and the number an operator would have read there is the number of
+  // people currently holding access. Missing is not the same as zero and must not look like it.
+  countsFailed = true;
+}
+
+try {
+  registry = await listIdentities({ status, type: typeFilter, q, limit: 200 });
+} catch (e: any) {
+  registryFailed = true;
+  // Its OWN message, not `err`. `err` may already hold the refusal from the POST just handled, and
+  // `err = err || ...` silently dropped the read failure's reason while the empty state below still
+  // told the operator to look for it "in the message above" — pointing them at an unrelated
+  // sentence about the act they just attempted.
+  readErr = 'The identity registry could not be read: ' + (e?.cause?.message || e?.message || 'unknown error');
+}
+
+if (registry.length) {
+  try {
+    lineage = await identityLineage(registry.map((r) => r.id));
+  } catch {
+    // Said out loud below rather than rendered as "no chain": an identity that replaced an earlier
+    // one still shows its immediate predecessor from its own row, and the missing part is the walk
+    // further back.
+    lineageFailed = true;
+  }
+}
+
+try {
+  targets = await transferTargets();
+} catch {
+  targetsFailed = true;
+}
+
+const deptOptions = targets ? targets.departments.map((d) => ({ value: d.id, label: d.name })) : [];
+// The position label carries the department's NAME, not its id. departments.id is a slug on this
+// project, so the raw value read as "Platform Engineer (r-and-d-2)" — a string the operator has to
+// decode to know what they are moving somebody into.
+const deptNameById = new Map<string, string>();
+if (targets) {
+  for (const d of targets.departments) deptNameById.set(d.id, d.name);
+}
+const posOptions = targets
+  ? targets.positions.map((p) => {
+      const where = p.departmentId ? (deptNameById.get(p.departmentId) || p.departmentId) : '';
+      return { value: p.id, label: p.title + (where ? ' (' + where + ')' : '') };
+    })
+  : [];
+
+// Every comparison is finished in the frontmatter: `<` and `<=` inside a JSX expression break
+// .astro parsing on this project, so the template only ever reads booleans and strings.
+const rows = registry.map((r) => {
+  const chain = lineage.get(r.id) || [];
+  const nexts = legalNextStatuses(r.status).map((s) => ({ value: String(s), label: IDENTITY_STATUS_LABELS[s] }));
+  const closed = isClosedStatus(r.status);
+  const convertible = r.status === 'active' || r.status === 'on_leave';
+
+  const deptLabel = r.departmentName || r.departmentId || '';
+  const typeLabel = IDENTITY_TYPE_LABELS[r.identityType] || String(r.identityType);
+  const statusLabel = IDENTITY_STATUS_LABELS[r.status] || String(r.status);
+  const statusClass = STATUS_CLASS[String(r.status)] || 'pill';
+
+  let datesNote = '';
+  if (r.startDate && r.endDate) datesNote = fmtDate(r.startDate) + ' to ' + fmtDate(r.endDate);
+  else if (r.startDate) datesNote = 'From ' + fmtDate(r.startDate);
+  else if (r.endDate) datesNote = 'Ended ' + fmtDate(r.endDate);
+  else datesNote = 'No dates recorded';
+
+  const previousLine = r.previousIdentityCode
+    ? r.previousIdentityCode + (r.previousIdentityType
+        ? ' (' + (IDENTITY_TYPE_LABELS[r.previousIdentityType as keyof typeof IDENTITY_TYPE_LABELS] || r.previousIdentityType) + ')'
+        : '')
+    : '';
+
+  const chainLines = chain.map((c) => {
+    const label = IDENTITY_TYPE_LABELS[c.identityType as keyof typeof IDENTITY_TYPE_LABELS] || c.identityType;
+    const state = IDENTITY_STATUS_LABELS[c.status as keyof typeof IDENTITY_STATUS_LABELS] || c.status;
+    const span = c.startDate && c.endDate ? fmtDate(c.startDate) + ' to ' + fmtDate(c.endDate)
+      : c.startDate ? 'from ' + fmtDate(c.startDate)
+      : c.endDate ? 'ended ' + fmtDate(c.endDate)
+      : 'no dates recorded';
+    return c.identityCode + ' — ' + label + ', ' + state.toLowerCase() + ', ' + span;
+  });
+
+  const convertOptions = TYPE_OPTIONS.filter((t) => t.value !== String(r.identityType));
+
+  return {
+    id: r.id,
+    code: r.identityCode,
+    codeSeries: r.codeSeries,
+    legacyNote: r.codeIsLegacy ? 'Imported code, kept as issued' : '',
+    personName: r.personName || 'Unnamed',
+    personCode: r.personCode,
+    workEmail: r.workEmail || '',
+    username: r.username || '',
+    typeLabel,
+    employmentType: r.employmentType || '',
+    deptLabel,
+    positionTitle: r.positionTitle,
+    statusLabel,
+    statusClass,
+    statusReason: r.statusReason || '',
+    datesNote,
+    previousLine,
+    chainLines,
+    hasChain: chainLines.length > 0,
+    nexts,
+    canChangeStatus: nexts.length > 0,
+    canTransfer: !closed,
+    canConvert: convertible,
+    convertOptions,
+    noActs: nexts.length === 0 && closed && !convertible,
+  };
+});
+
+const hasRows = rows.length > 0;
+const isFiltered = q.length > 0 || typeFilter.length > 0 || status !== 'live';
+// EITHER list is enough to compose a transfer: transferProblem() accepts a department alone, a
+// position alone, or both. Requiring the department list meant that with departments empty and
+// positions present, the transfer form vanished from every row with nothing on the page saying why.
+const showTransferPickers = !targetsFailed && (deptOptions.length > 0 || posOptions.length > 0);
+const noTransferTargets = !targetsFailed && deptOptions.length === 0 && posOptions.length === 0;
+const typeHref = (v: string): string =>
+  '/admin/talent/identity?status=' + status + (v ? '&type=' + encodeURIComponent(v) : '')
+  + (q ? '&q=' + encodeURIComponent(q) : '');
+---
+
+<AdminLayout title="Identity registry" activeNav="talent-identity">
+  <div class="wrap">
+    <header class="head">
+      <h1>Identity registry</h1>
+      <p class="sub">
+        Everyone this platform recognises organizationally, of every type, and what state their
+        identity is in. An identity arrives here when an onboarding is approved on
+        <a href="/admin/talent/onboarding">Onboarding review</a>; from then on this is where its
+        status, its department and its type are changed.
+      </p>
+    </header>
+
+    <div class="explain">
+      <p class="explain__title">The code is issued once and is never reused</p>
+      <p>
+        An identity code is allocated from its own series the moment the identity is created, and
+        nothing on this screen can renumber one. A mistaken identity is closed with a reason, not
+        renumbered, so a letter or a certificate carrying that code still resolves to the record it
+        was issued against.
+      </p>
+      <p>
+        That is why the three actions are different acts. <strong>Transfer</strong> is a new
+        department or position and keeps the same code. <strong>Convert</strong> is a change in what
+        somebody is to the organisation: it issues a new identity in the new series and closes the
+        old one in the same act, linked, so both codes still resolve and the chain shows the whole
+        history. A <strong>status change</strong> moves an identity through its lifecycle and always
+        carries a written reason, which is stored on the row for whoever reads it next.
+      </p>
+      <p>
+        <strong>An identity is not a sign-in account.</strong> Nothing yet writes the link between a
+        person in this registry and a login account, so every identity created here carries no
+        account, and closing or suspending one on this screen does not by itself close
+        anybody out of anything. It changes the organizational record that access is meant to be
+        derived from. Until the link between an identity and a login exists, treat revoking real
+        access as a separate act you still have to perform.
+      </p>
+      <p>
+        An identity created by approving an onboarding starts <strong>Active</strong>: the reviewer
+        reading the submission and approving it is the human check, so it is not parked in
+        Verification waiting for a second one that nothing would schedule. Verification is the state
+        an identity must pass through to become active by a status change made <em>here</em>, which
+        is why a refusal on this screen says so.
+      </p>
+      <p>
+        Reinstating somebody who left is a new identity, never a status change back to active, and
+        this screen has no reinstate action: the lattice refuses the status change, and nothing here
+        issues the replacement. A returning person is admitted through onboarding again, and that
+        path does not link the new identity back to the closed one, so the chain will not show the
+        earlier service until a reinstate action exists. This screen shows organizational facts only: no
+        identity documents, no government identifiers, no personal data beyond the name and the
+        organizational address.
+      </p>
+    </div>
+
+    {msg && <div class="note note--ok">{msg}</div>}
+    {err && <div class="note note--err">{err}</div>}
+    {auditWarn && <div class="note note--err">{auditWarn}</div>}
+    {readErr && <div class="note note--err">{readErr}</div>}
+
+    {countsFailed && (
+      <p class="warnline">
+        The counts across the top could not be read, so they are not shown. That is a failed read,
+        not an organisation with nobody in it. The registry below reports separately.
+      </p>
+    )}
+
+    {counts && (
+      <div class="tiles">
+        <div class="tile"><span class="tile__n">{counts.active}</span><span class="tile__l">Active</span></div>
+        <div class="tile"><span class="tile__n">{counts.onboarding}</span><span class="tile__l">In onboarding</span></div>
+        <div class="tile"><span class="tile__n">{counts.onLeave}</span><span class="tile__l">On leave</span></div>
+        <div class="tile"><span class="tile__n">{counts.suspended}</span><span class="tile__l">Suspended</span></div>
+        <div class="tile"><span class="tile__n">{counts.notice}</span><span class="tile__l">Serving notice</span></div>
+        <div class="tile"><span class="tile__n">{counts.withPrevious}</span><span class="tile__l">Replaced an earlier identity</span></div>
+        <div class="tile"><span class="tile__n">{counts.total}</span><span class="tile__l">Issued in total</span></div>
+      </div>
+    )}
+
+    <form method="GET" class="filters">
+      <div class="tabs">
+        {STATUS_TABS.map((t) => (
+          <a
+            href={'/admin/talent/identity?status=' + t.key + (typeFilter ? '&type=' + encodeURIComponent(typeFilter) : '') + (q ? '&q=' + encodeURIComponent(q) : '')}
+            class={t.key === status ? 'tab tab--on' : 'tab'}
+          >{t.label}</a>
+        ))}
+      </div>
+      <div class="search">
+        <input type="hidden" name="status" value={status} />
+        {typeFilter && <input type="hidden" name="type" value={typeFilter} />}
+        <input
+          type="text"
+          name="q"
+          value={q}
+          placeholder="Identity code, name, person reference, work address or department"
+        />
+        <button type="submit" class="btn">Search</button>
+        {q && <a class="btn" href={'/admin/talent/identity?status=' + status + (typeFilter ? '&type=' + encodeURIComponent(typeFilter) : '')}>Clear</a>}
+      </div>
+    </form>
+
+    <div class="tabs tabs--type">
+      <a href={typeHref('')} class={typeFilter === '' ? 'tab tab--on' : 'tab'}>All types</a>
+      {TYPE_OPTIONS.map((t) => (
+        <a href={typeHref(t.value)} class={t.value === typeFilter ? 'tab tab--on' : 'tab'}>{t.label}</a>
+      ))}
+    </div>
+
+    {registryFailed && (
+      <p class="empty">
+        The registry could not be read just now. This is not the same as nobody holding an identity,
+        and nothing has been changed. Reload; if it persists, the reason is in the red message giving
+        the database's own words.
+      </p>
+    )}
+
+    {lineageFailed && !registryFailed && (
+      <p class="warnline">
+        The full chain behind each identity could not be read, so only the identity immediately
+        before each one is shown below. Nothing has been changed.
+      </p>
+    )}
+
+    {targetsFailed && !registryFailed && (
+      <p class="warnline">
+        The department and position lists could not be read, so a transfer cannot be composed on this
+        screen right now. Status changes and conversions are unaffected.
+      </p>
+    )}
+
+    {noTransferTargets && !registryFailed && (
+      <p class="warnline">
+        There are no departments and no open positions on record, so there is nowhere to transfer
+        anybody to and the transfer form is not drawn. That list was read successfully and is empty,
+        which is not a failure. Status changes and conversions are unaffected.
+      </p>
+    )}
+
+    {!registryFailed && !hasRows && isFiltered && (
+      <p class="empty">
+        No identity matches that filter. Try Everything, or search by the code somebody actually
+        holds, which begins ERAI followed by the series.
+      </p>
+    )}
+
+    {!registryFailed && !hasRows && !isFiltered && (
+      <p class="empty">
+        No live identities. One appears here the moment an onboarding is approved on
+        {' '}<a href="/admin/talent/onboarding">Onboarding review</a>, which creates the identity and
+        allocates its code.
+      </p>
+    )}
+
+    {hasRows && (
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Identity</th>
+              <th>Person</th>
+              <th>Where they sit</th>
+              <th>Status</th>
+              <th>Dates and lineage</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr>
+                <td>
+                  <strong class="handle">{r.code}</strong>
+                  <span class="mono">{r.typeLabel}</span>
+                  {r.employmentType && <span class="mono">{r.employmentType}</span>}
+                  {r.legacyNote && <span class="mono">{r.legacyNote}</span>}
+                </td>
+                <td>
+                  <strong>{r.personName}</strong>
+                  {r.personCode && <span class="mono">{r.personCode}</span>}
+                  {r.workEmail && <span class="mono">{r.workEmail}</span>}
+                  {r.username && <span class="mono">{r.username}</span>}
+                </td>
+                <td>
+                  {r.deptLabel && <span class="mono">{r.deptLabel}</span>}
+                  {r.positionTitle && <span class="mono">{r.positionTitle}</span>}
+                  {!r.deptLabel && !r.positionTitle && <span class="muted">Not recorded</span>}
+                </td>
+                <td>
+                  <span class={r.statusClass}>{r.statusLabel}</span>
+                  {r.statusReason && <span class="mono">{r.statusReason}</span>}
+                </td>
+                <td>
+                  <span class="mono">{r.datesNote}</span>
+                  {r.previousLine && <span class="mono">Replaced {r.previousLine}</span>}
+                  {r.hasChain && (
+                    <div class="chain">
+                      <span class="chain__label">Chain</span>
+                      {r.chainLines.map((line) => <span class="mono">{line}</span>)}
+                    </div>
+                  )}
+                </td>
+                <td class="acts">
+                  {r.canChangeStatus && (
+                    <form method="POST" class="act">
+                      <input type="hidden" name="_action" value="status" />
+                      <input type="hidden" name="identityId" value={r.id} />
+                      <select name="status">
+                        {r.nexts.map((n) => <option value={n.value}>{n.label}</option>)}
+                      </select>
+                      <input type="text" name="reason" placeholder="Reason, in writing" required />
+                      <button type="submit" class="btn">Change status</button>
+                    </form>
+                  )}
+                  {r.canTransfer && showTransferPickers && (
+                    <form method="POST" class="act">
+                      <input type="hidden" name="_action" value="transfer" />
+                      <input type="hidden" name="identityId" value={r.id} />
+                      <select name="departmentId">
+                        <option value="">Department unchanged</option>
+                        {deptOptions.map((d) => <option value={d.value}>{d.label}</option>)}
+                      </select>
+                      <select name="positionId">
+                        <option value="">Position unchanged</option>
+                        {posOptions.map((p) => <option value={p.value}>{p.label}</option>)}
+                      </select>
+                      <input type="text" name="reason" placeholder="Why they are moving" required />
+                      <button type="submit" class="btn">Transfer</button>
+                    </form>
+                  )}
+                  {r.canConvert && (
+                    <form method="POST" class="act">
+                      <input type="hidden" name="_action" value="convert" />
+                      <input type="hidden" name="identityId" value={r.id} />
+                      <select name="newType">
+                        {r.convertOptions.map((t) => <option value={t.value}>{t.label}</option>)}
+                      </select>
+                      <input type="text" name="reason" placeholder="Why the type is changing" required />
+                      <button type="submit" class="btn btn--go">Convert</button>
+                    </form>
+                  )}
+                  {r.noActs && (
+                    <span class="muted">
+                      This identity is closed. Nothing here changes it, and that is deliberate.
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+  </div>
+</AdminLayout>
+
+<style>
+  .wrap { padding: 20px; max-width: 1500px; }
+  .head h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #9aa0aa; font-size: 13px; margin: 0 0 16px; max-width: 80ch; line-height: 1.6; }
+  .sub a, .empty a { color: inherit; }
+  .explain {
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px 14px;
+    margin-bottom: 18px; max-width: 90ch;
+  }
+  .explain__title { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  .explain p { font-size: 12px; color: #9aa0aa; line-height: 1.6; margin: 0 0 6px; }
+  .explain p:last-child { margin-bottom: 0; }
+  .note { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; }
+  .note--ok { background: rgba(46,160,90,0.12); border: 1px solid rgba(46,160,90,0.4); }
+  .note--err { background: rgba(200,60,60,0.12); border: 1px solid rgba(200,60,60,0.4); }
+  .warnline {
+    font-size: 12px; color: #d9a05b; border: 1px solid rgba(255,190,80,0.35);
+    background: rgba(255,190,80,0.06); border-radius: 8px; padding: 10px 12px;
+    margin-bottom: 14px; max-width: 90ch; line-height: 1.55;
+  }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .tile { border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .tile__n { font-size: 22px; font-weight: 600; }
+  .tile__l { font-size: 11px; color: #9aa0aa; text-transform: uppercase; letter-spacing: 0.06em; }
+  .filters { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-bottom: 10px; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tabs--type { margin-bottom: 14px; }
+  .tab {
+    font-size: 12px; padding: 5px 10px; border-radius: 999px; text-decoration: none; color: #9aa0aa;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .tab--on { color: inherit; border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.06); }
+  .search { display: flex; gap: 6px; align-items: center; }
+  .search input[type=text] { min-width: 320px; }
+  .tablewrap { overflow-x: auto; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 1180px; }
+  th { text-align: left; padding: 10px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; border-bottom: 1px solid rgba(255,255,255,0.1); }
+  td { padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.06); vertical-align: top; }
+  td strong { display: block; }
+  .handle { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 14px; letter-spacing: 0.06em; }
+  .mono { display: block; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #8b919b; margin-top: 2px; }
+  .chain { margin-top: 6px; border-left: 2px solid rgba(255,255,255,0.14); padding-left: 8px; }
+  .chain__label { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.18); }
+  .pill--live { border-color: rgba(46,160,90,0.55); color: #7fd6a0; }
+  .pill--soft { border-color: rgba(255,190,80,0.5); color: #d9b169; }
+  .pill--used { border-color: rgba(120,150,220,0.5); color: #a8bdf0; }
+  .pill--off { border-color: rgba(200,60,60,0.5); color: #e08b8b; }
+  .pill--muted { border-color: rgba(255,255,255,0.14); color: #8b919b; }
+  .acts { display: flex; flex-direction: column; gap: 10px; min-width: 300px; }
+  form.act { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .btn { border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.06); color: inherit; padding: 6px 10px; border-radius: 5px; font-size: 12px; cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn--go { border-color: rgba(46,160,90,0.5); }
+  input[type=text], select {
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.14); color: inherit;
+    padding: 5px 7px; border-radius: 4px; font-size: 12px;
+  }
+  form.act input[type=text] { width: 170px; }
+  form.act select { max-width: 190px; }
+  .muted { color: #6f757e; font-size: 12px; max-width: 34ch; line-height: 1.5; }
+  .empty { color: #9aa0aa; font-size: 13px; max-width: 70ch; line-height: 1.6; }
+</style>

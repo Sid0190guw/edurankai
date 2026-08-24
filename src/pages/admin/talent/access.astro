@@ -1,0 +1,1427 @@
+---
+// /admin/talent/access — ACCESS GROUPS, POLICY, REQUESTS AND PROPOSED PROVISIONING.
+//
+// Spec: docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md sections 20, 21, 22, 23, 26.7 and 35.
+//
+// THIS PAGE WAS LINKED FROM THE SIDEBAR AND DID NOT EXIST. src/lib/admin-nav.ts:199 has offered
+// "Access management" at this path, and src/middleware.ts:81 has been gating it behind the
+// `talent_access` section, since the talent console shipped. Five tables have been created on every
+// deploy since — tal_access_group, tal_access_policy, tal_identity_access, tal_access_request and
+// tal_provisioning_run — with nothing in the product able to read or write one of them.
+//
+// ONE KEY, AND IT IS THE NARROWEST IN THE PRODUCT. `access.manage` gates everything here, reading
+// included. super_admin holds it; `hr` deliberately does NOT (src/lib/auth/permissions.ts states the
+// reason at its own grant list), because spec 35 separates People Operations from the Access
+// Administrator: the desk that decides somebody joins must not also be the desk that decides what
+// they can reach. The page says that in words rather than leaving an operator to discover a missing
+// button and assume it is a bug.
+//
+// WHAT AN OPERATOR CAN AND CANNOT DO HERE.
+//
+// CAN: define access groups and what each one carries, write the policy that says which department,
+// position or identity type implies which group, look up any identity and see exactly what it
+// derives to WITH the reason beside every group, grant a time-bounded exception, decide an access
+// request, and record a review decision on a proposed provisioning run.
+//
+// CANNOT: provision anything. Nothing in this repository reaches an outside system. A provisioning
+// run is a proposal and reviewing one records a decision about what SHOULD be provisioned; a human
+// still does it. The copy below says so plainly, because an operator who believed otherwise would
+// stop doing by hand the thing nothing is doing for them.
+//
+// THE DERIVATION IS NOT COMPUTED ON THIS PAGE. deriveAccess() in src/lib/talent/access.ts is a pure
+// function with its own test file, and this page renders what it returns. tal_identity_access is a
+// CACHE — schema.ts says so on the table — so the lookup also shows where the cache and the formula
+// disagree, in both directions, rather than quietly trusting either.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { logAudit } from '@/lib/audit';
+import {
+  listAccessGroups, createAccessGroup, updateAccessGroup, deactivateAccessGroup,
+  listPolicies, addPolicy, retirePolicy,
+  lookupIdentities, accessForIdentity, grantManual, revokeManual,
+  listAccessRequests, decideAccessRequest,
+  listProvisioningRuns, reviewProvisioningRun,
+  parseList, defaultGrantUntil, formatDay, knownCapabilities,
+  ACCESS_CLASSIFICATIONS, CLASSIFICATION_LABELS, CLASSIFICATION_NOTES,
+  SUBJECT_KINDS, SUBJECT_KIND_LABELS, ACCESS_SOURCE_LABELS,
+  REQUEST_STATUS_LABELS, PROVISIONING_STATUS_LABELS,
+  type PolicyRow, type AccessRequestRow, type ProvisioningRunRow, type IdentityAccessView,
+  type IdentityBrief,
+} from '@/lib/talent/access';
+import { IDENTITY_TYPES, IDENTITY_TYPE_LABELS, IDENTITY_STATUS_LABELS, type AccessGroup } from '@/lib/talent/types';
+
+// EVERY const IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted, and a handler reaching a
+// later declaration threw on its first line every time while the page reported success — that is a
+// recorded outage on this project, not a style preference.
+const user = Astro.locals.user!;
+
+// Server-side gate, before any query runs, and it covers READING. Access administration is not a
+// screen a curious admin looks at: knowing which group carries which capability, and who holds an
+// exception to it, is itself a map of where the soft spots are.
+const mayManage = can(user, 'access.manage');
+if (!mayManage) return Astro.redirect('/admin');
+
+// Typed lookup maps are indexed HERE and never from inside JSX: a Record<string,string> used from a
+// template breaks .astro parsing on this project.
+const CLASS_LEGEND = ACCESS_CLASSIFICATIONS.map((c) => ({
+  key: String(c),
+  label: CLASSIFICATION_LABELS[String(c)] || String(c),
+  note: CLASSIFICATION_NOTES[String(c)] || '',
+}));
+
+const KIND_OPTIONS = SUBJECT_KINDS.map((k) => ({ value: String(k), label: SUBJECT_KIND_LABELS[String(k)] || String(k) }));
+const CLASS_OPTIONS = ACCESS_CLASSIFICATIONS.map((c) => ({ value: String(c), label: CLASSIFICATION_LABELS[String(c)] || String(c) }));
+const TYPE_LIST = IDENTITY_TYPES.map((t) => String(t)).join(', ');
+
+const defaultUntilDate = defaultGrantUntil(new Date()).slice(0, 10);
+
+const fmtDateTime = (iso: string | null): string => {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString('en-GB', {
+      day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+    });
+  } catch { return ''; }
+};
+
+let msg = '';
+let err = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+  try {
+    if (!mayManage) {
+      // A hidden button is not a lock. The page already redirects a viewer without the key, so
+      // reaching this branch means a hand-made POST, and it is refused the same way.
+      err = 'You do not hold access administration.';
+    } else if (action === 'create_group') {
+      const r = await createAccessGroup({
+        key: String(fd.get('key') || ''),
+        name: String(fd.get('name') || ''),
+        description: String(fd.get('description') || ''),
+        departmentId: String(fd.get('departmentId') || '') || null,
+        classification: String(fd.get('classification') || 'internal'),
+        capabilities: parseList(fd.get('capabilities')),
+        systems: parseList(fd.get('systems')),
+      }, user.id);
+      if (r.ok) {
+        msg = 'Access group created. It grants nothing to anybody until a policy names it or somebody is granted it by hand.';
+        await logAudit({
+          userId: user.id, action: 'access.group.created',
+          entity: 'tal_access_group', entityId: r.data ? r.data.id : '',
+          diff: r.data ? { key: r.data.key, classification: r.data.classification, capabilities: r.data.capabilities } : {},
+          ipAddress: Astro.clientAddress,
+        });
+      } else { err = r.error || 'Could not create the group.'; }
+    } else if (action === 'update_group') {
+      const groupId = String(fd.get('groupId') || '');
+      const r = await updateAccessGroup(groupId, {
+        name: String(fd.get('name') || ''),
+        description: String(fd.get('description') || ''),
+        departmentId: String(fd.get('departmentId') || '') || null,
+        classification: String(fd.get('classification') || 'internal'),
+        capabilities: parseList(fd.get('capabilities')),
+        systems: parseList(fd.get('systems')),
+      }, user.id);
+      if (r.ok) {
+        msg = 'Access group updated. Everyone the policy already gives it to now carries the new contents.';
+        await logAudit({
+          userId: user.id, action: 'access.group.updated',
+          entity: 'tal_access_group', entityId: groupId,
+          diff: r.data ? { classification: r.data.classification, capabilities: r.data.capabilities, systems: r.data.systems } : {},
+          ipAddress: Astro.clientAddress,
+        });
+      } else { err = r.error || 'Could not update the group.'; }
+    } else if (action === 'deactivate_group') {
+      const groupId = String(fd.get('groupId') || '');
+      const reason = String(fd.get('reason') || '').trim();
+      const r = await deactivateAccessGroup(groupId, reason, user.id);
+      if (r.ok) {
+        const n = r.data ? r.data.policiesRetired : 0;
+        msg = 'Group retired, and ' + n + ' policy row(s) that handed it out were retired with it. '
+          + 'Existing manual exceptions were left in place for a human to look at.';
+        await logAudit({
+          userId: user.id, action: 'access.group.retired',
+          entity: 'tal_access_group', entityId: groupId,
+          diff: { reason, policiesRetired: n }, ipAddress: Astro.clientAddress,
+        });
+      } else { err = r.error || 'Could not retire the group.'; }
+    } else if (action === 'add_policy') {
+      const groupId = String(fd.get('groupId') || '');
+      const subjectKind = String(fd.get('subjectKind') || '');
+      const subjectKey = String(fd.get('subjectKey') || '');
+      const reason = String(fd.get('reason') || '');
+      const r = await addPolicy(subjectKind, subjectKey, groupId, reason, user.id);
+      if (r.ok) {
+        msg = 'Policy added at version ' + (r.data ? r.data.version : 1)
+          + '. Everyone who matches derives this group from now on; nothing was written onto anybody.';
+        await logAudit({
+          userId: user.id, action: 'access.policy.added',
+          entity: 'tal_access_policy', entityId: r.data ? r.data.id : '',
+          diff: { subjectKind, subjectKey, groupId, reason }, ipAddress: Astro.clientAddress,
+        });
+      } else { err = r.error || 'Could not add the policy.'; }
+    } else if (action === 'retire_policy') {
+      const policyId = String(fd.get('policyId') || '');
+      const reason = String(fd.get('reason') || '');
+      const r = await retirePolicy(policyId, reason, user.id);
+      if (r.ok) {
+        msg = 'Policy retired. The row stays on the record with your reason on it, and it derives nothing from now on.';
+        await logAudit({
+          userId: user.id, action: 'access.policy.retired',
+          entity: 'tal_access_policy', entityId: policyId,
+          diff: { reason }, ipAddress: Astro.clientAddress,
+        });
+      } else { err = r.error || 'Could not retire the policy.'; }
+    } else if (action === 'grant_manual') {
+      const identityId = String(fd.get('identityId') || '');
+      const groupId = String(fd.get('groupId') || '');
+      const untilDay = String(fd.get('until') || '').trim();
+      const reason = String(fd.get('reason') || '');
+      // A date input gives a day; an exception ends at the end of that day rather than at midnight
+      // on the morning of it, which is what somebody choosing a date means.
+      const untilIso = untilDay ? untilDay + 'T23:59:59.000Z' : '';
+      const r = await grantManual(identityId, groupId, untilIso, reason, user.id);
+      if (r.ok) {
+        msg = r.data && r.data.extended
+          ? 'Existing exception extended. It is still marked as a manual grant and still expires.'
+          : 'Exception granted. It is time-bounded, it carries your reason, and it stays marked as an exception.';
+        // THE ROW EXISTS; THE ACCESS DOES NOT, AND THE OPERATOR HEARS IT NOW RATHER THAN FROM THE
+        // person who still cannot get in. Status is the first term of the derivation, so a grant
+        // written against a suspended or exited identity resolves to nothing until the status
+        // changes. Saying only "Exception granted" here is the screen claiming an outcome the
+        // formula does not produce.
+        if (r.data && r.data.gatedNow) {
+          msg += ' It grants nothing yet: this identity is '
+            + String(r.data.statusLabel).toLowerCase()
+            + ', and status is the first term of the derivation. The exception takes effect if and when the identity becomes active again.';
+        }
+      } else { err = r.error || 'Could not grant that.'; }
+    } else if (action === 'revoke_manual') {
+      const rowId = String(fd.get('rowId') || '');
+      const r = await revokeManual(rowId, user.id);
+      if (r.ok) { msg = 'Exception withdrawn. Anything still derived from policy is unaffected.'; }
+      else { err = r.error || 'Could not withdraw that.'; }
+    } else if (action === 'decide_request') {
+      const requestId = String(fd.get('requestId') || '');
+      const decision = String(fd.get('decision') || '') === 'approve' ? 'approve' : 'reject';
+      const note = String(fd.get('note') || '');
+      const r = await decideAccessRequest(requestId, decision, user.id, note);
+      if (r.ok) {
+        const status = r.data ? String(r.data.status) : '';
+        msg = r.data && r.data.granted
+          ? 'Request approved, and the exception was written with the same expiry rules a manual grant obeys.'
+          : 'Decision recorded. The request is now: ' + (REQUEST_STATUS_LABELS[status] || status) + '.';
+        // The access was granted; the permission.granted row that should record it was not. Said
+        // here rather than swallowed, because an audit trail with a hole in it that nobody was told
+        // about is the same trail read later as complete.
+        const auditProblem = r.data && r.data.auditProblem ? String(r.data.auditProblem) : '';
+        if (auditProblem) {
+          err = 'The decision was recorded, but the permission.granted entry could not be written to the audit log: '
+            + auditProblem + '. The access exists and the audit trail does not show it being given.';
+        }
+        await logAudit({
+          userId: user.id, action: 'access.request.decided',
+          entity: 'tal_access_request', entityId: requestId,
+          diff: { decision, note, status }, ipAddress: Astro.clientAddress,
+        });
+      } else { err = r.error || 'Could not record that decision.'; }
+    } else if (action === 'review_run') {
+      const runId = String(fd.get('runId') || '');
+      const decision = String(fd.get('decision') || '') === 'approve' ? 'approve' : 'decline';
+      const note = String(fd.get('note') || '');
+      const r = await reviewProvisioningRun(runId, decision, user.id, note);
+      if (r.ok) {
+        msg = decision === 'approve'
+          ? 'Reviewed. This records that the proposal is what SHOULD be provisioned. Nothing here provisions it, so somebody still has to.'
+          : 'Declined, with your reason on the run.';
+        await logAudit({
+          userId: user.id, action: 'access.provisioning.reviewed',
+          entity: 'tal_provisioning_run', entityId: runId,
+          diff: { decision, note }, ipAddress: Astro.clientAddress,
+        });
+      } else { err = r.error || 'Could not record that review.'; }
+    }
+  } catch (e: any) {
+    // The REAL Postgres reason lives on e.cause; e.message is only the failed statement.
+    err = e?.cause?.message || e?.message || 'Something went wrong.';
+  }
+}
+
+// Filters are read AFTER the POST so the screen reflects what just happened.
+const showRetiredGroups = Astro.url.searchParams.get('groups') === 'all';
+const showRetiredPolicy = Astro.url.searchParams.get('policy') === 'all';
+const q = (Astro.url.searchParams.get('q') || '').trim().slice(0, 120);
+const identityParam = (Astro.url.searchParams.get('identity') || '').trim();
+
+// EVERY LIST RETHROWS, AND EACH FAILURE IS CAUGHT SEPARATELY. "There are none" and "we could not
+// read whether there are any" render as the same empty table and mean opposite things; that
+// swallowed read presented as a confident empty state is the defect this project pays for most
+// often. One section failing must also not blank the other three.
+let groups: AccessGroup[] = [];
+let groupsFailed = '';
+try {
+  groups = await listAccessGroups(showRetiredGroups);
+} catch (e: any) {
+  groupsFailed = e?.cause?.message || e?.message || 'unknown error';
+}
+
+let policies: PolicyRow[] = [];
+let policiesFailed = '';
+try {
+  policies = await listPolicies({ includeRetired: showRetiredPolicy });
+} catch (e: any) {
+  policiesFailed = e?.cause?.message || e?.message || 'unknown error';
+}
+
+let requests: AccessRequestRow[] = [];
+let requestsFailed = '';
+try {
+  requests = await listAccessRequests('open', 100);
+} catch (e: any) {
+  requestsFailed = e?.cause?.message || e?.message || 'unknown error';
+}
+
+let runs: ProvisioningRunRow[] = [];
+let runsFailed = '';
+try {
+  runs = await listProvisioningRuns('open', 100);
+} catch (e: any) {
+  runsFailed = e?.cause?.message || e?.message || 'unknown error';
+}
+
+let matches: IdentityBrief[] = [];
+let view: IdentityAccessView | null = null;
+let lookupFailed = '';
+try {
+  if (identityParam) {
+    view = await accessForIdentity(identityParam);
+  } else if (q) {
+    matches = await lookupIdentities(q, 20);
+    if (matches.length === 1) view = await accessForIdentity(matches[0].id);
+  }
+} catch (e: any) {
+  lookupFailed = e?.cause?.message || e?.message || 'unknown error';
+}
+
+// THE LOOKUP IS ITSELF A SENSITIVE READ, AND IT IS RECORDED BEFORE IT IS RENDERED.
+//
+// This panel prints, for one named person, every capability they can reach and every exception
+// standing over them — which is a map of where that person is worth attacking. `access.manage` is
+// marked sensitive in the permission registry for exactly that reason, and an administration
+// surface that logs who CHANGED access while logging nothing about who READ whose cannot answer the
+// question that matters after an incident: who went looking first.
+//
+// NOT logAuditOrThrow, and it does not block the render. Refusing to show an administrator the
+// derivation because a log row would not write turns a degraded audit log into an outage on the one
+// screen used to investigate one — the trade `logAudit()` documents at its own definition. What
+// this does refuse to do is stay quiet: a failed write is said on the page, so nobody later reads a
+// gap in the trail as nobody having looked.
+let lookupAuditProblem = '';
+if (view) {
+  try {
+    const audited = await logAudit({
+      userId: user.id,
+      action: 'access.identity.viewed',
+      entity: 'tal_identity',
+      entityId: view.identity.id,
+      diff: {
+        identityCode: view.identity.identityCode,
+        status: view.identity.status,
+        derivedGroups: view.derivation.groups.length,
+        exceptionsHeld: view.cached.filter((c) => c.source === 'manual' || c.source === 'request').length,
+      },
+      ipAddress: Astro.clientAddress,
+    });
+    if (!audited?.ok) lookupAuditProblem = String(audited?.error || 'unknown reason');
+  } catch (e: any) {
+    lookupAuditProblem = e?.cause?.message || e?.message || 'unknown error';
+  }
+}
+
+// Every comparison and every map lookup is finished in the frontmatter: `<` inside a JSX expression
+// and a typed map indexed from a template both break .astro parsing on this project.
+// The match list printed `employee` and `on_leave` — the stored values, not the words. Every other
+// table on this page shows the label, and a screen that spells a status two different ways in two
+// places invites somebody to think they are two different statuses. The maps are indexed here
+// because a typed Record read from inside JSX breaks .astro parsing on this project.
+const matchRows = matches.map((m) => ({
+  id: m.id,
+  name: m.personName || 'Unnamed',
+  identityCode: m.identityCode,
+  workEmail: m.workEmail,
+  typeLabel: IDENTITY_TYPE_LABELS[m.identityType as keyof typeof IDENTITY_TYPE_LABELS] || m.identityType,
+  department: m.departmentId || 'no department',
+  position: m.positionId || 'no position',
+  statusLabel: IDENTITY_STATUS_LABELS[m.status] || String(m.status),
+  href: '/admin/talent/access?identity=' + m.id,
+}));
+
+const activeGroups = groups.filter((g) => g.isActive);
+const groupOptions = activeGroups.map((g) => ({
+  value: g.id,
+  label: g.key + ' (' + (CLASSIFICATION_LABELS[String(g.classification)] || g.classification) + ')',
+}));
+
+const groupRows = groups.map((g) => ({
+  id: g.id,
+  key: g.key,
+  name: g.name,
+  description: g.description,
+  departmentId: g.departmentId || '',
+  classification: String(g.classification),
+  classLabel: CLASSIFICATION_LABELS[String(g.classification)] || String(g.classification),
+  classNote: CLASSIFICATION_NOTES[String(g.classification)] || '',
+  classPill: 'pill pill--' + String(g.classification),
+  capabilities: g.capabilities,
+  capabilitiesText: g.capabilities.join(', '),
+  capabilityCount: g.capabilities.length,
+  hasCapabilities: g.capabilities.length > 0,
+  systemsText: g.systems.join(', '),
+  hasSystems: g.systems.length > 0,
+  isActive: g.isActive,
+  stateLabel: g.isActive ? 'Live' : 'Retired',
+  stateClass: g.isActive ? 'pill pill--live' : 'pill pill--off',
+}));
+
+// THE LOOKUP'S OWN GROUP READ IS FOLDED IN AS WELL. accessForIdentity() loads every group itself,
+// and the two reads are separate round trips: if the page-level one came back short or failed while
+// the lookup's succeeded, a derived row would print a bare uuid where a group key belongs — an
+// administrator staring at a reason for access they cannot identify. Whichever read has the group,
+// the name gets used.
+const groupNames = new Map<string, { key: string; name: string; classification: string; classLabel: string; capabilities: string[]; isActive: boolean }>();
+const namedGroups: AccessGroup[] = view ? groups.concat(view.groups) : groups;
+for (const g of namedGroups) {
+  groupNames.set(g.id, {
+    key: g.key, name: g.name,
+    classification: String(g.classification),
+    classLabel: CLASSIFICATION_LABELS[String(g.classification)] || String(g.classification),
+    capabilities: g.capabilities,
+    isActive: g.isActive,
+  });
+}
+
+const policyRows = policies.map((p) => ({
+  id: p.id,
+  kindLabel: SUBJECT_KIND_LABELS[String(p.subjectKind)] || String(p.subjectKind),
+  subjectKey: p.subjectKey,
+  subjectDisplay: p.subjectKind === 'identity_type'
+    ? (IDENTITY_TYPE_LABELS[p.subjectKey as keyof typeof IDENTITY_TYPE_LABELS] || p.subjectKey)
+    : p.subjectKey,
+  groupKey: p.groupKey || 'unknown group',
+  groupName: p.groupName,
+  classLabel: CLASSIFICATION_LABELS[String(p.groupClassification)] || String(p.groupClassification),
+  classPill: 'pill pill--' + String(p.groupClassification),
+  capabilitiesText: p.groupCapabilities.join(', '),
+  hasCapabilities: p.groupCapabilities.length > 0,
+  versionNote: 'v' + p.version,
+  isActive: p.isActive,
+  stateLabel: p.isActive ? 'Live' : 'Retired',
+  stateClass: p.isActive ? 'pill pill--live' : 'pill pill--off',
+  reason: p.changeReason || '',
+  changedBy: p.changedByName,
+  createdOn: formatDay(p.createdAt),
+  groupRetiredWarning: !p.groupIsActive && p.isActive,
+}));
+
+const requestRows = requests.map((r) => ({
+  id: r.id,
+  who: r.personName || r.identityCode || 'Unknown identity',
+  identityCode: r.identityCode,
+  groupKey: r.groupKey || 'unknown group',
+  groupName: r.groupName,
+  classLabel: CLASSIFICATION_LABELS[String(r.groupClassification)] || String(r.groupClassification),
+  classPill: 'pill pill--' + String(r.groupClassification),
+  capabilitiesText: r.groupCapabilities.join(', '),
+  hasCapabilities: r.groupCapabilities.length > 0,
+  reason: r.reason,
+  wantedUntil: r.requestedUntil ? 'Wanted until ' + formatDay(r.requestedUntil) : 'No end date asked for',
+  statusLabel: REQUEST_STATUS_LABELS[String(r.status)] || String(r.status),
+  raisedOn: fmtDateTime(r.createdAt),
+  needsSecurity: String(r.groupClassification) === 'classified',
+}));
+
+const runRows = runs.map((r) => {
+  const proposed = Array.isArray(r.proposed) ? r.proposed : [];
+  const names = proposed.map((p: any) => {
+    const gid = String(p?.accessGroupId || '');
+    const g = groupNames.get(gid);
+    const label = g ? g.key + ' (' + g.classLabel + ')' : gid || 'unnamed group';
+    const src = String(p?.source || '');
+    return label + (src ? ' via ' + (ACCESS_SOURCE_LABELS[src] || src).toLowerCase() : '');
+  });
+  return {
+    id: r.id,
+    who: r.personName || r.identityCode || 'Unknown identity',
+    identityCode: r.identityCode,
+    trigger: r.trigger,
+    statusLabel: PROVISIONING_STATUS_LABELS[String(r.status)] || String(r.status),
+    proposedNames: names,
+    proposedCount: names.length,
+    hasProposal: names.length > 0,
+    raisedOn: fmtDateTime(r.createdAt),
+  };
+});
+
+// The lookup panel. Built entirely here, so the template only reads strings and booleans.
+const derived = view ? view.derivation : null;
+const identityLine = view
+  ? {
+      name: view.identity.personName || 'Unnamed',
+      code: view.identity.identityCode,
+      personCode: view.identity.personCode,
+      email: view.identity.workEmail,
+      typeLabel: IDENTITY_TYPE_LABELS[view.identity.identityType as keyof typeof IDENTITY_TYPE_LABELS] || view.identity.identityType,
+      department: view.identity.departmentId || 'no department recorded',
+      position: view.identity.positionId || 'no position recorded',
+      statusLabel: IDENTITY_STATUS_LABELS[view.identity.status] || String(view.identity.status),
+      gated: !!(derived && derived.gatedReason),
+      gatedReason: derived && derived.gatedReason ? derived.gatedReason : '',
+    }
+  : null;
+
+const cacheByKey = new Map<string, string>();
+if (view) for (const c of view.cached) cacheByKey.set(c.accessGroupId + '|' + c.source, c.id);
+
+const derivedRows = derived
+  ? derived.reasons.map((r) => {
+      const g = groupNames.get(r.accessGroupId);
+      const isException = r.source === 'manual' || r.source === 'request';
+      return {
+        groupKey: g ? g.key : r.accessGroupId,
+        groupName: g ? g.name : '',
+        classLabel: g ? g.classLabel : 'unknown classification',
+        classPill: 'pill pill--' + (g ? g.classification : 'internal'),
+        capabilitiesText: g ? g.capabilities.join(', ') : '',
+        hasCapabilities: !!(g && g.capabilities.length > 0),
+        groupRetired: !!(g && !g.isActive),
+        sourceLabel: ACCESS_SOURCE_LABELS[String(r.source)] || String(r.source),
+        explanation: r.explanation,
+        note: r.note || '',
+        versionNote: r.policyVersion ? 'policy v' + r.policyVersion : '',
+        isException,
+        rowId: isException ? (cacheByKey.get(r.accessGroupId + '|' + r.source) || '') : '',
+      };
+    })
+  : [];
+
+// A REFUSED EXCEPTION IS STILL A ROW IN THE TABLE, AND SOMEBODY HAS TO BE ABLE TO CLEAR IT.
+//
+// An expired manual grant, and one written with no end date at all, derive nothing — but the row
+// stays in tal_identity_access until a reconciliation job that does not exist yet removes it, and
+// this page was computing the row id for each of them and then rendering no control. So the only
+// screen in the product that can see a dead exception was also the only one that could not withdraw
+// it. `isException` gates the button: a policy term withheld by the status gate has no row of its
+// own and is removed by retiring the policy, which the derived table already says.
+//
+// DEAD AND WITHHELD ARE NOT THE SAME ROW, AND THE BUTTON MAY NOT CALL THEM THE SAME THING. Every
+// refused entry used to get one control reading "Withdraw the dead exception". On a suspended
+// person that label sat beside a live, reasoned, unexpired manual grant that the status gate is
+// holding back and that returns by itself on reinstatement — so the one destructive control on this
+// screen described what it was about to destroy as something already gone. `r.gated` comes from
+// deriveAccess() and separates the two: withdrawing a withheld grant is still allowed, because an
+// administrator may genuinely want it gone before a reinstatement, but it is labelled as the
+// permanent act it is.
+const refusedRows = derived
+  ? derived.refused.map((r) => {
+      const g = groupNames.get(r.accessGroupId);
+      const isException = r.source === 'manual' || r.source === 'request';
+      const rowId = cacheByKey.get(r.accessGroupId + '|' + String(r.source)) || '';
+      const isGated = r.gated === true;
+      const canWithdraw = isException && rowId.length > 0;
+      return {
+        groupKey: g ? g.key : r.accessGroupId,
+        classLabel: g ? g.classLabel : 'unknown classification',
+        classPill: 'pill pill--' + (g ? g.classification : 'internal'),
+        explanation: r.explanation,
+        note: r.note || '',
+        rowId,
+        canWithdraw,
+        withdrawLabel: isGated ? 'Withdraw this exception permanently' : 'Withdraw the dead exception',
+        // Only said where there is a button to say it about. A withheld POLICY term is also gated
+        // and also comes back, but it has no row of its own and no control beside it, so a warning
+        // about a permanent withdrawal there would be a caution against an act nobody is offered.
+        withdrawNote: isGated && canWithdraw
+          ? 'This one is not dead. It is being held back by the status, and it would come back on its own if the identity became active again — withdrawing it now is permanent.'
+          : '',
+      };
+    })
+  : [];
+
+const driftMissing = view
+  ? view.drift.missing.map((d) => {
+      const g = groupNames.get(d.accessGroupId);
+      return (g ? g.key : d.accessGroupId) + ' from ' + (ACCESS_SOURCE_LABELS[String(d.source)] || String(d.source)).toLowerCase();
+    })
+  : [];
+const driftStale = view
+  ? view.drift.stale.map((d) => {
+      const g = groupNames.get(d.accessGroupId);
+      return (g ? g.key : d.accessGroupId) + ' from ' + (ACCESS_SOURCE_LABELS[String(d.source)] || String(d.source)).toLowerCase();
+    })
+  : [];
+const hasDriftMissing = driftMissing.length > 0;
+const hasDriftStale = driftStale.length > 0;
+const hasDrift = hasDriftMissing || hasDriftStale;
+// A GATED IDENTITY MAKES THE WHOLE CACHE READ AS STALE, AND THAT IS THE FORMULA WORKING.
+// deriveAccess() empties the set for a suspended, exited or terminated identity, so every row the
+// cache still holds is "materialised but no longer derived" — which is the exact wording this panel
+// uses for the dangerous kind of drift. Without this line an administrator looking at a suspended
+// person sees what reads as a broken cache and starts hunting a bug that is not there.
+const driftIsGate = !!(identityLine && identityLine.gated && hasDriftStale);
+
+const hasGroups = groupRows.length > 0;
+const hasPolicy = policyRows.length > 0;
+const hasRequests = requestRows.length > 0;
+const hasRuns = runRows.length > 0;
+const hasMatches = matches.length > 0;
+const showMatchList = !view && hasMatches;
+const searchedNothing = !view && !hasMatches && q.length > 0 && lookupFailed.length === 0;
+const identityNotFound = !view && identityParam.length > 0 && lookupFailed.length === 0;
+const hasDerived = derivedRows.length > 0;
+const hasRefused = refusedRows.length > 0;
+const showClear = q.length > 0 || identityParam.length > 0;
+
+// EVERY TAB KEEPS EVERYTHING ELSE THE SCREEN IS SHOWING. These four links used to be written as
+// bare paths, so opening "including retired" under Policy silently reset the Groups tab AND threw
+// away the identity the administrator was in the middle of looking at — the work is lost and the
+// page looks like it simply forgot.
+function tabHref(over: { groups?: string; policy?: string }): string {
+  const p = new URLSearchParams();
+  const g = over.groups !== undefined ? over.groups : (showRetiredGroups ? 'all' : '');
+  const pol = over.policy !== undefined ? over.policy : (showRetiredPolicy ? 'all' : '');
+  if (g) p.set('groups', g);
+  if (pol) p.set('policy', pol);
+  if (identityParam) p.set('identity', identityParam);
+  else if (q) p.set('q', q);
+  const qs = p.toString();
+  return qs ? '/admin/talent/access?' + qs : '/admin/talent/access';
+}
+const groupsLiveHref = tabHref({ groups: '' });
+const groupsAllHref = tabHref({ groups: 'all' });
+const policyLiveHref = tabHref({ policy: '' });
+const policyAllHref = tabHref({ policy: 'all' });
+
+// A COUNT IS A CLAIM, AND IT MAY NOT BE MADE OUT OF A FAILED READ. `groups` is empty both when no
+// group exists and when the query threw, and "0 live access groups" printed over the second one is
+// the exact defect this project pays for most: a confident number standing in for an answer nobody
+// got. When the read failed the sentence says so and no number appears.
+const groupCountNote = groupsFailed
+  ? 'How many live groups there are could not be read just now'
+  : activeGroups.length === 1 ? 'One live access group' : activeGroups.length + ' live access groups';
+
+// The two group pickers below are built from that same read. An empty dropdown after a failed read
+// reads as "no groups have been defined", so each one gets a line saying which it is.
+const groupPickerBroken = groupsFailed.length > 0;
+const groupPickerEmpty = !groupsFailed && groupOptions.length === 0;
+
+// THE PAGE PROMISED A CHECK IT CANNOT ALWAYS MAKE. groupProblem() only compares capability keys
+// against the permission catalogue when it was given one, and catalogue() returns null when
+// src/lib/auth/registry.ts cannot be read — so on that run a group saves with a key that grants
+// nothing, under a sentence telling the operator such a key is refused. Adding a policy already
+// fails closed for the same reason; saving a group deliberately does not, because a group grants
+// nobody anything until a policy or a hand grant names it. What changes here is that the screen
+// stops claiming a guarantee it is not currently able to give.
+let catalogueReadable = true;
+try {
+  catalogueReadable = (await knownCapabilities()) !== null;
+} catch {
+  catalogueReadable = false;
+}
+---
+
+<AdminLayout title="Access management" activeNav="talent-access">
+  <div class="wrap">
+    <header class="head">
+      <h1>Access management</h1>
+      <p class="sub">
+        What an access group carries, which department, position or identity type implies it, and
+        what any one identity therefore derives to. Access here is <strong>derived</strong>, not kept
+        as a list: change the policy or change somebody's department and the answer changes with it,
+        and every group a person can reach carries the reason beside it.
+      </p>
+    </header>
+
+    <div class="explain">
+      <p class="explain__title">Why this desk is separate from the people desk</p>
+      <p>
+        Everything on this page, reading included, needs <code>access.manage</code> — the narrowest
+        key in the product. People Operations does not hold it, and that is deliberate rather than an
+        oversight: the desk that decides somebody joins must not also be the desk that decides what
+        they can reach. Today that leaves access administration with the super administrator alone,
+        which is narrow and correct until a dedicated access administrator role exists.
+      </p>
+      <p class="explain__title">Status is the first thing the formula reads</p>
+      <p>
+        A suspended, exited or terminated identity resolves to no access at all, whatever department,
+        position, type or standing exception it holds. A suspended department head is not a
+        department head. Somebody serving notice keeps access until their last working day.
+      </p>
+      <p class="explain__title">Nothing on this page provisions anything</p>
+      <p>
+        There is no connector to any outside system in this product. A provisioning run is a
+        <strong>proposal</strong>: reviewing one records a decision about what should be provisioned,
+        and a person still has to go and do it. Nothing here creates an account anywhere.
+      </p>
+    </div>
+
+    {msg && <div class="note note--ok">{msg}</div>}
+    {err && <div class="note note--err">{err}</div>}
+
+    <div class="legend">
+      <p class="legend__title">Classification, which is shown beside every group on this page</p>
+      <div class="legend__grid">
+        {CLASS_LEGEND.map((c) => (
+          <div class="legend__item">
+            <span class={'pill pill--' + c.key}>{c.label}</span>
+            <span class="legend__note">{c.note}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+
+    <!-- ------------------------------------------------------------------ LOOKUP -->
+    <section class="block">
+      <h2>What does one identity derive to</h2>
+      <p class="blurb">
+        Enter an identity code, a work address, a name or an ERAI person reference. The answer is
+        computed from the policy below and from any standing exception, and every group comes with
+        the reason it is there. A grant with no visible reason is the thing this whole page exists to
+        prevent.
+      </p>
+
+      <form method="GET" class="search">
+        <input type="text" name="q" value={q} placeholder="Identity code, work address, name or ERAI reference" />
+        <button type="submit" class="btn">Look up</button>
+        {showClear && <a class="btn" href="/admin/talent/access">Clear</a>}
+      </form>
+
+      {lookupFailed && (
+        <p class="empty">
+          The lookup could not be run just now: {lookupFailed}. This is not the same as nobody
+          matching, and nothing has been changed.
+        </p>
+      )}
+
+      {searchedNothing && (
+        <p class="empty">
+          No identity matches that. An identity exists once onboarding has been approved and one has
+          been issued; before that a person is a candidate and has no access to derive.
+        </p>
+      )}
+
+      {identityNotFound && (
+        <p class="empty">That identity reference does not resolve to anybody.</p>
+      )}
+
+      {showMatchList && (
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Identity</th><th>Type</th><th>Placement</th><th>Status</th><th></th></tr></thead>
+            <tbody>
+              {matchRows.map((m) => (
+                <tr>
+                  <td>
+                    <strong>{m.name}</strong>
+                    <span class="mono">{m.identityCode}</span>
+                    {m.workEmail && <span class="mono">{m.workEmail}</span>}
+                  </td>
+                  <td>{m.typeLabel}</td>
+                  <td>
+                    <span class="mono">{m.department}</span>
+                    <span class="mono">{m.position}</span>
+                  </td>
+                  <td>{m.statusLabel}</td>
+                  <td><a class="btn" href={m.href}>Derive access</a></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {lookupAuditProblem && (
+        <p class="empty">
+          This lookup was shown, and the record that it was shown could not be written to the audit
+          log: {lookupAuditProblem}. Somebody read this person's access map and the trail does not
+          say so.
+        </p>
+      )}
+
+      {identityLine && (
+        <div class="derived">
+          <div class="derived__head">
+            <div>
+              <strong>{identityLine.name}</strong>
+              <span class="mono">{identityLine.code}</span>
+              {identityLine.personCode && <span class="mono">{identityLine.personCode}</span>}
+              {identityLine.email && <span class="mono">{identityLine.email}</span>}
+            </div>
+            <div>
+              <span class="mono">{identityLine.typeLabel}</span>
+              <span class="mono">Department: {identityLine.department}</span>
+              <span class="mono">Position: {identityLine.position}</span>
+              <span class="mono">Status: {identityLine.statusLabel}</span>
+            </div>
+          </div>
+
+          {identityLine.gated && (
+            <p class="gated">{identityLine.gatedReason}</p>
+          )}
+
+          {!identityLine.gated && !hasDerived && (
+            <p class="empty">
+              This identity derives to no access. Nothing is wrong: no policy matches its department,
+              its position or its type, and it holds no exception. Write a policy below, or grant a
+              time-bounded exception.
+            </p>
+          )}
+
+          {hasDerived && (
+            <div class="tablewrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Group</th>
+                    <th>Classification</th>
+                    <th>Capabilities</th>
+                    <th>Why</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {derivedRows.map((r) => (
+                    <tr>
+                      <td>
+                        <strong>{r.groupKey}</strong>
+                        {r.groupName && <span class="mono">{r.groupName}</span>}
+                        {r.groupRetired && <span class="mono warn">The group itself has been retired</span>}
+                      </td>
+                      <td><span class={r.classPill}>{r.classLabel}</span></td>
+                      <td>
+                        {r.hasCapabilities && <span class="mono">{r.capabilitiesText}</span>}
+                        {!r.hasCapabilities && <span class="mono">No capabilities recorded</span>}
+                      </td>
+                      <td>
+                        <span class="why">{r.explanation}</span>
+                        {r.note && <span class="mono">{r.note}</span>}
+                        {r.versionNote && <span class="mono">{r.versionNote}</span>}
+                        <span class="mono">{r.sourceLabel}</span>
+                      </td>
+                      <td>
+                        {r.isException && r.rowId && (
+                          <form method="POST">
+                            <input type="hidden" name="_action" value="revoke_manual" />
+                            <input type="hidden" name="rowId" value={r.rowId} />
+                            <button type="submit" class="btn btn--warn">Withdraw</button>
+                          </form>
+                        )}
+                        {!r.isException && (
+                          <span class="muted">Retire the policy to remove this</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {hasRefused && (
+            <div class="sub-block">
+              <p class="blurb">
+                Not access, and here is why. Two different things are listed here and they are not
+                interchangeable. An expired or unbounded exception is DEAD: it will never be access
+                again without being reissued, and its row sits in the table until somebody removes
+                it. Anything withheld by the status gate is LIVE and simply held back: it comes back
+                by itself when the identity is active again. A policy term withheld this way has no
+                row of its own; a withheld exception does, so a withdrawal control appears beside it,
+                and that withdrawal is permanent.
+              </p>
+              <ul class="plainlist">
+                {refusedRows.map((r) => (
+                  <li>
+                    <span class={r.classPill}>{r.classLabel}</span>
+                    <strong>{r.groupKey}</strong>
+                    <span class="mono">{r.explanation}</span>
+                    {r.note && <span class="mono">{r.note}</span>}
+                    {r.withdrawNote && <span class="mono warn">{r.withdrawNote}</span>}
+                    {r.canWithdraw && (
+                      <form method="POST" class="rowform">
+                        <input type="hidden" name="_action" value="revoke_manual" />
+                        <input type="hidden" name="rowId" value={r.rowId} />
+                        <button type="submit" class="btn btn--warn">{r.withdrawLabel}</button>
+                      </form>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {hasDrift && (
+            <div class="sub-block drift">
+              <p class="blurb">
+                The materialised table and the formula disagree. That table is a cache which
+                reconciliation re-derives; a difference here means something changed and the cache has
+                not caught up. The formula is the answer.
+              </p>
+              {hasDriftMissing && (
+                <p class="mono">Derived but not materialised: {driftMissing.join('; ')}</p>
+              )}
+              {hasDriftStale && (
+                <p class="mono warn">Materialised but no longer derived: {driftStale.join('; ')}</p>
+              )}
+              {driftIsGate && (
+                <p class="blurb">
+                  Every one of those is listed because the status gate emptied the derived set for
+                  this identity, not because the cache is broken. Reconciliation would remove them;
+                  the formula already treats them as nothing.
+                </p>
+              )}
+            </div>
+          )}
+
+          <div class="sub-block">
+            <p class="blurb">
+              Grant an exception. It is always time-bounded, it always carries a written reason, and
+              it stays marked as an exception for the whole of its life so a later reconciliation
+              reports it rather than absorbing it.
+            </p>
+            {groupPickerBroken && (
+              <p class="empty">
+                The group list could not be read, so this picker is empty for that reason and not
+                because no groups exist: {groupsFailed}.
+              </p>
+            )}
+            {groupPickerEmpty && (
+              <p class="empty">
+                There are no live groups to grant. Define one below first.
+              </p>
+            )}
+            <form method="POST" class="grantform">
+              <input type="hidden" name="_action" value="grant_manual" />
+              <input type="hidden" name="identityId" value={view ? view.identity.id : ''} />
+              <select name="groupId" required>
+                <option value="">Choose a group</option>
+                {groupOptions.map((g) => <option value={g.value}>{g.label}</option>)}
+              </select>
+              <label class="field">
+                <span>Until</span>
+                <input type="date" name="until" value={defaultUntilDate} required />
+              </label>
+              <input type="text" name="reason" placeholder="Why this person, and why by hand" required />
+              <button type="submit" class="btn btn--go">Grant exception</button>
+            </form>
+          </div>
+        </div>
+      )}
+    </section>
+
+    <!-- ------------------------------------------------------------------ GROUPS -->
+    <section class="block">
+      <h2>Access groups</h2>
+      <p class="blurb">
+        A group is a named bundle of capabilities from the product's own permission vocabulary, with
+        a classification. {groupCountNote}.
+        {catalogueReadable && ' A capability key that is not in the permission catalogue is refused at save: it would grant nothing while reading as though it did.'}
+      </p>
+
+      {!catalogueReadable && (
+        <p class="empty">
+          The permission catalogue cannot be read on this request, so capability keys are NOT being
+          checked against it while saving a group: a key that grants nothing would be accepted here
+          and would read on this screen as though it granted something. Adding a policy is refused
+          outright until the catalogue is readable again, because a policy hands a group to everybody
+          who matches it.
+        </p>
+      )}
+
+      <div class="tabs">
+        <a href={groupsLiveHref} class={showRetiredGroups ? 'tab' : 'tab tab--on'}>Live groups</a>
+        <a href={groupsAllHref} class={showRetiredGroups ? 'tab tab--on' : 'tab'}>Including retired</a>
+      </div>
+
+      {groupsFailed && (
+        <p class="empty">
+          The access groups could not be read: {groupsFailed}. This is not the same as none existing,
+          and nothing has been changed.
+        </p>
+      )}
+
+      {!groupsFailed && !hasGroups && (
+        <p class="empty">
+          No access groups have been defined. Nothing derives to anything until at least one exists,
+          which is why this page and the tables behind it can be empty and correct on a new
+          installation.
+        </p>
+      )}
+
+      {hasGroups && (
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Group</th>
+                <th>Classification</th>
+                <th>Capabilities</th>
+                <th>State</th>
+                <th>Change</th>
+              </tr>
+            </thead>
+            <tbody>
+              {groupRows.map((g) => (
+                <tr>
+                  <td>
+                    <strong>{g.key}</strong>
+                    <span class="mono">{g.name}</span>
+                    {g.description && <span class="mono">{g.description}</span>}
+                    {g.departmentId && <span class="mono">Department: {g.departmentId}</span>}
+                    {g.hasSystems && <span class="mono">Systems named: {g.systemsText}</span>}
+                  </td>
+                  <td>
+                    <span class={g.classPill}>{g.classLabel}</span>
+                    <span class="mono">{g.classNote}</span>
+                  </td>
+                  <td>
+                    {g.hasCapabilities && <span class="mono">{g.capabilitiesText}</span>}
+                    {!g.hasCapabilities && <span class="mono">No capabilities recorded. This group grants nothing.</span>}
+                  </td>
+                  <td><span class={g.stateClass}>{g.stateLabel}</span></td>
+                  <td class="acts">
+                    {g.isActive && (
+                      <form method="POST" class="editform">
+                        <input type="hidden" name="_action" value="update_group" />
+                        <input type="hidden" name="groupId" value={g.id} />
+                        <input type="text" name="name" value={g.name} placeholder="Name" required />
+                        <input type="text" name="description" value={g.description} placeholder="Description" />
+                        <input type="text" name="departmentId" value={g.departmentId} placeholder="Department id" />
+                        <select name="classification">
+                          {CLASS_OPTIONS.map((c) => (
+                            <option value={c.value} selected={c.value === g.classification}>{c.label}</option>
+                          ))}
+                        </select>
+                        <input type="text" name="capabilities" value={g.capabilitiesText} placeholder="Capability keys, comma separated" />
+                        <input type="text" name="systems" value={g.systemsText} placeholder="Systems, comma separated" />
+                        <button type="submit" class="btn">Save</button>
+                      </form>
+                    )}
+                    {g.isActive && (
+                      <form method="POST" class="rowform">
+                        <input type="hidden" name="_action" value="deactivate_group" />
+                        <input type="hidden" name="groupId" value={g.id} />
+                        <input type="text" name="reason" placeholder="Why retire it" required />
+                        <button type="submit" class="btn btn--warn">Retire</button>
+                      </form>
+                    )}
+                    {!g.isActive && <span class="muted">Retired. Policy rows that handed it out were retired with it.</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div class="sub-block">
+        <p class="blurb">Define a new group.</p>
+        <form method="POST" class="newform">
+          <input type="hidden" name="_action" value="create_group" />
+          <label class="field">
+            <span>Key</span>
+            <input type="text" name="key" placeholder="engineering.tooling" required />
+          </label>
+          <label class="field">
+            <span>Name</span>
+            <input type="text" name="name" placeholder="Engineering tooling" required />
+          </label>
+          <label class="field wide">
+            <span>Description</span>
+            <input type="text" name="description" placeholder="What somebody holding this can actually do" />
+          </label>
+          <label class="field">
+            <span>Department</span>
+            <input type="text" name="departmentId" placeholder="Optional department id" />
+          </label>
+          <label class="field">
+            <span>Classification</span>
+            <select name="classification">
+              {CLASS_OPTIONS.map((c) => <option value={c.value}>{c.label}</option>)}
+            </select>
+          </label>
+          <label class="field wide">
+            <span>Capabilities</span>
+            <input type="text" name="capabilities" placeholder="Permission keys, comma separated" />
+          </label>
+          <label class="field wide">
+            <span>Systems</span>
+            <input type="text" name="systems" placeholder="Systems this group is meant to open, comma separated. Naming one here does not connect to it." />
+          </label>
+          <button type="submit" class="btn btn--go">Create group</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------------ POLICY -->
+    <section class="block">
+      <h2>Policy</h2>
+      <p class="blurb">
+        Which department, position or identity type implies which group. A policy row is versioned
+        and retired, never deleted, so a retired rule and its replacement sit side by side and the
+        history reads in order. A group carrying a sensitive capability, or classified as such,
+        cannot be handed out by policy at all: sensitive access is granted one identity at a time,
+        with a reason and an expiry.
+      </p>
+
+      <div class="tabs">
+        <a href={policyLiveHref} class={showRetiredPolicy ? 'tab' : 'tab tab--on'}>Live policy</a>
+        <a href={policyAllHref} class={showRetiredPolicy ? 'tab tab--on' : 'tab'}>Including retired</a>
+      </div>
+
+      {policiesFailed && (
+        <p class="empty">
+          The policy set could not be read: {policiesFailed}. This is not the same as no policy
+          existing, and nothing has been changed.
+        </p>
+      )}
+
+      {!policiesFailed && !hasPolicy && (
+        <p class="empty">
+          No policy rows. Nobody derives a group from their department, position or type until one is
+          written, and every access anybody holds would be a hand-granted exception.
+        </p>
+      )}
+
+      {hasPolicy && (
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Applies to</th>
+                <th>Grants</th>
+                <th>Classification</th>
+                <th>State</th>
+                <th>Recorded</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {policyRows.map((p) => (
+                <tr>
+                  <td>
+                    <strong>{p.subjectDisplay}</strong>
+                    <span class="mono">{p.kindLabel}</span>
+                  </td>
+                  <td>
+                    <strong>{p.groupKey}</strong>
+                    {p.groupName && <span class="mono">{p.groupName}</span>}
+                    {p.hasCapabilities && <span class="mono">{p.capabilitiesText}</span>}
+                    {p.groupRetiredWarning && <span class="mono warn">The group behind this row is retired</span>}
+                  </td>
+                  <td><span class={p.classPill}>{p.classLabel}</span></td>
+                  <td>
+                    <span class={p.stateClass}>{p.stateLabel}</span>
+                    <span class="mono">{p.versionNote}</span>
+                  </td>
+                  <td>
+                    <span class="mono">{p.createdOn}</span>
+                    {p.changedBy && <span class="mono">{p.changedBy}</span>}
+                    {p.reason && <span class="mono">{p.reason}</span>}
+                  </td>
+                  <td class="acts">
+                    {p.isActive && (
+                      <form method="POST" class="rowform">
+                        <input type="hidden" name="_action" value="retire_policy" />
+                        <input type="hidden" name="policyId" value={p.id} />
+                        <input type="text" name="reason" placeholder="Why retire it" required />
+                        <button type="submit" class="btn btn--warn">Retire</button>
+                      </form>
+                    )}
+                    {!p.isActive && <span class="muted">Retired, and kept on the record</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div class="sub-block">
+        <p class="blurb">
+          Add a policy row. For a department, use the department id exactly as it is stored. For a
+          position, use the position reference. For an identity type, one of: {TYPE_LIST}.
+        </p>
+        {groupPickerBroken && (
+          <p class="empty">
+            The group list could not be read, so the picker below is empty for that reason and not
+            because no groups exist: {groupsFailed}.
+          </p>
+        )}
+        {groupPickerEmpty && (
+          <p class="empty">There are no live groups for a policy to hand out. Define one above first.</p>
+        )}
+        <form method="POST" class="newform">
+          <input type="hidden" name="_action" value="add_policy" />
+          <label class="field">
+            <span>Applies to</span>
+            <select name="subjectKind">
+              {KIND_OPTIONS.map((k) => <option value={k.value}>{k.label}</option>)}
+            </select>
+          </label>
+          <label class="field">
+            <span>Which one</span>
+            <input type="text" name="subjectKey" placeholder="engineering" required />
+          </label>
+          <label class="field">
+            <span>Grants</span>
+            <select name="groupId" required>
+              <option value="">Choose a group</option>
+              {groupOptions.map((g) => <option value={g.value}>{g.label}</option>)}
+            </select>
+          </label>
+          <label class="field wide">
+            <span>Reason</span>
+            <input type="text" name="reason" placeholder="Why does this group of people reach that" required />
+          </label>
+          <button type="submit" class="btn btn--go">Add policy</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------------ REQUESTS -->
+    <section class="block">
+      <h2>Access requests</h2>
+      <p class="blurb">
+        A request walks its steps in order: the manager step, then the department step, and a
+        security step as well when the group is classified. No step advances on its own, and a
+        refusal ends the request wherever it is. Approving the last step writes the access as a
+        time-bounded exception under the same rules a hand grant obeys.
+      </p>
+
+      {requestsFailed && (
+        <p class="empty">
+          The request queue could not be read: {requestsFailed}. This is not the same as nobody
+          waiting, and nothing has been changed.
+        </p>
+      )}
+
+      {!requestsFailed && !hasRequests && (
+        <p class="empty">
+          No open requests. Nothing in the product raises one yet: there is no employee-facing
+          request form, so rows appear here only if something else writes them. The queue being empty
+          is the honest state, not a filter hiding anything.
+        </p>
+      )}
+
+      {hasRequests && (
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Who</th>
+                <th>Wants</th>
+                <th>Classification</th>
+                <th>Where it stands</th>
+                <th>Decide</th>
+              </tr>
+            </thead>
+            <tbody>
+              {requestRows.map((r) => (
+                <tr>
+                  <td>
+                    <strong>{r.who}</strong>
+                    <span class="mono">{r.identityCode}</span>
+                    <span class="mono">{r.raisedOn}</span>
+                  </td>
+                  <td>
+                    <strong>{r.groupKey}</strong>
+                    {r.groupName && <span class="mono">{r.groupName}</span>}
+                    {r.hasCapabilities && <span class="mono">{r.capabilitiesText}</span>}
+                    <span class="mono">{r.reason}</span>
+                    <span class="mono">{r.wantedUntil}</span>
+                  </td>
+                  <td>
+                    <span class={r.classPill}>{r.classLabel}</span>
+                    {r.needsSecurity && <span class="mono">A security step is required</span>}
+                  </td>
+                  <td><span class="mono">{r.statusLabel}</span></td>
+                  <td class="acts">
+                    <form method="POST" class="rowform">
+                      <input type="hidden" name="_action" value="decide_request" />
+                      <input type="hidden" name="requestId" value={r.id} />
+                      <input type="hidden" name="decision" value="approve" />
+                      <input type="text" name="note" placeholder="Note for the record" required />
+                      <button type="submit" class="btn btn--go">Record approval</button>
+                    </form>
+                    <form method="POST" class="rowform">
+                      <input type="hidden" name="_action" value="decide_request" />
+                      <input type="hidden" name="requestId" value={r.id} />
+                      <input type="hidden" name="decision" value="reject" />
+                      <input type="text" name="note" placeholder="Why not" required />
+                      <button type="submit" class="btn btn--warn">Refuse</button>
+                    </form>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+
+    <!-- ------------------------------------------------------------------ RUNS -->
+    <section class="block">
+      <h2>Proposed provisioning</h2>
+      <p class="blurb">
+        A run is a proposal, computed for one identity, listing the access it should end up with.
+        Reviewing it records a judgement about the proposal. <strong>It does not provision
+        anything</strong> — no account is created, no outside system is contacted, and a person still
+        has to carry it out. Approving a run and the work being done are two different facts, and only
+        the first one is recorded here.
+      </p>
+
+      {runsFailed && (
+        <p class="empty">
+          The review queue could not be read: {runsFailed}. This is not the same as nothing waiting,
+          and nothing has been changed.
+        </p>
+      )}
+
+      {!runsFailed && !hasRuns && (
+        <p class="empty">
+          No runs waiting for review. Nothing in the product proposes one yet, so this queue is empty
+          on every installation until something writes to it.
+        </p>
+      )}
+
+      {hasRuns && (
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Identity</th>
+                <th>Proposed</th>
+                <th>Trigger</th>
+                <th>State</th>
+                <th>Review</th>
+              </tr>
+            </thead>
+            <tbody>
+              {runRows.map((r) => (
+                <tr>
+                  <td>
+                    <strong>{r.who}</strong>
+                    <span class="mono">{r.identityCode}</span>
+                    <span class="mono">{r.raisedOn}</span>
+                  </td>
+                  <td>
+                    {r.hasProposal && r.proposedNames.map((n) => <span class="mono">{n}</span>)}
+                    {!r.hasProposal && <span class="mono">Nothing proposed</span>}
+                  </td>
+                  <td><span class="mono">{r.trigger}</span></td>
+                  <td><span class="mono">{r.statusLabel}</span></td>
+                  <td class="acts">
+                    <form method="POST" class="rowform">
+                      <input type="hidden" name="_action" value="review_run" />
+                      <input type="hidden" name="runId" value={r.id} />
+                      <input type="hidden" name="decision" value="approve" />
+                      <input type="text" name="note" placeholder="Note for the record" />
+                      <button type="submit" class="btn btn--go">This is what should be provisioned</button>
+                    </form>
+                    <form method="POST" class="rowform">
+                      <input type="hidden" name="_action" value="review_run" />
+                      <input type="hidden" name="runId" value={r.id} />
+                      <input type="hidden" name="decision" value="decline" />
+                      <input type="text" name="note" placeholder="Why not" required />
+                      <button type="submit" class="btn btn--warn">Decline</button>
+                    </form>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  </div>
+</AdminLayout>
+
+<style>
+  .wrap { padding: 20px; max-width: 1400px; }
+  .head h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #9aa0aa; font-size: 13px; margin: 0 0 16px; max-width: 90ch; line-height: 1.6; }
+  .sub a, .empty a { color: inherit; }
+  .explain {
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px 14px;
+    margin-bottom: 18px; max-width: 90ch;
+  }
+  .explain__title { font-size: 13px; font-weight: 600; margin: 10px 0 6px; }
+  .explain__title:first-child { margin-top: 0; }
+  .explain p { font-size: 12px; color: #9aa0aa; line-height: 1.6; margin: 0 0 6px; }
+  .explain code { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; }
+  .note { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; }
+  .note--ok { background: rgba(46,160,90,0.12); border: 1px solid rgba(46,160,90,0.4); }
+  .note--err { background: rgba(200,60,60,0.12); border: 1px solid rgba(200,60,60,0.4); }
+  .legend { border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px 14px; margin-bottom: 20px; }
+  .legend__title { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
+  .legend__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }
+  .legend__item { display: flex; flex-direction: column; gap: 4px; }
+  .legend__note { font-size: 11px; color: #9aa0aa; line-height: 1.5; }
+  .block { margin-bottom: 30px; }
+  .block h2 { font-size: 15px; margin: 0 0 6px; }
+  .blurb { color: #9aa0aa; font-size: 12px; line-height: 1.6; max-width: 90ch; margin: 0 0 12px; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .tab {
+    font-size: 12px; padding: 5px 10px; border-radius: 999px; text-decoration: none; color: #9aa0aa;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .tab--on { color: inherit; border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.06); }
+  .search { display: flex; gap: 6px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .search input[type=text] { min-width: 340px; }
+  .tablewrap { overflow-x: auto; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 980px; }
+  th { text-align: left; padding: 10px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; border-bottom: 1px solid rgba(255,255,255,0.1); }
+  td { padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.06); vertical-align: top; }
+  td strong { display: block; }
+  .mono { display: block; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #8b919b; margin-top: 2px; line-height: 1.5; }
+  .mono.warn { color: #d9a05b; }
+  .why { display: block; font-size: 12px; }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.18); }
+  .pill--live { border-color: rgba(46,160,90,0.55); color: #7fd6a0; }
+  .pill--off { border-color: rgba(200,60,60,0.5); color: #e08b8b; }
+  .pill--public { border-color: rgba(120,150,220,0.5); color: #a8bdf0; }
+  .pill--internal { border-color: rgba(255,255,255,0.25); color: #c8ccd3; }
+  .pill--restricted { border-color: rgba(255,190,80,0.55); color: #d9b169; }
+  .pill--classified { border-color: rgba(200,60,60,0.6); color: #e08b8b; }
+  .derived { border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+  .derived__head { display: flex; gap: 30px; flex-wrap: wrap; margin-bottom: 12px; }
+  .derived__head strong { display: block; font-size: 14px; }
+  .gated {
+    border: 1px solid rgba(200,60,60,0.5); background: rgba(200,60,60,0.1); border-radius: 6px;
+    padding: 10px 12px; font-size: 12px; line-height: 1.6; max-width: 90ch; margin: 0 0 12px;
+  }
+  .sub-block { margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.08); }
+  .drift { border-top-color: rgba(255,190,80,0.4); }
+  .plainlist { list-style: none; padding: 0; margin: 0; }
+  .plainlist li { padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+  .plainlist li strong { display: inline-block; margin-left: 8px; font-size: 12px; }
+  .acts { display: flex; flex-direction: column; gap: 8px; min-width: 260px; }
+  .rowform, .editform, .grantform, .newform { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .newform { align-items: flex-end; gap: 10px; }
+  .editform { max-width: 420px; }
+  .field { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: #9aa0aa; }
+  .field.wide { flex: 1 1 320px; }
+  .field.wide input { width: 100%; }
+  .btn { border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.06); color: inherit; padding: 6px 10px; border-radius: 5px; font-size: 12px; cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn--go { border-color: rgba(46,160,90,0.5); }
+  .btn--warn { border-color: rgba(200,60,60,0.5); }
+  input[type=text], input[type=date], select {
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.14); color: inherit;
+    padding: 5px 7px; border-radius: 4px; font-size: 12px;
+  }
+  .rowform input[type=text] { width: 160px; }
+  .editform input[type=text] { width: 190px; }
+  .muted { color: #6f757e; font-size: 12px; line-height: 1.5; }
+  .empty { color: #9aa0aa; font-size: 13px; max-width: 80ch; line-height: 1.6; }
+</style>

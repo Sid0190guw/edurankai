@@ -1,0 +1,979 @@
+---
+// /admin/talent/sources — THE RECRUITMENT SOURCE DESK.
+//
+// Spec: docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md section 15 (and 26.2 for the tables).
+//
+// THIS PAGE WAS LINKED FROM THE SIDEBAR AND DID NOT EXIST. src/lib/admin-nav.ts:194 has offered
+// "Recruitment sources" at this path, src/lib/talent/overview.ts:204 puts a card for it on the
+// talent console, and src/middleware.ts has been gating it under the `talent` section — while
+// src/lib/talent/sources.ts, a thousand lines of registry, validation and key handling, had no
+// screen at all. Every source in the database was therefore a row nobody could see, and every
+// ingest credential was one nobody could revoke without a deploy, which is the exact thing spec 15
+// rule 5 says a source key must never be.
+//
+// PROVENANCE, NOT ATTRIBUTION. Two different questions about one application, and a report that
+// adds them together double-counts every channel:
+//   provenance   "which system did this application arrive through?"  asserted by the ingest path,
+//                and what this page administers (tal_recruitment_source).
+//   attribution  "how did you hear about us?"  candidate-declared, deliberately unverified, and
+//                administered on a different screen entirely (/admin/application-sources).
+// Nothing here reads or writes the other one.
+//
+// WHAT A KEY IS, AND IS NOT. A source key authorises an outside system to POST candidates to an
+// endpoint THIS organisation runs. It is not a connection to any outside job board, it pulls
+// nothing, and it reaches out to nowhere. issueSourceKey() returns the only plaintext copy that
+// will ever exist; the row keeps a sha256 and a sixteen-character prefix, so the secret has the
+// same life as an onboarding code — shown once, then gone for everybody, including a super admin
+// reading the database. The copy on this page says that plainly rather than leaving an operator to
+// find out after they closed the tab.
+//
+// WHO. `talent.view` reads; `talent.manage` acts. Both are held by super_admin and hr; recruiter
+// and reviewer hold `talent.view` and therefore see the registry with no buttons on it.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { logAudit } from '@/lib/audit';
+import {
+  sourceDesk, quarantineQueue, sourceActions,
+  createSource, updateSource, deactivateSource,
+  issueSourceKey, revokeSourceKey, markQuarantineReplayed,
+  sourceProblems, sourceSlug, maskSourceKey,
+  SOURCE_KEY_SCOPES, SOURCE_NAME_MAX,
+  type SourceDeskRow, type QuarantineRow,
+} from '@/lib/talent/sources';
+import {
+  SOURCE_CATEGORIES, INGEST_MODES,
+  type SourceCategory, type IngestMode,
+} from '@/lib/talent/types';
+
+// EVERY const IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted, and a handler reaching a
+// later declaration threw on its first line every time while the page reported success — that is a
+// recorded outage on this project, not a style preference.
+const user = Astro.locals.user!;
+
+// The page's own lock, decided before the first query runs. The middleware section gate stands in
+// front of this path as well; this is the one that actually decides what renders.
+const mayManage = can(user, 'talent.manage');
+const mayView = can(user, 'talent.view') || mayManage;
+if (!mayView) return Astro.redirect('/admin');
+
+// Typed lookup maps live in the frontmatter and are NEVER indexed from inside JSX: a
+// `Record<string, string>` used from a template breaks .astro parsing on this project.
+//
+// These are channel categories, not company names. No outside organisation is named here, in the
+// seed, or anywhere a source can be rendered — spec 15 rule 6 and the standing project rule.
+const CATEGORY_LABELS: Record<string, string> = {
+  platform: 'Hiring platform',
+  government: 'Government portal',
+  institution: 'Institution or placement cell',
+  referral: 'Referral',
+  community: 'Community outreach',
+  partner: 'Partner integration',
+  direct: 'Direct application',
+};
+
+const MODE_LABELS: Record<string, string> = {
+  api: 'Keyed API request',
+  webhook: 'Signed webhook',
+  csv: 'CSV, confirmed by an administrator',
+  manual: 'Entered by an administrator',
+};
+
+// What a key is allowed to do, in words. The values come from SOURCE_KEY_SCOPES so a key can never
+// be offered a scope the ingest path does not understand; only the wording is decided here.
+const SCOPE_LABELS: Record<string, string> = {
+  'candidate.ingest': 'Send candidates to us',
+  'candidate.status.read': 'Read back the status of candidates it sent',
+};
+
+const CATEGORY_OPTIONS = SOURCE_CATEGORIES.map((c) => ({
+  value: String(c),
+  label: CATEGORY_LABELS[String(c)] || String(c),
+}));
+
+const MODE_OPTIONS = INGEST_MODES.map((m) => ({
+  value: String(m),
+  label: MODE_LABELS[String(m)] || String(m),
+}));
+
+const SCOPE_OPTIONS = SOURCE_KEY_SCOPES.map((s) => ({
+  value: String(s),
+  label: SCOPE_LABELS[String(s)] || String(s),
+  // The narrow one is the default a partner integration actually needs; reading status back is
+  // asked for separately, on purpose.
+  preselect: String(s) === 'candidate.ingest',
+}));
+
+const fmtDate = (iso: string | null): string => {
+  if (!iso) return '';
+  try { return new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }); }
+  catch { return ''; }
+};
+const fmtDateTime = (iso: string | null): string => {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString('en-GB', {
+      day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+    });
+  } catch { return ''; }
+};
+
+let msg = '';
+let err = '';
+let problems: string[] = [];
+let issuedSecret = '';
+let issuedPrefix = '';
+// Resolved from the registry read below, NOT from the form that asked for the key. A display name
+// posted back in a hidden field is whatever the browser sent; printing it beside a live credential
+// would let a tampered form label a key with the wrong partner's name at the one moment an operator
+// is about to hand it over.
+let issuedSourceId = '';
+let issuedSourceName = '';
+let issuedScopeText = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+  const sourceId = String(fd.get('sourceId') || '');
+  // THE WRITTEN REASON. revokeSourceKey() and deactivateSource() take an actor and no justification,
+  // so without this a live partner credential could be killed, or a whole channel closed, with
+  // nothing anywhere saying why — and the person picking the incident up a month later has only a
+  // name and a timestamp. The library signatures are another module's to change; the console can
+  // still refuse to act without one and put it in its own audit row.
+  const reason = String(fd.get('reason') || '').trim().slice(0, 500);
+  try {
+    if (!mayManage) {
+      // ONE REFUSAL FOR EVERY WRITE ON THIS PAGE. A read-only holder of `talent.view` sees the
+      // registry and no buttons, so reaching this branch at all means a hand-made POST — a hidden
+      // button is not a lock, and this is the lock.
+      err = 'You do not hold the authority to administer recruitment sources.';
+    } else if (action === 'create') {
+      const input = {
+        name: String(fd.get('name') || '').trim(),
+        category: String(fd.get('category') || ''),
+        ingestMode: String(fd.get('ingestMode') || ''),
+      };
+      // sourceProblems() reports EVERY problem at once and it is the only validation on this
+      // screen: the page owns no rule about what a source may be called. It is also what makes the
+      // casts below honest — createSource() re-runs it and refuses again regardless.
+      const p = sourceProblems(input);
+      if (p.length) {
+        problems = p;
+        err = 'That source was not created.';
+      } else {
+        const r = await createSource(
+          { name: input.name, category: input.category as SourceCategory, ingestMode: input.ingestMode as IngestMode },
+          user.id,
+        );
+        if (r.ok) {
+          msg = 'Source registered. Its permanent key is "' + sourceSlug(input.name)
+            + '" — every reference and every report uses it, so only the display name can be changed later.';
+          await logAudit({
+            userId: user.id, action: 'source.created_from_console',
+            entity: 'tal_recruitment_source', entityId: r.data ? r.data.id : '',
+            diff: { name: input.name, category: input.category, ingestMode: input.ingestMode },
+            ipAddress: Astro.clientAddress,
+          });
+        } else {
+          err = r.error || 'Could not register that source.';
+        }
+      }
+    } else if (action === 'update') {
+      const input = {
+        name: String(fd.get('name') || '').trim(),
+        category: String(fd.get('category') || ''),
+        ingestMode: String(fd.get('ingestMode') || ''),
+      };
+      const p = sourceProblems(input);
+      if (p.length) {
+        problems = p;
+        err = 'That source was not changed.';
+      } else {
+        const r = await updateSource(
+          sourceId,
+          { name: input.name, category: input.category as SourceCategory, ingestMode: input.ingestMode as IngestMode },
+          user.id,
+        );
+        if (r.ok) {
+          msg = 'Source updated. The key it is referenced by has not moved.';
+          await logAudit({
+            userId: user.id, action: 'source.updated_from_console',
+            entity: 'tal_recruitment_source', entityId: sourceId,
+            diff: { name: input.name, category: input.category, ingestMode: input.ingestMode },
+            ipAddress: Astro.clientAddress,
+          });
+        } else {
+          err = r.error || 'Could not save that source.';
+        }
+      }
+    } else if (action === 'deactivate') {
+      if (!reason) {
+        err = 'Say why this source is being closed. Deactivating it revokes every live key on it, '
+          + 'and the reason is recorded against your name.';
+      } else {
+        const r = await deactivateSource(sourceId, user.id);
+        if (r.ok) {
+          msg = 'Source deactivated. Nothing new can arrive through it and its live keys were revoked '
+            + 'with it. The applications that already arrived keep it as their provenance.';
+          await logAudit({
+            userId: user.id, action: 'source.deactivated_from_console',
+            entity: 'tal_recruitment_source', entityId: sourceId,
+            diff: { reason },
+            ipAddress: Astro.clientAddress,
+          });
+        } else {
+          err = r.error || 'Could not deactivate that source.';
+        }
+      }
+    } else if (action === 'reactivate') {
+      const r = await updateSource(sourceId, { isActive: true }, user.id);
+      if (r.ok) {
+        // STATE, NOT TRANSITION. updateSource() carries no `is_active = FALSE` guard the way
+        // deactivateSource() carries `is_active = TRUE`, so a second click from a stale tab
+        // succeeds against a source that was already active. "Reactivated" would then be a success
+        // message for something this click did not do; the resulting state is true either way.
+        msg = 'That source is active. Keys revoked when it was closed stay revoked — issue a new '
+          + 'one if an integration needs to resume.';
+        await logAudit({
+          userId: user.id, action: 'source.reactivated_from_console',
+          entity: 'tal_recruitment_source', entityId: sourceId,
+          ipAddress: Astro.clientAddress,
+        });
+      } else {
+        err = r.error || 'Could not reactivate that source.';
+      }
+    } else if (action === 'issue_key') {
+      // getAll, not get: the scopes are a set, and a key quietly issued with only the first ticked
+      // box is a worse bug than one refused for having none. normalizeScopes() inside
+      // issueSourceKey() decides which of them are real.
+      const scopes = fd.getAll('scopes').map((s) => String(s));
+      const r = await issueSourceKey(sourceId, user.id, scopes);
+      if (r.ok && r.data) {
+        issuedSecret = r.data.secret;
+        issuedPrefix = r.data.prefix;
+        // The id, not the name. The name is looked up in the registry read below so the banner
+        // beside a live credential says who the key is actually for, rather than repeating a label
+        // the form supplied.
+        issuedSourceId = sourceId;
+        issuedScopeText = scopes.map((s) => SCOPE_LABELS[s] || s).join(', ');
+        msg = 'Key issued. It is shown once, below.';
+        await logAudit({
+          userId: user.id, action: 'source.key_issued_from_console',
+          entity: 'tal_source_key',
+          // THE PREFIX, NEVER THE SECRET, and never any part of it beyond the prefix — spec 16.1's
+          // rule for the onboarding code, applied to every secret this platform issues.
+          diff: { sourceId, keyPrefix: r.data.prefix, scopes },
+          ipAddress: Astro.clientAddress,
+        });
+      } else {
+        err = r.error || 'Could not issue a key.';
+      }
+    } else if (action === 'revoke_key') {
+      const keyId = String(fd.get('keyId') || '');
+      if (!reason) {
+        err = 'Say why this key is being revoked. Revocation is permanent — the same key cannot be '
+          + 'reinstated, only replaced — and the reason is recorded against your name.';
+      } else {
+        const r = await revokeSourceKey(keyId, user.id);
+        if (r.ok) {
+          // WHAT REVOCATION ACTUALLY DOES TODAY. The row is marked revoked at once and every future
+          // authentication attempt against it fails — but no ingest route in this installation
+          // authenticates a source key yet, so there is nothing currently presenting this one. The
+          // earlier wording ("stops authenticating immediately... the ingest path refusing it")
+          // described a path that does not exist here.
+          msg = 'Key revoked. It is marked dead in the same click, with no deploy and no cache in '
+            + 'between, and it can never be reinstated — only replaced. No route in this '
+            + 'installation authenticates a source key yet, so nothing was using it.';
+          await logAudit({
+            userId: user.id, action: 'source.key_revoked_from_console',
+            entity: 'tal_source_key', entityId: keyId,
+            // The reason and the id acted on, and NOTHING THE FORM SUPPLIED ABOUT THE KEY ITSELF.
+            // A prefix carried in a hidden field is whatever the browser sent; an audit row built
+            // from it records the poster's claim rather than the fact. revokeSourceKey() already
+            // writes `source.key_revoked` with the prefix and source read back off the row it
+            // actually updated, which is the copy that can be trusted.
+            diff: { reason },
+            ipAddress: Astro.clientAddress,
+          });
+        } else {
+          err = r.error || 'Could not revoke that key.';
+        }
+      }
+    } else if (action === 'mark_replayed') {
+      const quarantineId = String(fd.get('quarantineId') || '');
+      if (!reason) {
+        err = 'Say what was done with this delivery. Marking it handled is a claim that a person '
+          + 'dealt with it, and the claim is only worth anything with the account of it attached.';
+      } else {
+        const r = await markQuarantineReplayed(quarantineId, user.id);
+        if (r.ok) {
+          msg = 'Marked as handled, with your note. That records that an administrator dealt with '
+            + 'the delivery; it does not resend, re-import or create anything by itself.';
+          await logAudit({
+            userId: user.id, action: 'import.replayed_from_console',
+            entity: 'tal_ingest_quarantine', entityId: quarantineId,
+            diff: { reason },
+            ipAddress: Astro.clientAddress,
+          });
+        } else {
+          err = r.error || 'Could not mark that payload handled.';
+        }
+      }
+    }
+  } catch (e: any) {
+    // The REAL Postgres reason lives on e.cause; e.message is only the failed statement.
+    err = e?.cause?.message || e?.message || 'Something went wrong.';
+  }
+}
+
+// The filter is read AFTER the POST so the screen reflects what just happened.
+const showAll = Astro.url.searchParams.get('show') === 'all';
+
+// A THROW HERE IS NOT AN EMPTY REGISTRY. sourceDesk() and quarantineQueue() rethrow precisely so
+// this page can tell "there are none" apart from "we could not read whether there are any" — they
+// render as the same empty table otherwise, and they mean opposite things. The two reads are
+// caught separately so a quarantine failure cannot blank the registry, or the reverse.
+let desk: SourceDeskRow[] = [];
+let deskFailed = false;
+let deskErr = '';
+try {
+  desk = await sourceDesk({ includeInactive: showAll });
+} catch (e: any) {
+  deskFailed = true;
+  // ITS OWN MESSAGE, the way the quarantine read has its own. `err = err || ...` dropped this
+  // reason on the floor whenever a POST had already failed — leaving the panel below pointing at
+  // "the message above" while the message above was about something else entirely, and the real
+  // Postgres reason for the blank registry never reaching the screen at all.
+  deskErr = 'The source registry could not be read: ' + (e?.cause?.message || e?.message || 'unknown error');
+}
+
+let quarantine: QuarantineRow[] = [];
+let quarantineFailed = false;
+let quarantineErr = '';
+try {
+  quarantine = await quarantineQueue(50);
+} catch (e: any) {
+  quarantineFailed = true;
+  quarantineErr = 'The quarantine queue could not be read: ' + (e?.cause?.message || e?.message || 'unknown error');
+}
+
+// The name beside a freshly issued key, taken from the registry that was just read rather than from
+// the form that asked for the key. If the read failed the banner names no source at all, which is
+// the honest outcome: it never prints a name it could not confirm.
+if (issuedSourceId) {
+  const issuedRow = desk.find((s) => s.id === issuedSourceId);
+  issuedSourceName = issuedRow ? issuedRow.name : '';
+}
+
+// EVERY comparison is finished here. `<` and `<=` inside a JSX expression break .astro parsing on
+// this project, so the template only ever reads booleans and strings.
+const rows = desk.map((s) => {
+  const acts = sourceActions(s, mayManage);
+  const keys = s.keys.map((k) => ({
+    id: k.id,
+    // The masked form of a secret that no longer exists in plaintext anywhere: the stored prefix
+    // and an ellipsis. There is nothing further to show, on this screen or any other.
+    masked: maskSourceKey(k.keyPrefix),
+    scopeText: k.scopes.map((x) => SCOPE_LABELS[x] || x).join(', ') || 'No scope recorded',
+    stateLabel: k.isLive ? 'Live' : 'Revoked',
+    stateClass: k.isLive ? 'pill pill--live' : 'pill pill--off',
+    issuedNote: 'Issued ' + fmtDateTime(k.createdAt),
+    revokedNote: k.revokedAt ? 'Revoked ' + fmtDate(k.revokedAt) : '',
+    canRevoke: mayManage && k.isLive,
+  }));
+
+  const countNote = s.candidateCount === 1
+    ? '1 application arrived through this source'
+    : s.candidateCount + ' applications arrived through this source';
+
+  const inactiveWithHistory = !s.isActive && s.candidateCount > 0;
+  const administratorEntered = s.ingestMode === 'csv' || s.ingestMode === 'manual';
+
+  return {
+    id: s.id,
+    slug: s.slug,
+    name: s.name,
+    // 'other' is the column default in the DDL and is not a member of the category vocabulary, so a
+    // row written outside this console can carry it. It is shown as it is stored rather than mapped
+    // onto a nearby member: a screen that quietly reassigns its own inputs is worse than one showing
+    // a value somebody has to explain.
+    categoryLabel: CATEGORY_LABELS[s.category] || s.category,
+    modeLabel: MODE_LABELS[s.ingestMode] || s.ingestMode,
+    category: s.category,
+    ingestMode: s.ingestMode,
+    isActive: s.isActive,
+    stateLabel: s.isActive ? 'Active' : 'Inactive',
+    stateClass: s.isActive ? 'pill pill--live' : 'pill pill--off',
+    countNote,
+    // Deactivation is not deletion, and the count is the proof: an inactive source still owns
+    // everybody it brought in.
+    retainedNote: inactiveWithHistory
+      ? 'Inactive, and still the recorded provenance of those applications.'
+      : '',
+    keys,
+    hasKeys: keys.length > 0,
+    liveKeyNote: s.liveKeyCount === 1 ? '1 live key' : s.liveKeyCount + ' live keys',
+    keyWarning: mayManage && s.isActive && s.liveKeyCount > 0 && administratorEntered
+      ? 'A live key on a channel recorded as administrator-entered. Revoke it if no system is using it.'
+      : '',
+    canEdit: acts.canEdit,
+    canDeactivate: acts.canDeactivate,
+    canReactivate: acts.canReactivate,
+    canIssueKey: acts.canIssueKey,
+    noActions: !acts.canEdit && !acts.canDeactivate && !acts.canReactivate && !acts.canIssueKey,
+  };
+});
+
+const activeSources = rows.filter((r) => r.isActive).length;
+const liveKeys = desk.reduce((n, s) => n + s.liveKeyCount, 0);
+const totalArrivals = desk.reduce((n, s) => n + s.candidateCount, 0);
+const hasRows = rows.length > 0;
+
+const quarantineRows = quarantine.map((q) => ({
+  id: q.id,
+  sourceName: q.sourceName || 'Source not identified',
+  sourceSlug: q.sourceSlug || '',
+  reason: q.reason,
+  arrivedNote: 'Arrived ' + fmtDateTime(q.createdAt),
+  sizeNote: q.payloadBytes > 0 ? q.payloadBytes + ' bytes stored' : 'No payload stored',
+  stateLabel: q.isOpen ? 'Waiting' : 'Handled',
+  stateClass: q.isOpen ? 'pill pill--off' : 'pill pill--used',
+  handledNote: q.replayedAt ? 'Handled ' + fmtDate(q.replayedAt) : '',
+  canMark: mayManage && q.isOpen,
+}));
+const openQuarantine = quarantine.filter((q) => q.isOpen).length;
+const hasQuarantine = quarantineRows.length > 0;
+const hasOpenQuarantine = openQuarantine > 0;
+// THE TILE MUST NOT PRINT A ZERO IT DID NOT MEASURE. The tile row is drawn whenever the REGISTRY
+// read succeeded, and the quarantine read is a separate query that can fail on its own — which
+// rendered a confident "0 Quarantined, waiting" out of an unreadable queue. Every one of those rows
+// is a person who applied and is in nobody's queue, so that particular zero is the worst number on
+// the page to invent. When the read failed the tile says so instead.
+const quarantineTile = quarantineFailed ? 'unread' : String(openQuarantine);
+const quarantineTileLabel = quarantineFailed ? 'Quarantined (queue unreadable)' : 'Quarantined, waiting';
+const quarantinePhrase = openQuarantine === 1
+  ? 'One delivery arrived that could not be understood and is still waiting for somebody.'
+  : openQuarantine + ' deliveries arrived that could not be understood and are still waiting for somebody.';
+const hasProblems = problems.length > 0;
+---
+
+<AdminLayout title="Recruitment sources" activeNav="talent-sources">
+  <div class="wrap">
+    <header class="head">
+      <h1>Recruitment sources</h1>
+      <p class="sub">
+        The registry of systems applications arrive <em>through</em>, and the keys that let them in.
+        This is provenance — which system delivered a record — and it is a different question from
+        "how did you hear about us", which is candidate-declared and lives on
+        {' '}<a href="/admin/application-sources">Application sources</a>. The two are never added
+        together; doing that counts every channel twice.
+      </p>
+    </header>
+
+    <div class="explain">
+      <p class="explain__title">This platform does not pull applications from anywhere</p>
+      <p>
+        A source is a system that sends candidates <strong>to us</strong>, and there are only four
+        ways it can: a keyed request to an endpoint this organisation runs, a signed webhook to that
+        same endpoint, a CSV an administrator confirms, or a row an administrator enters. Nothing
+        here crawls, subscribes to, or reads any outside service.
+      </p>
+      <p>
+        A source key is therefore a credential for <em>our</em> door, scoped to one source. It is
+        shown once when it is issued and stored only as a hash, exactly like an onboarding code — no
+        page, no administrator and no database dump can read one back afterwards. Revoking one takes
+        effect immediately and needs no deploy.
+      </p>
+      <p>
+        <strong>None of those first three are deployed in this installation yet.</strong> There is no
+        keyed ingest route, no webhook endpoint and no CSV importer behind this registry: every
+        application recorded against a source today got there because an administrator entered it.
+        Registering a source and issuing its key still does exactly what it says — the credential is
+        minted, stored as a hash, audited and revocable from this screen, and it will authenticate
+        the moment such a route ships — but until then it authenticates nothing, because nothing
+        reads it. Choosing a mode records what a channel <em>is</em>; it switches no machinery on.
+      </p>
+      <p>
+        Source names are internal. They appear on this console and in reporting, and never in
+        anything a candidate reads.
+      </p>
+    </div>
+
+    {msg && <div class="note note--ok">{msg}</div>}
+    {err && <div class="note note--err">{err}</div>}
+
+    {hasProblems && (
+      <ul class="problems">
+        {problems.map((p) => <li>{p}</li>)}
+      </ul>
+    )}
+
+    {issuedSecret && (
+      <div class="secret">
+        <p class="secret__eyebrow">New source key{issuedSourceName ? ' for ' + issuedSourceName : ''}</p>
+        <p class="secret__code" id="secret-code">{issuedSecret}</p>
+        <div class="secret__acts">
+          <button type="button" class="btn" data-copy="#secret-code">Copy key</button>
+        </div>
+        <p class="secret__note">
+          Shown once. It is stored only as a hash, so nobody can read it back later, including from
+          the database — if it is lost, the only remedy is to revoke this one and issue another.
+          Hand it over through a channel the partner already uses for credentials, and never in the
+          same message as anything else about the integration. From now on it appears on this screen
+          as {' '}<strong>{issuedPrefix}</strong>, which is enough to name it in a ticket and useless
+          for authenticating.
+        </p>
+        {issuedScopeText && (
+          <p class="secret__note">
+            Granted: <strong>{issuedScopeText}</strong>, and nothing else. A key holds exactly the
+            powers it was issued; there is no wildcard.
+          </p>
+        )}
+        <p class="secret__note">
+          No route in this installation reads a source key yet, so this credential opens nothing
+          today. It is a real, stored, revocable key that will start working the moment an ingest
+          route ships — say that when you hand it over, rather than letting a partner discover it by
+          testing.
+        </p>
+      </div>
+    )}
+
+    {!deskFailed && (
+      <div class="tiles">
+        <div class="tile"><span class="tile__n">{activeSources}</span><span class="tile__l">Active sources</span></div>
+        <div class="tile"><span class="tile__n">{liveKeys}</span><span class="tile__l">Live keys</span></div>
+        <div class="tile"><span class="tile__n">{totalArrivals}</span><span class="tile__l">Applications by provenance</span></div>
+        <div class="tile"><span class="tile__n">{quarantineTile}</span><span class="tile__l">{quarantineTileLabel}</span></div>
+      </div>
+    )}
+
+    {mayManage && (
+      <details class="panel">
+        <summary>Register a source</summary>
+        <form method="POST" class="stack">
+          <input type="hidden" name="_action" value="create" />
+          <label class="field">
+            <span class="field__label">Name (internal)</span>
+            <input type="text" name="name" maxlength={SOURCE_NAME_MAX} required placeholder="Placement cell partnership" />
+            <span class="field__help">
+              Used on this console and in reporting only. The permanent key this source is referred
+              to by is derived from the name once, when it is created, and never changes afterwards
+              — a rename changes only what you read here.
+            </span>
+          </label>
+          <label class="field">
+            <span class="field__label">Category</span>
+            <select name="category">
+              {CATEGORY_OPTIONS.map((c) => <option value={c.value}>{c.label}</option>)}
+            </select>
+          </label>
+          <label class="field">
+            <span class="field__label">How records arrive</span>
+            <select name="ingestMode">
+              {MODE_OPTIONS.map((m) => <option value={m.value}>{m.label}</option>)}
+            </select>
+            <span class="field__help">
+              This records what the channel actually is. It switches nothing on: a key is issued
+              separately, from the row below, and only an active source can hold one.
+            </span>
+          </label>
+          <div><button type="submit" class="btn btn--go">Register source</button></div>
+        </form>
+      </details>
+    )}
+
+    <div class="filters">
+      <div class="tabs">
+        <a href="/admin/talent/sources" class={showAll ? 'tab' : 'tab tab--on'}>Active</a>
+        <a href="/admin/talent/sources?show=all" class={showAll ? 'tab tab--on' : 'tab'}>Including inactive</a>
+      </div>
+      <span class="muted">
+        Deactivating a source is not deleting it. An inactive source keeps every application that
+        arrived through it, and those applications keep it as their provenance.
+      </span>
+    </div>
+
+    {deskErr && <div class="note note--err">{deskErr}</div>}
+
+    {deskFailed && (
+      <p class="empty">
+        The registry could not be read just now. This is not the same as no sources existing, and
+        nothing has been changed. Reload; the reason the read gave is in the red message directly
+        above this line. If that reason says a relation does not exist, the talent tables have not
+        been created on this database — they are applied by hand from
+        {' '}<span class="mono-inline">db/talent-schema.sql</span>, because schema bootstrap is off
+        on the deployed site.
+      </p>
+    )}
+
+    {!deskFailed && !hasRows && !showAll && (
+      <p class="empty">
+        No active sources. This read succeeded and returned nothing. Either every source has been
+        deactivated — switch to {' '}
+        <a href="/admin/talent/sources?show=all">Including inactive</a> to see them — or none has
+        ever been registered here. Register the first one above; nothing else on this platform
+        creates one for you.
+      </p>
+    )}
+
+    {!deskFailed && !hasRows && showAll && (
+      <p class="empty">
+        No sources at all, active or inactive. This read succeeded and returned nothing, so the
+        registry really is empty. This module carries a set of generic starter channels, but they
+        are written only by a schema bootstrap that is switched off on the deployed site, so on this
+        installation the registry starts empty and stays that way until somebody registers a source
+        on this screen. Nothing in this console deletes one.
+      </p>
+    )}
+
+    {hasRows && (
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>Arrives as</th>
+              <th>Provenance</th>
+              <th>Keys</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr>
+                <td>
+                  <strong>{r.name}</strong>
+                  <span class="mono">{r.slug}</span>
+                  <span class={r.stateClass}>{r.stateLabel}</span>
+                </td>
+                <td>
+                  <span>{r.modeLabel}</span>
+                  <span class="mono">{r.categoryLabel}</span>
+                </td>
+                <td>
+                  <span class="mono">{r.countNote}</span>
+                  {r.retainedNote && <span class="mono">{r.retainedNote}</span>}
+                </td>
+                <td>
+                  {!r.hasKeys && <span class="mono">No key has ever been issued</span>}
+                  {r.hasKeys && <span class="mono">{r.liveKeyNote}</span>}
+                  {r.keys.map((k) => (
+                    <div class="key">
+                      <span class="handle">{k.masked}</span>
+                      <span class={k.stateClass}>{k.stateLabel}</span>
+                      <span class="mono">{k.scopeText}</span>
+                      <span class="mono">{k.issuedNote}</span>
+                      {k.revokedNote && <span class="mono">{k.revokedNote}</span>}
+                      {k.canRevoke && (
+                        <form method="POST" class="inline">
+                          <input type="hidden" name="_action" value="revoke_key" />
+                          <input type="hidden" name="keyId" value={k.id} />
+                          <input
+                            type="text"
+                            name="reason"
+                            required
+                            maxlength="500"
+                            placeholder="Why this key is being revoked"
+                            aria-label="Why this key is being revoked"
+                          />
+                          <button type="submit" class="btn btn--warn">Revoke</button>
+                        </form>
+                      )}
+                    </div>
+                  ))}
+                  {r.keyWarning && <span class="mono warn">{r.keyWarning}</span>}
+                </td>
+                <td class="acts">
+                  {r.canEdit && (
+                    <details class="mini">
+                      <summary>Edit</summary>
+                      <form method="POST" class="stack">
+                        <input type="hidden" name="_action" value="update" />
+                        <input type="hidden" name="sourceId" value={r.id} />
+                        <label class="field">
+                          <span class="field__label">Name</span>
+                          <input type="text" name="name" value={r.name} maxlength={SOURCE_NAME_MAX} required />
+                        </label>
+                        <label class="field">
+                          <span class="field__label">Category</span>
+                          <select name="category">
+                            {CATEGORY_OPTIONS.map((c) => (
+                              <option value={c.value} selected={c.value === r.category}>{c.label}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label class="field">
+                          <span class="field__label">How records arrive</span>
+                          <select name="ingestMode">
+                            {MODE_OPTIONS.map((m) => (
+                              <option value={m.value} selected={m.value === r.ingestMode}>{m.label}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <span class="field__help">
+                          The permanent key <strong>{r.slug}</strong> does not move. Everything that
+                          already refers to this source keeps working.
+                        </span>
+                        <div><button type="submit" class="btn btn--go">Save</button></div>
+                      </form>
+                    </details>
+                  )}
+
+                  {r.canIssueKey && (
+                    <details class="mini">
+                      <summary>Issue a key</summary>
+                      <form method="POST" class="stack">
+                        <input type="hidden" name="_action" value="issue_key" />
+                        <input type="hidden" name="sourceId" value={r.id} />
+                        <input type="hidden" name="sourceName" value={r.name} />
+                        <span class="field__label">What this key may do</span>
+                        {SCOPE_OPTIONS.map((s) => (
+                          <label class="check">
+                            <input type="checkbox" name="scopes" value={s.value} checked={s.preselect} />
+                            <span>{s.label}</span>
+                          </label>
+                        ))}
+                        <span class="field__help">
+                          The key is shown once, at the top of this page, and is unrecoverable
+                          afterwards. It is scoped to this source alone and can be revoked from here
+                          at any time.
+                        </span>
+                        <div><button type="submit" class="btn btn--go">Issue key</button></div>
+                      </form>
+                    </details>
+                  )}
+
+                  {r.canDeactivate && (
+                    <form method="POST" class="inline">
+                      <input type="hidden" name="_action" value="deactivate" />
+                      <input type="hidden" name="sourceId" value={r.id} />
+                      <input
+                        type="text"
+                        name="reason"
+                        required
+                        maxlength="500"
+                        placeholder="Why this source is being closed"
+                        aria-label="Why this source is being closed"
+                      />
+                      <button type="submit" class="btn btn--warn">Deactivate</button>
+                    </form>
+                  )}
+
+                  {r.canReactivate && (
+                    <form method="POST" class="inline">
+                      <input type="hidden" name="_action" value="reactivate" />
+                      <input type="hidden" name="sourceId" value={r.id} />
+                      <button type="submit" class="btn">Reactivate</button>
+                    </form>
+                  )}
+
+                  {r.noActions && <span class="muted">No action available to you</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+
+    <section class="quarantine">
+      <h2>Quarantine</h2>
+      <p class="sub">
+        A delivery that cannot be understood is stored here rather than dropped. Every row is
+        somebody who applied and is currently in nobody's queue, which is the only reason this table
+        exists.
+      </p>
+      <p class="sub">
+        <strong>What was actually sent is not readable from any screen in this installation.</strong>
+        The stored payload is kept in the database and no admin page reads it back yet, so this list
+        can tell you that something arrived and why it was refused, and no more than that. "Mark as
+        handled" records that a named administrator dealt with the delivery, together with what they
+        say they did; it resends nothing, imports nothing, and creates no candidate. Until a screen
+        exists that shows the payload, handling one means going to the database or back to whoever
+        sent it.
+      </p>
+
+      {quarantineErr && <div class="note note--err">{quarantineErr}</div>}
+
+      {quarantineFailed && (
+        <p class="empty">
+          The quarantine queue could not be read just now. That is not the same as nothing being
+          quarantined, and the two mean opposite things. Reload; if it persists, the reason is above.
+        </p>
+      )}
+
+      {!quarantineFailed && hasOpenQuarantine && <p class="warnline">{quarantinePhrase}</p>}
+
+      {!quarantineFailed && !hasQuarantine && (
+        <p class="empty">
+          Nothing is quarantined. This read succeeded and returned nothing, so no delivery has been
+          refused and stored.
+        </p>
+      )}
+
+      {hasQuarantine && (
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Source</th>
+                <th>Why it was refused</th>
+                <th>Arrived</th>
+                <th>State</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {quarantineRows.map((q) => (
+                <tr>
+                  <td>
+                    <strong>{q.sourceName}</strong>
+                    {q.sourceSlug && <span class="mono">{q.sourceSlug}</span>}
+                  </td>
+                  <td><span class="mono">{q.reason}</span></td>
+                  <td>
+                    <span class="mono">{q.arrivedNote}</span>
+                    <span class="mono">{q.sizeNote}</span>
+                  </td>
+                  <td>
+                    <span class={q.stateClass}>{q.stateLabel}</span>
+                    {q.handledNote && <span class="mono">{q.handledNote}</span>}
+                  </td>
+                  <td class="acts">
+                    {q.canMark && (
+                      <form method="POST" class="inline">
+                        <input type="hidden" name="_action" value="mark_replayed" />
+                        <input type="hidden" name="quarantineId" value={q.id} />
+                        <input
+                          type="text"
+                          name="reason"
+                          required
+                          maxlength="500"
+                          placeholder="What was done with it"
+                          aria-label="What was done with this delivery"
+                        />
+                        <button type="submit" class="btn">Mark as handled</button>
+                      </form>
+                    )}
+                    {!q.canMark && <span class="muted">Nothing to do</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  </div>
+</AdminLayout>
+
+<script is:inline>
+  // Delegated, and outside every conditional block: a <script> nested inside a JSX conditional
+  // breaks .astro parsing on this project, and the banner it serves is conditional.
+  document.addEventListener('click', function (ev) {
+    var t = ev.target;
+    if (!t || typeof t.getAttribute !== 'function') return;
+    var sel = t.getAttribute('data-copy');
+    if (!sel) return;
+    var el = document.querySelector(sel);
+    if (!el) return;
+    var text = typeof el.value === 'string' ? el.value : (el.textContent || '');
+    var label = t.textContent;
+    var done = function (word) {
+      t.textContent = word;
+      setTimeout(function () { t.textContent = label; }, 1600);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(String(text).trim()).then(function () { done('Copied'); },
+        function () { done('Select it and press Ctrl+C'); });
+    } else {
+      done('Select it and press Ctrl+C');
+    }
+  });
+</script>
+
+<style>
+  .wrap { padding: 20px; max-width: 1400px; }
+  .head h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 4px; }
+  .sub { color: #9aa0aa; font-size: 13px; margin: 0 0 16px; max-width: 80ch; line-height: 1.6; }
+  .sub a, .empty a { color: inherit; }
+  .explain {
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px 14px;
+    margin-bottom: 18px; max-width: 90ch;
+  }
+  .explain__title { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  .explain p { font-size: 12px; color: #9aa0aa; line-height: 1.6; margin: 0 0 6px; }
+  .explain p:last-child { margin-bottom: 0; }
+  .note { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; }
+  .note--ok { background: rgba(46,160,90,0.12); border: 1px solid rgba(46,160,90,0.4); }
+  .note--err { background: rgba(200,60,60,0.12); border: 1px solid rgba(200,60,60,0.4); }
+  .problems {
+    border: 1px solid rgba(200,60,60,0.4); background: rgba(200,60,60,0.08); border-radius: 6px;
+    padding: 10px 12px 10px 28px; margin: 0 0 14px; font-size: 12px; color: #e0b0b0; max-width: 80ch;
+  }
+  .problems li { margin-bottom: 4px; line-height: 1.5; }
+  .secret {
+    border: 1px solid rgba(255,190,80,0.5); background: rgba(255,190,80,0.08);
+    border-radius: 8px; padding: 14px 16px; margin-bottom: 18px;
+  }
+  .secret__eyebrow { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 6px; color: #d9b169; }
+  .secret__code {
+    font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 18px; letter-spacing: 0.04em;
+    margin: 0 0 10px; user-select: all; word-break: break-all;
+  }
+  .secret__acts { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .secret__note { font-size: 12px; color: #b9bec7; margin: 0 0 8px; max-width: 80ch; line-height: 1.5; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .tile { border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .tile__n { font-size: 22px; font-weight: 600; }
+  .tile__l { font-size: 11px; color: #9aa0aa; text-transform: uppercase; letter-spacing: 0.06em; }
+  .panel { border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; }
+  .panel summary, .mini summary { cursor: pointer; font-size: 12px; }
+  .mini { border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; padding: 6px 8px; }
+  .stack { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; max-width: 460px; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field__label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; }
+  .field__help { font-size: 11px; color: #8b919b; line-height: 1.5; }
+  .check { display: flex; gap: 6px; align-items: center; font-size: 12px; }
+  .filters { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-bottom: 12px; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tab {
+    font-size: 12px; padding: 5px 10px; border-radius: 999px; text-decoration: none; color: #9aa0aa;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .tab--on { color: inherit; border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.06); }
+  .tablewrap { overflow-x: auto; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; margin-bottom: 20px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 1050px; }
+  th { text-align: left; padding: 10px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; border-bottom: 1px solid rgba(255,255,255,0.1); }
+  td { padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.06); vertical-align: top; }
+  td strong { display: block; }
+  .key { border-top: 1px solid rgba(255,255,255,0.06); padding-top: 6px; margin-top: 6px; }
+  .handle { display: block; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 13px; letter-spacing: 0.04em; }
+  .mono { display: block; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #8b919b; margin-top: 2px; }
+  .mono.warn { color: #d9a05b; }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.18); margin-top: 4px; }
+  .pill--live { border-color: rgba(46,160,90,0.55); color: #7fd6a0; }
+  .pill--used { border-color: rgba(120,150,220,0.5); color: #a8bdf0; }
+  .pill--off { border-color: rgba(200,60,60,0.5); color: #e08b8b; }
+  .acts { display: flex; flex-direction: column; gap: 8px; min-width: 220px; }
+  form.inline { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+  /* The written reason sits beside its own destructive button, so it can never be filled in for one
+     row and submitted against another. */
+  form.inline input[type=text] { flex: 1 1 160px; min-width: 0; }
+  .btn { border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.06); color: inherit; padding: 6px 10px; border-radius: 5px; font-size: 12px; cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn--go { border-color: rgba(46,160,90,0.5); }
+  .btn--warn { border-color: rgba(200,60,60,0.5); }
+  input[type=text], select {
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.14); color: inherit;
+    padding: 5px 7px; border-radius: 4px; font-size: 12px;
+  }
+  .quarantine { margin-top: 26px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 18px; }
+  .warnline {
+    font-size: 12px; color: #d9a05b; border: 1px solid rgba(255,190,80,0.35);
+    background: rgba(255,190,80,0.06); border-radius: 8px; padding: 10px 12px; margin: 0 0 14px;
+    max-width: 80ch; line-height: 1.5;
+  }
+  .muted { color: #6f757e; font-size: 12px; max-width: 60ch; line-height: 1.5; }
+  .empty { color: #9aa0aa; font-size: 13px; max-width: 70ch; line-height: 1.6; }
+  .mono-inline { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; color: #b9bec7; }
+</style>

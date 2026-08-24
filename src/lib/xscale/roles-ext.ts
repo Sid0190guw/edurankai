@@ -536,7 +536,24 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
       AND (${f.level || null}::text IS NULL OR r.level::text = ${f.level || null})
       AND (${f.careerLevel ?? null}::int IS NULL OR r.career_level = ${f.careerLevel ?? null}::int)
       AND (${f.engagementType || null}::text IS NULL OR r.engagement_type::text = ${f.engagementType || null})
-      AND (${f.workMode || null}::text IS NULL OR r.location ILIKE '%' || ${f.workMode || null} || '%')
+      -- HYPHEN-INSENSITIVE, AND THAT IS NOT A NICETY.
+      --
+      -- The dropdown offers "On site" (MODES in src/pages/careers/opportunities.astro) while every
+      -- seeded posting writes the separator with a hyphen -- 'On-site -- Kolkata, West Bengal, India'
+      -- in src/data/role-catalog.ts, 'On-site, India' in src/data/catalog-flagship-ai.ts. ILIKE
+      -- '%On site%' cannot match 'On-site', so Work mode returned NOTHING for the value most people
+      -- pick, while "Hybrid" worked because it is spelled the same on both sides.
+      --
+      -- It matters that this is independent of the missing xscale columns. On a database where
+      -- db/xscale-schema.sql has not been applied the whole statement fails and the narrowed retry
+      -- drops this predicate anyway, so the fault is invisible behind the degraded banner. Apply the
+      -- migration and this predicate starts running -- and would have gone on returning zero rows
+      -- with nothing left to blame it on.
+      --
+      -- translate() normalises the separator on BOTH sides, so a stored 'On-site' and a chosen
+      -- 'On site' meet in the middle, and an ?mode=On+site link somebody already shared keeps working.
+      AND (${f.workMode || null}::text IS NULL
+           OR translate(r.location, '-', ' ') ILIKE '%' || translate(${f.workMode || null}, '-', ' ') || '%')
       AND (${f.classification || null}::text IS NULL OR r.research_classification = ${f.classification || null})
       AND (${f.skillCategory || null}::text IS NULL OR ${f.skillCategory || null} = ANY(COALESCE(r.skill_categories, ARRAY[]::text[])))
       AND (${f.product || null}::text IS NULL OR ${f.product || null} = ANY(COALESCE(r.products, ARRAY[]::text[])) OR r.product = ${f.product || null})

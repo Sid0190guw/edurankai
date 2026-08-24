@@ -1,0 +1,1170 @@
+---
+// /admin/talent/candidates — THE CANDIDATE REGISTER.
+//
+// Spec: docs/talent-to-org/TALENT_TO_ORG_MASTER_SPEC.md sections 24, 26.1, 26.4, 27, 32 and 43.
+//
+// THIS PAGE WAS LINKED FROM THE SIDEBAR AND DID NOT EXIST. src/lib/admin-nav.ts:193 has offered
+// "Candidates" at this path, and src/middleware.ts:86 has been gating it under the `talent` section,
+// since the talent console shipped — so recruiter, reviewer, department_head and the whole people
+// desk got a 404 from the one link they would click first. The spine it reads, tal_person, has been
+// written by every application since the platform's first import.
+//
+// ---------------------------------------------------------------------------------------------
+// ONE HUMAN, ONE ENTRY. THAT IS THE WHOLE SCREEN.
+// ---------------------------------------------------------------------------------------------
+// Spec 27 opens its cardinality rules with "One person, many applications", and spec 43 exists to
+// stop a register from quietly breaking it. So every card below is a PERSON and their applications
+// are nested underneath. There is no view here that lists applications at the top level wearing a
+// candidate's name, because that shape is how one human becomes four register entries, receives four
+// emails, and is asked the same screening question by four different people who each think they are
+// the first.
+//
+// The filters choose WHICH PEOPLE APPEAR. They do not trim what is shown under a person who does
+// appear: someone matching "in progress" on one application is still listed with all four of theirs,
+// and the ones outside the filter are marked rather than hidden.
+//
+// ---------------------------------------------------------------------------------------------
+// WHAT THIS SCREEN DOES NOT SHOW, AND WHY THAT IS NOT AN OVERSIGHT — spec 32.1 and 32.2
+// ---------------------------------------------------------------------------------------------
+// Recruitment facts only. No identity documents and no Drive links: a sensitive document needs
+// `document.view_sensitive`, which is a different desk (spec 33.2), and nothing on this path reads
+// tal_document_ref at all. No government identifiers, no date of birth, no bank or address details.
+// No health data of any kind and nothing from the wellness system, which is gated server-side and
+// has no business beside a hiring decision.
+//
+// tal_person_identifier is read for its KIND and its COUNT and never for value_norm — an identifier
+// row can hold an external reference or a government-issued number depending on who wrote it, so the
+// register says "two email addresses, one verified" and never says which. The single place a value
+// is touched is the search predicate, restricted to email and phone, where the operator is typing a
+// value they already hold.
+//
+// ---------------------------------------------------------------------------------------------
+// MERGES ARE PROPOSED HERE AND DECIDED BY A PERSON — finding F2
+// ---------------------------------------------------------------------------------------------
+// Nothing on this page auto-confirms anything. A confirmed merge is a claim that two records are one
+// human; it is not reversible from this screen, so it takes a written reason and the screen states
+// in full what it will do before the button exists to do it. Confidence is ADVISORY and labelled as
+// such: matching on an email alone merges two students who shared a college address and splits one
+// person who changed jobs, which is precisely why a human decides.
+//
+// WHO. `talent.view` reads; `talent.manage` decides a merge. Both are checked in the frontmatter
+// before the first query runs, and `talent.manage` is checked AGAIN inside the POST handler — a
+// hidden button is not a lock.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { logAudit } from '@/lib/audit';
+import { uuidish } from '@/lib/page-safety';
+import {
+  listCandidates, candidateCounts, candidateDetail, listMergeProposals,
+  confirmMerge, rejectMerge, candidateOpportunityOptions,
+  classifySearch, describeMergeEffect, mergeDecisionProblem, overlappingOpportunities,
+  applicationsPhrase, STATUS_BUCKET_LABELS,
+  SEARCH_KIND_LABELS, CONFIDENCE_BAND_LABELS, MIN_MERGE_REASON,
+  type CandidateRow, type CandidateCounts, type CandidateDetail,
+  type MergeProposalRow, type OpportunityOption,
+} from '@/lib/talent/candidates';
+
+// EVERY const IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted, and a handler reaching a
+// later declaration threw on its first line every time while the page reported success — that is a
+// recorded outage on this project, not a style preference.
+const user = Astro.locals.user!;
+
+const mayManage = can(user, 'talent.manage');
+const mayView = can(user, 'talent.view') || mayManage;
+if (!mayView) return Astro.redirect('/admin');
+
+// The tab words come from the module's own bucket labels rather than being retyped here, so a tab
+// and the tile it filters can never disagree about what a bucket is called.
+const STATUS_TABS = [
+  { key: 'all', label: 'Everyone' },
+  { key: 'in_progress', label: STATUS_BUCKET_LABELS.in_progress },
+  { key: 'decided', label: STATUS_BUCKET_LABELS.decided },
+  { key: 'onboarding', label: STATUS_BUCKET_LABELS.onboarding },
+  { key: 'joined', label: STATUS_BUCKET_LABELS.joined },
+  { key: 'closed', label: STATUS_BUCKET_LABELS.closed },
+];
+
+// Typed lookup maps are indexed HERE and never inside JSX: a `Record<string,string>` used from a
+// template breaks .astro parsing on this project.
+const BUCKET_CLASS: Record<string, string> = {
+  in_progress: 'pill pill--live',
+  decided: 'pill pill--used',
+  onboarding: 'pill pill--used',
+  joined: 'pill pill--live',
+  closed: 'pill pill--off',
+  unknown: 'pill',
+};
+
+const fmtDate = (iso: string | null): string => {
+  if (!iso) return '';
+  try { return new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }); }
+  catch { return ''; }
+};
+const fmtDateTime = (iso: string | null): string => {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString('en-GB', {
+      day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+    });
+  } catch { return ''; }
+};
+
+let msg = '';
+let err = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+  const mergeId = String(fd.get('mergeId') || '');
+  const reason = String(fd.get('reason') || '').trim();
+  try {
+    if (!mayManage) {
+      // One refusal for every write on this page. A read-only holder of `talent.view` sees the
+      // queue and no buttons, so reaching this branch means a hand-made POST.
+      err = 'You do not hold the authority to decide a person merge.';
+    } else if (action === 'confirm_merge') {
+      const r = await confirmMerge(mergeId, user.id, reason);
+      if (r.ok) {
+        msg = 'Merged. The two records are now one entry in the register, and the folded record is kept, not deleted.';
+        await logAudit({
+          userId: user.id, action: 'talent.person.merge_confirmed',
+          entity: 'tal_person_merge', entityId: mergeId,
+          diff: {
+            reason,
+            keepPersonId: r.data ? r.data.keepPersonId : null,
+            mergePersonId: r.data ? r.data.mergePersonId : null,
+          },
+          ipAddress: Astro.clientAddress,
+        });
+      } else {
+        err = r.error || 'Could not confirm that merge.';
+      }
+    } else if (action === 'reject_merge') {
+      const r = await rejectMerge(mergeId, user.id, reason);
+      if (r.ok) {
+        // NOT "will not be proposed again". The unique index on tal_person_merge only covers rows
+        // whose status is 'proposed', so deciding this one FREES the pair — a later matching pass
+        // can raise it again on the same evidence. Promising otherwise would be a guarantee the
+        // schema does not make.
+        msg = 'Recorded as two different people. Nothing in the register has been changed, and the written reason is what the next person to see this pair will read. A later matching pass can raise the same pair again.';
+        await logAudit({
+          userId: user.id, action: 'talent.person.merge_rejected',
+          entity: 'tal_person_merge', entityId: mergeId,
+          diff: {
+            reason,
+            keepPersonId: r.data ? r.data.keepPersonId : null,
+            mergePersonId: r.data ? r.data.mergePersonId : null,
+          },
+          ipAddress: Astro.clientAddress,
+        });
+      } else {
+        err = r.error || 'Could not record that decision.';
+      }
+    }
+  } catch (e: any) {
+    // The REAL Postgres reason lives on e.cause; e.message is only the failed statement.
+    err = e?.cause?.message || e?.message || 'Something went wrong.';
+  }
+}
+
+// Filters are read AFTER the POST so the screen reflects what just happened.
+const statusParam = Astro.url.searchParams.get('status') || 'all';
+const status = STATUS_TABS.some((t) => t.key === statusParam) ? statusParam : 'all';
+const q = (Astro.url.searchParams.get('q') || '').trim().slice(0, 120);
+const oppParam = (Astro.url.searchParams.get('opportunity') || '').trim();
+const personParam = (Astro.url.searchParams.get('person') || '').trim();
+const mergeParam = (Astro.url.searchParams.get('merge') || '').trim();
+
+// THE PAGE IS SAID OUT LOUD, BECAUSE A REGISTER THAT STOPS SILENTLY AT ITS LIMIT LIES.
+// This screen asked for 100 people and rendered whatever came back with nothing said about the cap,
+// so at 101 candidates the hundred-and-first simply was not here — and an operator searching for a
+// person who is in the register reads that blank as "no record of them", which is the one answer
+// this whole module exists to stop it giving. ONE ROW MORE THAN THE PAGE IS REQUESTED: if it
+// arrives there is a next page, and that is a fact rather than a guess from a full page.
+const REGISTER_PAGE = 100;
+const QUEUE_PAGE = 100;
+const fromRaw = Number(Astro.url.searchParams.get('from') || '0');
+const registerFrom = Number.isFinite(fromRaw) && fromRaw > 0 ? Math.floor(fromRaw) : 0;
+
+// WHAT WAS ACTUALLY TYPED. Pure, no database. This is what stops the register answering "no such
+// candidate" to somebody who has pasted an opportunity code — a confident wrong answer to a question
+// it never understood.
+const search = classifySearch(q);
+const searchKindLabel = SEARCH_KIND_LABELS[search.kind] || 'Free text';
+const searchIsForeignCode = !search.searchable;
+
+// A THROW HERE IS NOT AN EMPTY REGISTER. listCandidates() and the rest rethrow precisely so this
+// page can tell "no candidate matches" apart from "the register could not be read" — they render as
+// the same empty table otherwise, and they mean opposite things. On this screen the second one
+// wearing the first one's clothes is how a real candidate gets told there is no record of them.
+let counts: CandidateCounts | null = null;
+let countsFailed = false;
+let register: CandidateRow[] = [];
+let registerFailed = false;
+let registerHasMore = false;
+let proposals: MergeProposalRow[] = [];
+let proposalsFailed = false;
+let proposalsTruncated = false;
+let opportunities: OpportunityOption[] = [];
+let opportunitiesFailed = false;
+
+// READ FAILURES GET THEIR OWN CHANNEL, not `err`. `err` belongs to the POST, and `err = err || ...`
+// meant that a failed merge decision and a failed register read in the same request threw the read's
+// reason away entirely — while the paragraph under the empty table went on saying "the reason is in
+// the message above" and pointed at the merge message instead. Two different failures, two messages.
+const readErrors: string[] = [];
+const noteRead = (what: string, e: any) => {
+  // The REAL Postgres reason lives on e.cause; e.message is only the failed statement.
+  readErrors.push(what + ': ' + (e?.cause?.message || e?.message || 'unknown error'));
+};
+
+try {
+  counts = await candidateCounts();
+} catch (e: any) {
+  // NOT SILENT. Tiles that vanish without a word read as a page with no header, and an operator has
+  // no way to tell that from a register that genuinely has nothing to count.
+  countsFailed = true;
+  noteRead('The register totals could not be read', e);
+}
+
+try {
+  const page = await listCandidates({
+    q, status, opportunityId: oppParam,
+    limit: REGISTER_PAGE + 1, offset: registerFrom,
+  });
+  registerHasMore = page.length > REGISTER_PAGE;
+  register = registerHasMore ? page.slice(0, REGISTER_PAGE) : page;
+} catch (e: any) {
+  registerFailed = true;
+  noteRead('The candidate register could not be read', e);
+}
+
+try {
+  opportunities = await candidateOpportunityOptions(300);
+} catch (e: any) {
+  opportunitiesFailed = true;
+  noteRead('The opportunity filter could not be loaded', e);
+}
+
+try {
+  // Same one-more-than-the-page rule as the register, for the same reason: a queue that stops at its
+  // cap without saying so turns "this proposal is beyond the hundredth" into "this proposal is gone".
+  const openQueue = await listMergeProposals('proposed', QUEUE_PAGE + 1);
+  proposalsTruncated = openQueue.length > QUEUE_PAGE;
+  proposals = proposalsTruncated ? openQueue.slice(0, QUEUE_PAGE) : openQueue;
+} catch (e: any) {
+  proposalsFailed = true;
+  noteRead('The merge queue could not be read', e);
+}
+
+// The opportunity the filter is currently on, resolved from the loaded options rather than queried
+// again. Empty when the id in the query string matches nothing, which is said on screen.
+const activeOpportunity = opportunities.find((o) => o.id === oppParam) || null;
+const oppFilterOn = oppParam.length > 0;
+// THE FILTER IN THE ADDRESS AND THE FILTER THAT RAN ARE NOT ALWAYS THE SAME ONE. listCandidates()
+// puts the opportunity id through uuidish() and drops it when it is not a uuid — correctly, because
+// forcing a bad cast is a 500 and returning no rows would read as "nobody applied". But the page was
+// then printing "the filter matches nothing" ABOVE A FULL, UNFILTERED REGISTER. Two different
+// situations, said apart here: a reference that could not be applied at all, and a well-formed one
+// that simply matches no opportunity anybody has applied to.
+const oppFilterApplied = oppFilterOn && !!uuidish(oppParam);
+const oppFilterNotApplied = oppFilterOn && !oppFilterApplied;
+const oppFilterUnknown = oppFilterApplied && !activeOpportunity && !opportunitiesFailed;
+// A FAILED DROPDOWN DOES NOT UNFILTER THE REGISTER. listCandidates() was handed the opportunity from
+// the address and applied it whatever happened to the options; the page nonetheless said "the
+// register below is unaffected" and rendered a select reading "Every opportunity" over a register
+// filtered down to one — which is a screen describing a filter it is not showing. Both are said
+// correctly here, and the id in the address is kept as a selectable option so submitting the form
+// does not silently drop a filter the operator can no longer see.
+const oppFilterStillOn = opportunitiesFailed && oppFilterApplied;
+const oppSelectionMissing = oppFilterApplied && !activeOpportunity;
+
+// If the operator pasted an OPPORTUNITY code, offer the filter that can actually answer it instead
+// of leaving them with an empty table. Matched against the options already in hand; no extra query.
+const pastedOpportunity = search.kind === 'opportunity_code'
+  ? (opportunities.find((o) => o.code.toUpperCase() === search.term) || null)
+  : null;
+
+// ---------------------------------------------------------------------------------------------
+// ONE PERSON, EXPANDED. ?person=<id>
+// ---------------------------------------------------------------------------------------------
+let detail: CandidateDetail | null = null;
+let detailFailed = false;
+if (personParam) {
+  try {
+    detail = await candidateDetail(personParam);
+  } catch (e: any) {
+    detailFailed = true;
+    noteRead('That candidate record could not be read', e);
+  }
+}
+
+const detailMissing = personParam.length > 0 && !detail && !detailFailed;
+
+// Captured into a `const` before the map. Narrowing a `let` does not survive into a callback, and
+// the alternative is a non-null assertion standing exactly where a null would be a 500.
+const detailPerson = detail ? detail.person : null;
+const detailApplications = detailPerson
+  ? detailPerson.applications.map((a) => ({
+      ...a,
+      submittedOn: fmtDate(a.submittedAt),
+      closedOn: fmtDate(a.closedAt),
+      stageText: a.currentStageLabel || a.currentStageKey || 'No stage recorded',
+      bucketClass: BUCKET_CLASS[a.bucket] || 'pill',
+      arrivedElsewhere: a.onPersonId !== detailPerson.personId,
+    }))
+  : [];
+const detailPhrase = detailPerson ? applicationsPhrase(detailPerson.applicationCount) : '';
+const detailIdentifiers = detail ? detail.identifierKinds : [];
+const detailFolded = detail ? detail.foldedIn : [];
+const detailFollowedFrom = detail ? detail.followedFromPersonCode : null;
+const detailHasIdentifiers = detailIdentifiers.length > 0;
+const detailHasFolded = detailFolded.length > 0;
+const detailHasApps = detailApplications.length > 0;
+// "no applications, listed below" pointed at a table that was not rendered. And an application list
+// that could not be READ is not an application list that is EMPTY — the note says which.
+const detailAppsUnreadable = !!detailPerson && detailPerson.applicationsUnreadable;
+const detailCountNote = detailPerson
+  ? (detailHasApps
+      ? detailPhrase + ', listed below.'
+      : (detailAppsUnreadable
+          ? "This record's applications could not be read back, so none are listed. That is a failed read, not a person with no applications."
+          : detailPhrase + ' recorded against this person.'))
+  : '';
+// WHAT THE COLUMN SAYS, NOT WHAT WE WISH IT SAID. tal_candidate_profile.talent_pool is a BOOLEAN
+// flag; consent is recorded separately in that table's consent_state JSONB, which this screen does
+// not read. Calling the flag "has consented" states a consent record that nothing here has checked.
+const detailPoolNote = detailPerson && detailPerson.talentPool
+  ? 'This person is flagged for the talent pool on their candidate profile. The consent behind that flag is recorded elsewhere and is not read on this screen.'
+  : '';
+
+// ---------------------------------------------------------------------------------------------
+// THE MERGE UNDER REVIEW. ?merge=<id>
+//
+// TWO STEPS ON PURPOSE. The queue offers "Review", which only navigates; the panel then states in
+// full what confirming will do, and only then is there a button that does it. A one-click confirm on
+// an irreversible act is the shape this screen must not have.
+// ---------------------------------------------------------------------------------------------
+const reviewing = mergeParam ? (proposals.find((p) => p.id === mergeParam) || null) : null;
+let reviewKeep: CandidateDetail | null = null;
+let reviewFold: CandidateDetail | null = null;
+let reviewLoadFailed = false;
+if (reviewing) {
+  try {
+    reviewKeep = await candidateDetail(reviewing.keep.personId);
+    reviewFold = await candidateDetail(reviewing.fold.personId);
+  } catch (e: any) {
+    reviewLoadFailed = true;
+    noteRead("The two records under review could not be read", e);
+  }
+}
+
+// COMPUTED AFTER THE LAST READ ON THIS PAGE. Joining the list earlier meant a detail or review
+// failure recorded after that point never reached the template at all — the silent swallow this
+// channel exists to end, reintroduced by ordering.
+const readErrText = readErrors.join(' ');
+const hasReadErr = readErrors.length > 0;
+
+// The STRUCTURAL preconditions only. A reason of exactly the minimum length is passed in so the
+// "no reason yet" rule does not fire before the operator has had a chance to type one — the real
+// check, reason included, runs inside confirmMerge() and rejectMerge() on the POST, which are the
+// ones that decide. A hidden button is never the lock here; these only stop a pointless round trip.
+const reviewInput = reviewing
+  ? {
+      status: reviewing.status,
+      keepPersonId: reviewing.keep.personId,
+      mergePersonId: reviewing.fold.personId,
+      reason: 'x'.repeat(MIN_MERGE_REASON),
+      keepAlreadyMergedInto: reviewing.keep.mergedIntoId,
+      mergeAlreadyMergedInto: reviewing.fold.mergedIntoId,
+    }
+  : null;
+const reviewProblem = reviewInput ? mergeDecisionProblem(reviewInput, 'confirm') : null;
+// CHECKED SEPARATELY, because they are not the same question. "These are two different people"
+// stays true and stays worth recording even when one of the records has since been folded
+// elsewhere, so a chain refusal must not take the rejection button away with it.
+const reviewRejectProblem = reviewInput ? mergeDecisionProblem(reviewInput, 'reject') : null;
+
+const reviewLines = reviewing
+  ? describeMergeEffect(
+      { personCode: reviewing.keep.personCode, displayName: reviewing.keep.displayName, applicationCount: reviewing.keep.applicationCount },
+      { personCode: reviewing.fold.personCode, displayName: reviewing.fold.displayName, applicationCount: reviewing.fold.applicationCount },
+    )
+  : [];
+
+// WHETHER THE OVERLAP CHECK ACTUALLY RAN IS A SEPARATE FACT FROM WHAT IT FOUND, and printing
+// nothing when it did not run is the same defect as an empty table that means "could not read".
+// It does not run when either record could not be loaded, and it MUST NOT run when either side has
+// already been folded: candidateDetail() follows the merge pointer to the survivor, so on a retry
+// where the fold record already points at the keeper both sides resolve to the SAME record and
+// every opportunity would be reported as a duplicate application that does not exist.
+const reviewSidesFolded = !!reviewing && (!!reviewing.keep.mergedIntoId || !!reviewing.fold.mergedIntoId);
+const reviewOverlapChecked = !!reviewing && !reviewLoadFailed && !reviewSidesFolded
+  && !!reviewKeep && !!reviewFold;
+const reviewOverlap = reviewOverlapChecked && reviewKeep && reviewFold
+  ? overlappingOpportunities(reviewKeep.person.applications, reviewFold.person.applications)
+  : [];
+const reviewOverlapText = reviewOverlap.join(', ');
+const reviewHasOverlap = reviewOverlap.length > 0;
+const reviewOverlapUnchecked = !!reviewing && !reviewOverlapChecked;
+const reviewCanConfirm = mayManage && !!reviewing && !reviewProblem;
+const reviewCanReject = mayManage && !!reviewing && !reviewRejectProblem;
+const reviewCanAct = reviewCanConfirm || reviewCanReject;
+const reviewBandLabel = reviewing ? (CONFIDENCE_BAND_LABELS[reviewing.band] || '') : '';
+const reviewSignalsText = reviewing ? reviewing.signals.join(', ') : '';
+const reviewHasSignals = reviewing ? reviewing.signals.length > 0 : false;
+// THREE STATES, NOT TWO. Evidence that was recorded and matched on; evidence that was genuinely
+// never recorded; and evidence that exists and could not be read. Printing the third as the second
+// tells the person deciding an irreversible merge that the matcher offered nothing when it did.
+const reviewEvidenceLine = reviewHasSignals
+  ? '. Matched on: ' + reviewSignalsText
+  : (reviewing && reviewing.evidenceUnreadable
+      ? '. The evidence recorded with this proposal could not be read, so what it matched on is not shown here'
+      : '. No matching evidence was recorded');
+const reviewNotFound = mergeParam.length > 0 && !reviewing && !proposalsFailed;
+
+// ---------------------------------------------------------------------------------------------
+// PRESENTATION. Every comparison is finished HERE: `<` inside a JSX expression breaks .astro
+// parsing on this project, so the template only ever reads booleans and strings.
+// ---------------------------------------------------------------------------------------------
+const rows = register.map((c) => {
+  const apps = c.applications.map((a) => ({
+    ...a,
+    submittedOn: fmtDate(a.submittedAt),
+    stageText: a.currentStageLabel || a.currentStageKey || 'No stage recorded',
+    bucketClass: BUCKET_CLASS[a.bucket] || 'pill',
+    dimmed: !a.matchesFilter,
+    arrivedElsewhere: a.onPersonId !== c.personId,
+  }));
+  const outsideFilter = apps.filter((a) => a.dimmed).length;
+  return {
+    personId: c.personId,
+    personCode: c.personCode,
+    displayName: c.displayName || 'Unnamed',
+    preferredName: c.preferredName && c.preferredName !== c.displayName ? c.preferredName : '',
+    primaryEmail: c.primaryEmail || '',
+    primaryPhone: c.primaryPhone || '',
+    country: c.country || '',
+    candidateCode: c.candidateCode,
+    headline: c.headline,
+    talentPool: c.talentPool,
+    apps,
+    hasApps: apps.length > 0,
+    // AN EMPTY NESTED LIST HAS TWO MEANINGS AND THEY ARE OPPOSITE. Without this the card said
+    // "no application recorded against this person yet" over a payload that failed to read.
+    appsUnreadable: c.applicationsUnreadable,
+    countPhrase: c.applicationsUnreadable
+      ? 'Applications could not be read'
+      : applicationsPhrase(c.applicationCount),
+    manyApplications: c.applicationCount > 1,
+    outsideFilterNote: outsideFilter > 0
+      ? (outsideFilter === 1
+        ? 'One further application, outside this filter, shown for context.'
+        : outsideFilter + ' further applications, outside this filter, shown for context.')
+      : '',
+    foldedNote: c.foldedInCount > 0
+      ? (c.foldedInCount === 1
+        ? 'One earlier record has been folded into this one.'
+        : c.foldedInCount + ' earlier records have been folded into this one.')
+      : '',
+    lastSeen: c.lastActivityAt ? 'Last application ' + fmtDate(c.lastActivityAt) : 'No application recorded',
+    detailHref: '/admin/talent/candidates?person=' + encodeURIComponent(c.personId),
+  };
+});
+
+const queue = proposals.map((p) => ({
+  id: p.id,
+  keepName: p.keep.displayName || 'Unnamed',
+  keepCode: p.keep.personCode,
+  keepEmail: p.keep.primaryEmail,
+  keepPhrase: applicationsPhrase(p.keep.applicationCount),
+  foldName: p.fold.displayName || 'Unnamed',
+  foldCode: p.fold.personCode,
+  foldEmail: p.fold.primaryEmail,
+  foldPhrase: applicationsPhrase(p.fold.applicationCount),
+  bandLabel: CONFIDENCE_BAND_LABELS[p.band] || '',
+  bandClass: p.band === 'strong' ? 'pill pill--used' : 'pill',
+  signalsText: p.signals.join(', '),
+  hasSignals: p.signals.length > 0,
+  // "No evidence recorded" is a statement about the proposal. It must not be printed over evidence
+  // that was recorded and could not be read — that understates a proposal a human is about to act on.
+  evidenceUnreadable: p.evidenceUnreadable,
+  noEvidence: p.signals.length === 0 && !p.evidenceUnreadable,
+  raisedOn: fmtDateTime(p.createdAt),
+  reviewHref: '/admin/talent/candidates?merge=' + encodeURIComponent(p.id),
+  alreadyFolded: !!p.keep.mergedIntoId || !!p.fold.mergedIntoId,
+  isOpen: p.id === mergeParam,
+}));
+
+// A BARE NUMBER IN BRACKETS IS NOT A FACT. "(3)" beside an opportunity could be a headcount, a
+// vacancy count or an application count; applicationsPhrase() is the same wording the register uses
+// under a person's name, so the two cannot be read as different quantities.
+const oppOptions = opportunities.map((o) => ({
+  id: o.id,
+  selected: o.id === oppParam,
+  label: (o.title || o.code || 'Untitled opportunity') + ' — ' + applicationsPhrase(o.applicationCount),
+}));
+
+const hasRows = rows.length > 0;
+const isFiltered = q.length > 0 || status !== 'all' || oppFilterOn;
+const hasQueue = queue.length > 0;
+const showFootnote = !!counts && counts.applications > 0;
+const multiPhrase = counts && counts.multiApplicants === 1
+  ? 'One person in the register holds more than one application.'
+  : counts
+    ? counts.multiApplicants + ' people in the register hold more than one application.'
+    : '';
+const baseQuery = 'status=' + encodeURIComponent(status)
+  + (q ? '&q=' + encodeURIComponent(q) : '')
+  + (oppFilterOn ? '&opportunity=' + encodeURIComponent(oppParam) : '');
+const clearHref = '/admin/talent/candidates';
+
+// PAGING. Every comparison is finished here: `<` and `>` inside a JSX expression break .astro
+// parsing on this project, so the template only ever reads booleans and finished strings.
+const onFirstPage = registerFrom === 0;
+const registerHasPrev = registerFrom > 0;
+const prevFrom = registerFrom - REGISTER_PAGE > 0 ? registerFrom - REGISTER_PAGE : 0;
+const nextFrom = registerFrom + REGISTER_PAGE;
+const prevHref = '/admin/talent/candidates?' + baseQuery + (prevFrom > 0 ? '&from=' + prevFrom : '');
+const nextHref = '/admin/talent/candidates?' + baseQuery + '&from=' + nextFrom;
+const firstPageHref = '/admin/talent/candidates?' + baseQuery;
+const showPaging = hasRows && (registerHasMore || registerHasPrev);
+// A RANGE, NOT A BARE COUNT. "100" on its own could be the size of the register; this says which
+// hundred of what. The total is deliberately NOT claimed: the tile above counts people who hold an
+// application, while the register also lists a person who has a candidate profile and none, so a
+// "100 of 340" here would be two different populations in one sentence.
+const pageRangeNote = 'Showing people ' + (registerFrom + 1) + ' to ' + (registerFrom + rows.length)
+  + ' of this filter, in order of most recent application.'
+  + (registerHasMore ? ' There are more beyond this page.' : ' This is the last page.');
+// Past the end of the filter is not the same as the filter matching nobody, and the two empty
+// states below would otherwise both say the second.
+const pastEnd = registerHasPrev && !hasRows && !registerFailed;
+---
+
+<AdminLayout title="Candidates" activeNav="talent-candidates">
+  <div class="wrap">
+    <header class="head">
+      <h1>Candidates</h1>
+      <p class="sub">
+        Everyone who has applied, listed once each with all of their applications underneath. A
+        person is the record here; an application hangs off it. When somebody has applied three
+        times, this page shows one entry with three applications, never three candidates who happen
+        to share a name.
+      </p>
+    </header>
+
+    <div class="explain">
+      <p class="explain__title">What this register shows, and what it deliberately does not</p>
+      <p>
+        Recruitment facts: who applied, to what, how far it went, and how to reach them. It shows
+        <strong>no identity documents</strong>, no government identifiers, no financial details and
+        nothing health-related. Identity documents are read on a separate desk that holds
+        <span class="mono">document.view_sensitive</span>, and every read there is recorded.
+      </p>
+      <p>
+        Where a person has been recognised by more than one identifier, the register says how many of
+        each <strong>kind</strong> exist and never what they are. Anything an evaluator wrote about a
+        candidate lives with the evaluation, not here.
+      </p>
+    </div>
+
+    {msg && <div class="note note--ok">{msg}</div>}
+    {err && <div class="note note--err">{err}</div>}
+    {hasReadErr && <div class="note note--err">{readErrText}</div>}
+
+    {countsFailed && (
+      <p class="empty">
+        The totals across the top could not be read, so they are not shown. That is a failed read,
+        not a register with nothing in it, and the list below reports its own state separately.
+      </p>
+    )}
+
+    {counts && (
+      <div class="tiles">
+        <div class="tile"><span class="tile__n">{counts.people}</span><span class="tile__l">People who have applied</span></div>
+        <div class="tile"><span class="tile__n">{counts.applications}</span><span class="tile__l">Applications</span></div>
+        <div class="tile"><span class="tile__n">{counts.inProgress}</span><span class="tile__l">In progress</span></div>
+        <div class="tile"><span class="tile__n">{counts.decided}</span><span class="tile__l">Decision recorded</span></div>
+        <div class="tile"><span class="tile__n">{counts.onboarding}</span><span class="tile__l">In onboarding</span></div>
+        <div class="tile"><span class="tile__n">{counts.joined}</span><span class="tile__l">Joined</span></div>
+        <div class="tile"><span class="tile__n">{counts.openMerges}</span><span class="tile__l">Merges to decide</span></div>
+      </div>
+    )}
+
+    {showFootnote && (
+      <p class="footnote">
+        {multiPhrase} People and applications are counted separately on purpose: a register that
+        counted applications and called them candidates would overstate how many humans are in it.
+      </p>
+    )}
+
+    <form method="GET" class="filters">
+      <div class="tabs">
+        {STATUS_TABS.map((t) => (
+          <a
+            href={'/admin/talent/candidates?status=' + t.key
+              + (q ? '&q=' + encodeURIComponent(q) : '')
+              + (oppFilterOn ? '&opportunity=' + encodeURIComponent(oppParam) : '')}
+            class={t.key === status ? 'tab tab--on' : 'tab'}
+          >{t.label}</a>
+        ))}
+      </div>
+      <div class="search">
+        <input type="hidden" name="status" value={status} />
+        <select name="opportunity">
+          <option value="">Every opportunity</option>
+          {oppSelectionMissing && (
+            <option value={oppParam} selected>The opportunity in the address (its title is not loaded)</option>
+          )}
+          {oppOptions.map((o) => (
+            <option value={o.id} selected={o.selected}>{o.label}</option>
+          ))}
+        </select>
+        <input
+          type="text"
+          name="q"
+          value={q}
+          placeholder="Name, email, or an ERAI reference"
+        />
+        <button type="submit" class="btn">Search</button>
+        {isFiltered && <a class="btn" href={clearHref}>Clear</a>}
+      </div>
+    </form>
+
+    {opportunitiesFailed && !oppFilterStillOn && (
+      <p class="empty">
+        The opportunity filter could not be loaded just now, so it is showing no options. That is not
+        the same as there being no opportunities. No opportunity filter is applied, so the register
+        below is the whole of it.
+      </p>
+    )}
+
+    {oppFilterStillOn && (
+      <p class="empty">
+        The opportunity filter could not be loaded just now, so this screen cannot name the
+        opportunity. The one in the address <strong>is still applied</strong>: the register below is
+        filtered to it and is not the whole register. <a href={clearHref}>Clear the filters</a> to
+        see everyone.
+      </p>
+    )}
+
+    {oppFilterNotApplied && (
+      <p class="empty">
+        The opportunity in the address is not a reference this register can use, so the opportunity
+        filter <strong>was not applied</strong> and the register below is unfiltered by opportunity.
+        Choose one from the list, or <a href={clearHref}>clear the filters</a>.
+      </p>
+    )}
+
+    {oppFilterUnknown && (
+      <p class="empty">
+        The opportunity in the address is not one that has received an application, so the filter
+        matches nothing. Choose one from the list, or <a href={clearHref}>clear the filters</a>.
+      </p>
+    )}
+
+    {searchIsForeignCode && (
+      <div class="note note--warn">
+        <strong>{searchKindLabel}.</strong> What you pasted is a valid reference, but it is not a
+        candidate reference, so this register cannot resolve it and an empty result below would mean
+        nothing. Look in {search.belongsTo}.
+        {pastedOpportunity && (
+          <span>
+            {' '}That opportunity is <strong>{pastedOpportunity.title}</strong>:{' '}
+            <a href={'/admin/talent/candidates?status=' + encodeURIComponent(status) + '&opportunity=' + encodeURIComponent(pastedOpportunity.id)}>
+              show everyone who applied to it
+            </a>.
+          </span>
+        )}
+      </div>
+    )}
+
+    {detailFailed && (
+      <p class="empty">
+        That candidate record could not be read just now. This is not the same as the person not
+        existing, and nothing has been changed. The reason is in the message above.
+      </p>
+    )}
+
+    {detailMissing && (
+      <p class="empty">
+        No candidate record with that reference. <a href={clearHref}>Back to the register</a>.
+      </p>
+    )}
+
+    {detailPerson && (
+      <section class="detail">
+        <div class="detail__head">
+          <div>
+            <h2>{detailPerson.displayName || 'Unnamed'}</h2>
+            <span class="mono">{detailPerson.personCode}</span>
+            {detailPerson.candidateCode && <span class="mono">{detailPerson.candidateCode}</span>}
+            {detailPerson.primaryEmail && <span class="mono">{detailPerson.primaryEmail}</span>}
+            {detailPerson.primaryPhone && <span class="mono">{detailPerson.primaryPhone}</span>}
+            {detailPerson.country && <span class="mono">{detailPerson.country}</span>}
+          </div>
+          <a class="btn" href={clearHref}>Close</a>
+        </div>
+
+        {detailFollowedFrom && (
+          <p class="detail__note">
+            You asked for <span class="mono">{detailFollowedFrom}</span>, which was folded
+            into this record by a confirmed merge. This is the surviving record.
+          </p>
+        )}
+
+        {detailPerson.headline && <p class="detail__headline">{detailPerson.headline}</p>}
+
+        <p class="detail__note">
+          {detailCountNote} {detailPoolNote}
+        </p>
+
+        {detailHasFolded && (
+          <div class="detail__block">
+            <p class="detail__label">Records folded into this one</p>
+            <ul class="plain">
+              {detailFolded.map((f) => (
+                <li><span class="mono">{f.personCode}</span> {f.displayName}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {detailHasIdentifiers && (
+          <div class="detail__block">
+            <p class="detail__label">How this person is recognised</p>
+            <ul class="plain">
+              {detailIdentifiers.map((k) => (
+                <li>
+                  {k.label}: {k.count}
+                  {k.anyVerified ? ', at least one verified' : ', none verified'}
+                </li>
+              ))}
+            </ul>
+            <p class="detail__fine">
+              Kinds and counts only. The values themselves are not shown on this screen to anybody,
+              because an identifier row can hold anything from a partner system's reference to a
+              government-issued number.
+            </p>
+          </div>
+        )}
+
+        {detailHasApps && (
+          <div class="tablewrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Application</th>
+                  <th>Opportunity</th>
+                  <th>Status</th>
+                  <th>Stage</th>
+                  <th>Submitted</th>
+                </tr>
+              </thead>
+              <tbody>
+                {detailApplications.map((a) => (
+                  <tr>
+                    <td>
+                      <strong class="mono">{a.applicationCode}</strong>
+                      {a.isInternal && <span class="mono">Internal applicant</span>}
+                      {a.arrivedElsewhere && <span class="mono">Arrived on {a.onPersonCode}</span>}
+                    </td>
+                    <td>
+                      {a.opportunityTitle}
+                      {a.opportunityCode && <span class="mono">{a.opportunityCode}</span>}
+                      {a.departmentName && <span class="mono">{a.departmentName}</span>}
+                      {a.employmentType && <span class="mono">{a.employmentType}</span>}
+                    </td>
+                    <td><span class={a.bucketClass}>{a.statusLabel}</span></td>
+                    <td><span class="mono">{a.stageText}</span></td>
+                    <td>
+                      {a.submittedOn}
+                      {a.closedOn && <span class="mono">Closed {a.closedOn}</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    )}
+
+    {registerFailed && (
+      <p class="empty">
+        The register could not be read just now. This is not the same as nobody having applied, and
+        nothing has been changed. Reload; if it persists, the reason is in the message above.
+      </p>
+    )}
+
+    {pastEnd && (
+      <p class="empty">
+        There is nothing on this page of the register. That is the end of the list, not an empty
+        register: this page starts at person {registerFrom + 1} and the filter does not reach that
+        far. <a href={firstPageHref}>Back to the first page</a>.
+      </p>
+    )}
+
+    {!registerFailed && !hasRows && onFirstPage && isFiltered && (
+      <p class="empty">
+        No candidate matches that filter. The search covers a person's name, their email address, an
+        ERAI person, candidate or application reference, and any email or phone number recorded
+        against them.
+      </p>
+    )}
+
+    {!registerFailed && !hasRows && onFirstPage && !isFiltered && (
+      <p class="empty">
+        No candidates. This register reads the person spine — <span class="mono">tal_person</span>
+        and the applications hanging off it — and <strong>nothing in this build writes to it
+        yet</strong>. Every talent screen reads those tables and no code path inserts into them, so
+        this page reads empty however many people have applied elsewhere on the platform. That is a
+        missing intake path, not an answer about how many candidates exist.
+      </p>
+    )}
+
+    {showPaging && <p class="footnote">{pageRangeNote}</p>}
+
+    {hasRows && rows.map((c) => (
+      <article class="person">
+        <div class="person__head">
+          <div class="person__who">
+            <strong class="person__name">{c.displayName}</strong>
+            {c.preferredName && <span class="mono">Known as {c.preferredName}</span>}
+            <span class="mono">{c.personCode}</span>
+            {c.candidateCode && <span class="mono">{c.candidateCode}</span>}
+          </div>
+          <div class="person__contact">
+            {c.primaryEmail && <span class="mono">{c.primaryEmail}</span>}
+            {c.primaryPhone && <span class="mono">{c.primaryPhone}</span>}
+            {c.country && <span class="mono">{c.country}</span>}
+          </div>
+          <div class="person__meta">
+            <span class={c.manyApplications ? 'pill pill--live' : 'pill'}>{c.countPhrase}</span>
+            {c.talentPool && <span class="pill">Talent pool</span>}
+            <span class="mono">{c.lastSeen}</span>
+            <a class="btn" href={c.detailHref}>Open</a>
+          </div>
+        </div>
+
+        {c.headline && <p class="person__headline">{c.headline}</p>}
+        {c.foldedNote && <p class="person__note">{c.foldedNote}</p>}
+        {c.outsideFilterNote && <p class="person__note">{c.outsideFilterNote}</p>}
+
+        {c.hasApps && (
+          <div class="tablewrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Application</th>
+                  <th>Opportunity</th>
+                  <th>Status</th>
+                  <th>Stage</th>
+                  <th>Submitted</th>
+                </tr>
+              </thead>
+              <tbody>
+                {c.apps.map((a) => (
+                  <tr class={a.dimmed ? 'dim' : ''}>
+                    <td>
+                      <strong class="mono">{a.applicationCode}</strong>
+                      {a.isInternal && <span class="mono">Internal applicant</span>}
+                      {a.arrivedElsewhere && <span class="mono">Arrived on {a.onPersonCode}</span>}
+                    </td>
+                    <td>
+                      {a.opportunityTitle}
+                      {a.departmentName && <span class="mono">{a.departmentName}</span>}
+                    </td>
+                    <td><span class={a.bucketClass}>{a.statusLabel}</span></td>
+                    <td><span class="mono">{a.stageText}</span></td>
+                    <td>{a.submittedOn}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {!c.hasApps && !c.appsUnreadable && (
+          <p class="person__note">
+            No application recorded against this person yet. They are in the register because a
+            candidate profile exists for them.
+          </p>
+        )}
+
+        {c.appsUnreadable && (
+          <p class="person__note">
+            This person's applications could not be read back, so none are shown and the count above
+            is withheld. That is a failed read, not a person who has never applied.
+          </p>
+        )}
+      </article>
+    ))}
+
+    {showPaging && (
+      <p class="footnote">
+        {registerHasPrev && <a href={prevHref}>Previous 100</a>}
+        {registerHasPrev && registerHasMore && <span> · </span>}
+        {registerHasMore && <a href={nextHref}>Next 100</a>}
+      </p>
+    )}
+
+    <section class="merges">
+      <h2>Possible duplicate people</h2>
+      <p class="sub">
+        Pairs of records that may be the same human. Each one is a <strong>proposal</strong> and
+        nothing acts on it by itself. Matching on an email address alone merges two people who once
+        shared a college address and splits one person who changed jobs, so the confidence below is
+        advisory and a person decides.
+      </p>
+
+      {proposalsFailed && (
+        <p class="empty">
+          The merge queue could not be read just now. This is not the same as there being no
+          duplicates to look at, and nothing has been changed.
+        </p>
+      )}
+
+      {reviewNotFound && !proposalsTruncated && (
+        <p class="empty">
+          That merge proposal is not in the open queue. It may have been decided already.{' '}
+          <a href={clearHref}>Back to the register</a>.
+        </p>
+      )}
+
+      {reviewNotFound && proposalsTruncated && (
+        <p class="empty">
+          That merge proposal is not on this page of the queue, and there are more open proposals
+          than this page shows — so it may simply be beyond the ones listed rather than decided.
+          Nothing has been checked about it either way. <a href={clearHref}>Back to the register</a>.
+        </p>
+      )}
+
+      {reviewing && (
+        <div class="review">
+          <p class="review__eyebrow">Before you confirm</p>
+          {reviewLines.map((line) => <p class="review__line">{line}</p>)}
+
+          <p class="review__meta">
+            {reviewBandLabel}{reviewEvidenceLine}.
+            The band is advisory; it orders this queue and decides nothing.
+          </p>
+
+          {reviewOverlapUnchecked && (
+            <p class="review__meta">
+              The check for a duplicate application to the same opportunity did not run for this
+              pair, so nothing below should be read as it having found none. Either the two records'
+              applications could not be loaded, or one of the records has already been folded
+              elsewhere, in which case both sides resolve to the same surviving record and the
+              comparison would be meaningless.
+            </p>
+          )}
+
+          {reviewHasOverlap && (
+            <p class="review__warn">
+              Both records applied to the same opportunity: {reviewOverlapText}. Confirming the merge
+              does <strong>not</strong> resolve that duplicate application. Both submissions remain,
+              and both stay in whatever stage they reached, so close one deliberately afterwards.
+            </p>
+          )}
+
+          {reviewProblem && <p class="review__warn">{reviewProblem}</p>}
+
+          {reviewCanAct && (
+            <div class="review__acts">
+              {reviewCanConfirm && (
+                <form method="POST" class="review__form">
+                  <input type="hidden" name="_action" value="confirm_merge" />
+                  <input type="hidden" name="mergeId" value={reviewing.id} />
+                  <label class="review__label">
+                    Why these are one person
+                    <textarea name="reason" rows="3" required minlength={MIN_MERGE_REASON}
+                      placeholder="How you established it. This is permanent and it is what anybody reading the record later has to go on."></textarea>
+                  </label>
+                  <button type="submit" class="btn btn--warn">Confirm they are one person</button>
+                </form>
+              )}
+              {reviewCanReject && (
+                <form method="POST" class="review__form">
+                  <input type="hidden" name="_action" value="reject_merge" />
+                  <input type="hidden" name="mergeId" value={reviewing.id} />
+                  <label class="review__label">
+                    Why these are two people
+                    <textarea name="reason" rows="3" required minlength={MIN_MERGE_REASON}
+                      placeholder="So the next person to see this pair knows it was looked at."></textarea>
+                  </label>
+                  <button type="submit" class="btn btn--go">Record as two different people</button>
+                </form>
+              )}
+            </div>
+          )}
+
+          {!mayManage && (
+            <p class="review__meta">
+              You can read this proposal. Deciding it needs the talent management desk.
+            </p>
+          )}
+
+          <p class="review__meta"><a href={clearHref}>Leave it undecided</a></p>
+        </div>
+      )}
+
+      {!proposalsFailed && !hasQueue && (
+        <p class="empty">
+          No open merge proposals, and that means nothing has been proposed — not that duplicates
+          have been ruled out. Nothing in this build writes a proposal: no identifier-matching pass
+          exists yet, so this queue stays empty until one is built, however many duplicate records
+          the register holds. The screen is here to decide proposals, and it does not find them.
+        </p>
+      )}
+
+      {proposalsTruncated && (
+        <p class="footnote">
+          More open proposals exist than this page shows. The {QUEUE_PAGE} most recently raised are
+          listed; the rest are not on this screen and have not been ruled out.
+        </p>
+      )}
+
+      {hasQueue && (
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Record to keep</th>
+                <th>Record to fold in</th>
+                <th>Evidence</th>
+                <th>Raised</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {queue.map((p) => (
+                <tr class={p.isOpen ? 'open' : ''}>
+                  <td>
+                    <strong>{p.keepName}</strong>
+                    <span class="mono">{p.keepCode}</span>
+                    {p.keepEmail && <span class="mono">{p.keepEmail}</span>}
+                    <span class="mono">{p.keepPhrase}</span>
+                  </td>
+                  <td>
+                    <strong>{p.foldName}</strong>
+                    <span class="mono">{p.foldCode}</span>
+                    {p.foldEmail && <span class="mono">{p.foldEmail}</span>}
+                    <span class="mono">{p.foldPhrase}</span>
+                  </td>
+                  <td>
+                    <span class={p.bandClass}>{p.bandLabel}</span>
+                    {p.hasSignals && <span class="mono">Matched on: {p.signalsText}</span>}
+                    {p.noEvidence && <span class="mono">No evidence recorded</span>}
+                    {p.evidenceUnreadable && <span class="mono warn">The recorded evidence could not be read</span>}
+                    {p.alreadyFolded && <span class="mono warn">One of these records has already been folded elsewhere</span>}
+                  </td>
+                  <td><span class="mono">{p.raisedOn}</span></td>
+                  <td>
+                    <a class="btn" href={p.reviewHref}>Review</a>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  </div>
+</AdminLayout>
+
+<style>
+  .wrap { padding: 20px; max-width: 1400px; }
+  .head h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #9aa0aa; font-size: 13px; margin: 0 0 16px; max-width: 80ch; line-height: 1.6; }
+  .sub a, .empty a, .note a, .footnote a { color: inherit; }
+  .explain {
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px 14px;
+    margin-bottom: 18px; max-width: 90ch;
+  }
+  .explain__title { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  .explain p { font-size: 12px; color: #9aa0aa; line-height: 1.6; margin: 0 0 6px; }
+  .explain p:last-child { margin-bottom: 0; }
+  .note { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; line-height: 1.55; }
+  .note--ok { background: rgba(46,160,90,0.12); border: 1px solid rgba(46,160,90,0.4); }
+  .note--err { background: rgba(200,60,60,0.12); border: 1px solid rgba(200,60,60,0.4); }
+  .note--warn { background: rgba(255,190,80,0.08); border: 1px solid rgba(255,190,80,0.45); }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 10px; }
+  .tile { border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .tile__n { font-size: 22px; font-weight: 600; }
+  .tile__l { font-size: 11px; color: #9aa0aa; text-transform: uppercase; letter-spacing: 0.06em; }
+  .footnote { font-size: 12px; color: #8b919b; max-width: 80ch; line-height: 1.6; margin: 0 0 16px; }
+  .filters { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-bottom: 12px; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tab {
+    font-size: 12px; padding: 5px 10px; border-radius: 999px; text-decoration: none; color: #9aa0aa;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .tab--on { color: inherit; border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.06); }
+  .search { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .search input[type=text] { min-width: 280px; }
+  .person {
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 14px;
+    margin-bottom: 14px;
+  }
+  .person__head { display: flex; gap: 16px; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; }
+  .person__who, .person__contact { display: flex; flex-direction: column; gap: 2px; min-width: 200px; }
+  .person__meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .person__name { font-size: 15px; }
+  .person__headline { font-size: 12px; color: #b9bec7; margin: 8px 0 0; max-width: 90ch; line-height: 1.55; }
+  .person__note { font-size: 12px; color: #8b919b; margin: 8px 0 0; max-width: 90ch; line-height: 1.55; }
+  .person .tablewrap { margin-top: 10px; }
+  .detail {
+    border: 1px solid rgba(255,255,255,0.25); border-radius: 8px; padding: 14px 16px;
+    margin-bottom: 18px; background: rgba(255,255,255,0.03);
+  }
+  .detail__head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+  .detail__head h2 { font-size: 17px; margin: 0 0 4px; }
+  .detail__headline { font-size: 13px; color: #b9bec7; margin: 10px 0 0; max-width: 90ch; line-height: 1.55; }
+  .detail__note { font-size: 12px; color: #9aa0aa; margin: 10px 0 0; max-width: 90ch; line-height: 1.6; }
+  .detail__fine { font-size: 11px; color: #8b919b; margin: 6px 0 0; max-width: 80ch; line-height: 1.55; }
+  .detail__block { margin-top: 14px; }
+  .detail__label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; margin: 0 0 4px; }
+  .detail .tablewrap { margin-top: 14px; }
+  .plain { list-style: none; padding: 0; margin: 0; font-size: 12px; color: #b9bec7; line-height: 1.7; }
+  .merges { margin-top: 26px; }
+  .merges h2 { font-size: 16px; margin: 0 0 4px; }
+  .review {
+    border: 1px solid rgba(255,190,80,0.5); background: rgba(255,190,80,0.08);
+    border-radius: 8px; padding: 14px 16px; margin-bottom: 16px;
+  }
+  .review__eyebrow { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 8px; color: #d9b169; }
+  .review__line { font-size: 13px; margin: 0 0 6px; max-width: 90ch; line-height: 1.6; }
+  .review__meta { font-size: 12px; color: #b9bec7; margin: 10px 0 0; max-width: 90ch; line-height: 1.55; }
+  .review__warn { font-size: 12px; color: #e8b98b; margin: 10px 0 0; max-width: 90ch; line-height: 1.55; }
+  .review__acts { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 14px; }
+  .review__form { display: flex; flex-direction: column; gap: 6px; min-width: 300px; flex: 1; }
+  .review__label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; display: flex; flex-direction: column; gap: 4px; }
+  .review__form textarea {
+    width: 100%; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.14);
+    color: inherit; border-radius: 5px; padding: 8px 10px; font-size: 12px; line-height: 1.55;
+    font-family: inherit; resize: vertical;
+  }
+  .review__form button { align-self: flex-start; }
+  .tablewrap { overflow-x: auto; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 860px; }
+  th { text-align: left; padding: 10px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #9aa0aa; border-bottom: 1px solid rgba(255,255,255,0.1); }
+  td { padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.06); vertical-align: top; }
+  td strong { display: block; }
+  tr.dim td { opacity: 0.55; }
+  tr.open td { background: rgba(255,190,80,0.07); }
+  .mono { display: block; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #8b919b; margin-top: 2px; }
+  .mono.warn { color: #d9a05b; }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.18); }
+  .pill--live { border-color: rgba(46,160,90,0.55); color: #7fd6a0; }
+  .pill--used { border-color: rgba(120,150,220,0.5); color: #a8bdf0; }
+  .pill--off { border-color: rgba(200,60,60,0.5); color: #e08b8b; }
+  .btn { border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.06); color: inherit; padding: 6px 10px; border-radius: 5px; font-size: 12px; cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn--go { border-color: rgba(46,160,90,0.5); }
+  .btn--warn { border-color: rgba(200,60,60,0.5); }
+  input[type=text], select {
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.14); color: inherit;
+    padding: 5px 7px; border-radius: 4px; font-size: 12px;
+  }
+  .empty { color: #9aa0aa; font-size: 13px; max-width: 80ch; line-height: 1.6; margin: 0 0 14px; }
+</style>

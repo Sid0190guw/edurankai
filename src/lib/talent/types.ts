@@ -348,11 +348,35 @@ export const UNIFORM_REJECTION =
   'That code is not valid for onboarding. If you were told to expect one, reply to the message you '
   + 'received from EduRankAI and the people desk will check it for you.';
 
-/** Unambiguous alphabet: no 0/O, no 1/I/L. 32 symbols, 15 characters, ~75 bits — spec 16.1. */
+/**
+ * Unambiguous alphabet: no 0/O and no 1/I. 32 symbols, 15 characters, ~75 bits — spec 16.1.
+ *
+ * L IS IN THIS ALPHABET, AND THIS COMMENT USED TO SAY IT WAS NOT. Every surface that tells a
+ * candidate which characters a code cannot contain either reads CODE_ALPHABET or repeats this
+ * sentence, and /apply/gateway repeated the wrong version — telling somebody holding a perfectly
+ * good code containing L that they had mistyped it. Dropping L from the alphabet instead would make
+ * every already-issued code containing one permanently unredeemable, so the alphabet is canonical
+ * and the words follow it. Count it: 8 digits plus 24 letters, I and O removed, is 32.
+ */
 export const CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 export const CODE_GROUP_LEN = 5;
 export const CODE_GROUPS = 3;
 export const CODE_BODY_LEN = CODE_GROUP_LEN * CODE_GROUPS;
+
+/**
+ * The human-facing prefix a code is DISPLAYED with: ERA-SEL-XXXXX-XXXXX-XXXXX.
+ *
+ * NOT PART OF THE SECRET AND NEVER STORED. formatSecret() adds it, normaliseCode() strips it, and
+ * the hash is taken over the 15-character body alone — so a code issued before this prefix existed
+ * still redeems, and a candidate who pastes the prefix and one who drops it both get in.
+ *
+ * IT EXISTS BECAUSE THE FRONT DOOR ALREADY PROMISED IT. /apply/gateway has told every candidate
+ * since launch that they were "sent a code beginning ERA-SEL", while issueCode() minted a bare body
+ * with no prefix at all — so the people desk was sharing codes that did not look like the thing the
+ * candidate had been told to expect. One of the two had to become true. Making the display match
+ * the promise costs no entropy and breaks nothing already issued.
+ */
+export const CODE_DISPLAY_PREFIX = 'ERA-SEL';
 
 export const CODE_LIMITS = {
   /** Per IP, per window. Spec 16.5. */
