@@ -17,10 +17,14 @@ established pattern here is that migrations are handed over as a command.
 psql "$DATABASE_URL" -f db/xscale-schema.sql
 ```
 
-**Evidence.** `/api/careers/search` answers `"degraded": true` to every query, including one with no
-filters at all. That flag is `listOpportunities()` reporting that its real statement failed and the
-narrowed retry answered instead — and the real statement joins `divisions`, which only this file
-creates.
+**Evidence.** Confirmed by `/api/health` on 2026-08-24 once `divisions` and five of the `roles`
+columns were added to its watch lists: `schemas.missingCount` rose by exactly 1 and
+`columns.missingCount` by exactly 5 — every object this file creates that is monitored is absent.
+
+It was first found the harder way, and that is worth keeping: `/api/careers/search` answers
+`"degraded": true` to every query, including one with no filters at all. That flag is
+`listOpportunities()` reporting that its real statement failed and the narrowed retry answered
+instead — and the real statement joins `divisions`, which only this file creates.
 
 **What is broken until it runs.** The public careers search silently ignores its own division,
 classification, scale-band and discipline filters: the result is *wider* than what was asked for,
@@ -53,16 +57,30 @@ parent or teacher cannot open one.
 
 ---
 
-## 3. One registered module table, name not visible from outside
+## 3. One more registered module table, name not visible from outside
 
-`/api/health` reports `schemas: { ran: 48, expected: 49, missingCount: 1 }`. The public endpoint
-deliberately gives a count and not the name — the inventory of internal tables is not something a
-stranger needs. **The name is on `/api/health/deep` or the `/admin/ops` bootstrap panel**, both of
-which need an operator sign-in.
+As of 2026-08-24 `/api/health` reports:
+
+```
+schemas: { ran: 48, expected: 51, missingCount: 3 }
+columns: { present: 5, expected: 10, missingCount: 5 }
+```
+
+Two of those three tables and all five columns are items 1 and 2 above. **One table is left over**,
+and the public endpoint deliberately gives a count rather than a name — a stranger does not need the
+inventory of internal tables. **The name is on `/api/health/deep` or the `/admin/ops` bootstrap
+panel**, both of which need an operator sign-in.
 
 Most likely `application_invitations`: it was added to `BOOTSTRAP_MODULES` by the most recent commit
 to touch that list, and `db/application-invitations-schema.sql` is committed but there is no evidence
 it has been run.
+
+```bash
+psql "$DATABASE_URL" -f db/application-invitations-schema.sql
+```
+
+**Running all three files takes the endpoint to `schemas 51/51` and `columns 10/10`.** That is the
+whole outstanding set, as far as anything currently watched can see.
 
 ---
 
