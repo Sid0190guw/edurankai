@@ -41,6 +41,13 @@ import { quickHealth, publicErrorSummary } from '@/lib/observability-health';
 // turn an outage into a 503 reported nothing at all for the quarter hour the site was down. The
 // catch below was always correct; it simply never ran, because the query never rejected.
 import { withDbTimeout } from '@/lib/db';
+// TWO IN-PROCESS COUNTERS, NO EXTRA QUERIES. Both answer questions this endpoint could not answer
+// during the incident it was written for: is the database circuit currently open (so reads are being
+// refused instantly rather than waited out), and is request-time DDL still being attempted by
+// bootstraps that never got onto ensureOnce. A guard nobody can see is the next invisible incident,
+// and this project has already shipped one bootstrap that reported success while doing nothing.
+import { dbCircuitState } from '@/lib/db-timeout';
+import { suppressedDdlState } from '@/lib/schema-bootstrap';
 
 export const prerender = false;
 
@@ -66,6 +73,11 @@ export const GET: APIRoute = async () => {
       at: h.at,
       database: { ok: h.database.ok, latencyMs: h.database.latencyMs, ...(publicDbError ? { error: publicDbError } : {}) },
       schemas: { ran: h.schemas.ran, expected: h.schemas.expected, missingCount: h.schemas.missing.length },
+      // Per-instance, not site-wide: a serverless deployment has many instances and this is whichever
+      // one answered. Non-zero `suppressed` means a bootstrap is still trying to run DDL on the
+      // request path; the sample list names which statements, in the function logs.
+      ddl: (() => { const d = suppressedDdlState(); return { bootstrapEnabled: d.bootstrapEnabled, suppressed: d.count, samples: d.samples.slice(0, 5) }; })(),
+      dbCircuit: dbCircuitState(),
       release: { commit: h.release.shortCommit, ref: h.release.ref, environment: h.release.environment, region: h.release.region, known: h.release.known },
       checks: h.checks.map((c) => ({
         name: c.name,

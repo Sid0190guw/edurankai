@@ -297,6 +297,8 @@ export const REQUIREMENTS: readonly EnvRequirement[] = Object.freeze([
   { name: 'DB_TIMEOUT_MS', severity: 'optional',
     breaks: 'Nothing, unless the database stops answering. It bounds how long a query may hang before withDbTimeout() rejects it, and it defaults to 8000ms. On 2026-08-23 the transaction pooler accepted connections and authenticated fine while never answering a query, so postgres-js waited forever and /api/health hung along with every other route — meaning nothing anywhere reported an outage that had been running for a quarter of an hour. Keep it well under the platform gateway timeout so the page decides what a visitor sees rather than the platform.' },
 
+  { name: 'DB_CIRCUIT_COOLDOWN_MS', severity: 'optional',
+    breaks: 'Nothing, unless the database stops answering. After a bounded wait times out, further database waits are refused INSTANTLY for this long instead of each waiting out its own DB_TIMEOUT_MS; it defaults to 5000ms. This is what makes a per-query timeout sufficient on a page with a dozen reads: /admin issues roughly twelve sequential reads, and twelve consecutive 8-second timeouts is ninety-six seconds, which is still a gateway timeout. With the circuit, the same page costs one timeout and eleven instant refusals and renders its degraded state. Nothing here retries anything, so raising it only delays recovery; the first call after the cooldown is let through to find out whether the database is back.' },
   { name: 'VERCEL_GIT_COMMIT_SHA', severity: 'optional',
     breaks: 'Nothing to set — the host injects it. The health endpoint and the metrics payload cannot say which commit is serving, which is the first question asked when two deployments behave differently.' },
 ]);
