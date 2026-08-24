@@ -3,6 +3,7 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { computeIntegrityScore, EVENT_SEVERITY, RISK_BAND_COLORS } from '@/lib/proctoring-integrity';
+import { withDbRetry, isDbUnavailable } from '@/lib/db-timeout';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -14,27 +15,49 @@ if (!id) return Astro.redirect('/admin/tests/attempts');
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
 // Load the attempt and events. Test_attempts uses started_at not created_at.
+//
+// Both reads are bounded. Unbounded, one stalled connection held this page open until the gateway
+// killed the invocation, and a reviewer waiting on an integrity decision got a blank tab instead of
+// a page that says what it does not know.
 let attempt: any = null;
 let events: any[] = [];
+// Kept per read. An unreadable event log used to be indistinguishable from an empty one, and this
+// page turned the empty one into a green 100/100 CLEAN badge — a fabricated exoneration on a screen
+// where a human decides. Proctoring here is advisory only, so the honest answer is "no score".
+let eventsError = '';
+let eventsDbDown = false;
 try {
-  attempt = rows(await db.execute(sql`
+  attempt = rows(await withDbRetry(() => db.execute(sql`
     SELECT a.id, a.test_id, a.candidate_email, a.candidate_name, a.status,
       a.started_at, a.submitted_at, a.total_score, a.auto_score, a.percentage,
       t.title AS test_title, t.slug AS test_slug
     FROM test_attempts a LEFT JOIN tests t ON t.id = a.test_id
     WHERE a.id = ${id} LIMIT 1
-  `))[0];
-} catch (e) { /* swallow — render empty state below */ }
+  `), 'integrity.attempt'))[0];
+} catch (e: any) {
+  // The redirect below is the right fail-closed answer, but it used to be undiagnosable: an admin
+  // reported "it just bounces me back" and there was nothing in the log to tell a stall from a
+  // deleted attempt.
+  console.error('[integrity] attempt read failed:', e?.cause?.message || e?.message);
+}
 if (!attempt) return Astro.redirect('/admin/tests/attempts');
 
 try {
-  events = rows(await db.execute(sql`
+  events = rows(await withDbRetry(() => db.execute(sql`
     SELECT event_type AS type, severity, detail, client_ts, created_at
     FROM test_attempt_events WHERE attempt_id = ${id}
     ORDER BY COALESCE(client_ts, created_at) ASC LIMIT 2000
-  `));
-} catch (e) { events = []; }
+  `), 'integrity.events'));
+} catch (e: any) {
+  events = [];
+  eventsError = String(e?.cause?.message || e?.message || 'unknown error');
+  eventsDbDown = isDbUnavailable(e);
+  console.error('[integrity] event log read failed:', eventsError);
+}
 
+// Still computed here, but consumed ONLY in the !eventsUnreadable branch below: computeIntegrityScore([])
+// scores 100 and bands 'clean', which is exactly the sentence this page must not say when it did not read.
+const eventsUnreadable = eventsError !== '';
 const result = computeIntegrityScore(events);
 const band = RISK_BAND_COLORS[result.riskBand];
 
@@ -59,7 +82,22 @@ const totalDuration = startTs ? Math.max(1, endTs - startTs) : 1;
     <p style="font-size:13px;color:#9aa6b6;margin:0;">{attempt.candidate_name || attempt.candidate_email} · {fmt(attempt.started_at)}</p>
   </div>
 
-  <!-- Integrity score card -->
+  <!-- Integrity score card.
+       When the event log could not be read this card does not render at all. It used to: an empty
+       events array scores 100/100 and bands 'clean', so a reviewer was handed a green CLEAN badge
+       and four zero counts for an attempt nobody had actually looked at. A suppressed score is
+       something a human can act on; a fabricated one is not. -->
+  {eventsUnreadable ? (
+  <div style="background:#0f0f14;border:1px solid #2a3038;border-radius:14px;padding:24px;margin-top:16px;">
+    <p style="font-size:11px;letter-spacing:0.14em;text-transform:uppercase;font-family:'Geist Mono',monospace;color:#9aa6b6;font-weight:700;margin:0 0 10px;">Integrity score not available</p>
+    <p style="font-size:15px;color:#fff;margin:0 0 8px;line-height:1.5;font-weight:600;">The event log for this attempt could not be read, so no integrity score can be shown. This is not a clean result.</p>
+    <p style="font-size:12.5px;color:#9aa6b6;margin:0 0 14px;line-height:1.6;max-width:70ch;">{eventsDbDown ? 'The database did not answer in time. Nothing about this attempt changed and no flag was cleared, the log simply was not read on this request.' : 'The query for the events on this attempt failed. This is a problem on our side, not with this attempt or this candidate.'} Please do not decide on this attempt from this screen until the log loads.</p>
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+      <a href={'/admin/tests/attempts/' + id + '/integrity'} style="display:inline-block;background:rgba(255,112,64,0.12);border:1px solid rgba(255,112,64,0.4);color:#FF7040;font-family:'Geist Mono',monospace;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;padding:7px 16px;border-radius:100px;text-decoration:none;">Try again</a>
+      <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:#6e6e78;word-break:break-word;">{eventsError}</span>
+    </div>
+  </div>
+  ) : (
   <div style={`background:${band.bg};border:1px solid ${band.border};border-radius:14px;padding:24px;margin-top:16px;display:grid;grid-template-columns:auto 1fr auto;gap:20px;align-items:center;flex-wrap:wrap;`}>
     <div style="text-align:center;">
       <p style="font-size:11px;letter-spacing:0.14em;text-transform:uppercase;font-family:'Geist Mono',monospace;color:#9aa6b6;font-weight:700;margin:0 0 6px;">Integrity Score</p>
@@ -93,6 +131,7 @@ const totalDuration = startTs ? Math.max(1, endTs - startTs) : 1;
       <p style="font-size:11px;color:#FF7040;margin:6px 0 0;font-family:'Geist Mono',monospace;">{result.flaggedEvents} flagged</p>
     </div>
   </div>
+  )}
 
   <!-- Top flag types -->
   {result.topFlags.length > 0 && (
@@ -116,10 +155,11 @@ const totalDuration = startTs ? Math.max(1, endTs - startTs) : 1;
 
   <!-- Event timeline -->
   <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:18px;margin-top:14px;">
-    <p style="font-size:11px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 6px;font-family:'Geist Mono',monospace;font-weight:700;">Event timeline ({events.length})</p>
-    <p style="font-size:11.5px;color:#6e6e78;margin:0 0 14px;line-height:1.5;">Hover an event for detail. Coloured by category. Position on the bar is proportional to time-in-attempt.</p>
+    <p style="font-size:11px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 6px;font-family:'Geist Mono',monospace;font-weight:700;">Event timeline ({eventsUnreadable ? '—' : events.length})</p>
+    <p style="font-size:11.5px;color:#6e6e78;margin:0 0 14px;line-height:1.5;">{eventsUnreadable ? 'The timeline is not shown because the log behind it could not be read.' : 'Hover an event for detail. Coloured by category. Position on the bar is proportional to time-in-attempt.'}</p>
 
-    {startTs && (
+    <!-- An empty bar reads as "nothing happened during this attempt", so it is not drawn from a log we failed to read. -->
+    {startTs && !eventsUnreadable && (
       <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:12px;margin-bottom:14px;position:relative;height:48px;">
         {events.map((e: any) => {
           const ts = e.client_ts ? new Date(e.client_ts).getTime() : new Date(e.created_at).getTime();
@@ -147,7 +187,13 @@ const totalDuration = startTs ? Math.max(1, endTs - startTs) : 1;
           </div>
         );
       })}
-      {events.length === 0 && <div style="text-align:center;color:#6e6e78;padding:24px;font-size:12px;">No events logged for this attempt.</div>}
+      {!eventsUnreadable && events.length === 0 && <div style="text-align:center;color:#6e6e78;padding:24px;font-size:12px;">No events logged for this attempt.</div>}
+      {eventsUnreadable && (
+        <div style="text-align:center;color:#fbbf24;padding:24px;font-size:12.5px;line-height:1.6;">
+          <p style="margin:0 0 6px;font-weight:600;">This log could not be read just now, so it is not empty and it is not clean.</p>
+          <p style="margin:0;color:#9aa6b6;font-size:11.5px;">Every event recorded for this attempt is still stored. Reload to read it again.</p>
+        </div>
+      )}
     </div>
   </div>
 </div>

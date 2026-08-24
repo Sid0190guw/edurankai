@@ -31,6 +31,7 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
+import { withDbRetry } from '@/lib/db-timeout';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 const errText = (e: any): string => e?.cause?.message || e?.message || String(e);
@@ -1329,11 +1330,22 @@ export async function deleteCycle(userId: string, cycleId: string): Promise<{ ok
   }
 }
 
-/** Newest first. Dates come back as text so nothing has to guess at a timezone. */
-export async function listCycles(userId: string, limit = 24): Promise<CycleRow[]> {
+/**
+ * Newest first. Dates come back as text so nothing has to guess at a timezone.
+ *
+ * DISCRIMINATED, for the same reason the consultant queue below is. A failed read used to come back
+ * as [], and [] on this page means "Nothing logged yet" over months of her own record — which then
+ * invites her to log a period she already logged. `{ ok:false, reason }` lets the page say the one
+ * true thing instead: it could not be read, and nothing has gone missing.
+ *
+ * The read is bounded because the honest state has to be reachable. Unbounded, a stalled connection
+ * ran past the platform's function budget and she got a gateway timeout rather than any sentence at
+ * all. withDbRetry is right here: this is a pure owner-scoped SELECT, so a second attempt is safe.
+ */
+export async function listCyclesRead(userId: string, limit = 24): Promise<WellnessRead<CycleRow[]>> {
   try {
     await ensureWellnessSchema();
-    const r = await db.execute(sql`
+    const r = await withDbRetry(() => db.execute(sql`
       SELECT id,
              to_char(started_on, 'YYYY-MM-DD') AS started_on,
              to_char(ended_on, 'YYYY-MM-DD') AS ended_on,
@@ -1342,18 +1354,28 @@ export async function listCycles(userId: string, limit = 24): Promise<CycleRow[]
       WHERE user_id = ${userId}::uuid
       ORDER BY started_on DESC
       LIMIT ${Math.max(1, Math.min(200, Math.floor(limit)))}
-    `);
-    return rows(r).map((x) => ({
-      id: x.id,
-      startedOn: x.started_on,
-      endedOn: x.ended_on || null,
-      flow: x.flow || null,
-      notes: x.notes || null,
-    }));
+    `), 'wellness.listCycles');
+    return {
+      ok: true,
+      value: rows(r).map((x) => ({
+        id: x.id,
+        startedOn: x.started_on,
+        endedOn: x.ended_on || null,
+        flow: x.flow || null,
+        notes: x.notes || null,
+      })),
+    };
   } catch (e: any) {
-    console.error('[wellness] listCycles:', errText(e));
-    return [];
+    const reason = errText(e);
+    console.error('[wellness] listCycles:', reason);
+    return { ok: false, reason };
   }
+}
+
+/** The list on its own, for callers that have nowhere to put a failure. Prefer listCyclesRead. */
+export async function listCycles(userId: string, limit = 24): Promise<CycleRow[]> {
+  const r = await listCyclesRead(userId, limit);
+  return r.ok ? r.value : [];
 }
 
 export interface SymptomRow {
@@ -1391,28 +1413,43 @@ export async function logSymptom(
   }
 }
 
-export async function listSymptoms(userId: string, sinceDays = 90, limit = 200): Promise<SymptomRow[]> {
+/**
+ * Discriminated for the same reason as the cycle list: an unreadable three months of symptoms and a
+ * genuinely quiet three months are opposite facts, and only one of them means "there is no pattern
+ * here". Bounded so the page can say which one it is before the gateway gives up.
+ */
+export async function listSymptomsRead(userId: string, sinceDays = 90, limit = 200): Promise<WellnessRead<SymptomRow[]>> {
   const days = Math.max(1, Math.min(730, Math.floor(sinceDays)));
   try {
     await ensureWellnessSchema();
-    const r = await db.execute(sql`
+    const r = await withDbRetry(() => db.execute(sql`
       SELECT id, to_char(logged_on, 'YYYY-MM-DD') AS logged_on, symptom, severity, note
       FROM wellness_symptoms
       WHERE user_id = ${userId}::uuid AND logged_on >= (CURRENT_DATE - make_interval(days => ${days}::int))
       ORDER BY logged_on DESC, created_at DESC
       LIMIT ${Math.max(1, Math.min(500, Math.floor(limit)))}
-    `);
-    return rows(r).map((x) => ({
-      id: x.id,
-      loggedOn: x.logged_on,
-      symptom: x.symptom,
-      severity: Number(x.severity) || 1,
-      note: x.note || null,
-    }));
+    `), 'wellness.listSymptoms');
+    return {
+      ok: true,
+      value: rows(r).map((x) => ({
+        id: x.id,
+        loggedOn: x.logged_on,
+        symptom: x.symptom,
+        severity: Number(x.severity) || 1,
+        note: x.note || null,
+      })),
+    };
   } catch (e: any) {
-    console.error('[wellness] listSymptoms:', errText(e));
-    return [];
+    const reason = errText(e);
+    console.error('[wellness] listSymptoms:', reason);
+    return { ok: false, reason };
   }
+}
+
+/** The list on its own, for callers that have nowhere to put a failure. Prefer listSymptomsRead. */
+export async function listSymptoms(userId: string, sinceDays = 90, limit = 200): Promise<SymptomRow[]> {
+  const r = await listSymptomsRead(userId, sinceDays, limit);
+  return r.ok ? r.value : [];
 }
 
 export async function deleteSymptom(userId: string, id: string): Promise<{ ok: boolean }> {
@@ -1450,10 +1487,12 @@ export interface WellnessSettings {
 export async function getSettings(userId: string): Promise<WellnessSettings> {
   try {
     await ensureWellnessSchema();
-    const r = await db.execute(sql`
+    // Bounded: this is the second read on the wellness page's path, and an unbounded wait here spent
+    // the budget that the cycle read's honest failure line needs in order to reach the screen at all.
+    const r = await withDbRetry(() => db.execute(sql`
       SELECT reminders_enabled, average_cycle_days, last_reviewed_at
       FROM wellness_settings WHERE user_id = ${userId}::uuid LIMIT 1
-    `);
+    `), 'wellness.getSettings');
     const row = rows(r)[0];
     if (!row) return { remindersEnabled: false, averageCycleDays: null, lastReviewedAt: null };
     return {
@@ -1503,12 +1542,32 @@ export interface CycleOverview {
   phase: CyclePhase;
   prediction: Prediction;
   guidance: PhaseGuidance;
+  /**
+   * TRUE when her cycle record could not be READ, not when there is nothing in it.
+   *
+   * Every zero and null in this object is then a zero we could not check, and the page must not
+   * draw the first-run screen off them. `cyclesLogged: 0` is left as it is deliberately — it is the
+   * count of what we have in hand, and this flag is what says the count is not a fact about her.
+   */
+  readFailed: boolean;
 }
 
-/** Everything one page needs about her own cycle, in a single round trip. */
+/** Everything one page needs about her own cycle. */
 export async function cycleOverview(userId: string): Promise<CycleOverview> {
-  const [cycles, settings] = await Promise.all([listCycles(userId, 24), getSettings(userId)]);
+  // Sequential, not Promise.all. The pool is small and these two reads fan out to two connections
+  // for no gain; on a struggling database the second connection is exactly what is scarce.
+  const cyclesRead = await listCyclesRead(userId, 24);
+  const cycles = cyclesRead.ok ? cyclesRead.value : [];
+  const settings = await getSettings(userId);
   const phase = currentPhase(cycles);
+  const prediction = predictNext(cycles, { overrideCycleDays: settings.averageCycleDays });
+  // predictNext over an empty list says "Nothing is logged yet, so there is nothing to estimate
+  // from" — true of an empty record, a lie about one we failed to read. The basis line is printed
+  // verbatim beside the date, so it is the sentence that has to change.
+  if (!cyclesRead.ok) {
+    prediction.basis =
+      'Your record could not be read just now, so nothing has been estimated from it. This is not saying you have logged nothing — everything you have logged is still there. Please try again in a moment.';
+  }
   return {
     cycles,
     cyclesLogged: cycles.length,
@@ -1517,8 +1576,9 @@ export async function cycleOverview(userId: string): Promise<CycleOverview> {
     lastStart: cycles.length ? cycles[0].startedOn : null,
     dayOfCycle: cycleDay(cycles),
     phase,
-    prediction: predictNext(cycles, { overrideCycleDays: settings.averageCycleDays }),
+    prediction,
     guidance: guidanceFor(phase),
+    readFailed: !cyclesRead.ok,
   };
 }
 
@@ -1608,11 +1668,16 @@ export async function createConsultRequest(
   }
 }
 
-/** Her own requests, with the replies. Scoped in the query. */
-export async function listMyConsultRequests(userId: string, limit = 20): Promise<ConsultRow[]> {
+/**
+ * Her own requests, with the replies. Scoped in the query.
+ *
+ * Discriminated: an unreadable list printed "Nothing sent yet" to a woman waiting on an answer to
+ * something she had already sent, which reads as the request having been lost. It has not been.
+ */
+export async function listMyConsultRequestsRead(userId: string, limit = 20): Promise<WellnessRead<ConsultRow[]>> {
   try {
     await ensureWellnessSchema();
-    const r = await db.execute(sql`
+    const r = await withDbRetry(() => db.execute(sql`
       SELECT q.id, q.topic, q.urgency, q.message, q.status, q.response, q.created_at, q.answered_at,
              c.display_name AS consultant_name
       FROM wellness_consult_requests q
@@ -1620,12 +1685,19 @@ export async function listMyConsultRequests(userId: string, limit = 20): Promise
       WHERE q.user_id = ${userId}::uuid
       ORDER BY q.created_at DESC
       LIMIT ${Math.max(1, Math.min(100, Math.floor(limit)))}
-    `);
-    return rows(r).map(mapConsultRow);
+    `), 'wellness.listMyConsultRequests');
+    return { ok: true, value: rows(r).map(mapConsultRow) };
   } catch (e: any) {
-    console.error('[wellness] listMyConsultRequests:', errText(e));
-    return [];
+    const reason = errText(e);
+    console.error('[wellness] listMyConsultRequests:', reason);
+    return { ok: false, reason };
   }
+}
+
+/** The list on its own. Prefer listMyConsultRequestsRead, so an empty screen can say which empty. */
+export async function listMyConsultRequests(userId: string, limit = 20): Promise<ConsultRow[]> {
+  const r = await listMyConsultRequestsRead(userId, limit);
+  return r.ok ? r.value : [];
 }
 
 function mapConsultRow(x: any): ConsultRow {

@@ -16,6 +16,21 @@ import {
   PENDING_TTL_SECONDS, PENDING_COOKIE_SECURE,
   type SecondFactorMethod,
 } from '@/lib/auth/two-factor';
+// EVERY DATABASE WAIT ON THIS PAGE IS BOUNDED FROM HERE DOWN — the same change made on
+// /admin/login, for the same reason.
+//
+// What an applicant saw before: they pressed Sign in and the form posted into nothing. A spinning
+// tab, then FUNCTION_INVOCATION_TIMEOUT. Each catch below has said "Sign-in is temporarily
+// unavailable" for a long time, and none of them could fire, because a catch cannot catch a wait
+// that has not ended — and on this deployment it is OPENING a connection that fails, not answering
+// a query (~810ms when it works, no answer at all in roughly a quarter of the attempts that must
+// open one).
+//
+// The rule used throughout this file: withDbRetry around reads, because a second ask usually reuses
+// the connection the abandoned attempt left in the pool. withDbTimeout and NEVER a retry around
+// anything that writes — a challenge, a session, a rate-limit counter that must not be spent twice
+// for one attempt.
+import { withDbRetry, withDbTimeout } from '@/lib/db-timeout';
 
 if (Astro.locals.user) {
   return Astro.redirect('/portal');
@@ -49,10 +64,13 @@ function clearPendingCookies(cookies: any) {
 }
 async function startSession(userId: string, req: Request, ip: string | undefined, cookies: any) {
   const token = generateSessionToken();
-  const session = await createSession(token, userId, {
+  // The bound goes around createSession and NOT around this whole function, so the cookie is still
+  // written only after a session row we actually waited for. A timeout throws to the caller's catch,
+  // which says so; nobody walks away holding a cookie for a session we never confirmed.
+  const session = await withDbTimeout(createSession(token, userId, {
     userAgent: req.headers.get('user-agent') || undefined,
     ipAddress: ip,
-  });
+  }), 'portalLogin.createSession');
   setSessionCookie(cookies, token, session.expiresAt);
 }
 /**
@@ -120,26 +138,32 @@ if (Astro.request.method === 'POST') {
       : ((fd2.get('code') as string) || '').trim();
     try {
       if (method === 'face') {
-        const peek = await resolvePendingChallenge(pendingToken, SURFACE);
+        const peek = await withDbRetry(() => resolvePendingChallenge(pendingToken, SURFACE), 'portalLogin.2faPeek');
         if (peek) {
-          const r = await verifyFaceSecondFactor(peek.userId, payload);
-          await db.execute(sql`
+          const r = await withDbRetry(() => verifyFaceSecondFactor(peek.userId, payload), 'portalLogin.faceCompare');
+          await withDbTimeout(db.execute(sql`
             INSERT INTO identity_verifications (user_id, email, claimed_name, method, face_match_distance, face_match_passed, verdict, ip_address, user_agent)
             VALUES (${peek.userId}, ${''}, ${''}, 'face_login', ${Number.isFinite(r.distance) ? r.distance : null}, ${r.matched}, ${r.matched ? 'verified' : 'rejected'}, ${(Astro.clientAddress || '').toString().slice(0, 64) || null}, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500)})
-          `).catch(() => {});
+          `), 'portalLogin.faceAudit', 2000).catch(() => {});
         }
       }
-      const result = await verifySecondFactor(pendingToken, SURFACE, method, payload);
+      // NOT withDbRetry. This consumes the challenge and spends an attempt against it — a second run
+      // would burn two of somebody's tries for one code they typed once. A timeout throws to the
+      // catch below and no session is created, which is the only safe direction here.
+      const result = await withDbTimeout(verifySecondFactor(pendingToken, SURFACE, method, payload), 'portalLogin.verifySecond');
       if (!result.ok) {
         errorMsg = result.error;
         if (result.locked) { clearPendingCookies(Astro.cookies); pendingToken = ''; }
       } else {
+        // Bookkeeping on a sign-in that has already been decided. Both stamps were already written
+        // to be lost without comment; all that is added is a short bound, so a stalled connection
+        // cannot hold a successful sign-in open until the gateway gives up on it.
         if (method === 'face') {
-          await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${result.userId}`).catch(() => {});
+          await withDbTimeout(db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${result.userId}`), 'portalLogin.faceUsed', 2000).catch(() => {});
         }
         const dest = await destinationFor(result.userId);
         await startSession(result.userId, Astro.request, Astro.clientAddress, Astro.cookies);
-        await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, result.userId)).catch(() => {});
+        await withDbTimeout(db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, result.userId)), 'portalLogin.lastLogin', 2000).catch(() => {});
         clearPendingCookies(Astro.cookies);
         return Astro.redirect(dest);
       }
@@ -149,7 +173,9 @@ if (Astro.request.method === 'POST') {
       errorMsg = 'Verification is temporarily unavailable. Please try again.';
     }
   } else if (action === 'cancel_second_step') {
-    await dropPendingChallenge(pendingToken).catch(() => {});
+    // Cancelling must never be the thing that hangs. The cookies are cleared on the next line
+    // whatever the server managed to do, so the person is back at the password form either way.
+    await withDbTimeout(dropPendingChallenge(pendingToken), 'portalLogin.dropChallenge', 2000).catch(() => {});
     clearPendingCookies(Astro.cookies);
     return Astro.redirect('/portal/login');
   } else if (action === 'face_verified') {
@@ -157,14 +183,14 @@ if (Astro.request.method === 'POST') {
     const liveRaw = (fd2.get('live_descriptor') as string) || '';
     try {
       const found = faceFirstUserId
-        ? await db.select().from(users).where(eq(users.id, faceFirstUserId)).limit(1)
+        ? await withDbRetry(() => db.select().from(users).where(eq(users.id, faceFirstUserId)).limit(1), 'portalLogin.faceFirstUser')
         : [];
       const u = found[0];
       if (!u || !u.isActive) {
         errorMsg = 'Session expired. Please start again.';
         clearPendingCookies(Astro.cookies);
         faceFirstUserId = '';
-      } else if (await countAttempt(FACE_FIRST_BUCKET + u.id, FACE_WINDOW_SECONDS) > FACE_MAX_ATTEMPTS) {
+      } else if (await withDbTimeout(countAttempt(FACE_FIRST_BUCKET + u.id, FACE_WINDOW_SECONDS), 'portalLogin.faceCount') > FACE_MAX_ATTEMPTS) {
         // THE ONE FACE PATH THAT COULD BE GUESSED AT WITHOUT LIMIT.
         //
         // This branch signs somebody in on a face alone, and it answers matched /
@@ -177,35 +203,46 @@ if (Astro.request.method === 'POST') {
         //
         // The password form is deliberately left working while this cools off, so
         // a jammed face gate never means a person cannot sign in at all.
+        //
+        // THE BOUND ON THAT COUNTER IS withDbTimeout, NOT withDbRetry, AND ITS FAILURE IS NOT
+        // SWALLOWED. Not retried, because countAttempt is an INSERT ... ON CONFLICT DO UPDATE
+        // attempts = attempts + 1 — running it twice charges two attempts for one face. Not
+        // swallowed, because if it throws, the catch at the end of this arm refuses the attempt
+        // outright, and that is the fail-closed answer this branch has to keep: a ceiling that
+        // quietly stops counting whenever the database is slow is the same as no ceiling, and this
+        // is the branch that answers matched / not matched to anyone who can post 128 numbers.
         Astro.cookies.delete(LEGACY_FACE_COOKIE, { path: '/' });
         faceFirstUserId = '';
         errorMsg = 'Too many face attempts. Please wait 15 minutes, or sign in with your password now.';
       } else {
-        const r = await verifyFaceSecondFactor(u.id, liveRaw);
-        await db.execute(sql`
+        const r = await withDbRetry(() => verifyFaceSecondFactor(u.id, liveRaw), 'portalLogin.faceFirstCompare');
+        await withDbTimeout(db.execute(sql`
           INSERT INTO identity_verifications (user_id, email, claimed_name, method, face_match_distance, face_match_passed, verdict, ip_address, user_agent)
           VALUES (${u.id}, ${u.email || ''}, ${u.name || ''}, 'face_login', ${Number.isFinite(r.distance) ? r.distance : null}, ${r.matched}, ${r.matched ? 'verified' : 'rejected'}, ${(Astro.clientAddress || '').toString().slice(0, 64) || null}, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500)})
-        `).catch(() => {});
+        `), 'portalLogin.faceFirstAudit', 2000).catch(() => {});
         if (!r.matched) {
           errorMsg = 'Face not recognised. Try again in better light, or use your password.';
         } else {
-          await clearAttempts(FACE_FIRST_BUCKET + u.id);
-          await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${u.id}`).catch(() => {});
+          // Both of these are housekeeping on a face that has already matched. Bounded and
+          // swallowed: failing to give the allowance back leaves the count standing, which is the
+          // strict direction, and neither is a reason to refuse somebody the server has recognised.
+          await withDbTimeout(clearAttempts(FACE_FIRST_BUCKET + u.id), 'portalLogin.faceClear', 2000).catch(() => {});
+          await withDbTimeout(db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${u.id}`), 'portalLogin.faceFirstUsed', 2000).catch(() => {});
           // Face was only the FIRST factor. If this account opted in to a second
           // step it still owes one, and the remaining factor must not be face.
-          const methods = await availableSecondFactors(u.id);
-          const optedIn = await isSecondStepRequired(u.id);
+          const methods = await withDbRetry(() => availableSecondFactors(u.id), 'portalLogin.faceFirstFactors');
+          const optedIn = await withDbRetry(() => isSecondStepRequired(u.id), 'portalLogin.faceFirstPolicy');
           if (optedIn && methods.indexOf('totp') < 0) {
             errorMsg = 'This account requires a second step, but no authenticator is set up. Sign in with your password and a recovery code.';
           } else if (optedIn) {
-            const t = await startPendingChallenge(u.id, SURFACE, 'face');
+            const t = await withDbTimeout(startPendingChallenge(u.id, SURFACE, 'face'), 'portalLogin.faceChallenge');
             Astro.cookies.delete(LEGACY_FACE_COOKIE, { path: '/' });
             setPendingCookie(Astro.cookies, t);
             return Astro.redirect('/portal/login');
           } else {
             const dest = await destinationFor(u.id);
             await startSession(u.id, Astro.request, Astro.clientAddress, Astro.cookies);
-            await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, u.id)).catch(() => {});
+            await withDbTimeout(db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, u.id)), 'portalLogin.faceLastLogin', 2000).catch(() => {});
             clearPendingCookies(Astro.cookies);
             return Astro.redirect(dest);
           }
@@ -232,10 +269,14 @@ if (Astro.request.method === 'POST') {
       // makes bulk enumeration expensive without ever blocking the password form.
       const ipKey = (Astro.clientAddress || Astro.request.headers.get('x-forwarded-for') || 'unknown')
         .toString().split(',')[0].trim().slice(0, 64);
-      const throttled = await countAttempt(FACE_LOOKUP_BUCKET + ipKey, FACE_WINDOW_SECONDS) > FACE_LOOKUP_MAX;
-      const u = throttled ? null : await findUserByLoginIdentifier(identifier);
+      // Bounded, not retried, and NOT swallowed — same rule as the face counter above, and for the
+      // same reason. This ceiling is the only thing making bulk enumeration of handles expensive; if
+      // it cannot be written, the honest answer is the refusal the catch below produces, not a free
+      // lookup. countAttempt increments, so a retry would charge two attempts for one lookup.
+      const throttled = await withDbTimeout(countAttempt(FACE_LOOKUP_BUCKET + ipKey, FACE_WINDOW_SECONDS), 'portalLogin.faceLookupCount') > FACE_LOOKUP_MAX;
+      const u = throttled ? null : await withDbRetry(() => findUserByLoginIdentifier(identifier), 'portalLogin.faceLookupUser');
       const hasFace = (u && u.isActive)
-        ? (await availableSecondFactors(u.id)).indexOf('face') >= 0
+        ? (await withDbRetry(() => availableSecondFactors(u.id), 'portalLogin.faceLookupFactors')).indexOf('face') >= 0
         : false;
       if (throttled) {
         errorMsg = 'Too many attempts from this connection. Please wait 15 minutes, or sign in with your password now.';
@@ -261,26 +302,59 @@ if (Astro.request.method === 'POST') {
     } else {
       const identifier = (fd2.get('email') as string || '').trim();
       const password = fd2.get('password') as string || '';
+
+      // THIS USED TO BE `} else if (await passwordAttemptsBlocked(...)) {` — an unbounded database
+      // wait sitting in the if-chain, OUTSIDE the try below that would have reported it. It was the
+      // first thing every sign-in touched and the one await in this branch that had nowhere to fail
+      // to. Hoisted here so the wait is bounded and a failure lands somewhere that can speak.
+      //
+      // It stays FALSE when the counter cannot be read, which is the posture the limiter itself
+      // documents (two-factor.ts: "letting the password check decide"). The counter is depth, not
+      // the lock — the password and scrypt are still required either way — and refusing here on an
+      // unreadable database would be a total sign-in outage across all four surfaces, which is the
+      // exact failure this codebase has already shipped twice.
+      let pwBlocked = false;
+      if (identifier && password) {
+        try {
+          pwBlocked = await withDbRetry(() => passwordAttemptsBlocked(identifier, CLIENT_IP), 'portalLogin.throttle');
+        } catch (e: any) {
+          console.error('[portal/login throttle] attempt counter unreadable; letting the password check decide:',
+            e?.cause?.message || e?.message);
+          pwBlocked = false;
+        }
+      }
+
       if (!identifier || !password) {
         errorMsg = 'Enter your email or internal handle, and your password.';
-      } else if (await passwordAttemptsBlocked(identifier, CLIENT_IP)) {
+      } else if (pwBlocked) {
         // The face paths on this page have been counted in shared Postgres state for a while; the
         // password path was not, and it is the one that needs no camera. Failures only, cleared on
         // success, nothing durable written to the account.
         errorMsg = PASSWORD_THROTTLED_MESSAGE;
       } else {
         try {
-          const u = await findUserByLoginIdentifier(identifier);
+          const u = await withDbRetry(() => findUserByLoginIdentifier(identifier), 'portalLogin.identifier');
           // scrypt runs either way, so an unknown handle and a wrong password
           // cost the same and answer the same.
+          // Deliberately NOT bounded: this is scrypt over a row already in hand, not a database
+          // wait, and a database bound around CPU work would mean nothing.
           const ok = await verifyPasswordForLogin(u, password);
           if (!ok || !u || !u.isActive) {
-            await recordFailedPassword(identifier, CLIENT_IP);
+            // THE LIMITER SWALLOWS ITS OWN TIMEOUT, AND THAT IS THE POINT OF THE `.catch` HERE.
+            // recordFailedPassword already never throws — two-factor.ts says so, precisely so a
+            // limiter that cannot count does not break the form. Letting the bound around it throw
+            // into the catch below would turn a plain wrong password into "Sign-in is temporarily
+            // unavailable", which is a worse lie than the outage it is describing. Short bound for
+            // the same reason: a counter must not spend the form's whole budget.
+            await withDbTimeout(recordFailedPassword(identifier, CLIENT_IP), 'portalLogin.recordFail', 2000).catch(() => {});
             errorMsg = 'Invalid email or password.';
           } else {
-            await clearPasswordAttempts(identifier, CLIENT_IP);
-            const methods = await availableSecondFactors(u.id);
-            const optedIn = await isSecondStepRequired(u.id);
+            // Giving the allowance back is housekeeping on a sign-in that has already succeeded. If
+            // it times out the count simply stands, which is the strict direction — never a reason
+            // to refuse somebody who typed the right password.
+            await withDbTimeout(clearPasswordAttempts(identifier, CLIENT_IP), 'portalLogin.clearThrottle', 2000).catch(() => {});
+            const methods = await withDbRetry(() => availableSecondFactors(u.id), 'portalLogin.factors');
+            const optedIn = await withDbRetry(() => isSecondStepRequired(u.id), 'portalLogin.policy');
             const isApplicant = u.role === 'applicant';
             // Pre-existing posture: staff with a face on file were challenged.
             const legacyFaceRule = !isApplicant && methods.indexOf('face') >= 0;
@@ -288,13 +362,17 @@ if (Astro.request.method === 'POST') {
             // account whose enrolled factor was cleared is still challenged rather
             // than waved through on the password alone. False only when nothing is
             // left at all — the one case where challenging would be a lockout.
-            if ((optedIn || legacyFaceRule) && await canCompleteSecondStep(u.id)) {
-              const t = await startPendingChallenge(u.id, SURFACE, 'password');
+            // Left inline so it still SHORT CIRCUITS — an account with no second step must not pay a
+            // round trip to be told so. A timeout on it throws to the catch below and nobody is
+            // signed in, which is the fail-closed direction and must stay that way: an unreadable
+            // factor list is not permission to skip the second step.
+            if ((optedIn || legacyFaceRule) && await withDbRetry(() => canCompleteSecondStep(u.id), 'portalLogin.canComplete')) {
+              const t = await withDbTimeout(startPendingChallenge(u.id, SURFACE, 'password'), 'portalLogin.challenge');
               setPendingCookie(Astro.cookies, t);
               return Astro.redirect('/portal/login');
             }
             await startSession(u.id, Astro.request, Astro.clientAddress, Astro.cookies);
-            await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, u.id)).catch(() => {});
+            await withDbTimeout(db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, u.id)), 'portalLogin.pwLastLogin', 2000).catch(() => {});
             clearPendingCookies(Astro.cookies);
             // The same one decider as every other branch. `isApplicant` still governs the legacy
             // face-challenge posture above, which is a different question from where they land.
@@ -312,12 +390,16 @@ if (Astro.request.method === 'POST') {
 // Render whichever step is live.
 if (pendingToken) {
   try {
-    const pending = await resolvePendingChallenge(pendingToken, SURFACE);
+    // Three reads, and they run on the GET that DRAWS the challenge — so until they were bounded a
+    // stall here hung the login page itself, not just a submission.
+    const pending = await withDbRetry(() => resolvePendingChallenge(pendingToken, SURFACE), 'portalLogin.pending');
     if (pending) {
       requireSecondStep = true;
-      const u = await db.select({ name: users.name }).from(users).where(eq(users.id, pending.userId)).limit(1);
+      const u = await withDbRetry(
+        () => db.select({ name: users.name }).from(users).where(eq(users.id, pending.userId)).limit(1),
+        'portalLogin.pendingName');
       pendingUserName = u[0]?.name || '';
-      const methods = await availableSecondFactors(pending.userId);
+      const methods = await withDbRetry(() => availableSecondFactors(pending.userId), 'portalLogin.pendingFactors');
       // If face was the first factor it cannot also be the second.
       offerFace = methods.indexOf('face') >= 0 && pending.firstFactor !== 'face';
       offerCode = methods.indexOf('totp') >= 0;
@@ -334,8 +416,10 @@ if (pendingToken) {
   }
 } else if (faceFirstUserId) {
   try {
-    const u = await db.select({ name: users.name, isActive: users.isActive })
-      .from(users).where(eq(users.id, faceFirstUserId)).limit(1);
+    const u = await withDbRetry(
+      () => db.select({ name: users.name, isActive: users.isActive })
+        .from(users).where(eq(users.id, faceFirstUserId)).limit(1),
+      'portalLogin.faceFirstPending');
     if (u[0]?.isActive) {
       requireFaceFirstFactor = true;
       pendingUserName = u[0]?.name || '';

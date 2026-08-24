@@ -32,8 +32,25 @@
 // 4. 303, NOT 302. The response to a POST must send the browser to the next page with a GET; 303 is
 //    the status that says so. Browsers do it for 302 too, by convention rather than by spec, and
 //    the convention is not worth relying on for the one request that must not be replayed.
+// 5. THE DELETE IS BOUNDED, BECAUSE POINT 3 ABOVE WAS UNREACHABLE ON THE FAILURE THAT MATTERS.
+//
+//    "A failed delete is never swallowed" was true of a delete that FAILS. It was not true of one
+//    that never answers, which is the failure this deployment actually has: opening a connection
+//    costs ~810ms when it works and stalls past five seconds a fraction of the time. The await below
+//    carried no bound, so a stall did not throw — the invocation died at the gateway instead. No
+//    response, therefore no Set-Cookie, therefore clearSessionCookie() on the line after it never
+//    reached the browser: the person on the borrowed phone got a hung tab and walked away still
+//    signed in, on both halves, with the honest DONE_PARTIAL page never rendered. A catch cannot
+//    catch a wait that never settles.
+//
+//    withDbRetry rather than withDbTimeout, and the distinction is not cosmetic: a DELETE by primary
+//    key is idempotent, so asking twice is safe, and what fails here is the connection rather than
+//    the statement — the abandoned first attempt leaves the connection it was opening in the pool,
+//    so the second ask usually reuses it and answers in milliseconds. Worst case is 5s + 3s, well
+//    inside the gateway, and anything thrown still lands in the catch below.
 import type { APIRoute, AstroCookies } from 'astro';
 import { invalidateSession } from '@/lib/auth/session';
+import { withDbRetry } from '@/lib/db-timeout';
 import { readSessionCookie, clearSessionCookie } from '@/lib/auth/cookie';
 
 // Declared before the handlers that use them — `const` is not hoisted, and a handler reaching a
@@ -56,10 +73,12 @@ async function endSession(cookies: AstroCookies): Promise<boolean> {
   let serverSideEnded = true;
   if (token) {
     try {
-      await invalidateSession(token);
+      await withDbRetry(() => invalidateSession(token), 'logout.invalidate');
     } catch (e: any) {
       serverSideEnded = false;
-      // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+      // The real Postgres reason is on e.cause; e.message is only the failed SQL. A DbTimeoutError or
+      // a DbCircuitOpenError arrives here too, and lands in exactly the right place: the server side
+      // is not known to have finished, so it is reported as not finished.
       console.error('[portal/logout] session delete failed', e?.cause?.message || e?.message);
     }
   }

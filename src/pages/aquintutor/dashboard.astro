@@ -3,13 +3,33 @@ import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { isFeatureEnabled } from '@/lib/feature-flags';
+import { safeRows } from '@/lib/page-safety';
+import { withDbTimeout, withDbRetry } from '@/lib/db-timeout';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/aquintutor/login?next=' + encodeURIComponent('/aquintutor/dashboard'));
 
+// EVERY READ ON THIS PAGE IS BOUNDED, AND A FAILED READ NOW SAYS SO.
+//
+// WHAT A LEARNER SAW BEFORE: ten `catch (_) {}` blocks and nothing else. A student with three
+// enrolments, six sat examinations and two issued credentials opened this page during a database
+// stall and was told, in the page's own editorial type, "You have not enrolled in any courses yet",
+// "You haven't sat an examination yet" and "No credentials yet" - with the First enrolment and
+// First credential badges re-locked and the daily-goal ring drawn as NaN%. Not one word anywhere
+// said a read had failed. An empty state on this page is a statement about somebody's record, so it
+// has to keep meaning "there are none".
+//
+// safeRows() bounds the wait, never throws, and reports `ok` separately from `rows` - which is
+// exactly the distinction that was missing. Each read passes an explicit 4000ms rather than taking
+// the 8000ms default: ten reads at the default is eighty seconds of budget on a page the gateway
+// gives far less, and the circuit breaker only collapses the tail after three consecutive timeouts.
+
 // Hide entry points to features that are turned off (admin: /admin/feature-flags).
-const showDaily = await isFeatureEnabled('dailyChallenge');
-const showTutor = await isFeatureEnabled('aiTutor');
+// Bounded because these are the first two database round trips on the page, and a stall in them
+// hung the render before a single learner-facing read had started. Falling back to false hides a
+// link rather than asserting anything untrue.
+const showDaily = await withDbTimeout(isFeatureEnabled('dailyChallenge'), 'dashboard.flag.dailyChallenge', 2000).catch(() => false);
+const showTutor = await withDbTimeout(isFeatureEnabled('aiTutor'), 'dashboard.flag.aiTutor', 2000).catch(() => false);
 
 let enrollments: any[] = [];
 let recentAttempts: any[] = [];
@@ -21,27 +41,32 @@ let stats = { totalLessons: 0, completedLessons: 0, totalAttempts: 0, passedAtte
 let weeklySparkline: number[] = [0,0,0,0,0,0,0];
 
 // XP + streak (Duolingo-style engagement layer)
-let xpState: any = { totalXp: 0, level: 1, streakDays: 0, longestStreak: 0, xpToNextLevel: 100, levelProgress: 0 };
+//
+// WHAT A LEARNER SAW BEFORE: this fallback literal carried six of the twelve keys getUserXp
+// returns, so a failed read drew the daily-goal ring at "NaN%" over a bare "/ XP" (Astro prints
+// undefined as nothing) and printed "0 days" to somebody on a forty-day streak. The five added keys
+// keep the arithmetic finite; the flag is what stops us drawing zeros at all, because a zero here
+// is a claim about a person's record and the rail is hidden instead.
+let xpUnreadable = false;
+let xpState: any = { totalXp: 0, level: 1, streakDays: 0, longestStreak: 0, xpToNextLevel: 100, levelProgress: 0, dailyGoalXp: 30, todayXp: 0, hearts: 5, goalMetToday: false, streakFreezes: 0 };
 try {
   const { getUserXp } = await import('@/lib/xp');
-  xpState = await getUserXp(user.id);
-} catch (_) {}
+  xpState = await withDbRetry(() => getUserXp(user.id), 'dashboard.xp');
+} catch (e: any) {
+  xpUnreadable = true;
+  console.error('[dashboard] xp read failed:', e?.cause?.message || e?.message);
+}
 
 // Practice CTA — find a published test the user can practise right now
-let practiceTest: any = null;
-try {
-  const r = await db.execute(sql`
+const practiceRead = await safeRows('dashboard.practiceTest', () => db.execute(sql`
     SELECT slug, title FROM tests
     WHERE is_published = true AND COALESCE(practice_enabled, true) = true
     ORDER BY CASE WHEN slug = 'sanskrit-awareness' THEN 0 ELSE 1 END, created_at DESC
     LIMIT 1
-  `);
-  const rows = Array.isArray(r) ? r : (r?.rows || []);
-  practiceTest = rows[0] || null;
-} catch (_) {}
+  `), 4000);
+const practiceTest: any = practiceRead.rows[0] || null;
 
-try {
-  const r = await db.execute(sql`
+const enrolRead = await safeRows('dashboard.enrolments', () => db.execute(sql`
     SELECT e.id, e.progress_pct, e.last_lesson_id, e.enrolled_at,
       c.slug, c.title, c.subtitle, c.short_desc, c.course_code, c.duration_weeks,
       c.credit_hours, c.level, c.is_free, c.pricing_model, c.instructor_name,
@@ -54,39 +79,36 @@ try {
     LEFT JOIN academic_departments d ON c.department_id = d.id
     WHERE e.user_id = ${user.id}
     ORDER BY e.enrolled_at DESC LIMIT 12
-  `);
-  enrollments = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+  `), 4000);
+enrollments = enrolRead.rows;
+const enrolUnreadable = !enrolRead.ok;
 
-try {
-  const r = await db.execute(sql`
+const attemptsRead = await safeRows('dashboard.attempts', () => db.execute(sql`
     SELECT a.id, a.percentage, a.status, a.started_at, a.submitted_at, a.total_score, a.max_score, a.is_passed,
       t.slug as test_slug, t.title as test_title, t.test_type, t.duration_mins
     FROM test_attempts a
     LEFT JOIN tests t ON a.test_id = t.id
     WHERE a.candidate_id = ${user.id}
     ORDER BY a.started_at DESC NULLS LAST LIMIT 10
-  `);
-  recentAttempts = Array.isArray(r) ? r : (r?.rows || []);
-  liveAttempt = recentAttempts.find((a: any) => a.status === 'in_progress') || null;
-  stats.totalAttempts = recentAttempts.filter((a: any) => a.status !== 'in_progress').length;
-  stats.passedAttempts = recentAttempts.filter((a: any) => a.is_passed).length;
-} catch (_) {}
+  `), 4000);
+const attemptsUnreadable = !attemptsRead.ok;
+recentAttempts = attemptsRead.rows;
+liveAttempt = recentAttempts.find((a: any) => a.status === 'in_progress') || null;
+stats.totalAttempts = recentAttempts.filter((a: any) => a.status !== 'in_progress').length;
+stats.passedAttempts = recentAttempts.filter((a: any) => a.is_passed).length;
 
-try {
-  const r = await db.execute(sql`
+const upcomingRead = await safeRows('dashboard.upcoming', () => db.execute(sql`
     SELECT t.slug, t.title, t.test_type, t.duration_mins, t.is_premium, t.currency, t.price_inr_paise, t.total_questions,
       (SELECT COUNT(*)::int FROM test_questions WHERE test_id = t.id) as question_count
     FROM tests t
     WHERE t.is_published = true
       AND NOT EXISTS (SELECT 1 FROM test_attempts WHERE test_id = t.id AND candidate_id = ${user.id} AND status IN ('submitted','auto_submitted'))
     ORDER BY t.created_at DESC LIMIT 4
-  `);
-  upcomingTests = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+  `), 4000);
+const upcomingUnreadable = !upcomingRead.ok;
+upcomingTests = upcomingRead.rows;
 
-try {
-  const r = await db.execute(sql`
+const credsRead = await safeRows('dashboard.credentials', () => db.execute(sql`
     SELECT c.certificate_number as credential_number,
       tc.title as course_title, tc.slug as course_slug,
       c.issued_at
@@ -94,65 +116,61 @@ try {
     JOIN training_courses tc ON c.course_id = tc.id
     WHERE c.user_id = ${user.id}
     ORDER BY c.issued_at DESC LIMIT 4
-  `);
-  myCertificates = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+  `), 4000);
+const credsUnreadable = !credsRead.ok;
+myCertificates = credsRead.rows;
 
-try {
-  const r = await db.execute(sql`
+const interviewRead = await safeRows('dashboard.lastInterview', () => db.execute(sql`
     SELECT s.id, s.status, s.started_at, s.ended_at, s.language, t.title as template_title
     FROM ai_interview_sessions s
     JOIN ai_interview_templates t ON s.template_id = t.id
     WHERE s.candidate_id = ${user.id}
     ORDER BY s.started_at DESC LIMIT 1
-  `);
-  const rows = Array.isArray(r) ? r : (r?.rows || []);
-  lastInterview = rows[0] || null;
-} catch (_) {}
+  `), 4000);
+lastInterview = interviewRead.rows[0] || null;
 
-try {
-  const r = await db.execute(sql`
+const statsRead = await safeRows('dashboard.stats', () => db.execute(sql`
     SELECT
       (SELECT COALESCE(SUM(total_lessons),0)::int FROM training_courses WHERE id IN (SELECT course_id FROM training_enrollments WHERE user_id = ${user.id})) as total_lessons,
       (SELECT COUNT(DISTINCT DATE(started_at))::int FROM test_attempts WHERE candidate_id = ${user.id} AND started_at IS NOT NULL) as days_active
-  `);
-  const rows = Array.isArray(r) ? r : (r?.rows || []);
-  if (rows[0]) {
-    stats.totalLessons = (rows[0] as any).total_lessons || 0;
-    stats.daysActive = (rows[0] as any).days_active || 0;
-  }
-  stats.completedLessons = enrollments.reduce((s, e: any) => s + Math.round(((e.progress_pct || 0) / 100) * (e.total_lessons || 0)), 0);
-} catch (_) {}
+  `), 4000);
+const statsUnreadable = !statsRead.ok;
+if (statsRead.rows[0]) {
+  stats.totalLessons = (statsRead.rows[0] as any).total_lessons || 0;
+  stats.daysActive = (statsRead.rows[0] as any).days_active || 0;
+}
+stats.completedLessons = enrollments.reduce((acc, e: any) => acc + Math.round(((e.progress_pct || 0) / 100) * (e.total_lessons || 0)), 0);
 
-try {
-  // weekly attempt counts for the last 7 days
-  const r = await db.execute(sql`
+// Weekly attempt counts for the last 7 days.
+const weekRead = await safeRows('dashboard.weeklyAttempts', () => db.execute(sql`
     SELECT EXTRACT(DOW FROM started_at)::int as dow, COUNT(*)::int as n
     FROM test_attempts
     WHERE candidate_id = ${user.id} AND started_at > NOW() - INTERVAL '7 days'
     GROUP BY dow
-  `);
-  const rows = (Array.isArray(r) ? r : (r?.rows || [])) as any[];
-  const map: any = {};
-  rows.forEach((row) => { map[row.dow] = row.n; });
-  // align with today as the rightmost bar
-  const todayDow = new Date().getDay();
-  for (let i = 0; i < 7; i++) {
-    const dow = (todayDow - 6 + i + 7) % 7;
-    weeklySparkline[i] = map[dow] || 0;
-  }
-} catch (_) {}
+  `), 4000);
+const sparkUnreadable = !weekRead.ok;
+const dowCounts: any = {};
+(weekRead.rows as any[]).forEach((row) => { dowCounts[row.dow] = row.n; });
+// align with today as the rightmost bar
+const todayDow = new Date().getDay();
+for (let i = 0; i < 7; i++) {
+  const dow = (todayDow - 6 + i + 7) % 7;
+  weeklySparkline[i] = dowCounts[dow] || 0;
+}
 
 // Faculty showcase - from the actual roll
-let faculty: any[] = [];
-try {
-  const r = await db.execute(sql`
+const facultyRead = await safeRows('dashboard.faculty', () => db.execute(sql`
     SELECT name, title, bio, slug, specialties, years_experience, is_featured
     FROM training_instructors
     ORDER BY is_featured DESC, sort_order LIMIT 6
-  `);
-  faculty = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+  `), 4000);
+const faculty: any[] = facultyRead.rows;
+
+// The standing plate, the badge cabinet and the activity feed all describe the learner's record as
+// a WHOLE, and every number on them is derived from these four reads. If any one of them failed,
+// every zero on those surfaces is a claim we cannot support - a locked "First credential" badge in
+// front of somebody who holds two is worse than showing nothing at all.
+const recordUnreadable = enrolUnreadable || attemptsUnreadable || credsUnreadable || statsUnreadable;
 
 const firstName = (user.name || '').split(' ')[0] || 'student';
 const hour = new Date().getHours();
@@ -223,11 +241,11 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
       <span style="opacity:0.5;">&middot;</span>
       <span><span style="opacity:0.6;">week:</span> {weekOfTerm}</span>
       <span style="opacity:0.5;">&middot;</span>
-      <span><span style="opacity:0.6;">level:</span> {level}</span>
+      <span><span style="opacity:0.6;">level:</span> {recordUnreadable ? '\u2014' : level}</span>
       <span style="opacity:0.5;">&middot;</span>
-      <span><span style="opacity:0.6;">enrolments:</span> {enrollments.length}</span>
+      <span><span style="opacity:0.6;">enrolments:</span> {enrolUnreadable ? '\u2014' : enrollments.length}</span>
       <span style="opacity:0.5;">&middot;</span>
-      <span><span style="opacity:0.6;">credentials:</span> {myCertificates.length}</span>
+      <span><span style="opacity:0.6;">credentials:</span> {credsUnreadable ? '\u2014' : myCertificates.length}</span>
       {liveAttempt && <>
         <span style="opacity:0.5;">&middot;</span>
         <span style="color:#d97757; font-weight:600;">EXAMINATION IN PROGRESS</span>
@@ -239,6 +257,11 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
   <section style="background:linear-gradient(180deg,#fff8f3 0%, var(--paper) 100%); border-bottom:1px solid var(--rule);">
     <div style="max-width:1320px; margin:0 auto; padding:18px 28px;">
       <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:14px; align-items:center;">
+        {xpUnreadable ? (
+          <p style="font-family:'Inter Tight',sans-serif; font-size:13px; line-height:1.55; color:var(--ink); margin:0; grid-column:1 / -1;">
+            <strong style="font-weight:700;">Your streak, daily goal and XP could not be read just now.</strong> <span style="color:var(--ink-500);">Nothing has been reset and no streak has been lost &mdash; this is a problem on our side, not a record of a quiet day.</span> <a href="/aquintutor/dashboard" style="color:var(--rust); font-weight:600; text-decoration:underline;">Try again</a>
+          </p>
+        ) : (<>
         <div style="display:flex; gap:12px; align-items:center;">
           <span style="display:inline-flex; align-items:center; justify-content:center; width:42px; height:42px; border-radius:50%; background:rgba(249,115,22,0.12); color:#f97316; flex-shrink:0;">
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 14a4 4 0 1 0 7 0c0-2-1-3.5-3-5-2 1.5-3 3-3 5z"/><path d="M12 2c1 2 2 3.5 2 5a3 3 0 0 1-3 3"/></svg>
@@ -281,6 +304,7 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
             </div>
           </div>
         </div>
+        </>)}
 
         <div style="display:flex; gap:6px; flex-wrap:wrap;">
           <a href="/aquintutor/practice-hub" style="background:var(--rust); color:#fff; padding:9px 12px; border-radius:9px; font-family:'Inter Tight',sans-serif; font-size:12px; font-weight:700; text-decoration:none;">Practise</a>
@@ -334,7 +358,9 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
             <span style="font-style:italic; font-weight:300; color:var(--ink-500);">{firstName}.</span>
           </h1>
           <p class="font-serif" style="font-family:'Cormorant Garamond',serif; font-style:italic; font-size:clamp(1.05rem, 1.4vw, 1.3rem); line-height:1.5; color:var(--ink-500); margin:20px 0 0; max-width:36rem;">
-            {enrollments.length > 0
+            {enrolUnreadable
+              ? <>We could not read your enrolments just now, so this page is not showing them. Nothing has been unenrolled and nothing has been lost &mdash; this is a problem on our side. Reload in a moment.</>
+              : enrollments.length > 0
               ? <>You're {stats.completedLessons > 0 ? stats.completedLessons + ' lessons into ' : 'enrolled in '} {enrollments.length} {enrollments.length === 1 ? 'course' : 'courses'}. Pick up where you left off, sit a proctored examination, or browse the catalogue for what to take next.</>
               : <>Your enrolment is active. Open the catalogue below and pick the first course of your term.</>}
           </p>
@@ -343,8 +369,11 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
         <aside style="background:var(--sand-100); border:1px solid var(--rule); border-radius:14px; padding:24px; position:relative;">
           <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:18px;">
             <p style="font-family:'Inter Tight',sans-serif; font-size:11px; letter-spacing:0.18em; text-transform:uppercase; color:var(--ink-500); font-weight:600; margin:0;">Your standing</p>
-            <span style="display:inline-flex; align-items:center; gap:5px; padding:3px 10px; border-radius:999px; background:var(--paper); border:1px solid var(--rule); font-family:'JetBrains Mono',monospace; font-size:11px; font-weight:600; color:var(--rust);">LV {level}</span>
+            <span style="display:inline-flex; align-items:center; gap:5px; padding:3px 10px; border-radius:999px; background:var(--paper); border:1px solid var(--rule); font-family:'JetBrains Mono',monospace; font-size:11px; font-weight:600; color:var(--rust);">{recordUnreadable ? 'LV \u2014' : 'LV ' + level}</span>
           </div>
+          {recordUnreadable ? (
+            <p style="font-family:'Inter Tight',sans-serif; font-size:13px; line-height:1.55; color:var(--ink-500); margin:0 0 18px;">Your experience and streak could not be worked out just now, because your record could not be read. These are not zeros &mdash; they are unknown, and that is a problem on our side.</p>
+          ) : (
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:18px;">
             <div>
               <p style="font-family:'Inter Tight',sans-serif; font-size:10.5px; letter-spacing:0.16em; text-transform:uppercase; color:var(--ink-500); font-weight:600; margin:0 0 6px;">Experience</p>
@@ -357,10 +386,14 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
               <p style="font-family:'Inter Tight',sans-serif; font-size:11px; color:var(--ink-500); margin:5px 0 0;">{stats.daysActive} days active</p>
             </div>
           </div>
+          )}
 
           <!-- 7-day sparkline -->
           <div style="padding-top:14px; border-top:1px solid var(--rule);">
             <p style="font-family:'Inter Tight',sans-serif; font-size:10.5px; letter-spacing:0.16em; text-transform:uppercase; color:var(--ink-500); font-weight:600; margin:0 0 10px;">Last seven days</p>
+            {sparkUnreadable ? (
+              <p style="font-family:'Inter Tight',sans-serif; font-size:12.5px; line-height:1.55; color:var(--ink-500); margin:0;">Your last seven days could not be read. Seven empty bars would say you sat nothing all week, and we do not know that.</p>
+            ) : (
             <div style="display:grid; grid-template-columns:repeat(7, 1fr); gap:6px; align-items:end; height:54px;">
               {weeklySparkline.map((v: number, i: number) => (
                 <div style="display:flex; flex-direction:column; align-items:center; gap:4px; height:100%;">
@@ -371,6 +404,7 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
                 </div>
               ))}
             </div>
+            )}
           </div>
         </aside>
       </div>
@@ -521,7 +555,13 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
             <a href="/aquintutor/courses" style="font-family:'Inter Tight',sans-serif; font-size:13.5px; color:var(--rust); text-decoration:none; font-weight:500;">Browse catalogue &rarr;</a>
           </div>
 
-          {enrollments.length === 0 ? (
+          {enrolUnreadable ? (
+            <div style="background:var(--paper); border:1px dashed var(--rule); border-radius:12px; padding:30px 28px;">
+              <p style="font-family:'Inter Tight',sans-serif; font-size:15px; font-weight:700; color:var(--ink); margin:0 0 8px;">We could not read your enrolments.</p>
+              <p style="font-family:'Inter Tight',sans-serif; font-size:13.5px; line-height:1.6; color:var(--ink-500); margin:0 0 16px;">Nothing has been unenrolled, and this is not a statement that you have none. The fault is on our side.</p>
+              <a href="/aquintutor/dashboard" style="font-family:'Inter Tight',sans-serif; font-size:13.5px; font-weight:600; color:var(--rust); text-decoration:underline;">Try again</a>
+            </div>
+          ) : enrollments.length === 0 ? (
             <div style="background:var(--paper); border:1px dashed var(--rule); border-radius:12px; padding:36px; text-align:center;">
               <p style="font-family:'Cormorant Garamond',serif; font-style:italic; font-size:1.15rem; color:var(--ink-500); margin:0 0 18px;">You have not enrolled in any courses yet.</p>
               <a href="/aquintutor/courses" style="background:var(--ink); color:var(--sand-50); padding:12px 22px; border-radius:6px; font-family:'Inter Tight',sans-serif; font-size:14px; font-weight:600; text-decoration:none; display:inline-block;">Browse the catalogue &rarr;</a>
@@ -560,7 +600,9 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
         <aside>
           <p style="font-family:'Inter Tight',sans-serif; font-size:12px; color:var(--rust); font-weight:600; letter-spacing:0.16em; text-transform:uppercase; margin:0 0 8px;">Activity</p>
           <h2 class="font-display" style="font-size:1.5rem; font-weight:500; margin:0 0 22px; line-height:1.15; letter-spacing:-0.015em; color:var(--ink);">Recent record</h2>
-          {activity.length === 0 ? (
+          {recordUnreadable ? (
+            <p style="font-family:'Inter Tight',sans-serif; font-size:13.5px; line-height:1.6; color:var(--ink-500); margin:0;">Your record could not be read just now, so this feed is empty for a reason that is not "nothing has happened". Nothing has been removed. This is a problem on our side &mdash; reload in a moment.</p>
+          ) : activity.length === 0 ? (
             <p style="font-family:'Cormorant Garamond',serif; font-style:italic; font-size:1rem; color:var(--ink-500); margin:0;">No activity yet. Your enrolments, examinations, and credentials will appear here as you go.</p>
           ) : (
             <ol style="list-style:none; padding:0; margin:0; display:flex; flex-direction:column; gap:0; background:var(--paper); border:1px solid var(--rule); border-radius:14px; overflow:hidden;">
@@ -593,6 +635,9 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
         </div>
         <a href="/aquintutor/rewards" style="font-family:'Inter Tight',sans-serif; font-size:13.5px; color:var(--rust); text-decoration:none; font-weight:500;">Full rewards page &rarr;</a>
       </div>
+      {recordUnreadable ? (
+        <p style="font-family:'Inter Tight',sans-serif; font-size:13.5px; line-height:1.6; color:var(--ink-500); margin:0; background:var(--sand-100); border:1px dashed var(--rule); border-radius:12px; padding:22px 24px;">Your badges could not be worked out just now, because your record could not be read. Showing them locked would say you have not earned them, and we do not know that. Nothing has been taken away &mdash; reload in a moment.</p>
+      ) : (
       <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:12px;" class="badges-grid">
         {badges.map((b) => (
           <div style={'background:' + (b.unlocked ? 'var(--paper)' : 'var(--sand-100)') + '; border:1px solid var(--rule); border-radius:12px; padding:18px; display:flex; flex-direction:column; align-items:center; gap:10px; text-align:center; ' + (b.unlocked ? '' : 'opacity:0.55;')}>
@@ -607,6 +652,7 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
           </div>
         ))}
       </div>
+      )}
     </div>
   </section>
 
@@ -619,7 +665,9 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
         <div>
           <p style="font-family:'Inter Tight',sans-serif; font-size:12px; color:var(--rust); font-weight:600; letter-spacing:0.16em; text-transform:uppercase; margin:0 0 8px;">Examinations</p>
           <h2 class="font-display" style="font-size:clamp(1.4rem, 2.3vw, 1.85rem); font-weight:500; margin:0 0 22px; line-height:1.15; letter-spacing:-0.015em; color:var(--ink);">Recent attempts</h2>
-          {recentAttempts.length === 0 ? (
+          {attemptsUnreadable ? (
+            <p style="font-family:'Inter Tight',sans-serif; font-size:13.5px; line-height:1.6; color:var(--ink-500); margin:0;">We could not read your examination history. Every attempt you have sat is still recorded, and every mark still stands &mdash; this is a problem on our side. Reload in a moment.</p>
+          ) : recentAttempts.length === 0 ? (
             <p style="font-family:'Cormorant Garamond',serif; font-style:italic; font-size:1rem; color:var(--ink-500); margin:0;">You haven't sat an examination yet.</p>
           ) : (
             <div style="background:var(--paper); border:1px solid var(--rule); border-radius:14px; overflow:hidden;">
@@ -644,7 +692,9 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
         <div>
           <p style="font-family:'Inter Tight',sans-serif; font-size:12px; color:var(--rust); font-weight:600; letter-spacing:0.16em; text-transform:uppercase; margin:0 0 8px;">Open</p>
           <h2 class="font-display" style="font-size:clamp(1.4rem, 2.3vw, 1.85rem); font-weight:500; margin:0 0 22px; line-height:1.15; letter-spacing:-0.015em; color:var(--ink);">To sit next</h2>
-          {upcomingTests.length === 0 ? (
+          {upcomingUnreadable ? (
+            <p style="font-family:'Inter Tight',sans-serif; font-size:13.5px; line-height:1.6; color:var(--ink-500); margin:0;">We could not read the open examinations. This does not mean there are none left to sit &mdash; it means we could not check. Reload in a moment.</p>
+          ) : upcomingTests.length === 0 ? (
             <p style="font-family:'Cormorant Garamond',serif; font-style:italic; font-size:1rem; color:var(--ink-500); margin:0;">You've covered every published examination. Watch this space.</p>
           ) : (
             <div style="display:flex; flex-direction:column; gap:10px;">
@@ -678,7 +728,9 @@ const sparkLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
             </div>
             {myCertificates.length > 0 && <p style="font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--ink-500); letter-spacing:0.1em; margin:0;">{myCertificates.length} ISSUED</p>}
           </div>
-          {myCertificates.length === 0 ? (
+          {credsUnreadable ? (
+            <p style="font-family:'Inter Tight',sans-serif; font-size:13.5px; line-height:1.6; color:var(--ink-500); margin:0;">We could not read your credentials. Anything issued to you is still valid and still live at its public URL &mdash; this is a problem on our side. Reload in a moment.</p>
+          ) : myCertificates.length === 0 ? (
             <p style="font-family:'Cormorant Garamond',serif; font-style:italic; font-size:1rem; color:var(--ink-500); margin:0;">No credentials yet. Pass any course examination to receive your first.</p>
           ) : (
             <div style="display:grid; grid-template-columns:1fr; gap:12px;" class="cred-grid">

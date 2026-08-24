@@ -3,6 +3,7 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { can } from '@/lib/auth/permissions';
+import { withDbRetry } from '@/lib/db-timeout';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -32,11 +33,11 @@ if (Astro.request.method === 'POST') {
     // payment still exists (referencing the intent), so resolve its order_id from
     // there — otherwise the retry has nothing to work with and bails.
     if (!orderId && intentId) {
-      const pr = rows(await db.execute(sql`
+      const pr = rows(await withDbRetry(() => db.execute(sql`
         SELECT order_id FROM payments
         WHERE reference_id = ${intentId} AND status IN ('paid','captured','authorized') AND order_id IS NOT NULL
         ORDER BY created_at DESC LIMIT 1
-      `))[0] as any;
+      `), 'paidStuck.resolveOrder'))[0] as any;
       orderId = pr?.order_id || '';
     }
     if (orderId) {
@@ -48,12 +49,22 @@ if (Astro.request.method === 'POST') {
     } else {
       errMsg = 'No paid order recorded for this intent.';
     }
-  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 200); }
+  } catch (e: any) {
+    // The real reason lives on e.cause; e.message is only the failed SQL. An operator who retries a
+    // stuck payment and is shown the SQL learns nothing about why the money is still stranded.
+    console.error('[paid-stuck] retry', e?.cause?.message || e?.message);
+    errMsg = String(e?.cause?.message || e?.message || e).slice(0, 200);
+  }
 }
 
+// The empty state below POSITIVELY AFFIRMS that everyone who paid has an application. A read that
+// failed used to land in a bare catch and produce exactly that sentence, on the one console whose
+// whole job is to find people who were charged and got nothing - so nobody retried, and the
+// applicants stayed lost. Unknown is now its own state and says so.
 let stuck: any[] = [];
+let stuckError = '';
 try {
-  stuck = rows(await db.execute(sql`
+  stuck = rows(await withDbRetry(() => db.execute(sql`
     SELECT i.id, i.email, i.first_name, i.last_name, i.role_title_snapshot, i.created_at,
            i.materialise_error, i.paid_order_id,
            p.razorpay_payment_id, p.amount_paise, p.updated_at AS paid_at
@@ -61,8 +72,11 @@ try {
     LEFT JOIN payments p ON p.reference_id = i.id AND p.status IN ('paid','captured','authorized')
     WHERE i.paid_order_id IS NOT NULL OR p.id IS NOT NULL
     ORDER BY i.created_at DESC LIMIT 100
-  `));
-} catch (_) {}
+  `), 'paidStuck.list'));
+} catch (e: any) {
+  stuckError = 'The paid-intent join could not be read, so this list is UNKNOWN, not empty. Postgres said: ' + (e?.cause?.message || e?.message || 'unknown');
+  console.error('[paid-stuck] list', e?.cause?.message || e?.message);
+}
 
 function fmt(d: any) { try { return d ? new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '-'; } catch { return '-'; } }
 function inr(p: any) { return '₹' + ((Number(p) || 0) / 100).toLocaleString('en-IN', { maximumFractionDigits: 0 }); }
@@ -76,9 +90,12 @@ function inr(p: any) { return '₹' + ((Number(p) || 0) / 100).toLocaleString('e
     {okMsg && <div style="background:#ecfdf5;color:#047857;border:1px solid #a7f3d0;border-radius:9px;padding:9px 13px;font-size:13px;margin-bottom:13px;">{okMsg}</div>}
     {errMsg && <div style="background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;border-radius:9px;padding:9px 13px;font-size:13px;margin-bottom:13px;">{errMsg}</div>}
 
-    {stuck.length === 0 ? (
+    {stuckError && <div style="background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;border-radius:9px;padding:9px 13px;font-size:13px;line-height:1.5;margin-bottom:13px;">{stuckError}</div>}
+
+    {!stuckError && stuck.length === 0 && (
       <div style="background:#fff;border:1px solid rgba(14,11,8,0.1);border-radius:12px;padding:30px;text-align:center;color:#8a8078;font-size:0.9rem;">No stuck paid applications. Everyone who paid has an application.</div>
-    ) : (
+    )}
+    {stuck.length > 0 && (
       <div style="background:#fff;border:1px solid rgba(14,11,8,0.1);border-radius:12px;overflow:hidden;">
         <div style="overflow-x:auto;">
           <table style="width:100%;border-collapse:collapse;font-size:13px;">

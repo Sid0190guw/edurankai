@@ -6,10 +6,23 @@ import { sql } from 'drizzle-orm';
 // read honestly, per panel -- but a pooler that accepts the connection and then never answers the
 // query is not a failure they could catch, because postgres-js has no query timeout and the await
 // simply never settled. That is the 504 on this URL: not a slow dashboard, a render that never
-// finished. withDbTimeout turns it into the 'could not be read' state these panels already have,
-// and db-timeout.ts's circuit breaker means the second and third reads are refused instantly
-// rather than each waiting out their own eight seconds.
-import { withDbTimeout } from '@/lib/db-timeout';
+// finished. A bound turns it into the 'could not be read' state these panels already have, and
+// db-timeout.ts's circuit breaker means that once the database really has gone away the remaining
+// reads are refused instantly rather than each waiting out its own fuse.
+// BOUNDING THE WAIT WAS HALF THE ANSWER. THE OTHER HALF IS ASKING AGAIN.
+//
+// Each of the three reads below was bounded at the 8s default and none of them was retried, so one
+// stalled connection cost this page a full eight seconds and three of them in a row opened the
+// process-global breaker - after which the remaining reads were refused instantly and every tile
+// painted 0 under the "some of the figures could not be read" banner. The founder read "the company
+// has no staff and no applications" off a database that was answering in 140ms.
+//
+// What actually fails here is OPENING a connection: ~810ms when it works, no answer at all a fair
+// fraction of the time, at a rate that does not move with load. That failure is per-attempt, so a
+// second attempt is a genuinely independent draw - and it usually reuses the connection the
+// abandoned attempt left in the pool, which is why the pair costs no more than the single 8s wait
+// it replaces. All three are pure SELECTs, so withDbRetry's idempotency condition holds.
+import { withDbRetry } from '@/lib/db-timeout';
 import { adminSectionLabel } from '@/lib/admin-sections';
 // THE FIRST SCREEN SOMEBODY SEES HAS TO SAY WHAT TO DO FIRST.
 //
@@ -43,6 +56,11 @@ const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Go
 // console that says the company has no applications, no staff and no open roles, in the confident
 // typography of a real answer. `const` before the reads that populate it.
 let statsError = '';
+// A ZERO A READER CANNOT TELL APART FROM "NONE" IS THE WHOLE PROBLEM, so keep the two apart.
+// statsError is the banner's variable and the panels below borrow it when THEY fail, which means it
+// cannot answer "did the tile numbers themselves come back?". This flag can, and only the tiles read
+// it: when it is set they say so instead of animating up to a confident 0.
+let countsUnreadable = false;
 
 let appCount = 0, roleCount = 0, userCount = 0, eventCount = 0, newThisWeek = 0;
 let empCount = 0, pendingLeave = 0, heiCount = 0;
@@ -55,7 +73,7 @@ try {
   // nothing here and the tile disagreed with /admin/applications, which defaults to the active
   // filter. Same for "new this week", the pipeline breakdown and the recent list below: all four
   // now read the same set the Applications page shows, so the numbers agree.
-  const counts = await withDbTimeout(db.execute(sql`
+  const counts = await withDbRetry(() => db.execute(sql`
     SELECT
       (SELECT COUNT(*) FROM applications WHERE is_archived = false AND status NOT IN ('hired','rejected','withdrawn','pending_payment'))::int as a,
       (SELECT COUNT(*) FROM roles WHERE is_open = true)::int as r,
@@ -67,7 +85,7 @@ try {
       (SELECT COUNT(*) FROM hei_institutions WHERE is_published = true)::int as h,
       (SELECT COUNT(*) FROM hr_employees WHERE is_active = true)::int as emp,
       (SELECT COUNT(*) FROM hr_leave_request WHERE status = 'pending')::int as lv
-  `), 'admin.dashboard.counts');
+  `), 'admin.dashboard.counts', 4000, 2500);
   // postgres-js driver returns array directly, not {rows:[]}
   const row = (Array.isArray(counts) ? counts[0] : counts?.rows?.[0]) as any;
   if (row) {
@@ -79,10 +97,18 @@ try {
     heiCount = Number(row.h) || 0;
     empCount = Number(row.emp) || 0;
     pendingLeave = Number(row.lv) || 0;
+  } else {
+    // Eight scalar COUNTs always produce exactly one row, so no row means we did not get an answer
+    // even though nothing threw. That is unknown, not zero: leaving the eight variables at their
+    // initialised 0 here is precisely how this page came to state that the company has no staff.
+    countsUnreadable = true;
+    statsError = 'the figures query returned no row';
+    console.error('Dashboard stats error: counts statement returned no row');
   }
 } catch(e: any) {
   // The real Postgres reason is on e.cause; e.message is only the failed statement.
   statsError = e?.cause?.message || e?.message || 'unknown reason';
+  countsUnreadable = true;
   console.error('Dashboard stats error:', statsError);
 }
 // EACH PANEL OWNS ITS OWN FAILURE. Folding both of these into `statsError` meant a thrown pipeline
@@ -92,7 +118,7 @@ try {
 let pipelineError = '';
 let recentError = '';
 try {
-  const rs = await withDbTimeout(db.execute(sql`SELECT status, COUNT(*)::int as n FROM applications WHERE is_archived = false GROUP BY status ORDER BY n DESC`), 'admin.dashboard.pipeline');
+  const rs = await withDbRetry(() => db.execute(sql`SELECT status, COUNT(*)::int as n FROM applications WHERE is_archived = false GROUP BY status ORDER BY n DESC`), 'admin.dashboard.pipeline', 4000, 2000);
   statusRows = (Array.isArray(rs) ? rs : (rs?.rows || [])) as any[];
 } catch(e: any) {
   pipelineError = e?.cause?.message || e?.message || 'the pipeline breakdown could not be read';
@@ -100,7 +126,7 @@ try {
   console.error('Dashboard pipeline error:', pipelineError);
 }
 try {
-  const rra = await withDbTimeout(db.execute(sql`SELECT id, first_name, last_name, email, role_title_snapshot, status, created_at FROM applications WHERE is_archived = false ORDER BY created_at DESC LIMIT 6`), 'admin.dashboard.recent');
+  const rra = await withDbRetry(() => db.execute(sql`SELECT id, first_name, last_name, email, role_title_snapshot, status, created_at FROM applications WHERE is_archived = false ORDER BY created_at DESC LIMIT 6`), 'admin.dashboard.recent', 4000, 2000);
   recentApps = (Array.isArray(rra) ? rra : (rra?.rows || [])) as any[];
 } catch(e: any) {
   recentError = e?.cause?.message || e?.message || 'the recent applications list could not be read';
@@ -203,7 +229,7 @@ const STATUS_COLOR: Record<string,string> = {
   <div class="dash-wrap" style="padding:20px 22px 0;">
     <div class="dash-stats">
       {[
-        {label:'Applications',value:appCount,sub:newThisWeek+' new this week · in progress',href:'/admin/applications',color:'#FF7040'},
+        {label:'Applications',value:appCount,sub:countsUnreadable?'in progress · this week is not counted either':newThisWeek+' new this week · in progress',href:'/admin/applications',color:'#FF7040'},
         {label:'Open Roles',value:roleCount,sub:'actively hiring',href:'/admin/roles',color:'#60a5fa'},
         // Sign-in accounts, NOT headcount. This sits next to the Employees tile and the two will
         // legitimately differ (an admin account is not an employee record), so say which is which.
@@ -213,7 +239,15 @@ const STATUS_COLOR: Record<string,string> = {
         <a href={s.href} class="ds-tap ds-reveal dash-card" style="text-decoration:none;background:#0f0f14;border:1px solid #1a1a1f;border-radius:16px;padding:20px;display:block;position:relative;overflow:hidden;">
           <div style={`position:absolute;inset:0;pointer-events:none;background:radial-gradient(180px 120px at 82% -10%, ${s.color}33, transparent 70%);`}></div>
           <div style={`position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg, ${s.color}, transparent);box-shadow:0 0 12px ${s.color};`}></div>
-          <p class="ds-count" data-count={s.value} style={`font-size:38px;font-weight:800;color:${s.color};margin:0;line-height:1;font-family:'Space Grotesk','Geist Mono',monospace;letter-spacing:-0.02em;text-shadow:0 0 24px ${s.color}55;position:relative;`}>0</p>
+          {/* NO data-count WHEN THE FIGURE IS UNKNOWN. era-motion.js animates every [data-count]
+              element from 0 up to its value, so leaving the attribute on would have this tile count
+              confidently up to zero — the single most believable false statement on the console.
+              Without the attribute the script never touches it and the word stands. */}
+          {countsUnreadable ? (
+            <p class="ds-count" title="This figure could not be read. It is not a count of zero." style={`font-size:20px;font-weight:700;color:#e8c46a;margin:0;line-height:1.35;font-family:'Space Grotesk','Geist Mono',monospace;letter-spacing:-0.01em;position:relative;`}>not read</p>
+          ) : (
+            <p class="ds-count" data-count={s.value} style={`font-size:38px;font-weight:800;color:${s.color};margin:0;line-height:1;font-family:'Space Grotesk','Geist Mono',monospace;letter-spacing:-0.02em;text-shadow:0 0 24px ${s.color}55;position:relative;`}>0</p>
+          )}
           <p style="font-size:13px;font-weight:700;color:#fff;margin:9px 0 2px;position:relative;">{s.label}</p>
           <p style="font-size:10.5px;color:#9aa6b6;margin:0;position:relative;">{s.sub}</p>
         </a>
@@ -227,7 +261,11 @@ const STATUS_COLOR: Record<string,string> = {
         {label:'HEI Published',value:heiCount,href:'/admin/hei/institutions',color:'#FF7040'},
       ].map(s=>(
         <a href={s.href} class="ds-tap ds-reveal dash-card" style="text-decoration:none;background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:12px;text-align:center;display:block;">
-          <p class="ds-count" data-count={s.value} style={`font-size:24px;font-weight:800;color:${s.color};margin:0;line-height:1;font-family:'Geist Mono',monospace;`}>0</p>
+          {countsUnreadable ? (
+            <p class="ds-count" title="This figure could not be read. It is not a count of zero." style="font-size:14px;font-weight:700;color:#e8c46a;margin:0;line-height:1.3;font-family:'Geist Mono',monospace;">not read</p>
+          ) : (
+            <p class="ds-count" data-count={s.value} style={`font-size:24px;font-weight:800;color:${s.color};margin:0;line-height:1;font-family:'Geist Mono',monospace;`}>0</p>
+          )}
           <p style="font-size:10.5px;color:#9aa6b6;margin:5px 0 0;line-height:1.3;">{s.label}</p>
         </a>
       ))}
@@ -243,13 +281,17 @@ const STATUS_COLOR: Record<string,string> = {
           <div style="display:flex;flex-direction:column;gap:10px;">
             {statusRows.map((row:any)=>{
               if (!row || !row.status) return null;
-              const pct = appCount > 0 ? Math.round((row.n/appCount)*100) : 0;
+              // The percentage needs a denominator, and the denominator comes from the tiles query.
+              // When that did not answer, appCount is 0 and every stage would have printed "0%"
+              // beside a real count - a share of nothing, stated as a fact. Print the count alone.
+              const pctKnown = !countsUnreadable && appCount > 0;
+              const pct = pctKnown ? Math.round((row.n/appCount)*100) : 0;
               const color = STATUS_COLOR[row.status] || '#6e6e78';
               return (
                 <div>
                   <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
                     <span style={`font-size:11.5px;font-weight:600;color:${color};text-transform:capitalize;`}>{row.status.replace('_',' ')}</span>
-                    <span style="font-size:11px;color:#6e6e78;font-family:'Geist Mono',monospace;">{row.n} · {pct}%</span>
+                    <span style="font-size:11px;color:#6e6e78;font-family:'Geist Mono',monospace;">{pctKnown ? row.n + ' · ' + pct + '%' : row.n}</span>
                   </div>
                   <div style="background:#15151a;border-radius:100px;height:5px;overflow:hidden;">
                     <div style={`background:${color};height:100%;width:${pct}%;border-radius:100px;box-shadow:0 0 8px ${color}88;`}></div>

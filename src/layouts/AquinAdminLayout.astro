@@ -16,6 +16,7 @@
 //
 // A NEW FILE, not an edit to an existing layout. Nothing that renders today changes.
 import { requireAquinAdmin } from '@/lib/aquin/gate';
+import { withDbRetry, isDbUnavailable } from '@/lib/db-timeout';
 import { isAquinSuperAdmin } from '@/lib/aquin/identity';
 
 interface Props {
@@ -46,9 +47,38 @@ interface Props {
 }
 const { title, active = '', superAdminOnly = false, roles: allowedRoles } = Astro.props;
 
-const gate = superAdminOnly
-  ? await (await import('@/lib/aquin/gate')).requireAquinSuperAdmin(Astro as any)
-  : await requireAquinAdmin(Astro as any);
+// BOUNDED, BECAUSE THE DEGRADED ANSWER THIS PANEL ALREADY HAS WAS UNREACHABLE.
+//
+// src/lib/aquin/gate.ts:74 already returns an honest gate for `principal.degraded` — "Your
+// AquinTutor sign-in could not be checked just now. Nothing is wrong with your account." That
+// branch is exactly right and it could not be reached, because the await above it had no bound at
+// all: postgres-js has no query timeout, so when a connection stalls the promise never settles and
+// the platform kills the invocation. Every page in this panel answered with a gateway timeout
+// instead of the sentence someone had already written for the occasion.
+//
+// withDbRetry rather than withDbTimeout, and for the same reason src/middleware.ts uses it at its
+// own five gates: what fails on this deployment is OPENING a connection, so asking a second time
+// gets an answer where waiting longer does not.
+//
+// FAILS CLOSED. A timeout produces a degraded gate — not a redirect to the login, which would sign
+// an administrator out over a five-second blip, and not an open door.
+let gate: Awaited<ReturnType<typeof requireAquinAdmin>>;
+let gateUnreadable = false;
+try {
+  gate = superAdminOnly
+    ? await withDbRetry(() => (import('@/lib/aquin/gate')).then((m) => m.requireAquinSuperAdmin(Astro as any)), 'aquinAdmin.gate.super')
+    : await withDbRetry(() => requireAquinAdmin(Astro as any), 'aquinAdmin.gate');
+} catch (e: any) {
+  if (!isDbUnavailable(e)) throw e;
+  console.error('[AquinAdminLayout] access could not be checked -', e?.cause?.message || e?.message);
+  gateUnreadable = true;
+  // Shaped like a denial so everything below reads it unchanged. principal is the empty one, so the
+  // header renders "Not signed in" rather than inventing an identity we could not verify.
+  gate = { ok: false, principal: { userId: null, email: null, name: null, roles: [] } as any, redirect: null, message: null } as any;
+}
+// The gate's own degraded answer, which means the same thing arrived by a different route: the
+// principal resolved to "could not be checked" rather than to a person. Both render the same panel.
+if (!gateUnreadable && !gate.ok && !gate.redirect && (gate.principal as any)?.degraded) gateUnreadable = true;
 
 // A LAYOUT CANNOT REDIRECT, AND TRYING TO TOOK EVERY PAGE IN THIS PANEL DOWN.
 //
@@ -169,7 +199,19 @@ const visible = NAV.filter((n) => !n.sup || superAdmin);
     </div>
   </header>
 
-  {signInHref ? (
+  {gateUnreadable ? (
+    <div class="aq-deny" style="border-color:rgba(14,11,8,0.18);">
+      <p style="margin:0 0 8px;font-weight:700;font-size:15px;">Your access could not be checked just now</p>
+      <p style="margin:0;font-size:13.5px;color:var(--mute);line-height:1.65;">
+        The database did not answer, so nothing is being shown rather than something wrong. This is a
+        problem on our side and not a problem with your account or your roles - you have not been
+        signed out.
+      </p>
+      <p style="margin:16px 0 0;">
+        <a href="" style="display:inline-flex;align-items:center;min-height:44px;padding:0 18px;border-radius:10px;background:var(--rust);color:#fff;text-decoration:none;font-weight:650;font-size:15px;">Try again</a>
+      </p>
+    </div>
+  ) : signInHref ? (
     <div class="aq-deny" style="border-color:rgba(14,11,8,0.18);">
       <p style="margin:0 0 8px;font-weight:700;font-size:15px;">Sign in to AquinTutor administration</p>
       <p style="margin:0;font-size:13.5px;color:var(--mute);line-height:1.65;">

@@ -11,6 +11,7 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { createRequest, notifyNewRequest, isFreePath, FIRM_VERIFICATION_FEE_CHF, type VerifierKind } from '@/lib/offer-verification';
+import { withDbRetry } from '@/lib/db-timeout';
 
 const token = String(Astro.params.token || '');
 const qKind = String(Astro.url.searchParams.get('kind') || 'institution');
@@ -21,17 +22,25 @@ const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
 // Confirm the token belongs to a real offer before collecting anyone's details. Nothing about the
 // candidate is shown here — only that the reference is valid.
-let validToken = false;
+// THREE STATES, NOT TWO. A failed lookup used to collapse onto the same `false` as "no such row",
+// so a background-check firm following the QR code on a genuine offer letter was told the reference
+// was not recognised - the candidate's real offer reading as fabricated to the party deciding
+// whether to hire them. "Unreadable" is now its own answer and the page says which one it is.
+let tokenState: 'valid' | 'unknown' | 'unreadable' = 'unknown';
 try {
-  validToken = rows(await db.execute(sql`SELECT 1 FROM offer_letters WHERE token = ${token} LIMIT 1`)).length > 0;
-} catch { validToken = false; }
+  const found = rows(await withDbRetry(() => db.execute(sql`SELECT 1 FROM offer_letters WHERE token = ${token} LIMIT 1`), 'offerVerify.token')).length > 0;
+  tokenState = found ? 'valid' : 'unknown';
+} catch (e: any) {
+  tokenState = 'unreadable';
+  console.error('[offer-verify] token lookup', e?.cause?.message || e?.message);
+}
 
 let done = false;
 let err = '';
 // Set for the firm path so the page can open checkout immediately after the request is recorded.
 let payRequestId = '';
 
-if (Astro.request.method === 'POST' && validToken) {
+if (Astro.request.method === 'POST' && tokenState === 'valid') {
   const fd = await Astro.request.formData();
   const res = await createRequest({
     token,
@@ -66,13 +75,31 @@ if (Astro.request.method === 'POST' && validToken) {
   }
 }
 
+// A POST that arrived while the reference could not be checked used to fall through every branch:
+// the page re-rendered as "Reference not recognised" and the details the verifier had just typed
+// went nowhere. The gate stays shut - a request is only ever recorded against a confirmed offer -
+// but the discard is now stated instead of silent.
+if (Astro.request.method === 'POST' && tokenState === 'unreadable') {
+  err = 'We could not check this reference just now, so nothing was submitted and nothing was recorded. This is a problem at our end, not with your details. Please try again shortly.';
+}
+
 const label = kind === 'firm' ? 'Employer, firm or organisation'
   : kind === 'individual' ? 'Individual' : 'Educational institution';
 const field = 'w-full px-3 py-3 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-white';
 ---
 <BaseLayout title="Request offer-letter certification" description="Request a formal certification of an EduRankAI offer letter.">
   <section class="px-[5vw] py-10 md:py-14 max-w-xl mx-auto">
-    {!validToken ? (
+    {tokenState === 'unreadable' ? (
+      <div class="border border-ink/12 rounded-xl p-6 text-center">
+        <h1 class="font-display text-[1.3rem] font-semibold text-ink mb-2">We could not check this reference just now</h1>
+        <p class="text-[0.88rem] text-ink-soft leading-relaxed">
+          This does not mean the reference is invalid - our records did not answer, so it has not
+          been looked up at all. Please try again shortly, or write to
+          <a href="mailto:hr@edurankai.in" class="text-burn underline">hr@edurankai.in</a>.
+        </p>
+        {err && <p class="text-[0.86rem] text-red-800 bg-red-50 border border-red-200 rounded-lg p-3 mt-4 text-left leading-relaxed">{err}</p>}
+      </div>
+    ) : tokenState === 'unknown' ? (
       <div class="border border-ink/12 rounded-xl p-6 text-center">
         <h1 class="font-display text-[1.3rem] font-semibold text-ink mb-2">Reference not recognised</h1>
         <p class="text-[0.88rem] text-ink-soft leading-relaxed">

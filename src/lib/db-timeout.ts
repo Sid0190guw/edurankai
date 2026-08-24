@@ -141,8 +141,36 @@ function noteSuccess(): void {
   consecutiveTimeouts = 0;
 }
 
-function noteTimeout(label: string): void {
+/**
+ * A READ NOTHING ON THE SCREEN DEPENDS ON MUST NOT BE ABLE TO REFUSE THE READS THAT EVERYTHING
+ * DEPENDS ON.
+ *
+ * The breaker is process-global by design, and that is what makes it worth having: a dozen reads on
+ * one page cost one timeout and eleven instant refusals instead of a gateway timeout. It is also
+ * what makes it dangerous to feed from the wrong place. src/layouts/AdminLayout.astro reads one
+ * column of hr_employees to choose an ACCENT COLOUR, on every one of ~160 admin surfaces. Nothing is
+ * wrong on the screen when that read fails — the layout already defaults the colour — but three of
+ * them in a row opened the circuit, and from that moment every real read in the instance was refused
+ * without waiting. A cosmetic detail was able to take the console's data down.
+ *
+ * `cosmetic` says: bound this, log it, hand the caller its error — and do not count it as evidence
+ * about the database. It is still REFUSED while the circuit is open, because that is exactly the
+ * situation in which a colour is not worth a connection.
+ *
+ * Use it only where the failure changes nothing a reader would notice. If a panel would render
+ * empty, or a number would render as zero, it is not cosmetic.
+ */
+export interface DbWaitOptions { cosmetic?: boolean }
+
+function noteTimeout(label: string, cosmetic = false): void {
   timeoutCount += 1;
+  if (cosmetic) {
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(), level: 'warn', event: 'db.timeout.cosmetic',
+      label, timeouts: timeoutCount, note: 'not counted toward the circuit breaker',
+    }));
+    return;
+  }
   consecutiveTimeouts += 1;
   // Only the run of failures opens it. A single slow read is logged and otherwise costs nothing:
   // its own caller already received a DbTimeoutError and will degrade that one panel.
@@ -161,7 +189,7 @@ function noteTimeout(label: string): void {
  * The losing promise keeps running; only the WAITING stops. Clearing the timer matters because a
  * pending timeout keeps a serverless instance's event loop alive after the response is sent.
  */
-export function withDbTimeout<T>(work: Promise<T>, label: string, ms: number = DB_TIMEOUT_MS): Promise<T> {
+export function withDbTimeout<T>(work: Promise<T>, label: string, ms: number = DB_TIMEOUT_MS, opts?: DbWaitOptions): Promise<T> {
   if (dbCircuitOpen()) {
     // Do not leave `work` unobserved: an unhandled rejection on a promise nobody awaits can take the
     // process down. Swallow it here — the caller is being told the circuit is open instead.
@@ -194,7 +222,7 @@ export function withDbTimeout<T>(work: Promise<T>, label: string, ms: number = D
       timer = setTimeout(() => {
         if (settled) return;
         settled = true;
-        noteTimeout(label);
+        noteTimeout(label, opts?.cosmetic === true);
         reject(new DbTimeoutError(label, ms));
       }, ms);
     }),

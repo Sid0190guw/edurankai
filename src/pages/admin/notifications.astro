@@ -7,12 +7,31 @@ import { notificationPreferences } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
 import { CATEGORY_META, metaFor } from '@/lib/notification-catalog';
 import { ensureNotificationsSchema } from '@/lib/notifications-schema';
+// THE HONEST STATES ON THIS PAGE WERE WRITTEN FOR A THROW, AND THE FAILURE IS A WAIT.
+//
+// Every read below already reported its own failure in its own words - the banner further down says
+// "Your notifications could not be read, so this list is empty for a reason that is not 'no
+// notifications'" - and not one of those sentences could ever reach a screen, because no wait on
+// this page was bounded. Opening a connection on this deployment costs ~810ms when it works and
+// stalls past five seconds a fair fraction of the times it has to open one, so what the admin
+// actually got was a gateway timeout and a blank tab, on the one surface whose entire job is telling
+// them what is waiting for them. A try/catch cannot catch a wait; these bounds turn the wait into
+// the throw the catch was always written for.
+import { withDbRetry, withDbTimeout, isDbUnavailable } from '@/lib/db-timeout';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 if (user.role === 'applicant') return Astro.redirect('/portal');
 
-await ensureNotificationsSchema();
+// This sat above every other statement on the page with no bound and no catch at all, so a stalled
+// or failing bootstrap took the whole route down before a single honest read state could render.
+// If it fails, the reads below say so in their own words, and a page that explains itself beats a
+// 500. Note reasonOf() is declared further down and const is not hoisted, so this logs inline.
+try {
+  await withDbTimeout(ensureNotificationsSchema(), 'admin.notifications.ensure', 2500);
+} catch (e: any) {
+  console.error('[admin/notifications] schema ensure failed:', e?.cause?.message || e?.message);
+}
 
 // Load this admin's saved opt-out map so toggles render their real state.
 //
@@ -25,9 +44,15 @@ await ensureNotificationsSchema();
 // preference they never changed. Unknown is drawn as unknown instead.
 let savedPrefs: Record<string, boolean> = {};
 let prefsReadError = '';
+// Bounded and asked twice: the measured failure is opening a connection, not answering a query, so
+// the second draw usually reuses the one the abandoned attempt left in the pool. A pure SELECT of
+// one row, so the retry is safe. Without the bound the "showing its DEFAULT and not necessarily
+// yours" warning below could never render - the page never finished at all.
 try {
-  const rows = await db.select().from(notificationPreferences)
-    .where(eq(notificationPreferences.userId, user.id)).limit(1);
+  const rows = await withDbRetry(
+    () => db.select().from(notificationPreferences)
+      .where(eq(notificationPreferences.userId, user.id)).limit(1),
+    'admin.notifications.prefs', 3000, 2000);
   if (rows.length > 0 && rows[0].prefs && typeof rows[0].prefs === 'object') {
     savedPrefs = rows[0].prefs as any;
   }
@@ -56,32 +81,42 @@ const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || '
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
+  // Each write is bounded and NONE is retried. A bound is all a write may have here: withDbTimeout
+  // sheds the WAIT and not the WORK, so the statement is already in flight and re-sending it would
+  // be a second, different change to the same rows.
   try {
     if (action === 'mark_read') {
       const notifId = fd.get('id') as string;
-      await db.execute(sql`UPDATE notifications SET is_read = true, read_at = NOW() WHERE id = ${notifId} AND user_id = ${user.id}`);
+      await withDbTimeout(db.execute(sql`UPDATE notifications SET is_read = true, read_at = NOW() WHERE id = ${notifId} AND user_id = ${user.id}`), 'admin.notifications.mark_read', 4000);
     } else if (action === 'mark_all_read') {
-      await db.execute(sql`UPDATE notifications SET is_read = true, read_at = NOW() WHERE user_id = ${user.id} AND is_read = false`);
+      await withDbTimeout(db.execute(sql`UPDATE notifications SET is_read = true, read_at = NOW() WHERE user_id = ${user.id} AND is_read = false`), 'admin.notifications.mark_all_read', 4000);
       okMsg = 'All notifications marked as read.';
     } else if (action === 'delete_notif') {
       const notifId = fd.get('id') as string;
-      await db.execute(sql`DELETE FROM notifications WHERE id = ${notifId} AND user_id = ${user.id}`);
+      await withDbTimeout(db.execute(sql`DELETE FROM notifications WHERE id = ${notifId} AND user_id = ${user.id}`), 'admin.notifications.delete_notif', 4000);
     } else if (action === 'archive') {
       const notifId = fd.get('id') as string;
-      await db.execute(sql`UPDATE notifications SET is_archived = true, is_read = true, read_at = COALESCE(read_at, NOW()) WHERE id = ${notifId} AND user_id = ${user.id}`);
+      await withDbTimeout(db.execute(sql`UPDATE notifications SET is_archived = true, is_read = true, read_at = COALESCE(read_at, NOW()) WHERE id = ${notifId} AND user_id = ${user.id}`), 'admin.notifications.archive', 4000);
     } else if (action === 'unarchive') {
       const notifId = fd.get('id') as string;
-      await db.execute(sql`UPDATE notifications SET is_archived = false WHERE id = ${notifId} AND user_id = ${user.id}`);
+      await withDbTimeout(db.execute(sql`UPDATE notifications SET is_archived = false WHERE id = ${notifId} AND user_id = ${user.id}`), 'admin.notifications.unarchive', 4000);
     } else if (action === 'archive_all_read') {
-      await db.execute(sql`UPDATE notifications SET is_archived = true WHERE user_id = ${user.id} AND is_read = true AND COALESCE(is_archived, false) = false`);
+      await withDbTimeout(db.execute(sql`UPDATE notifications SET is_archived = true WHERE user_id = ${user.id} AND is_read = true AND COALESCE(is_archived, false) = false`), 'admin.notifications.archive_all_read', 4000);
       okMsg = 'Archived all read notifications.';
     } else if (action === 'clear_all_read') {
-      await db.execute(sql`DELETE FROM notifications WHERE user_id = ${user.id} AND is_read = true`);
+      await withDbTimeout(db.execute(sql`DELETE FROM notifications WHERE user_id = ${user.id} AND is_read = true`), 'admin.notifications.clear_all_read', 4000);
       okMsg = 'Cleared all read notifications.';
     }
   } catch(e: any) {
     okMsg = '';
-    errMsg = 'Nothing was changed: ' + reasonOf(e);
+    // A TIMED-OUT WRITE IS NOT A WRITE THAT DID NOT HAPPEN, and this page must not say it was.
+    // We stopped waiting; the UPDATE or DELETE may well have landed a moment later. "Nothing was
+    // changed" is exactly the kind of confident false sentence this whole page exists to avoid, so
+    // it is now reserved for a statement that genuinely failed - a missing column, a bad value.
+    // When the database simply did not answer, say that we do not know, and say what to do about it.
+    errMsg = isDbUnavailable(e)
+      ? 'We could not confirm whether this was applied: the database did not answer in time. It may have gone through. Reload to see the current state before trying again.'
+      : 'Nothing was changed: ' + reasonOf(e);
     console.error('[admin/notifications] ' + action + ' failed:', reasonOf(e));
   }
 }
@@ -96,6 +131,15 @@ const q = (url.searchParams.get('q') || '').trim();
 // Build the filtered history query (server-side; no polling).
 let notifications: any[] = [];
 let unreadCount = 0;
+// AN UNREADABLE UNREAD COUNT IS NOT AN UNREAD COUNT OF ZERO. It used to be: the count was a second
+// statement inside the same try, so when it failed after the list had already been assigned, the
+// page painted real unread rows with the header badge silently gone and the filter chip reading
+// "Unread (0)" - a list visibly contradicting its own count. The count now rides along as a scalar
+// subquery on the statement that fetches the list, so one round trip carries both and one failure
+// state covers both. It cannot ride along when the filtered list is empty (no row to carry it, and
+// "no archived notifications" says nothing about unread ones in the inbox), so that one case asks
+// separately - and if THAT does not answer, the count is drawn as unknown rather than as zero.
+let unreadUnknown = false;
 try {
   const conds = [sql`user_id = ${user.id}`];
   conds.push(view === 'archived' ? sql`is_archived = true` : sql`COALESCE(is_archived, false) = false`);
@@ -103,20 +147,40 @@ try {
   else if (filter === 'read') conds.push(sql`is_read = true`);
   if (category !== 'all') conds.push(sql`category = ${category}`);
   if (q) conds.push(sql`(title ILIKE ${'%' + q + '%'} OR body ILIKE ${'%' + q + '%'})`);
-  const r = await db.execute(sql`
-    SELECT * FROM notifications
+  // A scalar subquery, not COUNT(*) OVER () - the window function would count only the 100 rows the
+  // LIMIT returned and the badge would cap itself at 100 without saying so.
+  const r = await withDbRetry(() => db.execute(sql`
+    SELECT notifications.*, (
+      SELECT COUNT(*)::int FROM notifications AS un
+      WHERE un.user_id = ${user.id} AND un.is_read = false AND COALESCE(un.is_archived, false) = false
+    ) AS unread_total
+    FROM notifications
     WHERE ${sql.join(conds, sql` AND `)}
     ORDER BY created_at DESC
     LIMIT 100
-  `);
+  `), 'admin.notifications.history', 4000, 2500);
   notifications = Array.isArray(r) ? r : (r?.rows || []);
-  const uc = await db.execute(sql`SELECT COUNT(*)::int AS n FROM notifications WHERE user_id = ${user.id} AND is_read = false AND COALESCE(is_archived, false) = false`);
-  const ucRows = Array.isArray(uc) ? uc : (uc?.rows || []);
-  unreadCount = Number((ucRows[0] as any)?.n) || 0;
+  if (notifications.length > 0) {
+    unreadCount = Number((notifications[0] as any)?.unread_total) || 0;
+  } else {
+    // No row came back to carry the count, and this view being empty says nothing about the inbox.
+    try {
+      const uc = await withDbTimeout(db.execute(sql`SELECT COUNT(*)::int AS n FROM notifications WHERE user_id = ${user.id} AND is_read = false AND COALESCE(is_archived, false) = false`), 'admin.notifications.unread', 2500);
+      const ucRows = Array.isArray(uc) ? uc : (uc?.rows || []);
+      unreadCount = Number((ucRows[0] as any)?.n) || 0;
+    } catch (e: any) {
+      unreadUnknown = true;
+      console.error('[admin/notifications] unread count read failed:', reasonOf(e));
+    }
+  }
 } catch(e: any) {
   loadError = reasonOf(e);
+  unreadUnknown = true;
   console.error('[admin/notifications] history read failed:', loadError);
 }
+// The label the filter chip carries, built here because a JSX expression is the wrong place to
+// decide what a number means. An unknown count is drawn without one rather than as "Unread (0)".
+const unreadChipLabel = unreadUnknown ? 'Unread' : 'Unread (' + unreadCount + ')';
 
 // Category icon glyphs (no emoji — inline SVG injected into <svg> via set:html).
 const ICONS: Record<string, string> = {
@@ -178,7 +242,11 @@ function timeAgo(d: any) {
         <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">Activity</p>
         <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">
           Notifications
-          {unreadCount > 0 && <span style="font-size:12px;font-weight:700;background:#FF4F00;color:#fff;padding:2px 8px;border-radius:100px;margin-left:8px;">{unreadCount}</span>}
+          {unreadUnknown ? (
+            <span title="The unread count could not be read, so this is not a count of zero." style="font-size:12px;font-weight:700;background:#2a2a32;color:#fbbf24;padding:2px 8px;border-radius:100px;margin-left:8px;">unknown</span>
+          ) : unreadCount > 0 ? (
+            <span style="font-size:12px;font-weight:700;background:#FF4F00;color:#fff;padding:2px 8px;border-radius:100px;margin-left:8px;">{unreadCount}</span>
+          ) : null}
         </h1>
       </div>
       {tab === 'inbox' && notifications.length > 0 && (
@@ -236,7 +304,7 @@ function timeAgo(d: any) {
 
       <!-- Read/unread filter -->
       <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;">
-        {[['all','All'],['unread',`Unread (${unreadCount})`],['read','Read']].map(([v,l]) => (
+        {[['all','All'],['unread',unreadChipLabel],['read','Read']].map(([v,l]) => (
           <a href={`?tab=inbox&view=${view}&filter=${v}${category!=='all'?`&category=${category}`:''}${q?`&q=${encodeURIComponent(q)}`:''}`} style={`text-decoration:none;font-size:11px;font-weight:600;padding:5px 12px;border-radius:100px;${filter === v ? 'background:#1f1f26;color:#fff;border:1px solid #2a2a32;' : 'background:#0f0f14;border:1px solid #1a1a1f;color:#8a8a94;'}`}>{l}</a>
         ))}
       </div>

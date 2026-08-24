@@ -6,24 +6,107 @@
 export const prerender = false;
 import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
 import { contentService } from '@/lib/kernel-content';
+import { createPgKernel } from '@/lib/kernel';
 import { startLesson } from '@/lib/edu-runtime';
 import { mdLite, latexToHtml, EQUATION_CSS } from '@/lib/content-render';
 import { resolveDirective, rewriteMedia, getOverride } from '@/lib/render-policy';
 import { assessmentsForObject } from '@/lib/assessment';
 import { can } from '@/lib/rbac';
+import { permissionContextDegraded } from '@/lib/rbac/guard';
+import { withDbRetry, withDbTimeout } from '@/lib/db-timeout';
 
 const user = Astro.locals.user;
 const id = Astro.params.id!;
+
+// A REFUSAL PAGE THAT SAYS WHICH THING FAILED, INSTEAD OF A BARE `new Response('Lesson not found')`.
+// Every branch below that stops the render used to blame the lesson or the reader. This one names
+// our side of it, and offers the only useful action. No lesson content, no identifiers, nothing the
+// reader did not already have.
+const esc = (s: string) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const here = esc(Astro.url.pathname);
+function notice(status: number, heading: string, body: string, retry: boolean): Response {
+  const html = '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
+    + '<title>' + heading + ' &middot; AquinTutor</title>'
+    // system-ui and not the lesson typeface: this document does not go through the layout, so
+    // Fraunces and Inter Tight are not loaded here and naming them only costs a reflow.
+    + '<style>body{font-family:system-ui,-apple-system,sans-serif;background:#FBFAF4;color:#141414;'
+    + 'margin:0;padding:56px 20px;line-height:1.65;}main{max-width:36rem;margin:0 auto;}'
+    + 'h1{font-size:1.5rem;margin:0 0 12px;}p{color:#3a3a3a;margin:0 0 12px;}'
+    + 'a{color:#B8512E;font-weight:600;}</style></head><body><main><h1>' + heading + '</h1><p>' + body + '</p><p>'
+    + (retry ? '<a href="' + here + '">Try again</a> &middot; ' : '')
+    + '<a href="/aquintutor/courses">All courses</a></p></main></body></html>';
+  const headers: Record<string, string> = { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' };
+  if (retry) headers['retry-after'] = '10';
+  return new Response(html, { status, headers });
+}
+
 const { view, assembled, isStaff } = await startLesson(user, id, Astro.request);
-if (!view || !assembled) return new Response('Lesson not found', { status: 404 });
+
+// A 404 THAT MEANT "WE DID NOT READ IT", NOT "IT IS NOT THERE".
+// startLesson swallows its own read (edu-runtime.ts does `getUnitView(koId).catch(() => null)`) and
+// getUnitView swallows the graph read under it (kernel-content.ts), so a lesson that exists and a
+// database that would not answer both arrive here as the same `null` — and this page printed
+// "Lesson not found" for both, with a 404. A student sent that link concludes the lesson was
+// withdrawn, and tells their tutor so.
+// So when the runtime comes back empty, ask ONE bounded question that is allowed to fail: is the row
+// there? PgKernelStore.getObject() throws on a database error and returns null only for a real miss,
+// which is exactly the distinction the swallowed reads above threw away.
+let lessonUnreadable = false;
+if (!view || !assembled) {
+  // kernel_objects.id is a UUID column, so an address that is not a UUID cannot match a row. That is
+  // a genuine 404 and it does not deserve a round trip — junk and crawler traffic stops here.
+  const looksLikeAnObjectId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+  if (looksLikeAnObjectId) {
+    try {
+      // Row present, but the runtime could not read it a moment ago: the lesson is fine, we were not.
+      if (await withDbRetry(() => createPgKernel().getObject(id), 'lesson.exists')) lessonUnreadable = true;
+    } catch (e: any) {
+      // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+      lessonUnreadable = true;
+      console.error('[aquintutor/lesson] existence check failed:', e?.cause?.message || e?.message);
+    }
+  }
+}
+if (lessonUnreadable) return notice(503, 'This lesson could not be read just now',
+  'The lesson has not been removed, unpublished or moved &mdash; our database did not answer this request in time. That is a problem on our side, not with your account, your enrolment or your connection.', true);
+if (!view || !assembled) return notice(404, 'There is no lesson at this address',
+  'We checked, and no lesson exists with this identifier. The link may be mistyped, or the lesson may have been replaced by another one. Nothing failed on our side just now.', false);
 
 const unit: any = view.unit;
+
+// "LOCKED" AND "WE COULD NOT CHECK" ARE NOT THE SAME SENTENCE.
+// The permission engine denies at Tier 0 whenever the permission context could not be read, so a
+// database that would not answer reached this line as outcome === 'denied' and the student was sent
+// to /aquintutor/courses?locked=<labels> — told, in the URL, that the material is above their
+// clearance. permissionContextDegraded() asks the one question that separates the two, and costs
+// nothing: it reads the same principal the runtime already resolved for this request.
+const refused = assembled.outcome === 'denied' || (unit.lifecycleState !== 'published' && !isStaff);
+const accessUncheckable = refused ? await permissionContextDegraded(user) : false;
+// STILL CLOSED. An unreadable permission context is a refusal and stays one; the only change is
+// that we say which of the two refusals it was, and the lesson is not rendered either way.
+if (accessUncheckable) return notice(503, 'We could not check whether you may open this lesson',
+  'Your access could not be confirmed, because the permission records did not answer just now. Nothing has changed about your account or your enrolment, and this lesson has not been locked. We will not open a lesson we cannot check, so please try again in a moment.', true);
 if (unit.lifecycleState !== 'published' && !isStaff) return Astro.redirect('/aquintutor/courses');
 if (assembled.outcome === 'denied') return Astro.redirect('/aquintutor/courses?locked=' + encodeURIComponent((unit.securityLabels || []).join(',')));
 
 // render the SERVED unit (a language/accessibility variant if the runtime chose one)
+// The runtime only names a variant it has already SEEN in the graph, so an empty answer here is a
+// failed read, not a missing translation. Falling back to the base unit is right; doing it silently
+// was not — a student who asked for Hindi was handed English with nothing on the page to explain it.
+// Bounded and not retried: the base unit is a complete lesson and is already in hand.
 const servedId = assembled.servedUnitId || id;
-const renderView = servedId === id ? view : ((await contentService().getUnitView(servedId).catch(() => null)) || view);
+let variantUnreadable = false;
+let renderView = view;
+if (servedId !== id) {
+  try {
+    const v = await withDbTimeout(contentService().getUnitView(servedId), 'lesson.variant', 4000);
+    if (v) renderView = v; else variantUnreadable = true;
+  } catch (e: any) {
+    variantUnreadable = true;
+    console.error('[aquintutor/lesson] served variant read failed:', e?.cause?.message || e?.message);
+  }
+}
 const data: any = renderView.unit.data;
 const lm: any = renderView.unit.learningMetadata || {};
 const equations = Array.isArray(data.equations) ? data.equations : [];
@@ -37,13 +120,37 @@ const justCompleted = Astro.url.searchParams.get('done') === '1';
 const rootFont = 16 * (plan.fontScale || 1);
 
 // Adaptive Rendering (Prompt 5): the tier + per-object override -> concrete render directives.
-const override = await getOverride(servedId).catch(() => null);
+// Bounded, not retried, and nothing is said on the page when it fails: an absent override means the
+// default directives for this tier, which is a correct lesson — the only cost is that a
+// hand-tuned image or hydration setting is not applied for one render.
+let override: Awaited<ReturnType<typeof getOverride>> = null;
+try {
+  override = await withDbTimeout(getOverride(servedId), 'lesson.renderOverride', 3000);
+} catch (e: any) {
+  console.error('[aquintutor/lesson] render override read failed:', e?.cause?.message || e?.message);
+}
 const directive = resolveDirective('KnowledgeObject', plan.tier, override);
 const bodyHtml = data.body ? rewriteMedia(mdLite(data.body), directive) : '';
 const interactiveEquations = directive.hydrate.includes('equation-explorer') && equations.length > 0;
 
 // Assessments attached to this KO (Prompt 8) — only published ones the student may see.
-const rawAssessments = await assessmentsForObject(id, true).catch(() => []);
+// An empty list here used to mean two different things and look like one: a lesson with no questions,
+// and a read that failed. The section simply vanished, and a student revising for an examination
+// concluded there was nothing to practise. assessmentsForObject() has its own inner catch that
+// returns [] (src/lib/assessment.ts) and this file cannot see through it — but it CAN see the wait,
+// and a stall is the shape this outage takes, so bound it and say so on the page.
+let assessmentsUnreadable = false;
+let rawAssessments: any[] = [];
+try {
+  rawAssessments = await withDbTimeout(assessmentsForObject(id, true), 'lesson.assessments', 4000);
+} catch (e: any) {
+  assessmentsUnreadable = true;
+  console.error('[aquintutor/lesson] assessments read failed:', e?.cause?.message || e?.message);
+}
+// One can() per assessment, deliberately: each is a separate authorization decision and each gets
+// its own audit row, which is enforce()'s stated contract. What used to make this expensive was that
+// every call re-resolved the same principal from three SELECTs; guard.ts now resolves it once per
+// request, so this loop costs one audit write apiece instead of four round trips.
 const assessments: any[] = [];
 for (const a of rawAssessments) { if ((await can(user, 'read', { type: 'AssessmentObject', securityLabels: a.securityLabels || ['public'] })).allow) assessments.push(a); }
 ---
@@ -61,6 +168,10 @@ for (const a of rawAssessments) { if ((await can(user, 'read', { type: 'Assessme
       {Array.isArray(lm.languages) && lm.languages.length ? <span style="border:1px solid var(--line,#e6e1d6);border-radius:100px;padding:3px 11px;">{lm.languages.join(' · ')}</span> : null}
       <span style="border:1px solid var(--line,#e6e1d6);border-radius:100px;padding:3px 11px;">{labels[0]}</span>
     </div>
+
+    {variantUnreadable ? (
+      <p style="font-family:'Inter Tight',sans-serif;font-size:13px;line-height:1.6;color:#8a5a1a;background:#fff8ef;border:1px solid #f0d9b4;border-radius:10px;padding:12px 16px;margin:0 0 22px;">The version prepared for you &mdash; a translation or an accessibility variant &mdash; could not be read just now, so the original lesson is shown below. Nothing is wrong with your settings; this is a problem on our side. Reload in a moment to get your own version back.</p>
+    ) : null}
 
     {unmet.length ? (
       <div style="background:#fff8ef;border:1px solid #f0d9b4;border-radius:12px;padding:14px 18px;margin-bottom:24px;">
@@ -100,7 +211,12 @@ for (const a of rawAssessments) { if ((await can(user, 'read', { type: 'Assessme
       </section>
     ) : null}
 
-    {assessments.length ? (
+    {assessmentsUnreadable ? (
+      <section style="margin-top:28px;">
+        <h2 style="font-family:Fraunces,serif;font-size:20px;font-weight:600;color:var(--ink,#1a1712);margin:0 0 12px;">Check your understanding</h2>
+        <p style="font-family:'Inter Tight',sans-serif;font-size:13.5px;line-height:1.6;color:#8a5a1a;background:#fff8ef;border:1px solid #f0d9b4;border-radius:10px;padding:12px 16px;margin:0;">The questions attached to this lesson could not be read just now. That is a problem on our side &mdash; it does not mean there are none, and none of them has been withdrawn. Reload the page in a moment.</p>
+      </section>
+    ) : assessments.length ? (
       <section style="margin-top:28px;">
         <h2 style="font-family:Fraunces,serif;font-size:20px;font-weight:600;color:var(--ink,#1a1712);margin:0 0 12px;">Check your understanding</h2>
         <div style="display:flex;flex-direction:column;gap:8px;">

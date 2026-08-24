@@ -93,6 +93,39 @@ describe('withDbRetry', () => {
     }
   });
 
+  it('a COSMETIC timeout never opens the circuit, however many of them there are', async () => {
+    // The whole point: three real timeouts in a row open it, three cosmetic ones must not — a colour
+    // must never be able to refuse the reads a page actually renders from.
+    const prev = process.env.DB_CIRCUIT_OPEN_AFTER;
+    process.env.DB_CIRCUIT_OPEN_AFTER = '1';
+    try {
+      for (let i = 0; i < 3; i++) {
+        await withDbTimeout(never(), 'test.cosmetic', 10, { cosmetic: true }).catch(() => {});
+      }
+      expect(dbCircuitState().open).toBe(false);
+      // ...and the very next NON-cosmetic timeout still opens it, so nothing was disarmed.
+      await withDbTimeout(never(), 'test.real', 10).catch(() => {});
+      expect(dbCircuitState().open).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.DB_CIRCUIT_OPEN_AFTER;
+      else process.env.DB_CIRCUIT_OPEN_AFTER = prev;
+    }
+  });
+
+  it('a cosmetic read is still REFUSED while the circuit is open', async () => {
+    const prev = process.env.DB_CIRCUIT_OPEN_AFTER;
+    process.env.DB_CIRCUIT_OPEN_AFTER = '1';
+    try {
+      await withDbTimeout(never(), 'test.open', 10).catch(() => {});
+      expect(dbCircuitState().open).toBe(true);
+      await expect(withDbTimeout(Promise.resolve('x'), 'test.cosmetic.refused', 50, { cosmetic: true }))
+        .rejects.toBeInstanceOf(DbCircuitOpenError);
+    } finally {
+      if (prev === undefined) delete process.env.DB_CIRCUIT_OPEN_AFTER;
+      else process.env.DB_CIRCUIT_OPEN_AFTER = prev;
+    }
+  });
+
   it('a timeout is still a DbTimeoutError, so every isDbUnavailable() gate keeps working', async () => {
     const e = await withDbRetry(() => never(), 'test.shape', 20, 20).catch((x) => x);
     expect(e).toBeInstanceOf(DbTimeoutError);

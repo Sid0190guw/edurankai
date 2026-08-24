@@ -41,6 +41,12 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+// This endpoint is driven by a CLIENT TIMER, which makes an unbounded read here different in kind
+// from an unbounded read on a page. A page that hangs costs one visitor one view; a poll that hangs
+// keeps its pooler connection and is joined a second later by the next tick from the same tab, and
+// by every other participant's ticks, until the instance has no connections left for anything else.
+// Bounded, and deliberately NOT retried — see the note at the admit() call.
+import { withDbTimeout } from '@/lib/db-timeout';
 
 export const prerender = false;
 
@@ -92,11 +98,17 @@ async function admit(roomId: string, peerId: string, locals: any): Promise<Admis
     // Looked up by room_code OR id::text. Compared ::text on both sides: meet_rooms.id is uuid on
     // the canonical shape and TEXT on the legacy one (see src/lib/meet-schema.ts), and ::uuid throws
     // on a value that is not one — which, in a gate, would deny everybody.
-    const found = rows(await db.execute(sql`
+    // BOUNDED, because this gate runs on EVERY poll and the poll is on a timer. An unbounded read
+    // here does not just delay one participant: postgres-js holds the connection until the server
+    // answers, and a room with four people polling holds four of the instance's five connections
+    // waiting on a lookup that never returns. 3 seconds, and no retry — a poll that fails is
+    // repeated by the client a second later anyway, so retrying inside it only doubles the load at
+    // the exact moment the database is struggling.
+    const found = rows(await withDbTimeout(db.execute(sql`
       SELECT id FROM meet_rooms
       WHERE room_code = ${base} OR id::text = ${base}
       LIMIT 1
-    `));
+    `), 'meet.signal.admit', 3000));
     managed = found.length > 0;
   } catch (e: any) {
     console.error('[api/portal/meet/signal] room lookup', causeOf(e));
@@ -181,14 +193,49 @@ export const GET: APIRoute = async ({ request, params, locals }) => {
 
   await ensure();
   try {
-    // signals for me (addressed to me OR broadcast), not my own, newer than cursor
-    const sig = rows(await db.execute(sql`SELECT id, from_peer, to_peer, kind, payload FROM meet_signals
-      WHERE room_id = ${roomId} AND id > ${since} AND from_peer <> ${peerId}
-        AND (to_peer = ${peerId} OR to_peer IS NULL)
-      ORDER BY id ASC LIMIT 100`));
-    const roster = rows(await db.execute(sql`SELECT peer_id, name FROM meet_presence WHERE room_id = ${roomId} AND last_seen > NOW() - ${sql.raw(LIVE)}`));
-    const cursor = sig.length ? sig[sig.length - 1].id : since;
-    return json({ ok: true, cursor, signals: sig.map((s: any) => ({ id: s.id, from: s.from_peer, to: s.to_peer, kind: s.kind, payload: s.payload })), roster: roster.map((r: any) => ({ peerId: r.peer_id, name: r.name })) });
+    // ONE ROUND TRIP FOR BOTH HALVES OF THE POLL, NOT TWO.
+    //
+    // public/meet-mesh.js calls this on a timer for as long as a huddle tab is open. Two separate
+    // awaits meant two round trips per participant per tick, on top of the gate above — three in
+    // total, every tick, per person in the room. The two reads are independent and neither depends
+    // on the other's result, which is exactly the shape that belongs in one statement rather than in
+    // Promise.all: at max:5 per instance, concurrency here buys nothing and costs connections.
+    //
+    // json_agg with COALESCE so an empty signal list is [] rather than NULL, and MAX(id) computed in
+    // the same pass because the cursor is the only thing the old code used the last row for.
+    const pollRows = rows(await withDbTimeout(db.execute(sql`
+      WITH sig AS (
+        SELECT id, from_peer, to_peer, kind, payload
+          FROM meet_signals
+         WHERE room_id = ${roomId} AND id > ${since} AND from_peer <> ${peerId}
+           AND (to_peer = ${peerId} OR to_peer IS NULL)
+         ORDER BY id ASC
+         LIMIT 100
+      ), ros AS (
+        SELECT peer_id, name
+          FROM meet_presence
+         WHERE room_id = ${roomId} AND last_seen > NOW() - ${sql.raw(LIVE)}
+      )
+      SELECT
+        COALESCE((SELECT json_agg(json_build_object(
+                   'id', s.id, 'from', s.from_peer, 'to', s.to_peer,
+                   'kind', s.kind, 'payload', s.payload) ORDER BY s.id) FROM sig s), '[]'::json) AS signals,
+        COALESCE((SELECT json_agg(json_build_object(
+                   'peerId', r.peer_id, 'name', r.name)) FROM ros r), '[]'::json) AS roster,
+        (SELECT MAX(s.id) FROM sig s) AS max_id
+    `), 'meet.signal.poll', 3000));
+    const poll: any = pollRows[0] || {};
+    // A json column comes back already parsed from postgres-js; the string branch is for the driver
+    // shape that does not, and costs nothing to keep.
+    const parseJson = (v: any, fallback: any) => {
+      if (v == null) return fallback;
+      if (typeof v === 'string') { try { return JSON.parse(v); } catch { return fallback; } }
+      return v;
+    };
+    const signals = parseJson(poll.signals, []);
+    const roster = parseJson(poll.roster, []);
+    const cursor = poll.max_id != null ? Number(poll.max_id) : since;
+    return json({ ok: true, cursor, signals, roster });
   } catch (e: any) {
     console.error('[api/portal/meet/signal] GET', causeOf(e));
     return json({ ok: false, error: 'server error', degrade: true }, 200);

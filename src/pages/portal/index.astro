@@ -1,9 +1,12 @@
 ---
-import { withDbTimeout } from '@/lib/db-timeout';
+import { withDbTimeout, withDbRetry, isDbUnavailable } from '@/lib/db-timeout';
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import WorkspaceNav from '@/components/workforce/WorkspaceNav.astro';
 import { db } from '@/lib/db';
-import { applications, applicationMessages } from '@/lib/db/schema';
+// `applicationMessages` is no longer imported: the only thing that used it was the per-application
+// message look-up in the applications fallback below, which was removed for being N+1 against a
+// database that had already failed once on this request.
+import { applications } from '@/lib/db/schema';
 import { eq, desc, sql } from 'drizzle-orm';
 // THE ONE DECIDER. src/lib/workforce/landing.ts answers "where does this person belong", and it
 // answers it by asking things that already existed: canOpenAdmin() for the console — the SAME
@@ -77,10 +80,18 @@ if (landing.reason === 'employee-onboarding') {
   try { Astro.cookies.delete(HOP_COOKIE, { path: '/' }); } catch (_) {}
 }
 
-// Auto-promote any legacy 'pending' account.
-try {
-  await db.execute(sql`UPDATE users SET access_status = 'approved', updated_at = NOW() WHERE id = ${user.id} AND access_status = 'pending'`);
-} catch (_) {}
+// THE LEGACY-'pending' PROMOTE THAT USED TO RUN HERE IS GONE, AND NOTHING IT DID IS LOST.
+//
+// It was an UPDATE with no bound of any kind, and it was the FIRST database call on this page —
+// above every read, and above the `if (landing.href) return Astro.redirect(...)` below, so somebody
+// who was about to be sent to the employee workspace still paid for it. One stalled connection open
+// there turned the applicant's home page into a gateway timeout before a single read had run:
+// cosmetic repair of legacy rows was able to kill the page.
+//
+// It is deleted rather than bounded because it was a duplicate, not a backstop. src/middleware.ts
+// runs the byte-identical statement for this same request, guarded by the `era_appr` cookie so it
+// costs one write per user per browser instead of one per page load, and /portal cannot render
+// without middleware having run. /portal/activate and /apply/step-1 hold the other copies.
 
 // NOTE: settling "paid but pending" orders hits the Razorpay API, so it must NOT
 // block page render (it was making the whole portal feel ultra-slow). It now runs
@@ -96,10 +107,19 @@ if (landing.href) return Astro.redirect(landing.href);
 // The composition, for the navigation. composeWorkspace() memoises on Astro.locals and resolveLanding
 // has already run it for this request, so this costs no queries at all — and it guarantees the nav
 // and the landing decision were resolved from the SAME composition rather than two of them.
+//
+// BOUNDED ANYWAY, PRECISELY BECAUSE OF THE SENTENCE ABOVE. "This costs no queries" holds only while
+// the memo is populated, and the one case where it is not is the case that matters: resolveLanding
+// just timed out, so nothing was memoised, and this call becomes a full unbounded composition on a
+// database that has already failed once this request. composeWorkspace is a pure read (no INSERT,
+// UPDATE or DELETE anywhere in composer.ts), so the retry is safe, and a failure lands in the catch
+// below which was already written to render no nav rather than a guessed one.
 let composed: any = null;
 try {
   const { composeWorkspace } = await import('@/lib/workforce/composer');
-  composed = await composeWorkspace(user as any, { locals: Astro.locals, next: '/portal' });
+  composed = await withDbRetry(
+    () => composeWorkspace(user as any, { locals: Astro.locals, next: '/portal' }),
+    'portal.compose');
 } catch (e: any) {
   // A nav that cannot be composed is not rendered. It is never guessed at: an entry somebody cannot
   // open is worse than no entry.
@@ -119,7 +139,7 @@ try {
 let appsUnreadable = false;
 let appsWithMessages: any[] = [];
 try {
-  const r = await db.execute(sql`
+  const r = await withDbRetry(() => db.execute(sql`
     SELECT a.id, a.role_title_snapshot, a.department_snapshot, a.level, a.status,
       a.score, a.scoring_feedback, a.created_at, a.updated_at,
       m.body AS last_msg_body, m.sender_role AS last_msg_role,
@@ -139,7 +159,7 @@ try {
     ) unread ON true
     WHERE a.applicant_user_id = ${user.id}
     ORDER BY a.created_at DESC
-  `);
+  `), 'portal.applications');
   const rows = Array.isArray(r) ? r : ((r as any)?.rows || []);
   appsWithMessages = rows.map((row: any) => ({
     id: row.id,
@@ -160,70 +180,94 @@ try {
       createdAt: row.last_msg_at,
     } : null,
   }));
-} catch (_) {
-  // Fallback: minimal query if the read_by_applicant column doesn't exist.
-  try {
-    const apps = await db.select({
-      id: applications.id,
-      roleTitleSnapshot: applications.roleTitleSnapshot,
-      departmentSnapshot: applications.departmentSnapshot,
-      level: applications.level,
-      status: applications.status,
-      score: applications.score,
-      scoringFeedback: applications.scoringFeedback,
-      createdAt: applications.createdAt,
-      updatedAt: applications.updatedAt
-    }).from(applications)
-      .where(eq(applications.applicantUserId, user.id))
-      .orderBy(desc(applications.createdAt));
-    for (const app of apps) {
-      const lastMsgs = await db.select({
-        body: applicationMessages.body,
-        senderRole: applicationMessages.senderRole,
-        senderName: applicationMessages.senderName,
-        isSystem: applicationMessages.isSystem,
-        createdAt: applicationMessages.createdAt
-      }).from(applicationMessages)
-        .where(eq(applicationMessages.applicationId, app.id))
-        .orderBy(desc(applicationMessages.createdAt))
-        .limit(1);
-      appsWithMessages.push({ ...app, lastMessage: lastMsgs[0] || null, unreadCount: 0 });
-    }
-  } catch (e: any) {
-    // Both reads are gone. The real Postgres reason is on e.cause; e.message is only the failed SQL.
-    console.error('[portal] applications could not be read -', e?.cause?.message || e?.message);
+} catch (e: any) {
+  // THE FALLBACK IS FOR A MISSING COLUMN. IT IS NOT FOR A DATABASE THAT DID NOT ANSWER.
+  //
+  // It exists because the LATERAL / read_by_applicant shape is not on every database, and that is a
+  // fault of the STATEMENT — it will fail identically every time. A stall is a fault of the
+  // CONNECTION, and running the fallback on one meant firing a second full read, and then one more
+  // per application, at the connection that had just failed to answer the first. That is N+1 at the
+  // worst possible moment, and it is how one bad connection open became a gateway timeout instead of
+  // the honest panel this page already carries.
+  //
+  // isDbUnavailable() separates the two: a timeout or an open circuit goes straight to "could not be
+  // read", and only a real query error still gets the simpler shape.
+  console.error('[portal] applications (lateral) could not be read -', e?.cause?.message || e?.message);
+  if (isDbUnavailable(e)) {
     appsUnreadable = true;
+  } else {
+    // Fallback: minimal query if the read_by_applicant column doesn't exist.
+    try {
+      const apps = await withDbRetry(() => db.select({
+        id: applications.id,
+        roleTitleSnapshot: applications.roleTitleSnapshot,
+        departmentSnapshot: applications.departmentSnapshot,
+        level: applications.level,
+        status: applications.status,
+        score: applications.score,
+        scoringFeedback: applications.scoringFeedback,
+        createdAt: applications.createdAt,
+        updatedAt: applications.updatedAt
+      }).from(applications)
+        .where(eq(applications.applicantUserId, user.id))
+        .orderBy(desc(applications.createdAt)), 'portal.applications.fallback');
+      // THE PER-APPLICATION MESSAGE LOOK-UP THAT USED TO RUN HERE IS GONE. It was one further read
+      // per application on the path taken only when the read above had already failed. What the
+      // applicant loses on this path is the one-line preview of the newest message; what they keep is
+      // the list itself and a link into every thread, which is the part that matters. The alternative
+      // was a page that dies before printing either.
+      appsWithMessages = apps.map((app: any) => ({ ...app, lastMessage: null, unreadCount: 0 }));
+    } catch (e2: any) {
+      // Both reads are gone. The real Postgres reason is on e.cause; e.message is only the failed SQL.
+      console.error('[portal] applications could not be read -', e2?.cause?.message || e2?.message);
+      appsUnreadable = true;
+    }
   }
 }
 
 const firstName = user.name ? user.name.split(' ')[0] : 'there';
 
-// THREE MORE READS THAT USED TO FAIL INTO A STATEMENT, on the page whose whole job is telling
-// somebody what is waiting on them. `appsUnreadable` above was repaired for exactly this shape and
-// these were left on `catch (_) {}`. Declared before the tries that set them.
+// MORE READS THAT USED TO FAIL INTO A STATEMENT, on the page whose whole job is telling somebody
+// what is waiting on them. `appsUnreadable` above was repaired for exactly this shape and these were
+// left on `catch (_) {}`. Declared before the tries that set them.
+//
+// `faceUnreadable` is kept and is now permanently false: the read that set it is gone (see the block
+// immediately below), so the inbox branch that reads it is simply never taken. It stays rather than
+// being deleted, so the guard is already there if a face read ever returns to this page.
 let faceUnreadable = false;
 let requestsUnreadable = false;
 let draftUnreadable = false;
 
-// Face 2FA enrollment status.
-let faceEnrolled = false;
-try {
-  const fr = await db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
-  const frows = Array.isArray(fr) ? fr : (fr?.rows || []);
-  faceEnrolled = frows.length > 0;
-} catch (e: any) {
-  // A failed read is not "not enrolled". It pushed an inbox row telling somebody to set up a factor
-  // they may already have — and /portal/face-setup forwards an enrolled person straight back out,
-  // so the nudge leads nowhere and reappears on the next load. The row is suppressed below instead.
-  faceUnreadable = true;
-  console.error('[portal] face enrolment read failed -', e?.cause?.message || e?.message);
-}
+// FACE 2FA: NOT A READ ANY MORE, BECAUSE THE DOOR HAS ALREADY PROVED THE ANSWER.
+//
+// This ran the byte-identical statement src/middleware.ts already ran — and RETRIED — for this same
+// request, with no bound at all, above eight more reads. /portal is isProtected() and is not
+// isExempt(), so rendering here IS the proof that the gate resolved 'enrolled': 'unknown' returns a
+// 503 and 'absent' redirects to /portal/face-setup, and neither reaches this line.
+//
+// The duplicate was not merely wasteful. When it FAILED it left faceEnrolled false, and the
+// next-step card below is not guarded by faceUnreadable the way the inbox row is — so one blip
+// painted an urgent "Set up Face 2FA" over the top of the page to somebody the gate had just proved
+// was enrolled, pointing at a page that forwards an enrolled person straight back here.
+//
+// Read out of locals rather than written as a bare `true`, so that the day the middleware publishes
+// the value it already computes this picks it up with no edit here. Until then it is the invariant.
+const faceEnrolled = (Astro.locals as any).faceEnrolled !== false;
 
 // Open admin↔applicant request threads.
+// `requestKindsUnreadable` is declared BEFORE the try that fills it; `const`/`let` is not hoisted in
+// a way a later reader can rely on, and this project has taken pages down that way.
+let requestKindsUnreadable: string[] = [];
 let openRequests: any[] = [];
 try {
-  const { listApplicantRequests } = await import('@/lib/request-threads');
-  openRequests = await listApplicantRequests(user.id);
+  const { listApplicantRequests, unreadableKinds } = await import('@/lib/request-threads');
+  openRequests = await withDbRetry(() => listApplicantRequests(user.id), 'portal.requests');
+  // A HALF-READ LIST IS STILL A FALSE CLAIM. listApplicantRequests reads access requests and fee
+  // waivers as two separate statements and hands back the kinds it could not read attached to the
+  // array — precisely so a caller can say so. This page dropped that on the floor: when the waiver
+  // read failed the waiver thread simply vanished from the inbox, on the one screen somebody opens
+  // to find out whether anybody has replied about the money.
+  requestKindsUnreadable = unreadableKinds(openRequests);
 } catch (e: any) {
   // These are the threads where the admissions team replies. A failure silently removed both the
   // "a reply is waiting for you" next-step card AND every request row from the inbox, so the portal
@@ -238,7 +282,7 @@ try {
 let intentsUnreadable = false;
 let pendingIntents: any[] = [];
 try {
-  const ri = await db.execute(sql`
+  const ri = await withDbRetry(() => db.execute(sql`
     SELECT i.id, i.role_title_snapshot, i.department_snapshot, i.level, i.created_at,
       i.first_name, i.last_name,
       w.id AS waiver_id, w.status AS waiver_status
@@ -247,7 +291,7 @@ try {
     WHERE i.user_id = ${user.id}
     ORDER BY i.created_at DESC
     LIMIT 20
-  `);
+  `), 'portal.intents');
   pendingIntents = (Array.isArray(ri) ? ri : (ri as any)?.rows || []).map((r: any) => ({
     id: r.id, roleTitle: r.role_title_snapshot, department: r.department_snapshot, level: r.level,
     createdAt: r.created_at,
@@ -293,7 +337,7 @@ try {
 let activeDraft: { step: number } | null = null;
 try {
   const { getActiveDraft } = await import('@/lib/apply/draft');
-  const dr: any = await getActiveDraft(user.id);
+  const dr: any = await withDbRetry(() => getActiveDraft(user.id), 'portal.draft');
   if (dr && dr.data) {
     const dd = typeof dr.data === 'string' ? JSON.parse(dr.data) : dr.data;
     if (dd && dd.step1) activeDraft = { step: Math.min(6, Math.max(1, parseInt(dr.step) || 1)) };
@@ -308,39 +352,57 @@ try {
 
 // AquinTutor learning surface — trimmed to 3 courses + 3 tests (slim rail).
 function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+// `xpUnreadable` before the try that sets it; `const` is not hoisted and this repo has been taken
+// down by exactly that.
+let xpUnreadable = false;
 let learnerXp: any = { totalXp: 0, level: 1, streakDays: 0 };
 try {
   const { getUserXp } = await import('@/lib/xp');
-  learnerXp = await getUserXp(user.id);
+  learnerXp = await withDbRetry(() => getUserXp(user.id), 'portal.xp');
 } catch (e: any) {
-  // Logged, not silent. A zero streak and an unreadable streak look identical on the rail.
+  // "Logged, not silent" was not enough, because the log is not where the applicant is looking. The
+  // old comment here named the defect and then left it in place: a zero streak and an unreadable
+  // streak still rendered identically, so somebody forty days into a streak was shown "0d · 0 XP ·
+  // Level 1". The three figures render an em dash now, and the rail says why.
+  xpUnreadable = true;
   console.error('[portal] xp:', e?.cause?.message || e?.message);
 }
+// TWO RAILS, ONE ROUND TRIP.
+//
+// These were two sequential statements, neither of them bounded, for one decorative panel — and
+// they sat between the applicant's unpaid-fee read and their interview badge, so a stall on either
+// took down the parts of the page somebody actually came for. They are independent lists, so they
+// ride in one statement as two json_agg subqueries and cost one connection instead of two.
+//
+// The aliases are `tc`/`tt` rather than `c`/`t`: the outer subquery aliases are already `c` and `t`,
+// and the lesson-count correlated subquery has to name the course table unambiguously.
 let portalCourses: any[] = [];
-try {
-  const r = await db.execute(sql`
-    SELECT slug, title, subtitle, category, level,
-      (SELECT COUNT(*)::int FROM training_lessons WHERE course_id = c.id) AS lesson_count
-    FROM training_courses c
-    WHERE c.is_published = true AND c.access_type IN ('public','both','applicants')
-    ORDER BY c.created_at DESC LIMIT 3
-  `);
-  portalCourses = rowsOf(r);
-} catch (e: any) {
-  console.error('[portal] courses rail:', e?.cause?.message || e?.message);
-}
 let portalTests: any[] = [];
 try {
-  const r = await db.execute(sql`
-    SELECT t.slug, t.title, t.duration_mins, t.total_questions,
-      COALESCE(t.is_premium, false) AS is_premium,
-      COALESCE(t.practice_enabled, true) AS practice_enabled
-    FROM tests t WHERE t.is_published = true
-    ORDER BY t.created_at ASC LIMIT 3
-  `);
-  portalTests = rowsOf(r);
+  const r = await withDbRetry(() => db.execute(sql`
+    SELECT
+      (SELECT COALESCE(json_agg(c), '[]'::json) FROM (
+         SELECT tc.slug, tc.title, tc.subtitle, tc.category, tc.level,
+           (SELECT COUNT(*)::int FROM training_lessons WHERE course_id = tc.id) AS lesson_count
+         FROM training_courses tc
+         WHERE tc.is_published = true AND tc.access_type IN ('public','both','applicants')
+         ORDER BY tc.created_at DESC LIMIT 3
+       ) c) AS courses,
+      (SELECT COALESCE(json_agg(t), '[]'::json) FROM (
+         SELECT tt.slug, tt.title, tt.duration_mins, tt.total_questions,
+           COALESCE(tt.is_premium, false) AS is_premium,
+           COALESCE(tt.practice_enabled, true) AS practice_enabled
+         FROM tests tt WHERE tt.is_published = true
+         ORDER BY tt.created_at ASC LIMIT 3
+       ) t) AS tests
+  `), 'portal.rails');
+  const rail = rowsOf(r)[0] as any;
+  // postgres-js hands a json column back already parsed. The guard is on the SHAPE, not the type:
+  // a null or a scalar must not become `.length` on undefined halfway down the template.
+  portalCourses = Array.isArray(rail?.courses) ? rail.courses : [];
+  portalTests = Array.isArray(rail?.tests) ? rail.tests : [];
 } catch (e: any) {
-  console.error('[portal] tests rail:', e?.cause?.message || e?.message);
+  console.error('[portal] aquintutor rail:', e?.cause?.message || e?.message);
 }
 
 // Quick access counts (interviews / submissions / mail / appeals).
@@ -363,9 +425,12 @@ try {
 // the application), because a badge that counts differently from the page it links to is its own
 // defect: the tile says two and the page lists three.
 const emailLower = String(user.email || '').trim().toLowerCase();
+// `quickCountsUnreadable` is declared before the try that sets it and before the tile list that
+// reads it. `const` is not hoisted, and that has taken pages down here.
+let quickCountsUnreadable = false;
 const quickCounts: Record<string, number> = { interviews: 0, submissions: 0, mail: 0, appeals: 0, certificates: 0 };
 try {
-  const c = await db.execute(sql`
+  const c = await withDbRetry(() => db.execute(sql`
     SELECT
       (SELECT COUNT(*)::int FROM interview_rounds ir
          LEFT JOIN applications a ON a.id = ir.application_id
@@ -375,7 +440,7 @@ try {
       (SELECT COUNT(*)::int FROM portal_submissions WHERE submitter_user_id = ${user.id} AND status IN ('submitted','under_review','revisions_requested')) AS submissions,
       (SELECT COUNT(*)::int FROM application_appeals WHERE user_id = ${user.id} AND status IN ('open','reviewing')) AS appeals,
       (SELECT COUNT(*)::int FROM training_certificates WHERE user_id = ${user.id}) AS certificates
-  `);
+  `), 'portal.quickCounts');
   const cr = rowsOf(c)[0] as any;
   if (cr) {
     quickCounts.interviews = cr.interviews || 0;
@@ -384,9 +449,12 @@ try {
     quickCounts.certificates = cr.certificates || 0;
   }
 } catch (e: any) {
-  // These drive the badge counts on the quick-access tiles. A failure leaves every badge at zero,
-  // which reads as "nothing is waiting for you" — including an interview tomorrow. Logged so the
-  // cause is findable; the tiles themselves stay reachable, which is what matters most here.
+  // These drive the badge counts on the quick-access tiles, and this catch used to leave every one of
+  // them at zero — which reads as "nothing is waiting for you", including an interview tomorrow. A
+  // zero badge and an unread badge are not the same statement, so the tiles now carry an em dash
+  // instead of a digit and say so on hover. The tiles themselves stay reachable either way, which is
+  // the part that matters most: every one of those pages can answer for itself.
+  quickCountsUnreadable = true;
   console.error('[portal] quick counts:', e?.cause?.message || e?.message);
 }
 
@@ -565,6 +633,40 @@ if (intentsUnreadable) {
     href: '/portal/applications',
   });
 }
+// THE REMAINING FAILURES GET A ROW TOO, AND THIS IS NOT DUPLICATION OF THE NEXT-STEP CARD ABOVE.
+//
+// That card prints exactly ONE thing, the highest-priority one — so an applicant with an unread
+// reply saw the unread reply and was never told that their draft, or their request threads, could
+// not be read at all. The card outranking a failure does not make the failure less true, and the
+// inbox is the list of everything, not the top of it.
+if (requestsUnreadable) {
+  inboxRows.push({
+    key: 'requests-unreadable',
+    icon: 'message',
+    title: 'We could not read your open request threads',
+    subtitle: 'This is not a confirmation that nobody has replied. Open Requests, or reload in a moment.',
+    href: '/portal/requests',
+  });
+} else if (requestKindsUnreadable.length > 0) {
+  // Half the list answered. Naming which half is the difference between "there is nothing there" and
+  // "we could not look" — and the fee-waiver half is the one about money.
+  inboxRows.push({
+    key: 'requests-partial',
+    icon: 'message',
+    title: 'We could not read your ' + requestKindsUnreadable.map((k: string) => k.toLowerCase()).join(' or ') + ' threads',
+    subtitle: 'Your other request threads are listed here as normal. A reply on that one may be waiting where this page cannot see it.',
+    href: '/portal/requests',
+  });
+}
+if (draftUnreadable) {
+  inboxRows.push({
+    key: 'draft-unreadable',
+    icon: 'draft',
+    title: 'We could not check whether you have an application in progress',
+    subtitle: 'Nothing half-finished has been discarded. Reload before starting again, so you do not begin a second one.',
+    href: '/portal/applications',
+  });
+}
 pendingIntents.forEach((p: any) => {
   if (p.waiverStatus === 'approved') return;
   inboxRows.push({
@@ -596,14 +698,17 @@ if (!faceEnrolled && !faceUnreadable) {
 }
 
 // ============ Quick access strip ============
+// `unknown` is per-tile rather than one page-wide flag because only four of these seven carry a real
+// count. The last three have never had one, so a failed counts read says nothing about them and they
+// must not sprout a dash claiming otherwise.
 const QUICK_ACCESS = [
-  { key: 'interviews',  label: 'Interviews',   href: '/portal/interviews',  count: quickCounts.interviews,  icon: 'calendar' },
-  { key: 'submissions', label: 'Submissions',  href: '/portal/submissions', count: quickCounts.submissions, icon: 'upload' },
-  { key: 'appeals',     label: 'Appeals',      href: '/portal/appeals',     count: quickCounts.appeals,     icon: 'gavel' },
-  { key: 'certificates',label: 'Credentials',  href: '/portal/profile#credentials', count: quickCounts.certificates, icon: 'award' },
-  { key: 'tools',       label: 'Tools',        href: '/portal/tools',       count: 0, icon: 'tool' },
-  { key: 'wallet',      label: 'Wallet',       href: '/portal/wallet',      count: 0, icon: 'wallet' },
-  { key: 'discussion',  label: 'Discussion',   href: '/portal/discussion',  count: 0, icon: 'community' },
+  { key: 'interviews',  label: 'Interviews',   href: '/portal/interviews',  count: quickCounts.interviews,  unknown: quickCountsUnreadable, icon: 'calendar' },
+  { key: 'submissions', label: 'Submissions',  href: '/portal/submissions', count: quickCounts.submissions, unknown: quickCountsUnreadable, icon: 'upload' },
+  { key: 'appeals',     label: 'Appeals',      href: '/portal/appeals',     count: quickCounts.appeals,     unknown: quickCountsUnreadable, icon: 'gavel' },
+  { key: 'certificates',label: 'Credentials',  href: '/portal/profile#credentials', count: quickCounts.certificates, unknown: quickCountsUnreadable, icon: 'award' },
+  { key: 'tools',       label: 'Tools',        href: '/portal/tools',       count: 0, unknown: false, icon: 'tool' },
+  { key: 'wallet',      label: 'Wallet',       href: '/portal/wallet',      count: 0, unknown: false, icon: 'wallet' },
+  { key: 'discussion',  label: 'Discussion',   href: '/portal/discussion',  count: 0, unknown: false, icon: 'community' },
 ];
 
 const noOpenApps = appsWithMessages.length === 0;
@@ -690,7 +795,11 @@ const noOpenApps = appsWithMessages.length === 0;
           </span>
           <span class="text-[0.84rem] font-medium text-ink truncate">{tile.label}</span>
           <span class="ml-auto flex items-center gap-1.5 shrink-0">
-            {tile.count > 0 && <span class="text-[0.58rem] font-mono px-1.5 py-0.5 rounded-full bg-burn-pale border border-burn-dim text-burn font-bold">{tile.count}</span>}
+            {tile.unknown ? (
+              <span class="text-[0.58rem] font-mono px-1.5 py-0.5 rounded-full bg-cream-3 border border-ink/15 text-ink-soft font-bold" title="This count could not be read just now. It is not a zero.">—</span>
+            ) : tile.count > 0 ? (
+              <span class="text-[0.58rem] font-mono px-1.5 py-0.5 rounded-full bg-burn-pale border border-burn-dim text-burn font-bold">{tile.count}</span>
+            ) : null}
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="text-ink-soft/50 group-hover:text-burn group-hover:translate-x-0.5 transition-all"><path d="m9 18 6-6-6-6"/></svg>
           </span>
         </a>
@@ -706,7 +815,11 @@ const noOpenApps = appsWithMessages.length === 0;
     <div id="qaRailPanel">
       {QUICK_ACCESS.map((tile) => (
         <a href={tile.href} class="qa-item" title={tile.label}>
-          {tile.count > 0 && <span class="qa-badge">{tile.count}</span>}
+          {tile.unknown ? (
+            <span class="qa-badge qa-badge-unknown" title="This count could not be read just now. It is not a zero.">—</span>
+          ) : tile.count > 0 ? (
+            <span class="qa-badge">{tile.count}</span>
+          ) : null}
           <span class="qa-ico">
             {tile.icon === 'calendar' && <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>}
             {tile.icon === 'upload' && <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>}
@@ -928,18 +1041,24 @@ const noOpenApps = appsWithMessages.length === 0;
             <h2 class="font-display text-[1.5rem] md:text-[1.75rem] font-semibold text-ink leading-[1.1] mt-1">
               Keep your <em class="italic text-burn font-medium">streak</em>.
             </h2>
+            {xpUnreadable && (
+              <p class="text-[0.78rem] text-ink-soft mt-2 leading-snug max-w-sm">
+                Your streak and XP could not be read on this load. That is a fault on our side, not a reset —
+                the figures are shown as dashes rather than as zeros, because a zero would be a claim about you.
+              </p>
+            )}
           </div>
           <div class="flex gap-6">
             <div>
-              <p class="font-display text-[1.5rem] font-semibold text-ink leading-none font-mono">{learnerXp.streakDays || 0}<span class="text-[0.75rem] text-ink-soft font-normal">d</span></p>
+              <p class="font-display text-[1.5rem] font-semibold text-ink leading-none font-mono">{xpUnreadable ? '—' : (<>{learnerXp.streakDays || 0}<span class="text-[0.75rem] text-ink-soft font-normal">d</span></>)}</p>
               <p class="text-[0.6rem] font-mono uppercase tracking-[0.15em] text-ink-soft mt-1.5 font-bold">Streak</p>
             </div>
             <div>
-              <p class="font-display text-[1.5rem] font-semibold text-ink leading-none font-mono">{learnerXp.totalXp || 0}</p>
+              <p class="font-display text-[1.5rem] font-semibold text-ink leading-none font-mono">{xpUnreadable ? '—' : (learnerXp.totalXp || 0)}</p>
               <p class="text-[0.6rem] font-mono uppercase tracking-[0.15em] text-ink-soft mt-1.5 font-bold">XP</p>
             </div>
             <div>
-              <p class="font-display text-[1.5rem] font-semibold text-burn leading-none font-mono">{learnerXp.level || 1}</p>
+              <p class="font-display text-[1.5rem] font-semibold text-burn leading-none font-mono">{xpUnreadable ? '—' : (learnerXp.level || 1)}</p>
               <p class="text-[0.6rem] font-mono uppercase tracking-[0.15em] text-ink-soft mt-1.5 font-bold">Level</p>
             </div>
           </div>
@@ -1302,6 +1421,9 @@ const noOpenApps = appsWithMessages.length === 0;
   .qa-ico { color: #FF4F00; display: flex; }
   .qa-lbl { font-size: 10px; font-weight: 600; color: #2b2620; text-align: center; line-height: 1.15; }
   .qa-badge { position: absolute; top: 5px; right: 9px; font-size: 9px; font-family: ui-monospace, monospace; background: #FF4F00; color: #fff; border-radius: 100px; padding: 0 5px; font-weight: 700; }
+  /* An unread count and an unreadable count must not look the same. The dash is deliberately muted:
+     it is the absence of an answer, not an alert. */
+  .qa-badge-unknown { background: #d6cfc4; color: #57503f; }
   @media (prefers-reduced-motion: reduce) { .qa-chev, #qaRailPanel { transition: none; } }
 </style>
 </BaseLayout>

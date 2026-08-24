@@ -2,31 +2,59 @@
 import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { withDbTimeout, isDbUnavailable } from '@/lib/db-timeout';
 
-let testCount = 0, courseCount = 0, lessonCount = 0, certCount = 0, enrolledCount = 0, deptCount = 0, facultyCount = 0, examAttempts = 0;
+// A COUNT WE COULD NOT READ IS `null`, AND null RENDERS AS AN EM DASH - NEVER AS 0.
+//
+// WHAT A VISITOR SAW BEFORE: during a database stall this public page printed, in live-styled type,
+// "LIVE - schools: 0 - courses open: 0 - examinations sitting now: 0"; a stat plate reading
+// Departments 0 / Open courses 0 / Lessons published 0 / Live examinations 0; "Browse all 0
+// courses"; and "All 0 faculty members". The claim also left the page: "0+ active courses" was
+// written into the meta description and into the EducationalOrganization JSON-LD, which is a
+// machine-readable assertion that this institution teaches nothing, cached and repeated by things
+// that never see the outage. Zero is a number a reader believes. Unknown is not zero.
+let testCount: number | null = null;
+let courseCount: number | null = null;
+let lessonCount: number | null = null;
+let certCount: number | null = null;
+let enrolledCount: number | null = null;
+let deptCount: number | null = null;
+let facultyCount: number | null = null;
+let examAttempts: number | null = null;
+let liveAttempts: number | null = null;
 let tests: any[] = [];
 let featuredCourses: any[] = [];
 let schools: any[] = [];
 let faculty: any[] = [];
 let recentCert: any = null;
 let recentAttempt: any = null;
-let liveAttempts = 0;
 
+// One flag per list read, so a section that renders nothing can say WHICH of the two things it
+// means: "there are none" or "we could not find out".
+let coursesUnreadable = false;
+let countsUnreadable = false;
+let schoolsUnreadable = false;
+let facultyUnreadable = false;
+
+// The stat plate's "Live examinations" and the dark band's "Examinations sat" both come from THIS
+// read, not from the combined counts below - which is why they stay null on their own when it fails.
 try {
-  const r = await db.execute(sql`
+  const r = await withDbTimeout(db.execute(sql`
     SELECT t.id, t.slug, t.title, t.description, t.test_type, t.duration_mins,
       (SELECT COUNT(*)::int FROM test_questions WHERE test_id = t.id) as question_count,
       (SELECT COUNT(*)::int FROM test_attempts WHERE test_id = t.id AND status IN ('submitted','auto_submitted')) as attempt_count
     FROM tests t WHERE t.is_published = true
     ORDER BY t.created_at DESC LIMIT 4
-  `);
+  `), 'aquintutor.tests', 3000);
   tests = Array.isArray(r) ? r : (r?.rows || []);
   testCount = tests.length;
   examAttempts = tests.reduce((s: any, t: any) => s + (t.attempt_count || 0), 0);
-} catch (_) {}
+} catch (e: any) {
+  console.error('[aquintutor] published tests read failed:', e?.cause?.message || e?.message);
+}
 
 try {
-  const r = await db.execute(sql`
+  const r = await withDbTimeout(db.execute(sql`
     SELECT c.slug, c.title, c.subtitle, c.short_desc, c.level, c.category, c.course_code,
       c.duration_hours, c.duration_weeks, c.credit_hours, c.is_free, c.pricing_model,
       s.name as school_name, s.code as school_code,
@@ -35,9 +63,12 @@ try {
     LEFT JOIN schools s ON c.school_id = s.id
     WHERE c.is_published = true AND c.access_type IN ('public', 'both')
     ORDER BY c.enrolled_count DESC NULLS LAST, c.created_at DESC LIMIT 6
-  `);
+  `), 'aquintutor.featuredCourses', 3000);
   featuredCourses = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+} catch (e: any) {
+  coursesUnreadable = true;
+  console.error('[aquintutor] featured courses read failed:', e?.cause?.message || e?.message);
+}
 
 // SEVEN COUNTS, ONE ROUND TRIP.
 //
@@ -52,44 +83,56 @@ try {
 // would zero all seven. So the fallback below re-runs them individually on failure — the fast path
 // is one round trip, and the degraded path behaves exactly as before.
 try {
-  const r = await db.execute(sql`SELECT
+  const r = await withDbTimeout(db.execute(sql`SELECT
     (SELECT COUNT(*)::int FROM training_courses WHERE is_published = true AND access_type IN ('public', 'both')) AS courses,
     (SELECT COUNT(*)::int FROM training_lessons l JOIN training_courses c ON l.course_id = c.id WHERE c.is_published = true) AS lessons,
     (SELECT COUNT(*)::int FROM training_certificates) AS certs,
     (SELECT COUNT(DISTINCT user_id)::int FROM training_enrollments) AS enrolled,
     (SELECT COUNT(*)::int FROM academic_departments) AS depts,
     (SELECT COUNT(*)::int FROM training_instructors) AS faculty,
-    (SELECT COUNT(*)::int FROM test_attempts WHERE status = 'in_progress' AND started_at > NOW() - INTERVAL '4 hours') AS live`);
+    (SELECT COUNT(*)::int FROM test_attempts WHERE status = 'in_progress' AND started_at > NOW() - INTERVAL '4 hours') AS live`), 'aquintutor.counts', 3000);
   const row = ((Array.isArray(r) ? r : (r?.rows || []))[0] as any) || {};
-  courseCount = row.courses || 0;
-  lessonCount = row.lessons || 0;
-  certCount = row.certs || 0;
-  enrolledCount = row.enrolled || 0;
-  deptCount = row.depts || 0;
-  facultyCount = row.faculty || 0;
-  liveAttempts = row.live || 0;
+  courseCount = row.courses ?? null;
+  lessonCount = row.lessons ?? null;
+  certCount = row.certs ?? null;
+  enrolledCount = row.enrolled ?? null;
+  deptCount = row.depts ?? null;
+  facultyCount = row.faculty ?? null;
+  liveAttempts = row.live ?? null;
 } catch (e: any) {
   // The real Postgres reason is on e.cause; e.message is only the failed SQL. Logged rather than
   // swallowed, because a silent fallback here means the page quietly costs seven round trips again
   // and nobody finds out why it got slow.
-  console.error('[aquintutor] combined counts failed, falling back to individual queries:', e?.cause?.message || e?.message);
-  const one = async (q: any): Promise<number> => {
-    try {
-      const r = await db.execute(q);
-      return ((Array.isArray(r) ? r : (r?.rows || []))[0] as any)?.n || 0;
-    } catch (_) { return 0; }
-  };
-  courseCount = await one(sql`SELECT COUNT(*)::int as n FROM training_courses WHERE is_published = true AND access_type IN ('public', 'both')`);
-  lessonCount = await one(sql`SELECT COUNT(*)::int as n FROM training_lessons l JOIN training_courses c ON l.course_id = c.id WHERE c.is_published = true`);
-  certCount = await one(sql`SELECT COUNT(*)::int as n FROM training_certificates`);
-  enrolledCount = await one(sql`SELECT COUNT(DISTINCT user_id)::int as n FROM training_enrollments`);
-  deptCount = await one(sql`SELECT COUNT(*)::int as n FROM academic_departments`);
-  facultyCount = await one(sql`SELECT COUNT(*)::int as n FROM training_instructors`);
-  liveAttempts = await one(sql`SELECT COUNT(*)::int as n FROM test_attempts WHERE status = 'in_progress' AND started_at > NOW() - INTERVAL '4 hours'`);
+  console.error('[aquintutor] combined counts failed:', e?.cause?.message || e?.message);
+  // THE FALLBACK IS FOR A BROKEN STATEMENT. IT IS NOT FOR A DATABASE THAT IS NOT ANSWERING.
+  //
+  // Unconditionally, this catch used to fire seven more sequential statements at the database that
+  // had just failed to answer one - seven more waits, on the slowest path, on a public URL, during
+  // the exact minute the database was struggling. It is worth doing only for the failure it was
+  // written for: one missing table zeroing the other six counts. isDbUnavailable() separates the
+  // two, and it can only do that because the read above is now bounded - against a raw db.execute a
+  // stall arrives as a plain postgres CONNECT_TIMEOUT and this gate would never recognise it.
+  if (isDbUnavailable(e)) {
+    countsUnreadable = true;
+  } else {
+    const one = async (q: any): Promise<number | null> => {
+      try {
+        const r = await withDbTimeout(db.execute(q), 'aquintutor.counts.one', 2000);
+        return ((Array.isArray(r) ? r : (r?.rows || []))[0] as any)?.n ?? null;
+      } catch (_) { return null; }
+    };
+    courseCount = await one(sql`SELECT COUNT(*)::int as n FROM training_courses WHERE is_published = true AND access_type IN ('public', 'both')`);
+    lessonCount = await one(sql`SELECT COUNT(*)::int as n FROM training_lessons l JOIN training_courses c ON l.course_id = c.id WHERE c.is_published = true`);
+    certCount = await one(sql`SELECT COUNT(*)::int as n FROM training_certificates`);
+    enrolledCount = await one(sql`SELECT COUNT(DISTINCT user_id)::int as n FROM training_enrollments`);
+    deptCount = await one(sql`SELECT COUNT(*)::int as n FROM academic_departments`);
+    facultyCount = await one(sql`SELECT COUNT(*)::int as n FROM training_instructors`);
+    liveAttempts = await one(sql`SELECT COUNT(*)::int as n FROM test_attempts WHERE status = 'in_progress' AND started_at > NOW() - INTERVAL '4 hours'`);
+  }
 }
 
 try {
-  const r = await db.execute(sql`
+  const r = await withDbTimeout(db.execute(sql`
     SELECT s.id, s.slug, s.code, s.name, s.tagline,
       (SELECT COUNT(*)::int FROM academic_departments WHERE school_id = s.id) as dept_count,
       (SELECT COUNT(*)::int FROM training_courses WHERE school_id = s.id AND is_published = true) as course_count,
@@ -97,40 +140,65 @@ try {
         SELECT name FROM academic_departments WHERE school_id = s.id ORDER BY display_order LIMIT 4
       ) sub) as dept_names
     FROM schools s WHERE s.is_published = true ORDER BY s.display_order ASC
-  `);
+  `), 'aquintutor.schools', 3000);
   schools = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+} catch (e: any) {
+  schoolsUnreadable = true;
+  console.error('[aquintutor] schools read failed:', e?.cause?.message || e?.message);
+}
 
 try {
-  const r = await db.execute(sql`
+  const r = await withDbTimeout(db.execute(sql`
     SELECT name, title, bio, specialties, slug FROM training_instructors
     WHERE is_featured = true ORDER BY sort_order LIMIT 4
-  `);
+  `), 'aquintutor.faculty', 3000);
   faculty = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+} catch (e: any) {
+  facultyUnreadable = true;
+  console.error('[aquintutor] featured faculty read failed:', e?.cause?.message || e?.message);
+}
 
 try {
-  const r = await db.execute(sql`
+  const r = await withDbTimeout(db.execute(sql`
     SELECT c.certificate_number, c.issued_at, u.name as user_name, t.title as course_title
     FROM training_certificates c
     JOIN users u ON c.user_id = u.id
     JOIN training_courses t ON c.course_id = t.id
     ORDER BY c.issued_at DESC LIMIT 1
-  `);
+  `), 'aquintutor.recentCredential', 3000);
   recentCert = ((Array.isArray(r) ? r : (r?.rows || []))[0]) || null;
-} catch (_) {}
+} catch (e: any) {
+  // The ticker simply drops this item when it is null, which asserts nothing either way.
+  console.error('[aquintutor] latest credential read failed:', e?.cause?.message || e?.message);
+}
 
 try {
-  const r = await db.execute(sql`
+  const r = await withDbTimeout(db.execute(sql`
     SELECT t.title, a.submitted_at, a.percentage
     FROM test_attempts a JOIN tests t ON a.test_id = t.id
     WHERE a.status IN ('submitted','auto_submitted')
     ORDER BY a.submitted_at DESC NULLS LAST LIMIT 1
-  `);
+  `), 'aquintutor.recentAttempt', 3000);
   recentAttempt = ((Array.isArray(r) ? r : (r?.rows || []))[0]) || null;
-} catch (_) {}
+} catch (e: any) {
+  // Same: absent from the ticker, rather than claimed.
+  console.error('[aquintutor] latest submitted attempt read failed:', e?.cause?.message || e?.message);
+}
 
-const pageDesc = 'AquinTutor is the technology platform behind partner universities. Vedic sciences, advanced computing, ASI and quantum technology. ' + courseCount + '+ active courses, proctored assessments, certificates of completion.';
+// THE COUNT CLAUSE COMES OUT RATHER THAN GOING TO ZERO.
+//
+// This string is the page's meta description AND the `description` inside the EducationalOrganization
+// JSON-LD below. "0+ active courses" published as structured data is a claim that outlives the
+// outage that produced it - crawlers keep it long after the database is answering again.
+const countsShown = !countsUnreadable && courseCount != null;
+const pageDesc = countsShown
+  ? 'AquinTutor is the technology platform behind partner universities. Vedic sciences, advanced computing, ASI and quantum technology. ' + courseCount + '+ active courses, proctored assessments, certificates of completion.'
+  : 'AquinTutor is the technology platform behind partner universities. Vedic sciences, advanced computing, ASI and quantum technology. Proctored assessments, certificates of completion.';
+
+// The hero sentence carries its numbers inside a claim about the institution, so a half-known pair
+// is worse than none: "0 schools, 0 departments" reads as a statement, not as a gap. The whole
+// clause drops out instead.
+const heroCountsKnown = !schoolsUnreadable && deptCount != null;
 const orgSchema = {
   '@context': 'https://schema.org',
   '@type': 'EducationalOrganization',
@@ -195,11 +263,11 @@ const principles = [
       <span style="opacity:0.5;">&middot;</span>
       <span><span style="opacity:0.6;">term:</span> autumn / {yr}</span>
       <span style="opacity:0.5;">&middot;</span>
-      <span><span style="opacity:0.6;">schools:</span> {schools.length}</span>
+      <span><span style="opacity:0.6;">schools:</span> {schoolsUnreadable ? '\u2014' : schools.length}</span>
       <span style="opacity:0.5;">&middot;</span>
-      <span><span style="opacity:0.6;">courses open:</span> {courseCount}</span>
+      <span><span style="opacity:0.6;">courses open:</span> {courseCount == null ? '\u2014' : courseCount}</span>
       <span style="opacity:0.5;">&middot;</span>
-      <span><span style="opacity:0.6;">examinations sitting now:</span> {liveAttempts}</span>
+      <span><span style="opacity:0.6;">examinations sitting now:</span> {liveAttempts == null ? '\u2014' : liveAttempts}</span>
       {recentCert && <>
         <span style="opacity:0.5;">&middot;</span>
         <span><span style="opacity:0.6;">last credential issued:</span> {relDate(recentCert.issued_at)}</span>
@@ -231,7 +299,7 @@ const principles = [
           <span style="font-style:italic; font-weight:300; color:var(--ink-500);">had room for.</span>
         </h1>
         <p class="font-serif" style="font-family:'Cormorant Garamond',serif; font-size:clamp(1.15rem, 1.5vw, 1.4rem); line-height:1.5; font-style:italic; color:var(--ink-500); margin:30px 0 0; max-width:38rem;">
-          AquinTutor is a frontier research university working in Vedic sciences, artificial super-intelligence, quantum technology and advanced computing. {schools.length} schools, {deptCount} departments, named faculty-written curriculum, proctored examinations, and a private AI co-pilot in every enrolment.
+          AquinTutor is a frontier research university working in Vedic sciences, artificial super-intelligence, quantum technology and advanced computing. {heroCountsKnown ? schools.length + ' schools, ' + deptCount + ' departments, named' : 'Named'} faculty-written curriculum, proctored examinations, and a private AI co-pilot in every enrolment.
         </p>
         <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:32px;">
           <a href="/aquintutor/signup" style="background:var(--ink); color:var(--sand-50); padding:14px 26px; border-radius:6px; font-family:'Inter Tight',sans-serif; font-size:14px; font-weight:600; text-decoration:none;">Apply for admission</a>
@@ -244,14 +312,14 @@ const principles = [
       <aside style="background:var(--sand-100); border:1px solid var(--rule); border-radius:14px; padding:28px 28px 22px; position:relative;" class="stat-plate">
         <div style="position:absolute; top:-12px; left:24px; background:var(--paper); border:1px solid var(--rule); border-radius:999px; padding:4px 14px; font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.2em; color:var(--rust); font-weight:600;">THE INSTITUTION TODAY</div>
         <dl style="display:grid; grid-template-columns:1fr auto; gap:14px 18px; margin:0 0 6px; font-family:'Inter Tight',sans-serif; font-size:14.5px;">
-          <dt style="color:var(--ink-500); padding-top:6px;">Schools</dt><dd class="font-display" style="margin:0; font-size:1.85rem; font-weight:500; line-height:1; color:var(--ink); letter-spacing:-0.02em; text-align:right;">{schools.length}</dd>
-          <dt style="color:var(--ink-500); padding-top:6px; border-top:1px dashed var(--rule);">Departments</dt><dd class="font-display" style="margin:0; font-size:1.85rem; font-weight:500; line-height:1; color:var(--ink); letter-spacing:-0.02em; text-align:right; padding-top:6px; border-top:1px dashed var(--rule);">{deptCount}</dd>
-          <dt style="color:var(--ink-500); padding-top:6px; border-top:1px dashed var(--rule);">Open courses</dt><dd class="font-display" style="margin:0; font-size:1.85rem; font-weight:500; line-height:1; color:var(--ink); letter-spacing:-0.02em; text-align:right; padding-top:6px; border-top:1px dashed var(--rule);">{courseCount}</dd>
-          <dt style="color:var(--ink-500); padding-top:6px; border-top:1px dashed var(--rule);">Lessons published</dt><dd class="font-display" style="margin:0; font-size:1.85rem; font-weight:500; line-height:1; color:var(--ink); letter-spacing:-0.02em; text-align:right; padding-top:6px; border-top:1px dashed var(--rule);">{lessonCount}</dd>
-          <dt style="color:var(--ink-500); padding-top:6px; border-top:1px dashed var(--rule);">Live examinations</dt><dd class="font-display" style="margin:0; font-size:1.85rem; font-weight:500; line-height:1; color:var(--ink); letter-spacing:-0.02em; text-align:right; padding-top:6px; border-top:1px dashed var(--rule);">{testCount}</dd>
+          <dt style="color:var(--ink-500); padding-top:6px;">Schools</dt><dd class="font-display" style="margin:0; font-size:1.85rem; font-weight:500; line-height:1; color:var(--ink); letter-spacing:-0.02em; text-align:right;">{schoolsUnreadable ? '\u2014' : schools.length}</dd>
+          <dt style="color:var(--ink-500); padding-top:6px; border-top:1px dashed var(--rule);">Departments</dt><dd class="font-display" style="margin:0; font-size:1.85rem; font-weight:500; line-height:1; color:var(--ink); letter-spacing:-0.02em; text-align:right; padding-top:6px; border-top:1px dashed var(--rule);">{deptCount == null ? '\u2014' : deptCount}</dd>
+          <dt style="color:var(--ink-500); padding-top:6px; border-top:1px dashed var(--rule);">Open courses</dt><dd class="font-display" style="margin:0; font-size:1.85rem; font-weight:500; line-height:1; color:var(--ink); letter-spacing:-0.02em; text-align:right; padding-top:6px; border-top:1px dashed var(--rule);">{courseCount == null ? '\u2014' : courseCount}</dd>
+          <dt style="color:var(--ink-500); padding-top:6px; border-top:1px dashed var(--rule);">Lessons published</dt><dd class="font-display" style="margin:0; font-size:1.85rem; font-weight:500; line-height:1; color:var(--ink); letter-spacing:-0.02em; text-align:right; padding-top:6px; border-top:1px dashed var(--rule);">{lessonCount == null ? '\u2014' : lessonCount}</dd>
+          <dt style="color:var(--ink-500); padding-top:6px; border-top:1px dashed var(--rule);">Live examinations</dt><dd class="font-display" style="margin:0; font-size:1.85rem; font-weight:500; line-height:1; color:var(--ink); letter-spacing:-0.02em; text-align:right; padding-top:6px; border-top:1px dashed var(--rule);">{testCount == null ? '\u2014' : testCount}</dd>
           <dt style="color:var(--ink-500); padding-top:6px; border-top:1px dashed var(--rule);">Research focus</dt><dd class="font-display" style="margin:0; font-size:1.35rem; font-weight:500; line-height:1.05; color:var(--rust); letter-spacing:-0.02em; text-align:right; padding-top:6px; border-top:1px dashed var(--rule); font-style:italic;">ASI &middot; quantum &middot; Vedic</dd>
         </dl>
-        <p style="font-family:'Inter Tight',sans-serif; font-size:11.5px; color:var(--ink-500); margin:12px 0 0; padding-top:10px; border-top:1px solid var(--rule); line-height:1.5;">Counts refresh on every page load. The institution is open to any applicant aged 16+ worldwide.</p>
+        <p style="font-family:'Inter Tight',sans-serif; font-size:11.5px; color:var(--ink-500); margin:12px 0 0; padding-top:10px; border-top:1px solid var(--rule); line-height:1.5;">{countsShown ? 'Counts refresh on every page load.' : 'A dash means that figure could not be read on this page load, not that it is zero.'} The institution is open to any applicant aged 16+ worldwide.</p>
       </aside>
     </div>
   </section>
@@ -430,12 +498,15 @@ const principles = [
           <p style="font-family:'Inter Tight',sans-serif; font-size:12px; color:var(--rust); font-weight:600; letter-spacing:0.16em; text-transform:uppercase; margin:0 0 10px;">The faculty</p>
           <h2 class="font-display" style="font-size:clamp(1.85rem, 3.5vw, 2.85rem); line-height:1.08; letter-spacing:-0.02em; font-weight:500; margin:0; color:var(--ink);">
             Six schools.<br/>
-            <span style="font-style:italic; font-weight:300; color:var(--ink-500);">{deptCount} departments under one charter.</span>
+            <span style="font-style:italic; font-weight:300; color:var(--ink-500);">{deptCount == null ? 'Departments under one charter.' : deptCount + ' departments under one charter.'}</span>
           </h2>
         </div>
         <p style="font-family:'Inter Tight',sans-serif; font-size:15px; color:var(--ink-500); line-height:1.65; margin:0; max-width:34rem; justify-self:end;" class="thesis-rhs">Each school is led by named faculty and authors its own programmes end-to-end. Departments are listed below; click through to see staff, courses, and entry requirements.</p>
       </div>
 
+      {schoolsUnreadable ? (
+        <p style="font-family:'Inter Tight',sans-serif; font-size:14.5px; line-height:1.65; color:var(--ink-500); margin:0; background:var(--sand-100); border:1px dashed var(--rule); border-radius:14px; padding:26px 28px;">The list of schools could not be read on this page load. No school has closed and no department has been withdrawn &mdash; the fault is on our side. Reload in a moment, or go straight to the <a href="/aquintutor/schools" style="color:var(--rust); font-weight:600;">schools directory</a>.</p>
+      ) : (
       <div style="display:grid; grid-template-columns:1fr; gap:1px; background:var(--rule); border:1px solid var(--rule); border-radius:14px; overflow:hidden;" class="schools-grid">
         {schools.map((s: any) => (
           <a href={'/aquintutor/schools/' + s.slug} style="background:var(--paper); padding:28px 26px; text-decoration:none; color:var(--ink); display:flex; flex-direction:column; gap:14px; transition:background 0.15s;" class="school-tile">
@@ -461,6 +532,7 @@ const principles = [
           </a>
         ))}
       </div>
+      )}
     </div>
   </section>
 
@@ -530,9 +602,17 @@ const principles = [
                 </li>
               ))}
             </ul>
-            <a href="/aquintutor/instructors" style="display:inline-block; margin-top:18px; font-family:'Inter Tight',sans-serif; font-size:13.5px; color:var(--rust); text-decoration:underline; font-weight:500;">All {facultyCount} faculty members &rarr;</a>
+            <a href="/aquintutor/instructors" style="display:inline-block; margin-top:18px; font-family:'Inter Tight',sans-serif; font-size:13.5px; color:var(--rust); text-decoration:underline; font-weight:500;">{facultyCount == null ? 'All faculty members' : 'All ' + facultyCount + ' faculty members'} &rarr;</a>
           </div>
         </div>
+      </div>
+    </section>
+  )}
+
+  {facultyUnreadable && (
+    <section style="border-bottom:1px solid var(--rule);">
+      <div style="max-width:1320px; margin:0 auto; padding:48px 28px;">
+        <p style="font-family:'Inter Tight',sans-serif; font-size:14.5px; line-height:1.65; color:var(--ink-500); margin:0;">The faculty roll could not be read on this page load, so this section is absent for a reason that is not "no faculty". Nobody has left &mdash; the fault is on our side. The <a href="/aquintutor/instructors" style="color:var(--rust); font-weight:600;">faculty directory</a> may still load.</p>
       </div>
     </section>
   )}
@@ -548,9 +628,12 @@ const principles = [
             <span style="font-style:italic; font-weight:300; color:var(--ink-500);">for the autumn intake.</span>
           </h2>
         </div>
-        <a href="/aquintutor/courses" style="font-family:'Inter Tight',sans-serif; font-size:14px; color:var(--ink); text-decoration:none; font-weight:600; border-bottom:1px solid var(--ink); padding-bottom:2px;">Browse all {courseCount} courses &rarr;</a>
+        <a href="/aquintutor/courses" style="font-family:'Inter Tight',sans-serif; font-size:14px; color:var(--ink); text-decoration:none; font-weight:600; border-bottom:1px solid var(--ink); padding-bottom:2px;">{courseCount == null ? 'Browse the catalogue' : 'Browse all ' + courseCount + ' courses'} &rarr;</a>
       </div>
 
+      {coursesUnreadable ? (
+        <p style="font-family:'Inter Tight',sans-serif; font-size:14.5px; line-height:1.65; color:var(--ink-500); margin:0; background:var(--paper); border:1px dashed var(--rule); border-radius:14px; padding:26px 28px;">The catalogue could not be read on this page load. Nothing has been withdrawn and no course has closed &mdash; the fault is on our side. Reload in a moment, or open the <a href="/aquintutor/courses" style="color:var(--rust); font-weight:600;">full catalogue</a>.</p>
+      ) : (
       <div style="display:grid; grid-template-columns:1fr; gap:14px;" class="courses-grid">
         {featuredCourses.slice(0,6).map((c: any) => (
           <a href={'/aquintutor/courses/' + c.slug} style="background:var(--paper); border:1px solid var(--rule); border-radius:14px; padding:0; text-decoration:none; color:var(--ink); display:flex; flex-direction:column; overflow:hidden; transition:transform 0.15s, box-shadow 0.15s;" class="course-card">
@@ -572,6 +655,7 @@ const principles = [
           </a>
         ))}
       </div>
+      )}
     </div>
   </section>
 
@@ -696,12 +780,15 @@ const principles = [
       </div>
       <div style="background:rgba(251,250,244,0.05); border:1px solid rgba(251,250,244,0.12); border-radius:14px; padding:24px;">
         <p style="font-family:'JetBrains Mono',monospace; font-size:10.5px; letter-spacing:0.2em; color:rgba(251,250,244,0.5); margin:0 0 16px; font-weight:600;">RIGHT NOW</p>
+        {countsUnreadable && (
+          <p style="font-family:'Inter Tight',sans-serif; font-size:12.5px; line-height:1.55; color:rgba(251,250,244,0.65); margin:0 0 14px;">These figures could not be read on this page load. A dash is not a zero.</p>
+        )}
         <dl style="display:grid; grid-template-columns:1fr auto; gap:10px 18px; margin:0; font-family:'Inter Tight',sans-serif; font-size:13.5px;">
-          <dt style="color:rgba(251,250,244,0.65);">Enrolled students</dt><dd style="margin:0; color:var(--sand-50); font-weight:600; text-align:right;">{enrolledCount}</dd>
-          <dt style="color:rgba(251,250,244,0.65); padding-top:8px; border-top:1px solid rgba(251,250,244,0.1);">Credentials issued</dt><dd style="margin:0; padding-top:8px; border-top:1px solid rgba(251,250,244,0.1); color:var(--sand-50); font-weight:600; text-align:right;">{certCount}</dd>
-          <dt style="color:rgba(251,250,244,0.65); padding-top:8px; border-top:1px solid rgba(251,250,244,0.1);">Examinations sat</dt><dd style="margin:0; padding-top:8px; border-top:1px solid rgba(251,250,244,0.1); color:var(--sand-50); font-weight:600; text-align:right;">{examAttempts}</dd>
-          <dt style="color:rgba(251,250,244,0.65); padding-top:8px; border-top:1px solid rgba(251,250,244,0.1);">Lessons in catalogue</dt><dd style="margin:0; padding-top:8px; border-top:1px solid rgba(251,250,244,0.1); color:var(--sand-50); font-weight:600; text-align:right;">{lessonCount}</dd>
-          <dt style="color:rgba(251,250,244,0.65); padding-top:8px; border-top:1px solid rgba(251,250,244,0.1);">Faculty</dt><dd style="margin:0; padding-top:8px; border-top:1px solid rgba(251,250,244,0.1); color:var(--sand-50); font-weight:600; text-align:right;">{facultyCount}</dd>
+          <dt style="color:rgba(251,250,244,0.65);">Enrolled students</dt><dd style="margin:0; color:var(--sand-50); font-weight:600; text-align:right;">{enrolledCount == null ? '\u2014' : enrolledCount}</dd>
+          <dt style="color:rgba(251,250,244,0.65); padding-top:8px; border-top:1px solid rgba(251,250,244,0.1);">Credentials issued</dt><dd style="margin:0; padding-top:8px; border-top:1px solid rgba(251,250,244,0.1); color:var(--sand-50); font-weight:600; text-align:right;">{certCount == null ? '\u2014' : certCount}</dd>
+          <dt style="color:rgba(251,250,244,0.65); padding-top:8px; border-top:1px solid rgba(251,250,244,0.1);">Examinations sat</dt><dd style="margin:0; padding-top:8px; border-top:1px solid rgba(251,250,244,0.1); color:var(--sand-50); font-weight:600; text-align:right;">{examAttempts == null ? '\u2014' : examAttempts}</dd>
+          <dt style="color:rgba(251,250,244,0.65); padding-top:8px; border-top:1px solid rgba(251,250,244,0.1);">Lessons in catalogue</dt><dd style="margin:0; padding-top:8px; border-top:1px solid rgba(251,250,244,0.1); color:var(--sand-50); font-weight:600; text-align:right;">{lessonCount == null ? '\u2014' : lessonCount}</dd>
+          <dt style="color:rgba(251,250,244,0.65); padding-top:8px; border-top:1px solid rgba(251,250,244,0.1);">Faculty</dt><dd style="margin:0; padding-top:8px; border-top:1px solid rgba(251,250,244,0.1); color:var(--sand-50); font-weight:600; text-align:right;">{facultyCount == null ? '\u2014' : facultyCount}</dd>
         </dl>
       </div>
     </div>

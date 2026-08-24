@@ -3,6 +3,19 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { proctorEventLabel } from '@/lib/proctor-events';
+// AN UNREAD EVENT LOG WAS SCORED AS A CLEAN ONE, ON THE SCREEN WHERE A HUMAN DECIDES.
+//
+// `catch (_) {}` left `events` as [], the two counters stayed at 0, and the arithmetic below turned
+// that into 100% integrity, a full green ring, "4 - Policy: continue" and the sentence "Continue -
+// no escalation needed". That is not a missing feature: it is a fabricated exoneration of a
+// candidate whose flag events the page never managed to read. Proctoring on this platform is
+// ADVISORY ONLY and a person decides on exactly this screen, so the one thing it must never do is
+// present silence as innocence.
+//
+// Both reads are bounded as well as caught, because the catch could not be reached on the failure
+// that matters - an unbounded await does not throw, it hangs until the platform kills the
+// invocation, and the reviewer waiting on a decision gets a blank tab.
+import { withDbRetry, isDbUnavailable } from '@/lib/db-timeout';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -27,18 +40,32 @@ try {
   `);
   const rows = Array.isArray(r) ? r : (r?.rows || []);
   attempt = rows[0] || null;
-} catch (_) {}
+} catch (e: any) {
+  // The redirect below is the right fail-closed answer; it was simply undiagnosable. "It just
+  // bounces me back" and "that attempt was deleted" looked identical in the log, which is to say in
+  // nothing.
+  console.error('[sentinel] attempt read failed:', e?.cause?.message || e?.message);
+}
 
 if (!attempt) return Astro.redirect('/admin/tests/attempts');
 
+let eventsUnreadable = false;
+let eventsError = '';
 try {
-  const r = await db.execute(sql`
+  const r = await withDbRetry(() => db.execute(sql`
     SELECT id, event_type, severity, detail, client_ts, created_at
     FROM test_attempt_events WHERE attempt_id = ${attemptId}
     ORDER BY created_at DESC LIMIT 80
-  `);
+  `), 'sentinel.events');
   events = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+} catch (e: any) {
+  events = [];
+  eventsUnreadable = true;
+  eventsError = isDbUnavailable(e)
+    ? 'The database did not answer.'
+    : String(e?.cause?.message || e?.message || 'unknown error');
+  console.error('[sentinel] event log read failed:', eventsError);
+}
 
 for (const e of events as any[]) {
   if (e.severity === 'flag') initialFlag++;
@@ -47,6 +74,23 @@ for (const e of events as any[]) {
 
 const isLive = attempt.status === 'in_progress';
 const integrity = Math.max(0, 100 - (initialFlag * 5 + initialWarn * 1.5));
+
+// EVERY COMPARISON THIS PAGE RENDERS IS DECIDED HERE, NOT IN THE MARKUP. Two reasons: a `<` inside a
+// JSX expression is a documented .astro parsing hazard on this project, and a score that does not
+// exist must not be silently compared against a threshold as though it were zero flags.
+const integrityText = eventsUnreadable ? 'no score' : Math.round(integrity) + '%';
+// The ring is drawn empty rather than full when the log is unreadable: a complete ring is the
+// picture of a clean attempt.
+const gaugeOffset = eventsUnreadable ? 276 : 276 * (1 - integrity / 100);
+const policyText = eventsUnreadable ? 'cannot decide' : (integrity < 60 ? 'escalate' : 'continue');
+const decisionClass = eventsUnreadable
+  ? 'decision warn'
+  : 'decision ' + (integrity < 60 ? 'bad' : integrity < 80 ? 'warn' : '');
+const decisionText = eventsUnreadable
+  ? 'No decision - the event log for this attempt could not be read, so there is nothing to judge. This is not a clean result.'
+  : (integrity < 60
+      ? 'Escalate to human invigilator'
+      : integrity < 80 ? 'Continue with caution - flags observed' : 'Continue - no escalation needed');
 
 function fmtTime(d: any) { try { return new Date(d).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }); } catch { return ''; } }
 function dur() {
@@ -152,7 +196,7 @@ function dur() {
 
     <!-- KPI row -->
     <div class="kpis">
-      <div class="tile"><p>Integrity</p><p id="kpiIntegrity">{Math.round(integrity)}%</p></div>
+      <div class="tile"><p>Integrity</p><p id="kpiIntegrity">{integrityText}</p></div>
       <div class="tile"><p>Score</p><p>{attempt.percentage != null ? Math.round(attempt.percentage) + '%' : '-'}</p></div>
       <div class="tile"><p>Duration</p><p>{dur()}</p></div>
       <div class="tile warn"><p>Tab switches</p><p id="kpiTabs">{attempt.tab_switches || 0}</p></div>
@@ -191,12 +235,12 @@ function dur() {
               <svg width="100" height="100">
                 <circle cx="50" cy="50" r="44" stroke="rgba(255,255,255,0.08)" stroke-width="6" fill="none"/>
                 <circle id="gaugeRing" cx="50" cy="50" r="44" stroke="#7dd3a8" stroke-width="6" fill="none"
-                  stroke-dasharray="276" stroke-dashoffset={276 * (1 - integrity / 100)}
+                  stroke-dasharray="276" stroke-dashoffset={gaugeOffset}
                   stroke-linecap="round"
                   style={'filter: drop-shadow(0 0 6px #7dd3a8aa); transition: stroke-dashoffset 0.5s;'} />
               </svg>
               <div class="face">
-                <div class="num" id="gaugeNum">{Math.round(integrity)}%</div>
+                <div class="num" id="gaugeNum">{integrityText}</div>
                 <div class="lab">score</div>
               </div>
             </div>
@@ -224,11 +268,11 @@ function dur() {
             <span class="arrow">&rsaquo;</span>
             <div class="stage"><div class="k">3 &middot; Classifier</div><div class="v" id="pipeClass">{initialFlag > 0 ? 'flag' : initialWarn > 0 ? 'warn' : 'clean'}</div></div>
             <span class="arrow">&rsaquo;</span>
-            <div class="stage"><div class="k">4 &middot; Policy</div><div class="v" id="pipePol">{integrity < 60 ? 'escalate' : 'continue'}</div></div>
+            <div class="stage"><div class="k">4 &middot; Policy</div><div class="v" id="pipePol">{policyText}</div></div>
           </div>
-          <div class={'decision ' + (integrity < 60 ? 'bad' : integrity < 80 ? 'warn' : '')} id="decisionCard">
+          <div class={decisionClass} id="decisionCard">
             <p class="k">Decision</p>
-            <p class="v" id="decisionText">{integrity < 60 ? 'Escalate to human invigilator' : integrity < 80 ? 'Continue with caution - flags observed' : 'Continue - no escalation needed'}</p>
+            <p class="v" id="decisionText">{decisionText}</p>
           </div>
         </div>
       </div>

@@ -18,7 +18,7 @@ import { getViewableSectionKeys } from '@/lib/auth/permissions';
 // db-timeout.ts imports nothing, so this adds no weight to the layout bundle, and its circuit
 // breaker means that once one read has timed out the rest are refused instantly rather than each
 // waiting out its own eight seconds.
-import { withDbTimeout } from '@/lib/db-timeout';
+import { withDbTimeout, withDbRetry } from '@/lib/db-timeout';
 
 interface Props {
   title?: string;
@@ -59,9 +59,24 @@ try {
   // page for every admin user. Nothing on the screen is wrong without it — the catch below already
   // leaves autoAccent at 'default' — so it is the one read here that should give up early rather
   // than spend the page's whole budget deciding a shade.
+  // MARKED COSMETIC, WHICH IS THE PART THAT MATTERS MORE THAN THE 3s BOUND.
+  //
+  // The bound was already right. What was wrong is that this read FED THE CIRCUIT BREAKER, and the
+  // breaker is process-global: three timeouts in a row and every subsequent read in the instance is
+  // refused instantly. This one runs on all ~160 admin surfaces and decides a colour that the line
+  // below already defaults — so a detail nobody would notice failing was able to make the console's
+  // real data unreadable. `cosmetic: true` keeps the bound and the log and stops it counting as
+  // evidence about the database. It is still refused while the circuit is open, which is correct: a
+  // shade is not worth a connection during an outage.
+  //
+  // NOT MERGED INTO THE ADMIN GATE'S hr_employees READ, though it is the same row. That read is an
+  // AUTHORIZATION check, and src/lib/auth/admin-access.ts states in its own comments that gender,
+  // Aadhaar, PAN, bank and salary "do not belong in an auth check" and deliberately selects five
+  // non-sensitive columns. Adding `gender` there to save a round trip would trade a documented
+  // data-minimisation boundary for ~140ms. The round trip stays.
   const gr = await withDbTimeout(
     db.execute(sql`SELECT gender FROM hr_employees WHERE user_id = ${user.id} OR personal_email = ${user.email} OR email = ${user.email} LIMIT 1`),
-    'adminLayout.accent', 3000);
+    'adminLayout.accent', 3000, { cosmetic: true });
   const g = ((Array.isArray(gr) ? gr : (gr?.rows || []))[0] as any)?.gender;
   if (g) { const gl = String(g).toLowerCase(); if (gl.startsWith('m')) autoAccent = 'amber'; else if (gl.startsWith('f')) autoAccent = 'rose'; }
 } catch (_) {}
@@ -101,12 +116,23 @@ function isGroupActive(group: NavGroup, activeId: string): boolean {
 // the entire sidebar. An empty set is the safe unknown: the sidebar renders only the universal
 // entries, the person can still reach the dashboard, and src/middleware.ts remains the gate that
 // actually decides what opens.
+//
+// FAILING CLOSED SILENTLY IS STILL A LIE, AND THAT IS WHAT THIS DID.
+//
+// The empty set is the right answer and it stays. What was missing is that it is INDISTINGUISHABLE
+// on screen from the true answer "you have been granted these three sections". An administrator
+// whose registry read stalled watched their sidebar collapse to Dashboard, Mail and Notifications
+// with nothing saying why — the same picture a genuinely restricted account sees, and the picture
+// somebody would reasonably report as "my permissions were taken away". `navUnreadable` carries the
+// difference to the sidebar, which now says it.
 let allowedKeys: Awaited<ReturnType<typeof getViewableSectionKeys>>;
+let navUnreadable = false;
 try {
-  allowedKeys = await withDbTimeout(getViewableSectionKeys(user), 'adminLayout.sectionKeys');
+  allowedKeys = await withDbRetry(() => getViewableSectionKeys(user), 'adminLayout.sectionKeys');
 } catch (e: any) {
   console.error('[AdminLayout] section permissions could not be read -', e?.cause?.message || e?.message);
   allowedKeys = new Set<string>();
+  navUnreadable = true;
 }
 // NAV_SECTION IS GONE. It was a second copy of a fact admin-nav.ts already records on every entry,
 // and it had rotted exactly as a second copy does: repeated keys (which TypeScript flags outright),
@@ -257,6 +283,16 @@ const pageTitle = title ? title + ' - Admin - ' + SITE.name : 'Admin - ' + SITE.
           </a>
         </div>
 
+        {navUnreadable && (
+          <div style="margin:0 12px 10px;padding:10px 12px;border:1px solid rgba(242,115,28,0.45);border-radius:10px;background:rgba(242,115,28,0.08);">
+            <div style="font-size:12px;font-weight:700;color:#f2731c;margin-bottom:4px;">Menu is incomplete</div>
+            <div style="font-size:11.5px;line-height:1.55;color:#9aa6b6;">
+              Your permissions could not be read, so only the universal entries are listed. Nothing has
+              been taken away from your account. <a href="" style="color:#f2731c;">Try again</a>
+            </div>
+          </div>
+        )}
+
         <nav class="admin-nav">
           {visibleNav.map((entry) => {
             if (isGroup(entry)) {
@@ -384,11 +420,27 @@ const pageTitle = title ? title + ' - Admin - ' + SITE.name : 'Admin - ' + SITE.
               requestAnimationFrame(function () { t.style.transform = 'translateX(0)'; t.style.opacity = '1'; });
               setTimeout(function () { t.style.transform = 'translateX(120%)'; t.style.opacity = '0'; setTimeout(function () { try { t.remove(); } catch (_) {} }, 400); }, 6500);
             }
+            // AN EMPTY BOX IS AN ANSWER, AND THIS ONE WAS GIVEN WITHOUT KNOWING ANYTHING.
+            //
+            // `if (!d.ok) return;` with no .catch on the chain left #eraBellList exactly as it was —
+            // on first open, a literally empty dropdown, which reads as "no notifications". Three
+            // different states shared that picture: nothing waiting, the feed could not be read, and
+            // the request never came back. The endpoint now sends ok:false with a reason rather than
+            // a 500, and this states it instead of drawing silence.
+            function bellUnavailable(message) {
+              if (list) {
+                list.innerHTML = '<p style="color:#9aa6b6;font-size:12.5px;padding:22px 12px;text-align:center;line-height:1.6;">'
+                  + (message || 'Your notifications could not be read just now.')
+                  + '<br><span style="color:#6e6e78;">This is not an empty inbox. Nothing has been lost.</span></p>';
+              }
+              // The badge is left exactly as it is: whatever it last showed was read from the
+              // database, and replacing it with nothing would be the same false zero in another form.
+            }
             function load() {
               fetch('/api/admin/notifications-recent', { credentials: 'same-origin' })
-                .then(function (r) { return r.json(); })
+                .then(function (r) { return r.json().catch(function () { return null; }); })
                 .then(function (d) {
-                  if (!d.ok) return;
+                  if (!d || !d.ok) { bellUnavailable(d && d.error); return; }
                   if (d.unread > 0) { badge.textContent = d.unread > 99 ? '99+' : d.unread; badge.style.display = 'inline-flex'; }
                   else { badge.style.display = 'none'; }
                   // Toast newly arrived unread items (skip on the very first call)
@@ -425,7 +477,10 @@ const pageTitle = title ? title + ' - Admin - ' + SITE.name : 'Admin - ' + SITE.
                       fetch('/api/admin/notifications-recent', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'mark_read', id: a.getAttribute('data-nid') }) });
                     });
                   });
-                });
+                })
+                // The chain had no .catch at all: a network failure or a gateway timeout rejected it
+                // silently and the dropdown stayed as it was, which on first open is empty.
+                .catch(function () { bellUnavailable('Your notifications could not be reached just now.'); });
             }
             btn.addEventListener('click', function (e) { e.stopPropagation(); box.style.display = box.style.display === 'block' ? 'none' : 'block'; if (box.style.display === 'block') load(); });
             document.addEventListener('click', function (e) { if (e.target !== btn && !box.contains(e.target)) box.style.display = 'none'; });
@@ -526,21 +581,46 @@ const pageTitle = title ? title + ' - Admin - ' + SITE.name : 'Admin - ' + SITE.
   <script is:inline>
   (function() {
     // Fetch unread notification count and update bell badge
+    // A HIDDEN BADGE IS AN ASSERTION, AND IT WAS BEING MADE ON NO INFORMATION.
+    //
+    // `data.count || 0` collapsed three different answers into one picture: nothing waiting, the
+    // count could not be read, and the request never came back. All three hid the badge, and a
+    // hidden badge on the only signal an admin has that something arrived reads as "nothing new".
+    // The endpoint stopped sending a zero on failure a while ago; the client kept drawing one.
+    //
+    // Unknown now looks like unknown - a muted dot with the reason on hover. Deliberately not a
+    // number and not a warning colour: nothing is wrong with the account, we simply do not know.
     function updateBellBadge() {
+      var b1 = document.getElementById('bellBadge');
+      function known(count) {
+        if (!b1) return;
+        b1.style.opacity = '';
+        if (count > 0) {
+          b1.textContent = count > 99 ? '99+' : String(count);
+          b1.title = count + ' unread';
+          b1.style.display = 'inline-flex';
+        } else {
+          b1.title = '';
+          b1.style.display = 'none';
+        }
+      }
+      function unknown() {
+        if (!b1) return;
+        b1.textContent = '·';
+        b1.title = 'The unread count could not be read just now. This is not a count of zero.';
+        b1.style.opacity = '0.55';
+        b1.style.display = 'inline-flex';
+      }
       fetch('/admin/api/notifications/unread-count', { credentials: 'same-origin' })
-        .then(function(r) { return r.json(); })
+        .then(function(r) { return r.json().catch(function() { return null; }); })
         .then(function(data) {
-          var count = data.count || 0;
-          var b1 = document.getElementById('bellBadge');
-          if (b1) {
-            if (count > 0) {
-              b1.textContent = count > 99 ? '99+' : String(count);
-              b1.style.display = 'inline-flex';
-            } else {
-              b1.style.display = 'none';
-            }
-          }
-        }).catch(function() {});
+          // A 401 is a real answer - signed out, so no count is owed. Anything else without a usable
+          // count is the unknown case.
+          if (data && data.ok === true && typeof data.count === 'number') { known(data.count); return; }
+          if (data && data.error === 'unauthorized') { known(0); return; }
+          unknown();
+        })
+        .catch(function() { unknown(); });
     }
     updateBellBadge();
     // Pause when the tab is hidden so an idle admin tab doesn't keep the DB awake.

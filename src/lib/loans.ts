@@ -55,6 +55,17 @@
 //   - NO BACKTICK inside a sql template literal, not even in a comment.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+// A MONEY REGISTER THAT COULD NOT BE READ MUST NOT BE DRAWN AS A REGISTER WITH NOTHING IN IT.
+//
+// Opening a connection on this deployment stalls past five seconds for about a quarter of the
+// attempts that have to open one. Every read below caught that, logged it, and answered with an
+// empty list — so an employee with an advance being recovered from their pay saw "no loans", and,
+// far worse, plannedRecoveries() handed payroll an empty charge list and the payslip went out with
+// no instalment deducted while the debt stayed on the books. withDbTimeout turns the stall into a
+// prompt error the caller can see; the *Read() variants below are what let a caller SEE it.
+//
+// withDbTimeout, never withDbRetry: nothing in this file is safe to re-run blind.
+import { withDbTimeout } from '@/lib/db-timeout';
 import { ensureOnce } from '@/lib/ensure-once';
 import { logAudit } from '@/lib/audit';
 import { startWorkflow, getInstance } from '@/lib/workflow';
@@ -265,15 +276,18 @@ export function ensureLoanSchema(): Promise<void> {
   });
 }
 
-/** Provision, but never throw into a reader — a read that cannot run returns an empty list. */
-async function safeEnsure(): Promise<boolean> {
-  try {
-    await ensureLoanSchema();
-    return true;
-  } catch {
-    return false;
-  }
-}
+// safeEnsure() USED TO LIVE HERE, AND IT WAS A GUARD THAT COULD NOT FAIL.
+//
+// It was `try { await ensureLoanSchema(); return true } catch { return false }`, and every read
+// below opened with `if (!(await safeEnsure())) return []`. ensureOnce() never rejects — it returns
+// Promise.resolve() when bootstrap is disabled, and otherwise ends in `p.catch(e => console.error)`
+// (src/lib/ensure-once.ts) — so ensureLoanSchema()'s own re-throw is swallowed there and safeEnsure()
+// returned true unconditionally. Five call sites read as though the register were guarded against a
+// schema that never landed; none of them was. Deleting it is not a loss of protection, it is the
+// removal of the APPEARANCE of protection, which is the more dangerous of the two.
+//
+// What actually decides whether a read answered is the catch inside each read, and what a caller
+// does about it is the `ok` the *Read() functions now return.
 
 // -------------------------------------------------------------------------------------------------
 // READS
@@ -354,46 +368,75 @@ const LOAN_SELECT = sql`
         FROM hr_loan_instalments GROUP BY loan_id
     ) led ON led.loan_id = l.id`;
 
-/** The register. `state` narrows it; omit for everything. Fails closed to an empty list. */
-export async function listLoans(
+/**
+ * THE REGISTER, WITH THE FAILURE KEPT. `state` narrows it; omit for everything.
+ *
+ * `ok: false` means the read did not run — a stalled connection, an open circuit, or a query error.
+ * It does NOT mean there are no loans, and nothing may render it as though it did. An employee whose
+ * salary advance is being recovered every month must never be shown "no loans", because the only
+ * conclusion available to them is that the debt is gone.
+ *
+ * listLoans() below keeps the old array signature for the screens that only display the register.
+ * plannedRecoveries() uses THIS one, and refuses to compute a payslip deduction without it.
+ */
+export async function listLoansRead(
   opts: { state?: string; employeeId?: string; limit?: number } = {},
-): Promise<LoanRow[]> {
+): Promise<{ ok: boolean; rows: LoanRow[] }> {
   const limit = Math.min(Math.max(Number(opts.limit) || 150, 1), 400);
-  if (!(await safeEnsure())) return [];
   try {
+    // Inside the try, where safeEnsure()'s catch used to be. ensureOnce() cannot reject today, but a
+    // reader that would 500 the page if it ever started to is not a property worth relying on.
+    await ensureLoanSchema();
     const stateFilter = opts.state ? sql`AND l.state = ${String(opts.state)}` : sql``;
     const empFilter = isUuid(opts.employeeId)
       ? sql`AND l.employee_id = ${String(opts.employeeId)}::uuid`
       : sql``;
-    const r = await db.execute(sql`
+    const r = await withDbTimeout(db.execute(sql`
       ${LOAN_SELECT}
        WHERE TRUE ${stateFilter} ${empFilter}
        ORDER BY (l.state IN ('pending', 'halted')) DESC, l.created_at DESC
-       LIMIT ${limit}`);
-    return rows(r).map(mapLoan);
+       LIMIT ${limit}`), 'loans.list');
+    return { ok: true, rows: rows(r).map(mapLoan) };
   } catch (e: any) {
     logFail('listLoans', e);
-    return [];
+    return { ok: false, rows: [] };
   }
+}
+
+/** The register. Fails closed to an empty list; use listLoansRead() when the empty list is drawn. */
+export async function listLoans(
+  opts: { state?: string; employeeId?: string; limit?: number } = {},
+): Promise<LoanRow[]> {
+  return (await listLoansRead(opts)).rows;
+}
+
+/** One person's own loans and advances, with the failure kept. Narrowed by employee_id in the WHERE. */
+export async function loansForEmployeeRead(employeeId: string): Promise<{ ok: boolean; rows: LoanRow[] }> {
+  if (!isUuid(employeeId)) return { ok: true, rows: [] };
+  return listLoansRead({ employeeId, limit: 100 });
 }
 
 /** One person's own loans and advances. Narrowed by employee_id in the WHERE clause. */
 export async function loansForEmployee(employeeId: string): Promise<LoanRow[]> {
-  if (!isUuid(employeeId)) return [];
-  return listLoans({ employeeId, limit: 100 });
+  return (await loansForEmployeeRead(employeeId)).rows;
+}
+
+/** One loan, with the failure kept: `ok: false` is "we could not look", not "there is no such loan". */
+export async function getLoanRead(id: string): Promise<{ ok: boolean; loan: LoanRow | null }> {
+  if (!isUuid(id)) return { ok: true, loan: null };
+  try {
+    await ensureLoanSchema();
+    const r = await withDbTimeout(db.execute(sql`${LOAN_SELECT} WHERE l.id = ${id}::uuid LIMIT 1`), 'loans.get');
+    const list = rows(r);
+    return { ok: true, loan: list.length ? mapLoan(list[0]) : null };
+  } catch (e: any) {
+    logFail('getLoan', e);
+    return { ok: false, loan: null };
+  }
 }
 
 export async function getLoan(id: string): Promise<LoanRow | null> {
-  if (!isUuid(id)) return null;
-  if (!(await safeEnsure())) return null;
-  try {
-    const r = await db.execute(sql`${LOAN_SELECT} WHERE l.id = ${id}::uuid LIMIT 1`);
-    const list = rows(r);
-    return list.length ? mapLoan(list[0]) : null;
-  } catch (e: any) {
-    logFail('getLoan', e);
-    return null;
-  }
+  return (await getLoanRead(id)).loan;
 }
 
 export interface InstalmentRow {
@@ -411,13 +454,13 @@ export interface InstalmentRow {
 /** Every recovery taken against one loan, newest first. The evidence behind the balance. */
 export async function loanLedger(loanId: string): Promise<InstalmentRow[]> {
   if (!isUuid(loanId)) return [];
-  if (!(await safeEnsure())) return [];
   try {
-    const r = await db.execute(sql`
+    await ensureLoanSchema();
+    const r = await withDbTimeout(db.execute(sql`
       SELECT * FROM hr_loan_instalments
        WHERE loan_id = ${loanId}::uuid
        ORDER BY year DESC, month DESC, created_at DESC
-       LIMIT 200`);
+       LIMIT 200`), 'loans.ledger');
     return rows(r).map((x: any) => ({
       id: String(x.id),
       loanId: String(x.loan_id),
@@ -842,15 +885,30 @@ export async function plannedRecoveries(
   opts: { month: number; year: number },
 ): Promise<LoanCharge[]> {
   if (!isUuid(employeeId)) return [];
-  if (!(await safeEnsure())) return [];
   const month = Math.max(1, Math.min(12, Math.round(Number(opts?.month) || 0)));
   const year = Math.max(1970, Math.min(9999, Math.round(Number(opts?.year) || 0)));
   const period = year * 12 + month;
 
   try {
-    const live = await listLoans({ employeeId, state: 'active', limit: 50 });
+    await ensureLoanSchema();
+    // AN UNREADABLE REGISTER MUST NOT BECOME AN EMPTY CHARGE LIST. THIS IS THE MONEY.
+    //
+    // listLoans() answers [] both for "this person has no live loans" and for "the read did not
+    // run", and those two produce the same payslip: one with no instalment on it. On a stalled
+    // connection during a payroll run — the failure this deployment actually has — the employee is
+    // under-deducted, the payslip is issued, and the debt stays on the books at its old balance. The
+    // loan screen and the payslip then disagree, which is precisely what src/lib/payroll.ts says at
+    // the top of its import of this module must never happen.
+    //
+    // So this throws instead. computePay() catches it and pushes 'loan and advance balances' onto
+    // its `gaps` list, generateRun() turns every gap into a warning beside the employee's name, and
+    // the human pressing the button is told this payslip was computed without the loan register.
+    // A payroll run that says what it could not see is recoverable; an under-deducted payslip that
+    // has already been issued is not.
+    const live = await listLoansRead({ employeeId, state: 'active', limit: 50 });
+    if (!live.ok) throw new Error('the loan register could not be read, so no recovery was computed for this payslip');
     const out: LoanCharge[] = [];
-    for (const l of live) {
+    for (const l of live.rows) {
       if (!l.disbursedAt) continue;                       // never recover money that has not gone out
       if (l.outstanding <= 0) continue;                   // already clear; closeCleared() will close it
       if (l.startYear * 12 + l.startMonth > period) continue; // recovery has not started yet
@@ -881,8 +939,13 @@ export async function plannedRecoveries(
     }
     return out;
   } catch (e: any) {
+    // RE-THROWN, NOT SWALLOWED — this catch used to `return []`, which is the same value as "this
+    // person owes nothing" and produced a payslip with no instalment on it. The arithmetic above is
+    // pure once `live` is in hand, so anything landing here is the register failing to answer, and
+    // the only honest answer to that is "I do not know what to deduct". payroll.ts:1483 already
+    // wraps this call in a try that records the gap and shows it to whoever is running payroll.
     logFail('plannedRecoveries', e);
-    return [];
+    throw e;
   }
 }
 

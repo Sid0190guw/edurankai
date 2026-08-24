@@ -32,6 +32,19 @@
 // the status that says so rather than the convention browsers happen to follow for 302.
 import type { APIRoute, AstroCookies } from 'astro';
 import { invalidateSession } from '@/lib/auth/session';
+// THE SAME BOUND ITS PORTAL TWIN GOT, AND FOR THE SAME REASON.
+//
+// "The cookie is cleared either way" below is true of a delete that FAILS and false of one that
+// never answers, which is the failure this deployment actually has: opening a connection costs
+// ~810ms when it works and stalls past five seconds a share of the time. Unbounded, the invocation
+// died at the gateway — no response, therefore no Set-Cookie, therefore clearSessionCookie() never
+// reached the browser and an admin signing out of a shared machine walked away still signed in,
+// with DONE_PARTIAL never rendered. A catch cannot catch a wait that never settles.
+//
+// withDbRetry, because a DELETE by primary key is idempotent and because what fails here is the
+// connection rather than the statement: the abandoned attempt leaves the connection it was opening
+// in the pool, so the second ask usually reuses it. Anything thrown still lands in the catch.
+import { withDbRetry } from '@/lib/db-timeout';
 import { readSessionCookie, clearSessionCookie } from '@/lib/auth/cookie';
 
 // Declared before the handlers that use them — `const` is not hoisted, and a handler reaching a
@@ -54,7 +67,7 @@ async function endSession(cookies: AstroCookies): Promise<boolean> {
   let serverSideEnded = true;
   if (token) {
     try {
-      await invalidateSession(token);
+      await withDbRetry(() => invalidateSession(token), 'adminLogout.invalidate');
     } catch (e: any) {
       serverSideEnded = false;
       // The real Postgres reason is on e.cause; e.message is only the failed SQL.

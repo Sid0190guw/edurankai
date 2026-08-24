@@ -49,6 +49,26 @@
 
 import { db } from './db';
 import { sql } from 'drizzle-orm';
+// EVERY WAIT IN A PUNCH IS BOUNDED, BECAUSE AN UNBOUNDED ONE IS AN ABSENCE.
+//
+// Opening a connection on this deployment costs ~810ms when it works and, for about a quarter of
+// the attempts that have to open one, never answers at all. punch() used to open with four
+// unbounded awaits, so that quarter did not produce any of the three sentences below it — it
+// produced a spinner, then the gateway's own timeout, then nothing in hr_clock_events and nothing
+// on screen. The employee finds out at the end of the month, on a timesheet showing an absence
+// they cannot explain. withDbTimeout turns that wait into a refusal this file can phrase.
+//
+// withDbTimeout only, never withDbRetry: the INSERT here is not idempotent, and the reads around it
+// are decided in the same breath as it.
+//
+// THE PUNCH PATH USES DB_TRY_MS (5s) RATHER THAN THE 8s DEFAULT, and the difference is the whole
+// point. punch() makes four round trips, so one 8s fuse plus the render is already at the platform's
+// invocation budget — the timeout would blow and the gateway would still be the thing the employee
+// sees. 5s is not an arbitrary tightening either: db-timeout.ts measured the slowest wait that
+// SUCCEEDS on this deployment at ~3.2s, so 5s sits above everything that works and below the
+// population that never answers. Anything slower than that is the stalled connection, not a slow
+// write, and the sentences below are a better answer to it than a spinner.
+import { withDbTimeout, isDbUnavailable, DB_TRY_MS } from './db-timeout';
 import { ensureAttendanceSchema, ensureWorkingTimeSchema } from './attendance-schema';
 import { startWorkflow, resumeWorkflow, instanceForRecord, type WorkflowInstanceRow } from './workflow';
 // FACE VERIFICATION IS AN OUTCOME THIS FILE RECORDS, NOT A CHECK IT PERFORMS. The comparison lives
@@ -1254,7 +1274,17 @@ export async function punch(
   if (!isUuid(employeeId)) return { ok: false, error: 'That is not an employee record.' };
   if (!isPunchKind(kind)) return { ok: false, error: 'That is not something we record.' };
 
-  const day = await today();
+  // today() catches its own query error and answers null, so the only thing this bound can throw is
+  // a DbTimeoutError or a DbCircuitOpenError — and both mean exactly what null already means here:
+  // we do not know which day this is. The refusal three lines down was written for that and is now
+  // reachable on a stall instead of only on a failed query.
+  let day: string | null = null;
+  try {
+    day = await withDbTimeout(today(), 'attendance.punch.today', DB_TRY_MS);
+  } catch (e: any) {
+    logFail('punch.today', e);
+    day = null;
+  }
   if (!day) {
     return {
       ok: false,
@@ -1262,7 +1292,21 @@ export async function punch(
     };
   }
 
-  const existing = await punchesOn(employeeId, day);
+  // THE DAY SO FAR IS WHAT THE NEXT PUNCH IS CHECKED AGAINST, so an unread day must not be read as
+  // an empty one. punchesOn() collapses a failed query to [], which is right for a screen that only
+  // displays the day and wrong here: an empty day makes punchRefusal() approve a second clock_in
+  // against a shift already running. On a timeout we therefore refuse rather than guess.
+  let existing: PunchEvent[];
+  try {
+    existing = await withDbTimeout(punchesOn(employeeId, day), 'attendance.punch.daySoFar', DB_TRY_MS);
+  } catch (e: any) {
+    logFail('punch.daySoFar', e);
+    return {
+      ok: false,
+      error: 'We could not read today\'s punches, so we will not record a punch we cannot check '
+        + 'against the day so far. Nothing has changed — try again in a moment.',
+    };
+  }
   const before = computeDay(existing);
   const refusal = punchRefusal(kind, before);
   if (refusal) return { ok: false, error: refusal, totals: before };
@@ -1306,7 +1350,7 @@ export async function punch(
     // resolved 'attendance_v1' would never run statements appended to it. ensureOnce swallows a
     // failed run for the caller, so a DDL hiccup cannot cost anybody their punch.
     await ensureFaceVerifySchema();
-    await db.execute(sql`
+    await withDbTimeout(db.execute(sql`
       INSERT INTO hr_clock_events
         (employee_id, event_type, lat, lon, accuracy, location_name, work_mode, note,
          ip_address, device_info, qr_station_id, qr_code_raw, source,
@@ -1315,9 +1359,24 @@ export async function punch(
         (${employeeId}::uuid, ${kind}, ${goodLat}, ${goodLon}, ${goodAcc},
          ${station ? station.label : null}, ${workMode}, ${note},
          ${ip}, ${device}, ${station ? station.id : null}::uuid, ${rawCode}, ${source},
-         ${faceVerified}, ${faceMethod}, ${faceOutcome}, ${faceAt}::timestamptz)`);
+         ${faceVerified}, ${faceMethod}, ${faceOutcome}, ${faceAt}::timestamptz)`),
+      'attendance.punch.insert', DB_TRY_MS);
   } catch (e: any) {
     logFail('punch.insert', e);
+    // A TIMED-OUT INSERT IS NOT A FAILED INSERT. withDbTimeout sheds the WAIT and not the WORK — it
+    // says so in its own header — so the row may well have landed after we stopped waiting for it.
+    // "The punch could not be recorded" would then be a confident false statement of the kind this
+    // module exists to avoid, so the two cases are phrased differently. The duplicate a retry might
+    // create is contained: punchRefusal() above refuses a second punch of the same kind, which is
+    // how the next tap tells the person the truth about the first one.
+    if (isDbUnavailable(e)) {
+      return {
+        ok: false,
+        totals: before,
+        error: 'We could not confirm your punch was recorded — the database did not answer in time. '
+          + 'Try again: if it did save, the next tap will tell you so.',
+      };
+    }
     return { ok: false, error: errText(e, 'The punch could not be recorded.'), totals: before };
   }
 
@@ -1329,7 +1388,17 @@ export async function punch(
   // `changed: true` and `ok: false` together, deliberately: the event IS in hr_clock_events, the log
   // on screen will show it, and the next punch recomputes the day correctly. What failed is the
   // rollup, and the sentence says exactly that instead of implying the punch was lost.
-  const read = await punchesOnRead(employeeId, day);
+  //
+  // The bound matters as much as the catch: on a stall this await is what the page is sitting on
+  // AFTER the punch is safely in hr_clock_events, so an unbounded one throws away a sentence we can
+  // already say truthfully in exchange for a gateway timeout that says nothing.
+  let read: Awaited<ReturnType<typeof punchesOnRead>>;
+  try {
+    read = await withDbTimeout(punchesOnRead(employeeId, day), 'attendance.punch.dayRollup', DB_TRY_MS);
+  } catch (e: any) {
+    logFail('punch.dayRollup', e);
+    read = { ok: false, error: 'The day could not be read back.' };
+  }
   if (!read.ok) {
     return {
       ok: false,
@@ -2548,63 +2617,112 @@ function mapTimesheetEntry(row: any): TimesheetEntry {
   };
 }
 
-/** One submitted week for one person, with its entries and its approval. Null when never submitted. */
-export async function timesheetFor(employeeId: string, anyDayInWeek: string): Promise<SubmittedTimesheet | null> {
-  if (!isUuid(employeeId)) return null;
+/**
+ * "NEVER SUBMITTED" AND "COULD NOT BE READ" ARE DIFFERENT ANSWERS, AND ONLY ONE OF THEM IS ABOUT
+ * THE PERSON.
+ *
+ * timesheetFor() answers null and timesheetsFor() answers [] for both, which is the ordinary
+ * fail-closed shape and is fine for anything that only wants to DISPLAY a week that exists. It is
+ * not fine for the two places a reader draws a conclusion from the absence: /portal/employee/timesheet
+ * prints "no recent timesheets" over an empty list, and an employee reads that as a statement that
+ * they submitted nothing — including for weeks they submitted and had approved. On a stalled
+ * connection, which is the failure this deployment actually has, that sentence is false.
+ *
+ * So the reads keep their failure, exactly as punchesOnRead() above does for the punch writer, and
+ * for the same reason: the display callers keep the old signature and the old behaviour, and a
+ * screen that wants to tell the truth about an empty list can now ask which kind of empty it is.
+ *
+ * A page that has `ok: false` must say so instead of drawing the empty state. weeklyTimesheet()
+ * already returns `unreadable` for the same purpose.
+ */
+export async function timesheetForRead(
+  employeeId: string,
+  anyDayInWeek: string,
+): Promise<{ ok: boolean; sheet: SubmittedTimesheet | null }> {
+  if (!isUuid(employeeId)) return { ok: true, sheet: null };
   const weekStart = weekStartIso(isDateIso(anyDayInWeek) ? anyDayInWeek : '');
-  if (!isDateIso(weekStart)) return null;
+  if (!isDateIso(weekStart)) return { ok: true, sheet: null };
   try {
     await ensureWorkingTimeSchema();
-    const head = rows(await db.execute(sql`
+    const head = rows(await withDbTimeout(db.execute(sql`
       SELECT t.*, e.full_name AS employee_name
         FROM hr_timesheets t
         LEFT JOIN hr_employees e ON e.id = t.employee_id
        WHERE t.employee_id = ${employeeId}::uuid AND t.week_start = ${weekStart}::date
-       LIMIT 1`));
-    if (!head.length) return null;
+       LIMIT 1`), 'attendance.timesheet.head', 4000));
+    if (!head.length) return { ok: true, sheet: null };
     const id = String(head[0].id);
-    const entries = rows(await db.execute(sql`
-      SELECT * FROM hr_timesheet_entries WHERE timesheet_id = ${id}::uuid ORDER BY work_date ASC`))
+    const entries = rows(await withDbTimeout(db.execute(sql`
+      SELECT * FROM hr_timesheet_entries WHERE timesheet_id = ${id}::uuid ORDER BY work_date ASC`),
+      'attendance.timesheet.entries', 4000))
       .map(mapTimesheetEntry);
     return {
-      id,
-      employeeId,
-      employeeName: head[0].employee_name ? String(head[0].employee_name) : null,
-      weekStart,
-      weekEnd: shiftDateIso(weekStart, 6),
-      note: head[0].note ? String(head[0].note) : null,
-      submittedAt: head[0].submitted_at ? new Date(head[0].submitted_at).toISOString() : null,
-      withdrawnAt: head[0].withdrawn_at ? new Date(head[0].withdrawn_at).toISOString() : null,
-      entries,
-      totalMinutes: entries.reduce((sum, e) => sum + e.minutes, 0),
-      workflow: await instanceForRecord('timesheet', id),
+      ok: true,
+      sheet: {
+        id,
+        employeeId,
+        employeeName: head[0].employee_name ? String(head[0].employee_name) : null,
+        weekStart,
+        weekEnd: shiftDateIso(weekStart, 6),
+        note: head[0].note ? String(head[0].note) : null,
+        submittedAt: head[0].submitted_at ? new Date(head[0].submitted_at).toISOString() : null,
+        withdrawnAt: head[0].withdrawn_at ? new Date(head[0].withdrawn_at).toISOString() : null,
+        entries,
+        totalMinutes: entries.reduce((sum, e) => sum + e.minutes, 0),
+        workflow: await withDbTimeout(instanceForRecord('timesheet', id), 'attendance.timesheet.workflow', 4000),
+      },
     };
   } catch (e: any) {
     logFail('timesheetFor', e);
-    return null;
+    return { ok: false, sheet: null };
+  }
+}
+
+/** One submitted week for one person, with its entries and its approval. Null when never submitted. */
+export async function timesheetFor(employeeId: string, anyDayInWeek: string): Promise<SubmittedTimesheet | null> {
+  return (await timesheetForRead(employeeId, anyDayInWeek)).sheet;
+}
+
+/**
+ * The weeks this person has submitted, newest first, WITH the failure kept — see timesheetForRead().
+ *
+ * `ok: false` covers the head read and every week read under it: one unreadable week in the middle
+ * of the list used to be dropped silently, so the history came back shorter than it really is with
+ * nothing saying a week was missing from it.
+ */
+export async function timesheetsForRead(
+  employeeId: string,
+  limit = 12,
+): Promise<{ ok: boolean; items: SubmittedTimesheet[] }> {
+  if (!isUuid(employeeId)) return { ok: true, items: [] };
+  const n = Math.min(Math.max(Number(limit) || 12, 1), 52);
+  try {
+    await ensureWorkingTimeSchema();
+    const heads = rows(await withDbTimeout(db.execute(sql`
+      SELECT week_start FROM hr_timesheets
+       WHERE employee_id = ${employeeId}::uuid
+       ORDER BY week_start DESC LIMIT ${n}`), 'attendance.timesheets.heads', 4000));
+    // ONE WEEK PER ITERATION, AND EACH WEEK IS THREE ROUND TRIPS. Twelve weeks is thirty-six waits,
+    // so the loop STOPS at the first week that could not be read rather than spending another
+    // thirty-odd fuses on a database that has just said it is not answering. `ok: false` already
+    // tells the caller the list is short; continuing would only make the page slower at saying so.
+    const out: SubmittedTimesheet[] = [];
+    let everyWeekRead = true;
+    for (const h of heads) {
+      const t = await timesheetForRead(employeeId, String(h.week_start).slice(0, 10));
+      if (!t.ok) { everyWeekRead = false; break; }
+      if (t.sheet) out.push(t.sheet);
+    }
+    return { ok: everyWeekRead, items: out };
+  } catch (e: any) {
+    logFail('timesheetsFor', e);
+    return { ok: false, items: [] };
   }
 }
 
 /** The weeks this person has submitted, newest first. */
 export async function timesheetsFor(employeeId: string, limit = 12): Promise<SubmittedTimesheet[]> {
-  if (!isUuid(employeeId)) return [];
-  const n = Math.min(Math.max(Number(limit) || 12, 1), 52);
-  try {
-    await ensureWorkingTimeSchema();
-    const heads = rows(await db.execute(sql`
-      SELECT week_start FROM hr_timesheets
-       WHERE employee_id = ${employeeId}::uuid
-       ORDER BY week_start DESC LIMIT ${n}`));
-    const out: SubmittedTimesheet[] = [];
-    for (const h of heads) {
-      const t = await timesheetFor(employeeId, String(h.week_start).slice(0, 10));
-      if (t) out.push(t);
-    }
-    return out;
-  } catch (e: any) {
-    logFail('timesheetsFor', e);
-    return [];
-  }
+  return (await timesheetsForRead(employeeId, limit)).items;
 }
 
 /**
@@ -2655,7 +2773,23 @@ export async function submitTimesheet(input: {
     return { ok: false, error: 'Every day on that timesheet is zero. Put some hours on it, or leave the week unsubmitted.' };
   }
 
-  const existing = await timesheetFor(employeeId, weekStart);
+  // AN UNREADABLE WEEK IS NOT AN UNSUBMITTED WEEK, and here the difference is a guard.
+  //
+  // This read is the only thing standing between a resubmission and an APPROVED week. When it
+  // answered null for a failed query — which is what timesheetFor() does, deliberately, for the
+  // screens that only display a week — the approved-state check three lines down could not fire, the
+  // INSERT below hit ON CONFLICT DO NOTHING, the raced re-read handed back the very row that was
+  // already signed off, and the entries were rewritten under an approval that had already happened.
+  // So the writer asks for the failure and refuses on it, exactly as punch() does with the day.
+  const prior = await timesheetForRead(employeeId, weekStart);
+  if (!prior.ok) {
+    return {
+      ok: false,
+      error: 'We could not read this week to see whether it has already been submitted or approved, '
+        + 'so nothing was saved. Your entries are still on this screen - try again in a moment.',
+    };
+  }
+  const existing = prior.sheet;
   if (existing?.workflow && (existing.workflow.state === 'approved' || existing.workflow.state === 'rejected')) {
     return {
       ok: false,
@@ -2674,10 +2808,22 @@ export async function submitTimesheet(input: {
         ON CONFLICT DO NOTHING
         RETURNING id`));
       if (!ins.length) {
-        // The unique index won a race the read could not see. Read the winner back.
-        const raced = await timesheetFor(employeeId, weekStart);
-        if (!raced) return { ok: false, error: 'The timesheet was not saved and the database did not say why.' };
-        timesheetId = raced.id;
+        // The unique index won a race the read could not see. Read the winner back — and keep the
+        // failure, because the winner may be an approved week and an unreadable answer must not be
+        // taken as "no such row" a second time.
+        const raced = await timesheetForRead(employeeId, weekStart);
+        if (!raced.ok) {
+          return { ok: false, error: 'The timesheet was not saved: the week could not be read back to see what it already holds.' };
+        }
+        if (!raced.sheet) return { ok: false, error: 'The timesheet was not saved and the database did not say why.' };
+        if (raced.sheet.workflow && (raced.sheet.workflow.state === 'approved' || raced.sheet.workflow.state === 'rejected')) {
+          return {
+            ok: false,
+            error: 'That week has already been ' + raced.sheet.workflow.state +
+              '. It cannot be rewritten - talk to your manager and, if it needs changing, ask for an attendance correction on the days concerned.',
+          };
+        }
+        timesheetId = raced.sheet.id;
       } else {
         timesheetId = String(ins[0].id);
       }

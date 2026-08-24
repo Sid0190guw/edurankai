@@ -17,6 +17,17 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { logEvent } from '@/lib/logger';
+// THE 503 BELOW WAS UNREACHABLE ON THE FAILURE THAT MATTERS.
+//
+// Everything this file's header says about not asserting zero was true of a query that FAILS. A
+// query that never answers reached none of it: postgres-js has no query timeout, so the await never
+// settled, the platform killed the invocation, and the badge got no response at all — which the
+// client also renders as "nothing waiting". Worse, this is POLLED from every open admin tab, so
+// each stalled poll held one of the instance's five pooler connections for the whole invocation.
+//
+// Bounded and deliberately NOT retried: it polls again on its own, and a second ask inside one poll
+// only doubles the load at the moment the database is already struggling.
+import { withDbTimeout } from '@/lib/db-timeout';
 
 // Declared above the handler that uses them: `const` is not hoisted.
 const json = (d: any, status = 200): Response =>
@@ -30,7 +41,9 @@ export const GET: APIRoute = async ({ locals }) => {
   const user = (locals as any)?.user;
   if (!user) return json({ ok: false, error: 'unauthorized' }, 401);
   try {
-    const r = await db.execute(sql`SELECT COUNT(*)::int as n FROM notifications WHERE user_id = ${user.id} AND is_read = false`);
+    const r = await withDbTimeout(
+      db.execute(sql`SELECT COUNT(*)::int as n FROM notifications WHERE user_id = ${user.id} AND is_read = false`),
+      'admin.unreadCount', 3000);
     const rows = Array.isArray(r) ? r : (r?.rows || []);
     const count = Number((rows[0] as any)?.n) || 0;
     return json({ ok: true, count });
