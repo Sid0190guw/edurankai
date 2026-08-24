@@ -57,7 +57,17 @@ SET statement_timeout = '60s';
 -- PART 1 -- THE tal_* CORE (src/lib/talent/schema.ts :: ensureTalentSchema)
 -- ================================================================================================
 
-SELECT to_regclass(${'public.' + SENTINEL}) IS NOT NULL AS present;
+-- ALREADY APPLIED? tal_event_subject_idx is the LAST object this file creates, so its existence
+-- proves every statement above it committed. This probe changes nothing and is safe to run on its
+-- own; a true here means everything below is a no-op.
+--
+-- THIS LINE USED TO READ  SELECT to_regclass(${'public.' + SENTINEL}) IS NOT NULL AS present;
+-- transcribed out of src/lib/talent/schema.ts:74 with its JavaScript template interpolation still
+-- in it. Postgres stops at the first dollar sign with "syntax error at or near $", and because it
+-- sits ABOVE every CREATE in this file, the whole run died before one table existed -- while the
+-- file's own header said it was safe to run. A .sql file mirroring a .ts bootstrap has to be read
+-- as SQL, not diffed against the TypeScript it came from.
+SELECT to_regclass('public.tal_event_subject_idx') IS NOT NULL AS talent_schema_already_applied;
 CREATE TABLE IF NOT EXISTS tal_person (
   id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   person_code    TEXT NOT NULL UNIQUE,
