@@ -6,7 +6,9 @@
 //
 // fields: templateId, file (optional), text (optional), count, lang, role
 import type { APIRoute } from 'astro';
-import { put } from '@vercel/blob';
+// putBounded, not put: @vercel/blob retries TEN times with an unbounded backoff
+// (~17 minutes) and no request timeout. See src/lib/blob-upload.ts.
+import { putBounded as put } from '@/lib/blob-upload';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { generateInterviewQuestions, isLlmConfigured } from '@/lib/llm';

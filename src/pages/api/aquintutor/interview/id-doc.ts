@@ -2,7 +2,9 @@
 // Candidate uploads a photo of their government ID at the start of the interview.
 // Stored to blob and saved against the session so the reviewer can verify it.
 import type { APIRoute } from 'astro';
-import { put } from '@vercel/blob';
+// putBounded, not put: @vercel/blob retries TEN times with an unbounded backoff
+// (~17 minutes) and no request timeout. See src/lib/blob-upload.ts.
+import { putBounded as put } from '@/lib/blob-upload';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { guardInterviewSession } from '@/lib/aquin/interview-session';

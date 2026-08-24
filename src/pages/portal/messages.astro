@@ -1,4 +1,5 @@
 ---
+import { withDbTimeout } from '@/lib/db-timeout';
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
@@ -47,7 +48,16 @@ function shortDate(v: any): string {
 //
 // ONE module now owns these tables and reconciles both shapes additively: src/lib/chat-schema.ts.
 // Nothing else may CREATE a chat table; a second one recreates the split.
-await ensureChatSchema();
+// BOUNDED. This page POSTs to ITSELF every 5 seconds from every open tab (the poll at the foot of
+// this file), so it is the highest-frequency authenticated database path on the site -- and every
+// one of those polls ran the full frontmatter, starting here, with nothing bounding the wait.
+// postgres-js has no query timeout, so a degraded pooler turned each open messenger tab into an
+// invocation that ran to the platform limit. A schema ensure is also the least important thing on
+// the page: production refuses request-time DDL anyway (src/lib/schema-bootstrap.ts), so a failure
+// here costs nothing that the reads below do not already report for themselves.
+await withDbTimeout(ensureChatSchema(), 'messages.ensureSchema', 4000).catch((e: any) => {
+  console.error('[messages] chat schema ensure did not complete -', e?.cause?.message || e?.message);
+});
 
 // --- Shared query helpers -----------------------------------------------------
 // Declared BEFORE the POST block that calls them. `const` is not hoisted and a handler that reaches
@@ -92,7 +102,9 @@ async function stampKnownKeys(threadId: string): Promise<void> {
 
 /** Thread rows for this reader, with a REAL unread count per thread. */
 async function threadRowsFor(): Promise<any[]> {
-  return rows(await db.execute(sql`
+  // Bounded, and an empty list on failure is what every caller already handles: the page renders its
+  // "no conversations" state rather than hanging. Called by the 5-second poll as well as the render.
+  return rows(await withDbTimeout(db.execute(sql`
     SELECT t.id, t.kind, t.title, t.last_message_preview, t.last_message_at, t.cover_url,
            t.disappearing_seconds, t.key_epoch,
            m.notifications_muted, m.last_read_at, m.role,
@@ -107,7 +119,10 @@ async function threadRowsFor(): Promise<any[]> {
       JOIN chat_thread_members m ON m.thread_id = t.id
      WHERE m.user_id = ${meId}
      ORDER BY COALESCE(t.last_message_at, t.created_at) DESC
-     LIMIT 100`));
+     LIMIT 100`), 'messages.threadRows').catch((e: any) => {
+    console.error('[messages] thread list could not be read -', e?.cause?.message || e?.message);
+    return [];
+  }));
 }
 
 /** Members of one thread, including whether each can be encrypted to and whether they hold a key. */

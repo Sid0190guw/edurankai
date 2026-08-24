@@ -3,7 +3,9 @@
 // of pasting a URL (Google Drive share links are not direct images and render
 // as a broken box). Magic-byte verified, size-capped, blob-stored.
 import type { APIRoute } from 'astro';
-import { put } from '@vercel/blob';
+// putBounded, not put: @vercel/blob retries TEN times with an unbounded backoff
+// (~17 minutes) and no request timeout. See src/lib/blob-upload.ts.
+import { putBounded as put } from '@/lib/blob-upload';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 

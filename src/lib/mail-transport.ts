@@ -166,7 +166,22 @@ export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
     return { ok: false, provider: 'none', error: 'No SMTP transport configured (add your mail server in Mail Settings)' };
   }
 
-  // Port-driven secure mode: 465 = implicit TLS, 587 = STARTTLS.
+  /**
+ * The total time one SMTP send may take, including its retries.
+ *
+ * Declared as a FUNCTION and read per call, so it is hoisted above every use in this file -- `const`
+ * is not, and a const used above its declaration has taken pages down on this project.
+ *
+ * Twenty seconds is far more than a healthy send needs (this deployment sends short transactional
+ * mail; the house rule is links, not attachments, so there are no large payloads to push) and far
+ * less than the ~95 seconds the previous timeouts multiplied out to.
+ */
+function sendBudgetMs(): number {
+  const n = Number(process.env.SMTP_SEND_BUDGET_MS);
+  return Number.isFinite(n) && n > 0 ? n : 20000;
+}
+
+// Port-driven secure mode: 465 = implicit TLS, 587 = STARTTLS.
   const port = c.smtpPort || 587;
   const secure = port === 465 ? true : port === 587 ? false : !!c.smtpSecure;
   const transport = nodemailer.createTransport({
@@ -178,9 +193,16 @@ export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
     // See verifySmtp() above: the attachment type is the control, these are the second line.
     disableFileAccess: true,
     disableUrlAccess: true,
-    connectionTimeout: 15000,
-    greetingTimeout: 10000,
-    socketTimeout: 30000,
+    // DERIVED FROM ONE BUDGET, so the worst case is a number somebody chose rather than the product
+    // of three that nobody multiplied together. See sendBudgetMs() and the deadline in the retry loop
+    // below: 15000 + 10000 + 30000 per attempt, times three attempts, plus the backoff, was about
+    // NINETY-FIVE SECONDS inside a single invocation -- and /api/auth/forgot-password awaits this on
+    // a public, unauthenticated route. The platform kills the function long before that, so the
+    // caller never learned anything and the visitor got a gateway error instead of "we could not
+    // send the email".
+    connectionTimeout: Math.min(10000, Math.floor(sendBudgetMs() / 2)),
+    greetingTimeout: Math.min(8000, Math.floor(sendBudgetMs() / 2)),
+    socketTimeout: sendBudgetMs(),
     pool: true,
     maxConnections: 3,
   });
@@ -221,9 +243,19 @@ export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
   };
 
   // Retry transient failures (greylisting, timeouts, dropped connections).
+  //
+  // BOUNDED AS A WHOLE, not only per attempt. Three attempts each allowed to run to the socket
+  // timeout, with the backoff between them, is a total this code never stated anywhere -- and the
+  // total is what the platform enforces. The deadline is checked BEFORE paying for a retry, so a
+  // slow host costs one attempt and an honest failure rather than an invocation the gateway kills.
+  const deadline = Date.now() + sendBudgetMs();
   const delays = [0, 1500, 4000];
   let lastErr = 'SMTP error';
   for (let attempt = 0; attempt < delays.length; attempt++) {
+    if (attempt > 0 && Date.now() + delays[attempt] >= deadline) {
+      lastErr = lastErr + ' (gave up after ' + (attempt) + ' attempt(s); the send budget was spent)';
+      break;
+    }
     if (delays[attempt]) await new Promise((r) => setTimeout(r, delays[attempt]));
     try {
       const info = await transport.sendMail(mail);

@@ -3,7 +3,9 @@
 // Magic-byte verified, size-capped, blob-stored. Returns { ok, url }.
 
 import type { APIRoute } from 'astro';
-import { put } from '@vercel/blob';
+// putBounded, not put: @vercel/blob retries TEN times with an unbounded backoff
+// (~17 minutes) and no request timeout. See src/lib/blob-upload.ts.
+import { putBounded as put } from '@/lib/blob-upload';
 import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }

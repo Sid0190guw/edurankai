@@ -5,7 +5,9 @@
 // extension. Returns { ok, url } for a private blob.
 
 import type { APIRoute } from 'astro';
-import { put } from '@vercel/blob';
+// putBounded, not put: @vercel/blob retries TEN times with an unbounded backoff
+// (~17 minutes) and no request timeout. See src/lib/blob-upload.ts.
+import { putBounded as put } from '@/lib/blob-upload';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });

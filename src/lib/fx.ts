@@ -28,7 +28,25 @@ export async function fxRateToInr(from: string): Promise<{ rate: number; date: s
 
   try {
     const url = 'https://api.frankfurter.app/latest?from=' + encodeURIComponent(code) + '&to=INR';
-    const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    // BOUNDED, BECAUSE THE FALLBACK BELOW COULD NEVER RUN OTHERWISE.
+    //
+    // This fetch had no signal and no timeout, and postgres-js's failure mode applies verbatim to a
+    // third party: a host that accepts the TCP connection and then never answers produces a promise
+    // that never settles, so the catch below -- and the carefully chosen FALLBACK table in it -- were
+    // unreachable. There is no error to catch, only a render that never finishes.
+    //
+    // That matters because this runs during a PAGE RENDER, not from the client: /apply/step-6 awaits
+    // it unconditionally, and that is the final submit screen an applicant reaches after filling in
+    // the whole form. A rate lookup nobody can see was able to cost somebody their application.
+    //
+    // 2.5s is generous for an exchange-rate lookup and far under any page budget. AbortSignal.timeout
+    // rejects with a TimeoutError, which lands in the same catch and produces the same conservative
+    // fallback rate the code already chose -- deliberately slightly above mid-market, so we
+    // under-charge rather than over-charge when we are guessing.
+    const r = await fetch(url, {
+      headers: { 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(Number(process.env.FX_TIMEOUT_MS) > 0 ? Number(process.env.FX_TIMEOUT_MS) : 2500),
+    });
     if (!r.ok) throw new Error('fx http ' + r.status);
     const d = await r.json() as any;
     const rate = Number(d?.rates?.INR);

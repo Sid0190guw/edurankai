@@ -72,6 +72,9 @@ export async function seedRbac(): Promise<{ roles: number; capabilities: number 
       await db.execute(sql`INSERT INTO rbac_role_capabilities (role_key, capability) VALUES (${r.key}, ${cap}) ON CONFLICT DO NOTHING`);
     }
   }
+  // The graph on disk has just changed; drop the memo rather than let this instance serve the
+  // pre-seed answer for the rest of the TTL.
+  invalidateRoleGraph();
   return { roles: SEED_ROLES.length, capabilities: CORE_CAPABILITIES.length };
 }
 
@@ -86,25 +89,77 @@ export async function seedRbac(): Promise<{ roles: number; capabilities: number 
  * the capabilities they removed. That case now reports `degraded`, and the caller turns it into a
  * denial rather than a guess.
  */
+// -------------------------------------------------------------------------------------------------
+// THE ROLE GRAPH IS GLOBAL, IT BARELY EVER CHANGES, AND IT WAS BEING RE-READ ON EVERY can() CALL
+// -------------------------------------------------------------------------------------------------
+//
+// loadRoleGraph() had no cache of any kind, and resolvePrincipal() calls it every time. So every
+// single can() issued two full-table reads -- `SELECT key, surface, inherits FROM rbac_roles` and
+// `SELECT role_key, capability FROM rbac_role_capabilities`, both unfiltered -- for a graph of about
+// seventeen roles and fifty capability rows that is identical between requests.
+//
+// That is a few kilobytes, which is why it never looked like anything. What makes it matter is where
+// can() is called from: src/pages/api/aquintutor/board/inspect.ts is polled every 4 seconds by
+// /aquintutor/board, and src/pages/api/aquintutor/moderate.ts every 6 seconds by /aquintutor/moderate.
+// One faculty tab left open is 21,600 polls a day, each re-reading both tables. The cost does not
+// scale with visitors; it scales with how long somebody leaves a tab open, which is exactly the kind
+// of load nobody notices until a quota does.
+//
+// A DEGRADED READ IS NEVER CACHED, and that is the part to keep right. `degraded: true` means we do
+// not know what the roles grant, and the engine turns it into a denial at Tier 0. Caching that would
+// hold the whole platform in a denial state for the life of the TTL after one hiccup -- and caching
+// its opposite would be worse, because a stale permissive graph is a security answer given from
+// memory. So only a good read is remembered.
+//
+// THIRTY SECONDS, and invalidated explicitly by seedRbac() below, so an administrator changing a
+// role sees it take effect within half a minute at worst and immediately when the change goes
+// through this module. Per-process, like everything else on this deployment: a warm instance holds
+// it, a cold one reads it once.
+let _graphCache: { at: number; value: { graph: SeedRole[]; degraded: boolean } } | null = null;
+
+function graphTtlMs(): number {
+  const n = Number(process.env.RBAC_GRAPH_TTL_MS);
+  return Number.isFinite(n) && n >= 0 ? n : 30000;
+}
+
+/** Drop the memoised role graph. Called by every writer in this module. */
+export function invalidateRoleGraph(): void {
+  _graphCache = null;
+}
+
 async function loadRoleGraph(): Promise<{ graph: SeedRole[]; degraded: boolean }> {
+  const ttl = graphTtlMs();
+  const cached = _graphCache;
+  if (cached && ttl > 0 && Date.now() - cached.at < ttl) return cached.value;
   try {
     const { db, sql } = await ctx();
     const roleRows = rows(await db.execute(sql`SELECT key, surface, inherits FROM rbac_roles`));
-    if (!roleRows.length) return { graph: SEED_ROLES, degraded: false };
+    // The unseeded answer is a real answer and is cached like any other: the code roster IS what
+    // seedRbac() would write. seedRbac() invalidates on the way out, so the flip to real rows is not
+    // waited out.
+    if (!roleRows.length) return remember({ graph: SEED_ROLES, degraded: false });
     const capRows = rows(await db.execute(sql`SELECT role_key, capability FROM rbac_role_capabilities`));
-    return {
+    return remember({
       graph: roleRows.map((r: any) => ({
         key: r.key, surface: r.surface, description: '',
         inherits: r.inherits ?? [],
         capabilities: capRows.filter((c: any) => c.role_key === r.key).map((c: any) => c.capability as Capability),
       })),
       degraded: false,
-    };
+    });
   } catch (e: any) {
     // The real Postgres reason is on e.cause; e.message is only the failed SQL.
     console.error('[rbac] role graph read failed', e?.cause?.message || e?.message);
+    // NOT remembered. See the note above: a degraded answer denies, and a denial served from cache
+    // outlives the hiccup that caused it.
     return { graph: SEED_ROLES, degraded: true };
   }
+}
+
+/** Cache a GOOD read and return it unchanged, so the call sites above stay one expression. */
+function remember(value: { graph: SeedRole[]; degraded: boolean }): { graph: SeedRole[]; degraded: boolean } {
+  if (!value.degraded) _graphCache = { at: Date.now(), value };
+  return value;
 }
 
 /** Resolve a full Principal from the existing auth user object (locals.user) or null.

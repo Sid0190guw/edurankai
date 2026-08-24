@@ -33,6 +33,29 @@ export interface RazorpayOrder {
   created_at: number;
 }
 
+/**
+ * Every call to Razorpay, bounded.
+ *
+ * All four functions in this file had a bare fetch() with no signal and no timeout, and each one
+ * wraps itself in a try/catch that returns a clean { ok: false } -- which fires on a network ERROR
+ * and never on a HANG. A payment gateway that accepts the connection and then stalls produced a
+ * promise that never settled, so those catches, and the honest error messages in them, could not
+ * run.
+ *
+ * Every one is on a request path: /api/payments/create-order, /api/payments/start-application-fee,
+ * /api/forms/submit, /api/founder/pay/create, /api/offer-verification/pay, the defence-in-depth
+ * verify in /api/aquintutor/confirm-payment, /api/founder/pay/verify and /api/admin/payments/refund.
+ *
+ * A TimeoutError from AbortSignal is an ordinary rejection, so it lands in each function's existing
+ * catch and becomes the message that function already knew how to produce. Eight seconds is well
+ * past a healthy gateway round trip and well inside a serverless budget -- and a payment call that
+ * has not answered in eight seconds is one the visitor has already stopped waiting for.
+ */
+function rzpFetch(url: string, init: RequestInit): Promise<Response> {
+  const ms = Number(process.env.RAZORPAY_TIMEOUT_MS) > 0 ? Number(process.env.RAZORPAY_TIMEOUT_MS) : 8000;
+  return fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
+}
+
 export async function createOrder(input: CreateOrderInput): Promise<{ ok: true; order: RazorpayOrder } | { ok: false; error: string }> {
   const creds = getCreds();
   if (!creds) return { ok: false, error: 'RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET not configured' };
@@ -42,7 +65,7 @@ export async function createOrder(input: CreateOrderInput): Promise<{ ok: true; 
   }
 
   try {
-    const resp = await fetch(RZP_API + '/orders', {
+    const resp = await rzpFetch(RZP_API + '/orders', {
       method: 'POST',
       headers: {
         'Authorization': authHeader(creds.keyId, creds.keySecret),
@@ -101,7 +124,7 @@ export async function fetchPayment(paymentId: string): Promise<any | null> {
   const creds = getCreds();
   if (!creds) return null;
   try {
-    const resp = await fetch(RZP_API + '/payments/' + encodeURIComponent(paymentId), {
+    const resp = await rzpFetch(RZP_API + '/payments/' + encodeURIComponent(paymentId), {
       method: 'GET',
       headers: { 'Authorization': authHeader(creds.keyId, creds.keySecret) },
     });
@@ -119,7 +142,7 @@ export async function fetchOrderPayments(orderId: string): Promise<any[]> {
   const creds = getCreds();
   if (!creds || !orderId) return [];
   try {
-    const resp = await fetch(RZP_API + '/orders/' + encodeURIComponent(orderId) + '/payments', {
+    const resp = await rzpFetch(RZP_API + '/orders/' + encodeURIComponent(orderId) + '/payments', {
       method: 'GET',
       headers: { 'Authorization': authHeader(creds.keyId, creds.keySecret) },
     });
@@ -151,7 +174,7 @@ export async function refundPayment(opts: {
   if (opts.amountPaise && opts.amountPaise > 0) body.amount = opts.amountPaise;
   if (opts.notes) body.notes = opts.notes;
   try {
-    const resp = await fetch(RZP_API + '/payments/' + encodeURIComponent(opts.paymentId) + '/refund', {
+    const resp = await rzpFetch(RZP_API + '/payments/' + encodeURIComponent(opts.paymentId) + '/refund', {
       method: 'POST',
       headers: {
         'Authorization': authHeader(creds.keyId, creds.keySecret),

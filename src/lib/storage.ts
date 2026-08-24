@@ -38,7 +38,11 @@ function vercelBlobStore(): BlobStore {
     kind: 'vercel-blob', enabled: !!process.env.BLOB_READ_WRITE_TOKEN,
     async put(key, data, contentType) {
       try {
-        const { put } = await import('@vercel/blob');
+        // The eighth call site, and it needs the same bound as the seven routes: @vercel/blob's put()
+        // retries ten times with an unbounded backoff and no request timeout. This adapter is the one
+        // VOD media goes through, so an unbounded upload here holds a serverless invocation open for
+        // as long as the platform allows and then dies without reporting anything.
+        const { putBounded: put } = await import('@/lib/blob-upload');
         const res = await put(key, data as any, { access: 'public', contentType, addRandomSuffix: false });
         return { url: (res as any).url, key };
       } catch { return null; }   // token missing / upload failed -> caller falls back to timeline-only
