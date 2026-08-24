@@ -2287,14 +2287,33 @@ export async function startWorkflow(input: StartWorkflowInput): Promise<Workflow
     if (plan.ok) {
       const def = DOMAINS[domain];
       const dueHours = def.escalateAfterHours;
-      for (const a of plan.approvers) {
+      // ONE INSERT FOR THE WHOLE CHAIN, NOT ONE PER APPROVER.
+      //
+      // An approval chain is short — a handful of steps — but this ran inside the request that
+      // raises the request, and each awaited round trip holds a pooler connection for ~140ms
+      // regardless of how small the row is. Raising a leave request or a loan should not cost the
+      // site six connections' worth of time, and it did.
+      //
+      // jsonb_to_recordset rather than a VALUES list built from N placeholders: one parameter
+      // whatever the chain length. The ON CONFLICT DO NOTHING is unchanged, so a resume that
+      // re-plans the same chain still writes nothing rather than duplicating a step — which is the
+      // property this whole block depends on and the reason the loop had it.
+      if (plan.approvers.length) {
         await db.execute(sql`
           INSERT INTO workflow_steps
             (instance_id, step_no, mode, via, approver_employee_id, approver_user_id, decision, due_at)
-          VALUES
-            (${instanceId}::uuid, ${a.step}, ${a.mode}, ${a.via},
-             ${a.employeeId}::uuid, ${a.userId}::uuid, 'pending',
-             NOW() + (${dueHours} * INTERVAL '1 hour'))
+          SELECT ${instanceId}::uuid, x.step_no, x.mode, x.via,
+                 x.approver_employee_id, x.approver_user_id, 'pending',
+                 NOW() + (${dueHours} * INTERVAL '1 hour')
+            FROM jsonb_to_recordset(${JSON.stringify(plan.approvers.map((a) => ({
+              step_no: a.step,
+              mode: a.mode,
+              via: a.via,
+              approver_employee_id: a.employeeId,
+              approver_user_id: a.userId,
+            })))}::jsonb)
+              AS x(step_no int, mode text, via text,
+                   approver_employee_id uuid, approver_user_id uuid)
           ON CONFLICT DO NOTHING`);
       }
 
