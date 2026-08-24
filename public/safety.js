@@ -85,16 +85,39 @@
             <option value="other">Other</option>
           </select>
           <textarea id="reportNote" placeholder="Additional details (optional)..." rows="3" style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;resize:vertical;width:100%;"></textarea>
-          <button type="button" onclick="submitReport()" style="background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;width:100%;">Submit Report</button>
+          <button type="button" id="safetyReportSubmit" style="background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;width:100%;">Submit Report</button>
+          <p id="safetyReportMsg" style="margin:0;font-size:12px;line-height:1.55;color:#9aa6b6;"></p>
         </form>
       </div>
     `;
     document.body.appendChild(modal);
+    // THE BUTTON WAS DEAD. It was `onclick="submitReport()"`, and an inline handler is resolved
+    // against `window` — while submitReport is declared inside this file's IIFE and never exported
+    // to it. Every click threw ReferenceError into the console and did nothing at all. This is the
+    // content-safety report button: somebody flagging hate speech or harassment pressed it, saw the
+    // modal sit there, and concluded the report had gone nowhere. It had.
+    var submitBtn = modal.querySelector('#safetyReportSubmit');
+    if (submitBtn) submitBtn.addEventListener('click', function () { submitReport(modal); });
   }
 
-  function submitReport() {
-    var flagType = document.getElementById('flagType')?.value;
-    var note = document.getElementById('reportNote')?.value;
+  function submitReport(modal) {
+    var flagType = document.getElementById('flagType') ? document.getElementById('flagType').value : '';
+    var note = document.getElementById('reportNote') ? document.getElementById('reportNote').value : '';
+    var btn = modal ? modal.querySelector('#safetyReportSubmit') : null;
+    var msg = modal ? modal.querySelector('#safetyReportMsg') : null;
+
+    function say(text, colour) {
+      if (!msg) return;
+      msg.textContent = text;
+      msg.style.color = colour || '#9aa6b6';
+    }
+    function done() {
+      if (btn) { btn.disabled = false; btn.textContent = 'Submit Report'; }
+    }
+
+    if (btn) { btn.disabled = true; btn.textContent = 'Submitting...'; }
+    say('Sending your report.');
+
     fetch('/api/safety/report', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -106,14 +129,39 @@
         contentSnippet: note,
         page: window.location.pathname,
       })
-    }).then(function() {
-      document.querySelector('div[style*="fixed"][style*="align-items:flex-end"]')?.remove();
+    }).then(function (r) {
+      // THE THANK-YOU USED TO FIRE ON ANY RESPONSE AT ALL. `.then(function(){ ...toast... })` with
+      // no look at r.ok meant a 500 produced "Report submitted. Thank you." — telling somebody who
+      // had just reported harassment that it had been recorded when it had not. A safety report is
+      // the last place to guess.
+      return r.text().then(function (body) {
+        var d = null;
+        try { d = JSON.parse(body); } catch (e) { d = null; }
+        // ok:true MUST BE STATED, not merely not-denied. A 200 with an unparseable body, or a body
+        // with no ok field at all, is not confirmation that a safety report was filed.
+        return { ok: r.ok && !!d && d.ok === true, status: r.status, data: d };
+      });
+    }).then(function (res) {
+      done();
+      if (!res.ok) {
+        say((res.data && res.data.error)
+          ? String(res.data.error)
+          : 'Your report was NOT recorded (' + res.status + '). Nothing has been lost from this form - please try again.', '#fca5a5');
+        return;
+      }
+      if (modal && modal.remove) modal.remove();
       var toast = document.createElement('div');
       toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#10b981;color:#fff;font-size:13px;font-weight:600;padding:10px 20px;border-radius:100px;z-index:99999;';
       toast.textContent = 'Report submitted. Thank you.';
       document.body.appendChild(toast);
-      setTimeout(function() { toast.remove(); }, 3000);
-    }).catch(function() {});
+      setTimeout(function () { toast.remove(); }, 3000);
+    }).catch(function (e) {
+      // There was a bare `.catch(function(){})` here: a network failure closed nothing, said
+      // nothing, and left the person looking at a form they believed they had submitted.
+      done();
+      say('Your report could not be sent' + (e && e.message ? ' (' + e.message + ')' : '')
+        + '. It has not been recorded. The form is still here - please try again.', '#fca5a5');
+    });
   }
 
   // ── 3. PROPAGANDA KEYWORD SCAN ────────────────────────────────────────

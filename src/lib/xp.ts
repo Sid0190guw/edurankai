@@ -214,15 +214,46 @@ export async function awardXp(p: XpAward): Promise<{ xp: number; level: number; 
     ON CONFLICT (user_id) DO NOTHING
   `);
 
-  // Pull current state for streak computation
-  const before = rows(await db.execute(sql`
-    SELECT total_xp, level, streak_days, longest_streak,
-      last_active_date::text AS last_active_date
-    FROM user_xp WHERE user_id = ${p.userId} LIMIT 1
-  `))[0] as any;
-
-  const todayRows = rows(await db.execute(sql`SELECT CURRENT_DATE::text AS today`))[0] as any;
-  const today: string = todayRows?.today || new Date().toISOString().slice(0, 10);
+  // ONE READ FOR ALL THREE THINGS THIS FUNCTION NEEDS BEFORE IT CAN WRITE.
+  //
+  // It was three statements: the streak columns, then a bare SELECT CURRENT_DATE, then today_xp and
+  // today_date OFF THE SAME ROW it had already fetched. On this deployment a round trip is ~140ms
+  // warm and ~950ms whenever it has to open a connection, so awarding a learner ten points for
+  // finishing a lesson cost three of them before the UPDATE. awardXp runs on every test submit,
+  // every lesson completion and every practice answer.
+  //
+  // The date cannot become new Date() in JS: it is compared against DATE columns the database writes
+  // with CURRENT_DATE, on a session with no timezone set, so only the database's own answer agrees
+  // with what is stored. It can, however, ride along on a row we were already fetching.
+  //
+  // THE NARROW FALLBACK IS KEPT, and it is why this is a try rather than one statement:
+  // today_xp / today_date are added by ensureSchema(), which can fail, and the old code isolated
+  // that in its own try so a missing column cost only the daily-goal rollup. Merging without this
+  // would have turned a missing column into a failure of the whole award.
+  let before: any;
+  try {
+    before = rows(await db.execute(sql`
+      SELECT total_xp, level, streak_days, longest_streak,
+        last_active_date::text AS last_active_date,
+        today_xp, today_date::text AS today_date,
+        CURRENT_DATE::text AS today
+      FROM user_xp WHERE user_id = ${p.userId} LIMIT 1
+    `))[0] as any;
+  } catch (e: any) {
+    logEvent('error', 'xp.award_read_fell_back', {
+      userId: p.userId, reason: e?.cause?.message || e?.message || 'unknown',
+    });
+    before = rows(await db.execute(sql`
+      SELECT total_xp, level, streak_days, longest_streak,
+        last_active_date::text AS last_active_date,
+        CURRENT_DATE::text AS today
+      FROM user_xp WHERE user_id = ${p.userId} LIMIT 1
+    `))[0] as any;
+  }
+  // `today` is only ever consulted on a branch that already requires a row to exist (a non-null
+  // last_active_date, or a today_date to compare against), so losing it with the row is harmless.
+  // The literal keeps the type honest for the arithmetic below.
+  const today: string = before?.today || new Date().toISOString().slice(0, 10);
   const last: string | null = before?.last_active_date || null;
 
   let newStreak = Number(before?.streak_days || 0);
@@ -244,15 +275,11 @@ export async function awardXp(p: XpAward): Promise<{ xp: number; level: number; 
 
   // Today's XP rollup so the daily-goal widget can show progress without
   // scanning xp_events on every render.
-  let todayXp = 0;
-  try {
-    const prevToday = rows(await db.execute(sql`SELECT today_xp, today_date::text AS today_date FROM user_xp WHERE user_id = ${p.userId} LIMIT 1`))[0] as any;
-    if (prevToday && prevToday.today_date === today) todayXp = Number(prevToday.today_xp || 0) + p.delta;
-    else todayXp = p.delta;
-  } catch (e: any) {
-    todayXp = p.delta;
-    logEvent('error', 'xp.today_read_failed', { userId: p.userId, reason: e?.cause?.message || e?.message || 'unknown' });
-  }
+  // Read above, not here. This was a THIRD statement selecting two more columns from the row the
+  // first statement had already fetched.
+  const todayXp = (before && before.today_date === today)
+    ? Number(before.today_xp || 0) + p.delta
+    : p.delta;
 
   await db.execute(sql`
     UPDATE user_xp SET
@@ -288,22 +315,28 @@ export async function awardXp(p: XpAward): Promise<{ xp: number; level: number; 
 
   // Weekly + monthly rollup for fast leaderboard queries.
   try {
-    const weekRow = rows(await db.execute(sql`SELECT date_trunc('week', CURRENT_DATE)::date::text AS w, date_trunc('month', CURRENT_DATE)::date::text AS m`))[0] as any;
-    if (weekRow) {
-      const rollupFailed = (e: any) => logEvent('error', 'xp.rollup_write_failed', {
-        userId: p.userId, reason: e?.cause?.message || e?.message || 'unknown',
-      });
-      await db.execute(sql`
-        INSERT INTO xp_period_rollups (user_id, period, period_key, total_xp)
-        VALUES (${p.userId}, 'week', ${weekRow.w}, ${p.delta})
-        ON CONFLICT (user_id, period, period_key) DO UPDATE SET total_xp = xp_period_rollups.total_xp + ${p.delta}, updated_at = NOW()
-      `).catch(rollupFailed);
-      await db.execute(sql`
-        INSERT INTO xp_period_rollups (user_id, period, period_key, total_xp)
-        VALUES (${p.userId}, 'month', ${weekRow.m}, ${p.delta})
-        ON CONFLICT (user_id, period, period_key) DO UPDATE SET total_xp = xp_period_rollups.total_xp + ${p.delta}, updated_at = NOW()
-      `).catch(rollupFailed);
-    }
+    // THE PERIOD KEYS ARE COMPUTED WHERE THE ROWS ARE WRITTEN, so this costs no read at all.
+    //
+    // It was a statement whose entire purpose was to fetch two strings back across the network and
+    // send them straight out again as parameters on the very next statements. date_trunc is a
+    // Postgres function; asking Postgres for its answer and then handing the answer back to Postgres
+    // is a round trip bought for nothing. It also removes the `if (weekRow)` guard, which silently
+    // skipped BOTH rollups whenever that read failed — the league and classroom boards going quiet
+    // with nothing on any screen to explain it.
+    //
+    // ONE STATEMENT FOR BOTH PERIODS. They differ only in the literal 'week'/'month' and the trunc
+    // unit, so a two-row VALUES with the same ON CONFLICT writes them together.
+    const rollupFailed = (e: any) => logEvent('error', 'xp.rollup_write_failed', {
+      userId: p.userId, reason: e?.cause?.message || e?.message || 'unknown',
+    });
+    await db.execute(sql`
+      INSERT INTO xp_period_rollups (user_id, period, period_key, total_xp)
+      VALUES
+        (${p.userId}, 'week',  date_trunc('week',  CURRENT_DATE)::date::text, ${p.delta}),
+        (${p.userId}, 'month', date_trunc('month', CURRENT_DATE)::date::text, ${p.delta})
+      ON CONFLICT (user_id, period, period_key)
+        DO UPDATE SET total_xp = xp_period_rollups.total_xp + ${p.delta}, updated_at = NOW()
+    `).catch(rollupFailed);
   } catch (e: any) {
     // The rollups feed the league, classroom and friends leaderboards. Losing them silently is why
     // those boards could be empty with nothing anywhere explaining it.
@@ -340,7 +373,14 @@ export async function getUserXp(userId: string): Promise<{ totalXp: number; leve
              COALESCE(daily_goal_xp, 30) AS daily_goal_xp,
              COALESCE(today_xp, 0) AS today_xp,
              today_date::text AS today_date,
-             COALESCE(streak_freezes, 0) AS streak_freezes
+             COALESCE(streak_freezes, 0) AS streak_freezes,
+             -- THE DATE RIDES ALONG. It used to be a statement of its own, below, purely to compare
+             -- against today_date on this very row -- a whole WAN round trip (~140ms on this
+             -- deployment, and ~950ms whenever it had to open the connection) to ask Postgres what
+             -- day it is. It cannot be new Date() in JS: the comparison is against a DATE column the
+             -- database writes with CURRENT_DATE, and the session has no timezone set, so only the
+             -- database's own answer is the same answer.
+             CURRENT_DATE::text AS today
       FROM user_xp WHERE user_id = ${userId} LIMIT 1
     `))[0] as any;
   } catch (e: any) {
@@ -348,15 +388,17 @@ export async function getUserXp(userId: string): Promise<{ totalXp: number; leve
     // makes the daily goal and streak-freeze inventory read as 0 for everyone. Silence here is what
     // made that look like a product decision rather than a broken schema.
     logEvent('error', 'xp.user_xp_read_fell_back', { userId, reason: e?.cause?.message || e?.message || 'unknown' });
-    r = rows(await db.execute(sql`SELECT total_xp, level, streak_days, longest_streak, last_active_date::text AS last_active_date, hearts FROM user_xp WHERE user_id = ${userId} LIMIT 1`))[0] as any;
+    r = rows(await db.execute(sql`SELECT total_xp, level, streak_days, longest_streak, last_active_date::text AS last_active_date, hearts, CURRENT_DATE::text AS today FROM user_xp WHERE user_id = ${userId} LIMIT 1`))[0] as any;
   }
   const xp = Number(r?.total_xp || 0);
   const level = levelFromXp(xp);
   const xpAtCurrent = 100 * Math.pow(level - 1, 2);
   const xpAtNext = 100 * Math.pow(level, 2);
   const progress = Math.max(0, Math.min(1, (xp - xpAtCurrent) / Math.max(1, xpAtNext - xpAtCurrent)));
-  const todayRow = rows(await db.execute(sql`SELECT CURRENT_DATE::text AS today`))[0] as any;
-  const isToday = r?.today_date === todayRow?.today;
+  // No row means no XP has ever been recorded for this person, so nothing can have been recorded
+  // TODAY either -- which is why losing the date with the row costs nothing. The old separate read
+  // returned a date in that case and then compared it against undefined for the same answer.
+  const isToday = !!r && !!r.today && r.today_date === r.today;
   const todayXp = isToday ? Number(r?.today_xp || 0) : 0;
   const dailyGoalXp = Number(r?.daily_goal_xp || 30);
   return {

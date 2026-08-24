@@ -19,10 +19,12 @@
 //      operator most needs to tell apart — this project has already shipped a bootstrap that
 //      reported success over ten missing tables, and the lesson was the same one.
 //
-//   4. PRUNING THE AUDIT LOG WRITES A CHECKPOINT FIRST. It is the one sweep that damages the evidence
-//      it is part of, so the range, the count and the hash the surviving chain links back to are
-//      recorded before anything goes — and the prune itself is an audit event, so removing the
-//      checkpoint is as detectable as removing anything else.
+//   4. PRUNING THE AUDIT LOG CHECKPOINTS EACH BATCH IN THE SAME TRANSACTION THAT DELETES IT. It is
+//      the one sweep that damages the evidence it is part of, so the range, the count and the hash
+//      the surviving chain links back to go in beside the rows they describe — never ahead of them on
+//      a separate connection, which is how a checkpoint ends up attesting to a delete that rolled
+//      back. The prune itself is an audit event, so removing a checkpoint is as detectable as
+//      removing anything else.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { logEvent } from '@/lib/logger';
@@ -349,57 +351,136 @@ async function clearAttachments(task: SweepTask, out: SweepOutcome): Promise<Swe
 /**
  * Prune the audit log.
  *
- * Three things happen, in this order, and the order is what keeps the chain verifiable:
+ * THE CHECKPOINT AND THE DELETE ARE ONE TRANSACTION, PER BATCH, AND THAT IS THE WHOLE POINT OF THIS
+ * FUNCTION'S SHAPE. It used to write the checkpoint with a bare `db.execute` — its own autocommit, on
+ * its own connection — and only then open a transaction holding one unbatched
+ * `DELETE ... WHERE occurred_at < cutoff RETURNING id` over the entire range. On any real backlog
+ * that DELETE loses: every removed row fires the per-row plpgsql trigger in ./schema.ts
+ * (mailapi_audit_guard, which calls current_setting for each one) and the statement runs into the
+ * connection's 30s statement_timeout (src/lib/db/index.ts) and rolls back — while the checkpoint
+ * claiming "removed 412,000" is already committed and cannot be taken back. The retention console
+ * then shows a checkpoint attesting to a deletion beside the events it says are gone, the next run
+ * writes another one, and the one table whose entire purpose is to prove nothing was tampered with
+ * fills with rows asserting deletions that never happened.
  *
- *   1. Read the range that is about to go, and the hash of its LAST row.
- *   2. Write the checkpoint, so a verifier walking the surviving chain can link the first remaining
- *      row back to something instead of concluding the log was tampered with.
- *   3. Delete, inside a transaction that sets `mailgov.prune` — the only flag the database trigger
- *      accepts, set in exactly this one function.
+ * So each batch does all three of these or none of them:
+ *
+ *   1. Set `mailgov.prune` — the only flag the delete trigger accepts. Transaction-local (the `true`
+ *      argument) because on a pooled connection a session-local setting would leak to whoever gets
+ *      the connection next, leaving the audit table deletable by an unrelated request, which is the
+ *      exact hole the trigger exists to close. It must therefore be set inside EVERY batch.
+ *   2. Read the batch — the OLDEST rows past the cutoff, `ORDER BY seq ASC`. The order is
+ *      load-bearing: `last_removed_hash` has to be the hash of the newest row THIS batch actually
+ *      removes, because that is what the first surviving row links back to and what
+ *      verifyAuditChain() resolves as its anchor (./audit.ts, `ORDER BY to_seq DESC LIMIT 1`).
+ *      Descending order would checkpoint a hash for rows a later batch has not reached yet.
+ *   3. Write that batch's checkpoint, then delete exactly that batch.
+ *
+ * A batch that rolls back therefore leaves no checkpoint behind, and a run the platform kills between
+ * batches leaves every checkpoint describing rows that are genuinely gone. Stopping at MAX_BATCHES is
+ * reported as stopping short, never as a finished prune.
  *
  * The prune is itself recorded as an audit event by the caller, so the log contains the reason its
  * own oldest entries are missing.
  */
 export async function pruneAuditLog(task: SweepTask, out: SweepOutcome, byUserId: string | null): Promise<SweepOutcome> {
+  // Declared outside the try so the catch can still say how much genuinely went. A failure that
+  // reports affected 0 after eight committed batches reads as "nothing was touched", and the next
+  // person to look at the checkpoint list would not be able to square the two.
+  let removed = 0;
+  let lastSeq = 0;
+
   try {
+    let stoppedShort = false;
     // Platform-wide by design: the chain is one chain across every tenant, and pruning one tenant's
     // rows out of the middle of it would break every link that crosses them. Audit retention is a
     // PLATFORM policy, and the console says so on the retention screen.
+    //
+    // Only the COUNT is read here — for the early return, and so the note can say how much is left
+    // when a run stops short. The range endpoints are NOT read here any more: each batch reads its
+    // own, because a range read up front describes rows a later statement may never reach.
     const doomed = rows(await db.execute(sql`
-      SELECT MIN(seq)::bigint AS from_seq, MAX(seq)::bigint AS to_seq, COUNT(*)::int AS n
-        FROM mailapi_audit_events WHERE occurred_at < ${task.cutoff}::timestamptz`))[0];
+      SELECT COUNT(*)::int AS n FROM mailapi_audit_events
+       WHERE occurred_at < ${task.cutoff}::timestamptz`))[0];
     const count = Number(doomed?.n) || 0;
     if (!count) return { ...out, affected: 0, note: 'Nothing older than the cutoff.' };
 
-    const last = rows(await db.execute(sql`
-      SELECT seq, hash FROM mailapi_audit_events
-       WHERE occurred_at < ${task.cutoff}::timestamptz ORDER BY seq DESC LIMIT 1`))[0];
-    if (!last?.hash) return { ...out, ok: false, error: 'Could not read the last hash in the range, so nothing was pruned.' };
+    for (let i = 0; i < MAX_BATCHES; i++) {
+      let n = 0;
+      let batchTo = 0;
 
-    const checkpoint: PruneCheckpoint = {
-      fromSeq: Number(doomed.from_seq), toSeq: Number(doomed.to_seq), removed: count,
-      lastRemovedHash: String(last.hash), cutoff: task.cutoff, by: byUserId,
+      await (db as any).transaction(async (tx: any) => {
+        await tx.execute(sql`SELECT set_config('mailgov.prune', 'on', true)`);
+
+        const batch = rows(await tx.execute(sql`
+          SELECT seq, hash FROM mailapi_audit_events
+           WHERE occurred_at < ${task.cutoff}::timestamptz
+           ORDER BY seq ASC LIMIT ${task.batchSize}`));
+        if (!batch.length) return;
+
+        const checkpoint: PruneCheckpoint = {
+          fromSeq: Number(batch[0].seq),
+          toSeq: Number(batch[batch.length - 1].seq),
+          removed: batch.length,
+          lastRemovedHash: String(batch[batch.length - 1].hash || ''),
+          cutoff: task.cutoff,
+          by: byUserId,
+        };
+        // No anchor, no prune. A checkpoint carrying a blank hash tells a later verifier nothing, and
+        // deleting the rows anyway would leave the surviving chain with nothing to link back to. The
+        // throw rolls this batch back, so nothing has gone and the sweep reports why.
+        if (!checkpoint.lastRemovedHash) {
+          throw new Error('Audit event seq ' + checkpoint.toSeq + ' has no hash, so no checkpoint could anchor the surviving chain. Nothing was pruned in this batch.');
+        }
+
+        await tx.execute(sql`
+          INSERT INTO mailapi_audit_checkpoints (from_seq, to_seq, removed, last_removed_hash, cutoff, created_by)
+          VALUES (${checkpoint.fromSeq}, ${checkpoint.toSeq}, ${checkpoint.removed},
+                  ${checkpoint.lastRemovedHash}, ${checkpoint.cutoff}::timestamptz, ${byUserId}::uuid)`);
+
+        // `seq <= toSeq` deletes exactly the rows just read: the batch is the LOWEST-seq rows past the
+        // cutoff, so nothing else in the range can sit at or below its last seq. RETURNING 1 rather
+        // than the ids — only the count is used, and materialising a batch of ids buys nothing.
+        n = rows(await tx.execute(sql`
+          DELETE FROM mailapi_audit_events
+           WHERE occurred_at < ${task.cutoff}::timestamptz AND seq <= ${checkpoint.toSeq}
+          RETURNING 1`)).length;
+        batchTo = checkpoint.toSeq;
+      });
+
+      if (!n) break;
+      removed += n;
+      lastSeq = batchTo;
+      if (n < task.batchSize) break;
+      // The ceiling is a decision, not an accident. A prune that walks away with rows still past the
+      // cutoff has to say so — the next run picks them up, but an operator reading "pruned 20,000"
+      // must not take it to mean the cutoff is now clean.
+      if (i === MAX_BATCHES - 1) stoppedShort = true;
+    }
+
+    if (!removed) {
+      return {
+        ...out, affected: 0,
+        note: 'Nothing was left past the cutoff by the time the first batch ran, so no checkpoint was written.',
+      };
+    }
+
+    const anchored = 'Pruned ' + removed + ' audit events up to seq ' + lastSeq
+      + '; each batch was checkpointed inside the transaction that deleted it.';
+    return {
+      ...out, affected: removed,
+      note: stoppedShort
+        ? anchored + ' This run stopped at its batch ceiling with roughly ' + Math.max(count - removed, 0)
+          + ' still older than the cutoff; the next run continues from there.'
+        : anchored,
     };
-
-    await db.execute(sql`
-      INSERT INTO mailapi_audit_checkpoints (from_seq, to_seq, removed, last_removed_hash, cutoff, created_by)
-      VALUES (${checkpoint.fromSeq}, ${checkpoint.toSeq}, ${checkpoint.removed},
-              ${checkpoint.lastRemovedHash}, ${checkpoint.cutoff}::timestamptz, ${byUserId}::uuid)`);
-
-    // The flag is transaction-local (the `true` argument). On a pooled connection a session-local
-    // setting would leak to whoever gets the connection next, which would leave the audit table
-    // deletable by an unrelated request — the exact hole the trigger exists to close.
-    let removed = 0;
-    await (db as any).transaction(async (tx: any) => {
-      await tx.execute(sql`SELECT set_config('mailgov.prune', 'on', true)`);
-      const r = rows(await tx.execute(sql`
-        DELETE FROM mailapi_audit_events WHERE occurred_at < ${task.cutoff}::timestamptz RETURNING id`));
-      removed = r.length;
-    });
-
-    return { ...out, affected: removed, note: 'Checkpoint written at seq ' + checkpoint.toSeq + ' before pruning.' };
   } catch (e: any) {
-    return { ...out, ok: false, error: dbReason(e) };
+    const failed: SweepOutcome = { ...out, affected: removed, ok: false, error: dbReason(e) };
+    if (removed) {
+      failed.note = 'The batches that committed before this failed removed ' + removed
+        + ' audit events up to seq ' + lastSeq + ', and each of those is checkpointed. Everything else is still past the cutoff.';
+    }
+    return failed;
   }
 }
 

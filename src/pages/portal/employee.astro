@@ -32,6 +32,13 @@ import StatusBadge from '@/components/workforce/StatusBadge.astro';
 import '@/styles/workforce.css';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+// THE BOUND FOR THE TWO BARRIERS AT THE BOTTOM OF THIS SCRIPT. postgres-js has no query timeout of
+// its own, so an await the pooler never answers does not fail — it HANGS, and the platform rather
+// than this file then decides what the visitor sees. Every thunk in the batches below swallows its
+// own error into a per-card flag, which means the Promise.all barriers can never REJECT: they can
+// only never settle. That is precisely the shape that turns this screen — the resolved Home for
+// anyone with an employee record — into a gateway timeout with nothing in the logs naming a cause.
+import { withDbTimeout, DB_TIMEOUT_MS } from '@/lib/db-timeout';
 // THE DECIDER. src/lib/workforce/composer.ts answers "what should this person see" ONCE, from the
 // real gates, and this page renders its answer. Nothing below branches on a role, a permission, a
 // department or an engagement type — the moment a second surface answers that question it answers it
@@ -1320,7 +1327,29 @@ if (employeeId && has('schedule.today')) {
 }
 })());
 // THE BARRIER. Everything above ran at once; nothing below may assume any of it until this line.
-await Promise.all(batch);
+//
+// AND IT IS THE BARRIER THAT IS BOUNDED, NOT THE MEMBERS. Bounding each read individually is the
+// shape openAfter()'s docblock in src/lib/db-timeout.ts warns about: a fan-out wider than the pool
+// queues the surplus, every queued read blows its own eight-second fuse, and three in a row open
+// the PROCESS-GLOBAL circuit — which is how /admin/help came to answer "we cannot reach the
+// database" while psql was being answered in 143ms. One bound over the whole wave costs one fuse at
+// worst and leaves the breaker's evidence honest.
+//
+// `let`, and declared BEFORE the wait rather than after it: `const` is not hoisted, and the flag has
+// to exist whichever way this settles because the markup reads it either way.
+let batchDegraded = false;
+try {
+  await withDbTimeout(Promise.all(batch), 'portalEmployee.batch', DB_TIMEOUT_MS);
+} catch (e: any) {
+  // Nothing is lost and nothing is re-run — withDbTimeout sheds the WAIT, not the work. What we
+  // know here is only that some of the reads above had not answered yet, so their cards are still
+  // holding the empty defaults they were declared with. An empty default rendered without this flag
+  // reads as "you have none", which on a screen that states today's clock position, logged hours,
+  // tasks and pending approvals is a claim rather than an absence. The banner at the top of the page
+  // is what stops it being read that way.
+  batchDegraded = true;
+  logFail('batch barrier', e);
+}
 
 // =================================================================================================
 // DERIVED FROM THE BATCH — pure arithmetic and sentence-building, no I/O of any kind.
@@ -1491,7 +1520,18 @@ if (has('tasks.activity') && user?.id && openTasks.length > 0) {
   }
 }
 })());
-await Promise.all(batch2);
+// The second barrier, bounded for the same reason and with the same shape. Both of these thunks
+// swallow to a local too, so this wait is equally incapable of rejecting on its own.
+try {
+  await withDbTimeout(Promise.all(batch2), 'portalEmployee.batch2', DB_TIMEOUT_MS);
+} catch (e: any) {
+  // The SAME flag as the first barrier, deliberately. From the reader's side there is one question —
+  // is what I am looking at complete — and two banners answering it would be two ways of saying one
+  // thing. Expect DbCircuitOpenError here whenever the first barrier was the timeout that opened the
+  // breaker: that is the breaker working, and it still leaves a degraded page rather than a dead one.
+  batchDegraded = true;
+  logFail('batch2 barrier', e);
+}
 
 // Only a value the select actually offers. Anything else — an old code, a null, a value written by a
 // surface that has since changed — falls back to the original default rather than rendering a
@@ -1920,6 +1960,10 @@ const slots = composed.widgets.map((w: any) => w.key);
     .flash svg{flex:0 0 auto;margin-top:1px;}
     .flash--ok{background:#ecfdf5;border:1px solid #a7d9c2;color:#065f46;}
     .flash--err{background:#fef2f2;border:1px solid #f0c0c0;color:#9b1c1c;}
+    /* A THIRD TONE, because "we could not read part of this" is neither of the other two: it is not
+       a success, and it is not a write that failed. The triangle glyph beside it carries the same
+       meaning with every colour deleted (SC 1.4.1), and #92400e on #fffbeb clears 4.5:1. */
+    .flash--warn{background:#fffbeb;border:1px solid #e6cf9a;color:#92400e;}
     @media (forced-colors: active){
       .flash{border-color:CanvasText;}
     }
@@ -2177,6 +2221,20 @@ const slots = composed.widgets.map((w: any) => w.key);
   <div class="flash flash--err" role="alert">
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="7.5" x2="12" y2="13"/><line x1="12" y1="16.5" x2="12" y2="16.6"/></svg>
     <span>{flashErr}</span>
+  </div>
+)}
+
+{/* A THIRD PANEL, FOR THE ONE THING THE OTHER TWO CANNOT SAY: part of this page was never read.
+    Each card below degrades on its own when ITS read throws, but a bounded-out barrier is different
+    — the reads had not answered at all, so their cards are holding the empty defaults they were
+    declared with and every one of them looks exactly like a quiet day. This says so once, at the
+    top, in the negative, and puts the fault where it belongs. role="status" and not "alert": the
+    person did not do anything to cause it, and a punch that failed must keep the assertive channel
+    to itself. */}
+{batchDegraded && (
+  <div class="flash flash--warn" role="status">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.6 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.6a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9.5" x2="12" y2="13.5"/><line x1="12" y1="16.8" x2="12" y2="16.9"/></svg>
+    <span>Some of this page could not be read just now: the database did not answer in time. That is a fault on our side and not a statement about your work — anything below showing nothing, or zero, may be unread rather than empty, so please do not re-enter it from what you see here. Nothing you have done is lost and nothing has been changed. Reload in a moment; if this keeps coming back, tell HR today rather than at the end of the month.</span>
   </div>
 )}
 

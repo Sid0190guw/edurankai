@@ -2,6 +2,17 @@
 // tables every can()/login already writes, runs the pure detectors, dedupes against open
 // signals, and inserts survivors. The serverless replacement for a resident SIEM daemon.
 import { SECURITY_DDL, type SecuritySignal } from './schema';
+import { withDbTimeout } from '@/lib/db-timeout';
+
+/**
+ * How long any one window read may take.
+ *
+ * Generous, because this is a scheduled job with no visitor waiting and the audit window can be a
+ * whole day; bounded, because it is a cron and an unbounded await there holds a pooler connection
+ * for the life of the invocation with nobody watching. Declared before the function that uses it —
+ * `const` is not hoisted and that has taken pages down on this project.
+ */
+const SCAN_READ_MS = 20000;
 import {
   detectLoginBursts, detectPrivilegeEscalation, detectSessionFanout, detectImpossibleTravel,
   type AuditRow, type RbacAuditRow, type SessionRow, type DetectedSignal,
@@ -17,7 +28,20 @@ export async function ensureSecuritySchema(): Promise<void> {
   booted = true;
 }
 
-export async function runSecurityScan(windowMinutes = 60): Promise<{ inserted: number; byKind: Record<string, number> }> {
+/**
+ * AN UNREADABLE LOG IS NOT A CLEAN ONE, AND THIS FUNCTION USED TO SAY IT WAS.
+ *
+ * The three window reads below each ended in a bare `catch { }` that left the array empty. Every
+ * detector is a counter over the rows it is handed, so an empty array means "no bursts, no
+ * escalation, no fan-out" — and the scan returned inserted:0, which the cron route published as
+ * ok:true and /admin/ops recorded as a healthy run. On a security scan that is the worst available
+ * answer: it reports the absence of EVIDENCE as the absence of THREAT, on the one surface whose
+ * entire job is to notice.
+ *
+ * `sourcesFailed` and `complete` carry the difference out to the caller. Nothing about detection
+ * changes; what changes is that a blind scan can no longer be mistaken for a quiet night.
+ */
+export async function runSecurityScan(windowMinutes = 60): Promise<{ inserted: number; byKind: Record<string, number>; sourcesFailed: string[]; complete: boolean }> {
   await ensureSecuritySchema();
   const { db, sql } = await ctx();
   const now = new Date();
@@ -36,9 +60,29 @@ export async function runSecurityScan(windowMinutes = 60): Promise<{ inserted: n
   try { const { ensureAuditIndexes } = await import('@/lib/audit'); await ensureAuditIndexes(); } catch { /* index work must never stop a scan */ }
 
   let audit: AuditRow[] = [], rbac: RbacAuditRow[] = [], sessions: SessionRow[] = [];
-  try { audit = rows(await db.execute(sql`SELECT user_id AS "userId", action, entity, ip_address AS "ipAddress", created_at AS "createdAt" FROM audit_log WHERE created_at >= ${start}`)).map((r: any) => ({ ...r, createdAt: new Date(r.createdAt) })); } catch { /* table may not exist yet */ }
-  try { rbac = rows(await db.execute(sql`SELECT user_id AS "userId", capability, allow, reason, at FROM rbac_audit WHERE at >= ${start}`)).map((r: any) => ({ ...r, at: new Date(r.at) })); } catch { /* */ }
-  try { sessions = rows(await db.execute(sql`SELECT user_id AS "userId", ip_address AS "ipAddress", created_at AS "createdAt" FROM sessions WHERE created_at >= ${start}`)).map((r: any) => ({ ...r, createdAt: new Date(r.createdAt) })); } catch { /* */ }
+  // WHICH OF THE THREE COULD NOT BE READ. Named, not counted: "the scan ran blind on audit_log" and
+  // "the scan ran blind on sessions" send whoever reads it to two different places.
+  const sourcesFailed: string[] = [];
+  const readFailed = (source: string, e: any) => {
+    sourcesFailed.push(source);
+    // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(), level: 'error', event: 'security.scan.source_unreadable',
+      source, windowMinutes, reason: e?.cause?.message || e?.message || 'unknown',
+    }));
+  };
+  // Bounded as well as caught. This is a cron: nobody is on a screen, so an unbounded read does not
+  // fail here — it hangs, holds a pooler connection for the whole invocation, and the only trace is
+  // a scheduled job that never reported an end.
+  try {
+    audit = rows(await withDbTimeout(db.execute(sql`SELECT user_id AS "userId", action, entity, ip_address AS "ipAddress", created_at AS "createdAt" FROM audit_log WHERE created_at >= ${start}`), 'security.scan.audit', SCAN_READ_MS)).map((r: any) => ({ ...r, createdAt: new Date(r.createdAt) }));
+  } catch (e: any) { readFailed('audit_log', e); }
+  try {
+    rbac = rows(await withDbTimeout(db.execute(sql`SELECT user_id AS "userId", capability, allow, reason, at FROM rbac_audit WHERE at >= ${start}`), 'security.scan.rbac', SCAN_READ_MS)).map((r: any) => ({ ...r, at: new Date(r.at) }));
+  } catch (e: any) { readFailed('rbac_audit', e); }
+  try {
+    sessions = rows(await withDbTimeout(db.execute(sql`SELECT user_id AS "userId", ip_address AS "ipAddress", created_at AS "createdAt" FROM sessions WHERE created_at >= ${start}`), 'security.scan.sessions', SCAN_READ_MS)).map((r: any) => ({ ...r, createdAt: new Date(r.createdAt) }));
+  } catch (e: any) { readFailed('sessions', e); }
 
   const detected: DetectedSignal[] = [
     ...detectLoginBursts(audit, now),
@@ -50,9 +94,14 @@ export async function runSecurityScan(windowMinutes = 60): Promise<{ inserted: n
   // de-dupe against OPEN signals with the same (kind, subject) inside the scan window.
   let openKeys = new Set<string>();
   try {
-    const existing = rows(await db.execute(sql`SELECT kind, subject_user_id AS "subjectUserId", subject_ip AS "subjectIp" FROM security_signals WHERE status = 'open' AND window_end >= ${start}`));
+    const existing = rows(await withDbTimeout(db.execute(sql`SELECT kind, subject_user_id AS "subjectUserId", subject_ip AS "subjectIp" FROM security_signals WHERE status = 'open' AND window_end >= ${start}`), 'security.scan.open', SCAN_READ_MS));
     openKeys = new Set(existing.map((r: any) => `${r.kind}|${r.subjectUserId ?? ''}|${r.subjectIp ?? ''}`));
-  } catch { /* */ }
+  } catch (e: any) {
+    // Failing to read the OPEN signals is the safe direction — an empty set means nothing is
+    // de-duplicated, so a real signal is re-raised rather than suppressed. It is still recorded,
+    // because a scan that cannot see what is already open will look noisier than it is.
+    readFailed('security_signals(open)', e);
+  }
 
   const byKind: Record<string, number> = {};
   let inserted = 0;
@@ -65,7 +114,7 @@ export async function runSecurityScan(windowMinutes = 60): Promise<{ inserted: n
     inserted++;
     byKind[s.kind] = (byKind[s.kind] ?? 0) + 1;
   }
-  return { inserted, byKind };
+  return { inserted, byKind, sourcesFailed, complete: sourcesFailed.length === 0 };
 }
 
 export async function listSignals(opts: { status?: string; limit?: number } = {}): Promise<SecuritySignal[]> {

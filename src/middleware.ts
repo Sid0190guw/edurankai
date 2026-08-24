@@ -20,7 +20,7 @@ import { sql } from 'drizzle-orm';
 // src/lib/db-timeout.ts — and a gate that waits longer on a connection that is not coming just
 // moves the gateway timeout. Asking a second time is what actually gets an answer, and it is nearly
 // free because the abandoned attempt's connection lands in the pool for the retry to reuse.
-import { withDbRetry, isDbUnavailable } from '@/lib/db-timeout';
+import { withDbRetry, withDbTimeout, isDbUnavailable } from '@/lib/db-timeout';
 import { getViewableSectionKeys, can } from '@/lib/auth/permissions';
 import { canOpenAdmin } from '@/lib/auth/admin-access';
 import { logEvent } from '@/lib/logger';
@@ -370,7 +370,15 @@ export const onRequest = defineMiddleware(async (context, next) => {
   try {
     const { readAquinCookie, resolveAquinPrincipal } = await import('@/lib/aquin/gate');
     if (readAquinCookie(context.cookies)) {
-      context.locals.aquin = await resolveAquinPrincipal(context as any);
+      // BOUNDED like the five gates below it. src/layouts/AquinAdminLayout.astro had its own call to
+      // this bounded first, and that left the more important one — this — unbounded: the layout runs
+      // on the AquinTutor admin panel, this runs on EVERY request that carries an AquinTutor cookie.
+      // A stall here hung requests that were not even going to use the answer.
+      //
+      // Fails closed on a timeout: locals.aquin stays null, which is what the catch below already
+      // guaranteed for every other failure, and resolveAquinPrincipal itself returns a degraded
+      // principal rather than an authenticated one when it cannot read.
+      context.locals.aquin = await withDbRetry(() => resolveAquinPrincipal(context as any), 'middleware.aquinPrincipal');
     }
   } catch (e: any) {
     // Never fatal to the request. resolveAquinPrincipal already fails closed on its own errors; this
@@ -542,11 +550,36 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // Run the promote at most ONCE per user per browser (cookie guard) instead of a
   // write on every request. Already-approved applicants then make zero writes on
   // navigation, so the database stays idle. The WHERE clause still no-ops safely.
+  //
+  // BOUNDED, AND THE COOKIE ONLY GOES OUT IF THE WRITE LANDED. Two things were wrong with this and
+  // the first pass at bounding this file walked straight past both, because it was looking at the
+  // GATES and this sits between two of them.
+  //
+  //   1. It was the one unbounded await left on the hottest path in the application. Every gate
+  //      around it fails fast now; this one still hung, and postgres-js held its connection for the
+  //      whole invocation while it did.
+  //   2. The cookie was set whether or not the UPDATE succeeded — so a promote that timed out was
+  //      recorded as done for the next thirty days, and the applicant stayed 'pending' with nothing
+  //      ever trying again. That is the same shape as a bootstrap latching a flag over work the
+  //      database refused: a memo that records an intention rather than an outcome.
+  //
+  // withDbTimeout and not withDbRetry: the cookie guard means this runs once per browser, a second
+  // attempt inside the same request buys nothing a later request would not, and it is a write.
   if (result.user.role === 'applicant' && context.cookies.get('era_appr')?.value !== result.user.id) {
+    let promoted = false;
     try {
-      await db.execute(sql`UPDATE users SET access_status = 'approved', updated_at = NOW() WHERE id = ${result.user.id} AND access_status = 'pending'`);
-    } catch (_) { /* never block the request on this */ }
-    try { context.cookies.set('era_appr', result.user.id, { path: '/', maxAge: 60 * 60 * 24 * 30, httpOnly: true, sameSite: 'lax' }); } catch (_) {}
+      await withDbTimeout(
+        db.execute(sql`UPDATE users SET access_status = 'approved', updated_at = NOW() WHERE id = ${result.user.id} AND access_status = 'pending'`),
+        'middleware.applicantPromote', 3000);
+      promoted = true;
+    } catch (e: any) {
+      // Never block the request on this — but no longer silent either: an applicant stuck at
+      // 'pending' because this quietly failed is a person who cannot use the portal they paid for.
+      console.error('[middleware] applicant auto-promote failed:', e?.cause?.message || e?.message);
+    }
+    if (promoted) {
+      try { context.cookies.set('era_appr', result.user.id, { path: '/', maxAge: 60 * 60 * 24 * 30, httpOnly: true, sameSite: 'lax' }); } catch (_) {}
+    }
   }
   context.locals.session = result.session;
 

@@ -19,7 +19,19 @@ const handler: APIRoute = async ({ request }) => {
   if (!isCronAuthorized(request, url)) return j({ ok: false, error: 'unauthorized' }, 401);
   const windowMinutes = Math.min(1440, Math.max(5, Number(url.searchParams.get('window')) || 60));
   const result = await runSecurityScan(windowMinutes);
-  return j({ ok: true, ...result });
+  // ok REFLECTS WHETHER THE SCAN COULD SEE, not merely whether it ran.
+  //
+  // `ok: true, inserted: 0` used to be the answer when every source read had failed — the scan had
+  // looked at nothing and reported no threats, and the cron inventory on /admin/ops recorded a
+  // healthy run. A monitor cannot tell a quiet night from a blind one unless this line does.
+  return j({
+    ok: result.complete,
+    ...result,
+    ...(result.complete ? {} : {
+      error: 'Scan incomplete: ' + result.sourcesFailed.join(', ') + ' could not be read. '
+        + 'The zero below is the number of signals RAISED, not a finding that there were none.',
+    }),
+  }, result.complete ? 200 : 503);
 };
 
 export const POST = handler;

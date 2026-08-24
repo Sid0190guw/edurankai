@@ -366,6 +366,28 @@
     });
 
     // Intake form submit -> save contact details + start conversation + switch to chat stage
+    /**
+     * Say that a message did not send, next to the box it is still sitting in.
+     *
+     * Declared before the submit handler that calls it. The widget already has an error slot for the
+     * intake form (#eraHelpIntakeErr); the conversation half had none, which is part of why its
+     * failures were silent.
+     */
+    function showSendError(text) {
+      var host = document.getElementById('eraHelpInput');
+      if (!host || !host.parentNode) return;
+      var note = document.getElementById('eraHelpSendErr');
+      if (!note) {
+        note = document.createElement('p');
+        note.id = 'eraHelpSendErr';
+        note.style.cssText = 'margin:6px 2px 0;font-size:12px;line-height:1.5;color:#c0392b;';
+        host.parentNode.insertBefore(note, host.nextSibling);
+      }
+      note.textContent = text;
+      clearTimeout(note.__t);
+      note.__t = setTimeout(function () { if (note && note.parentNode) note.textContent = ''; }, 12000);
+    }
+
     var intakeForm = document.getElementById('eraHelpIntakeForm');
     var intakeSubmit = document.getElementById('eraHelpIntakeSubmit');
     var intakeErr = document.getElementById('eraHelpIntakeErr');
@@ -453,9 +475,18 @@
       }
 
       if (!conversationId) {
+        // THE FIRST MESSAGE HAD NO .catch AT ALL, AND ITS FAILURE BRANCH SAID NOTHING.
+        //
+        // A rejected start() — a network drop, or an invocation the platform killed — left the
+        // promise unhandled, so sendBtn stayed DISABLED for as long as the widget was open. The
+        // person had typed a question, pressed send, and been left with a dead button and no
+        // explanation. A `d.ok === false` was barely better: the button came back, the text stayed
+        // in the box, and nothing on screen said the message had not gone anywhere.
+        //
+        // The typed text is never cleared on a failure, deliberately — it is the only copy.
         start(text).then(function(d) {
           sendBtn.disabled = false;
-          if (d.ok) {
+          if (d && d.ok) {
             conversationId = d.conversationId;
             if (d.messages) {
               appendMessages(d.messages);
@@ -463,7 +494,13 @@
             }
             input.value = '';
             input.style.height = 'auto';
+            return;
           }
+          showSendError((d && d.error) ? String(d.error) : 'Your message was not sent. It is still here - press send again.');
+        }).catch(function (e) {
+          sendBtn.disabled = false;
+          showSendError('We could not reach the server' + (e && e.message ? ' (' + e.message + ')' : '')
+            + '. Your message was not sent and is still here - press send again.');
         });
       } else {
         afterStart();

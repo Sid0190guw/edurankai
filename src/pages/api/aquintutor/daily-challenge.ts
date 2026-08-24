@@ -32,12 +32,25 @@ export const GET: APIRoute = async ({ locals }) => {
   // We pull a random 7-question slice from published tests, biased toward
   // 1-mark objective questions for fast feedback. Using setseed for repeatability.
   let questions: any[] = [];
+  // Hoisted out of the try so the response below can use it instead of asking a THIRD time. `const`
+  // is not hoisted on this project and that has taken pages down, so it is declared before the block
+  // that assigns it.
+  let today = '';
   try {
-    const today = rows(await db.execute(sql`SELECT CURRENT_DATE::text AS d`))[0].d;
-    // Seed PRNG between -1..1; map date to that range deterministically.
-    const seedNum = parseInt(today.replace(/-/g, ''), 10) % 1000000;
-    const seedFloat = (seedNum / 1000000.0) * 2 - 1; // -1..1
-    await db.execute(sql.raw('SELECT setseed(' + seedFloat.toFixed(6) + ')'));
+    // ONE STATEMENT FOR THE DATE AND THE SEED, not two. It was `SELECT CURRENT_DATE` to fetch a
+    // string, arithmetic on that string in JS, and then a second statement to send the result back
+    // as the seed - two round trips (~140ms each warm, ~950ms whenever one has to open a connection)
+    // to set a pseudo-random seed. The arithmetic is the same, moved to where the date already is:
+    // digits of the date, modulo a million, scaled into -1..1.
+    //
+    // The date must still come from the DATABASE and not from new Date(): every row this endpoint
+    // reads and writes below is keyed on challenge_date = CURRENT_DATE, so a date computed anywhere
+    // else can disagree with the rows it is meant to match.
+    const seeded = rows(await db.execute(sql`
+      SELECT CURRENT_DATE::text AS d,
+             setseed(((to_char(CURRENT_DATE, 'YYYYMMDD')::bigint % 1000000)::float8 / 1000000.0) * 2 - 1) AS s
+    `))[0] as any;
+    today = String(seeded?.d || '');
     questions = rows(await db.execute(sql`
       SELECT q.id, q.question_type, q.question_text, q.options, q.category, q.difficulty,
              q.image_url, q.marks, t.title AS test_title, t.slug AS test_slug
@@ -70,7 +83,10 @@ export const GET: APIRoute = async ({ locals }) => {
 
   return json({
     ok: true,
-    date: rows(await db.execute(sql`SELECT CURRENT_DATE::text AS d`))[0].d,
+    // Read once, above. This was a third round trip for the same date, on the response line.
+    // The fallback matters only when the block above failed, and it agrees with CURRENT_DATE because
+    // this deployment sets no session timezone, so both are UTC.
+    date: today || new Date().toISOString().slice(0, 10),
     questions,
     attemptId: attempt?.id || null,
     alreadyCompleted: !!attempt?.completed_at,

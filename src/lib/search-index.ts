@@ -151,8 +151,25 @@ export async function reindex(): Promise<number> {
   }
 
   // ---- SWAP. One transaction, so a failure leaves the previous index in place. ----
-  const CHUNK = 200;
+  //
+  // THE TRANSACTION'S LENGTH USED TO SCALE WITH THE CATALOGUE, AND IT HOLDS A POOL SLOT.
+  //
+  // DELETE-everything plus one INSERT per 200 documents meant a 4,000-object kernel spent about
+  // twenty-one sequential round trips inside a held transaction — at ~140ms each on a warm
+  // connection, several seconds during which every row of edu_search_index is locked and one of the
+  // instance's five pool slots is pinned. A second press of Reindex blocks on the first.
+  //
+  // TWO CHANGES, AND NEITHER GIVES UP THE ATOMICITY THAT MOTIVATED THE TRANSACTION. The chunk goes
+  // to 1000, which is a fifth of the statements for the same work and still far under Postgres's
+  // 65535-parameter ceiling (1000 rows x 8 columns = 8000). And SET LOCAL lock_timeout means a
+  // rebuild that cannot get its lock gives up in five seconds instead of queueing ahead of every
+  // reader — the mechanism src/lib/ensure-once.ts records taking this site down on 2026-08-23.
+  //
+  // The fuller fix, if this ever gets slow again, is a staging table so the swap is exactly two
+  // statements regardless of size. That needs a committed migration, so it is not done here.
+  const CHUNK = 1000;
   await db.transaction(async (tx: any) => {
+    await tx.execute(sql.raw("SET LOCAL lock_timeout = '5s'"));
     await tx.execute(sql`DELETE FROM edu_search_index`);
     for (let i = 0; i < docs.length; i += CHUNK) {
       const chunk = docs.slice(i, i + CHUNK);

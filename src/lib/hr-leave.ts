@@ -593,6 +593,22 @@ export async function creditCompOff(input: {
 }
 
 /**
+ * A REFUSAL CARRIED OUT OF THE SPEND TRANSACTION, so throwing is what rolls the spend back.
+ *
+ * Declared above consumeCompOff(), which is the only thing that throws or catches it. A class
+ * binding is in the temporal dead zone before its declaration exactly like a `const`, and a helper
+ * placed under its first reader has taken pages down on this project.
+ *
+ * It never reaches a caller: consumeCompOff catches it and returns the LedgerResult it carries.
+ */
+class CompOffRefusal extends Error {
+  constructor(public readonly refusal: LedgerResult) {
+    super('comp off refusal');
+    this.name = 'CompOffRefusal';
+  }
+}
+
+/**
  * Spend comp off, oldest expiry first.
  *
  * FIFO BY EXPIRY, not by earning date: spending the credit that dies soonest is the only order that
@@ -601,6 +617,44 @@ export async function creditCompOff(input: {
  *
  * Returns an error rather than going negative. Every UPDATE re-states its own precondition
  * (consumed_units + take <= units), so two requests racing cannot both spend the last half day.
+ *
+ * =================================================================================================
+ * THE WHOLE SPEND IS ONE TRANSACTION, AND THAT IS THE POINT
+ * =================================================================================================
+ *
+ * This used to be a bare loop of autocommitting UPDATEs with a JavaScript compensation bolted onto
+ * ONE of the two ways it could end. The race branch handed the credits back; the EXCEPTION branch
+ * did not — it could not, because the running total lived inside the try block and was not even in
+ * scope in the catch. So when a single UPDATE failed part-way (a stalled connection, the 30s
+ * statement_timeout, the circuit breaker) after earlier ones had already COMMITTED, consumeCompOff
+ * returned ok:false, applyLeave abandoned the request, and the screen said "The comp off could not
+ * be spent." That sentence was false: half a day to N days of comp off were permanently marked
+ * consumed, carrying the note for a leave request that was never written. No leave row, no audit
+ * row, no screen showed the deduction, and the amount taken died with the request that took it, so
+ * nothing could ever repair it.
+ *
+ * A ROLLBACK CANNOT FORGET AND CANNOT BE HALF-DONE, which is why the compensating refundCompOff()
+ * call that used to sit on the race branch is gone rather than duplicated onto the catch. Both ways
+ * of failing now end the same way: nothing was taken, because nothing was committed.
+ *
+ * WHAT IS SAFE TO DO IN HERE. At most 61 short statements, all against one employee's own
+ * hr_comp_off_credits rows. No HTTP, no mail, no blob, and no second connection checked out from
+ * inside the held one — refundCompOff() would have done exactly that, which at max:5 is how a pool
+ * deadlocks.
+ *
+ * ensureLeaveSchema() STAYS OUTSIDE IT, deliberately. It can emit DDL, and a `tx` handle reaches
+ * the driver directly — it does not pass through the request-time-DDL guard that every db.execute()
+ * goes through in src/lib/db/index.ts. Bootstrapping inside the transaction would also hold the
+ * pooler slot for the whole of it.
+ *
+ * AND THE TRANSACTION IS NOT WRAPPED IN withDbTimeout(), which is a deliberate exception to the
+ * house rule and not an oversight. withDbTimeout sheds the WAIT and not the WORK: on a timeout the
+ * statements keep running and the transaction can still COMMIT, so a client-side bound here would
+ * report "could not be spent" over credits that were in fact taken — precisely the false sentence
+ * this repair exists to delete. The bounds that apply to this await are the server-side ones set in
+ * src/lib/db/index.ts (statement_timeout 30s, idle_in_transaction_session_timeout 15s) and they are
+ * the right ones, because they ABORT the transaction rather than abandoning the wait on it. A
+ * killed invocation drops the connection, which rolls it back for the same reason.
  */
 export async function consumeCompOff(
   employeeId: string,
@@ -613,75 +667,81 @@ export async function consumeCompOff(
 
   try {
     await ensureLeaveSchema();
-    const credits = rows(await db.execute(sql`
-      SELECT id, units, consumed_units
-        FROM hr_comp_off_credits
-       WHERE employee_id = ${employeeId}::uuid
-         AND expires_on >= (NOW() AT TIME ZONE ${LEAVE_TIME_ZONE})::date
-         AND units > consumed_units
-       ORDER BY expires_on ASC, earned_on ASC
-       LIMIT 60`));
-
-    const total = credits.reduce(
-      (sum, c) => sum + Math.max(0, (Number(c.units) || 0) - (Number(c.consumed_units) || 0)),
-      0,
-    );
-    if (round2(total) < need) {
-      return {
-        ok: false,
-        error: 'There is only ' + round2(total) + ' day(s) of comp off left, and this needs ' + need + '.',
-      };
-    }
-
-    // WHAT THIS CALL HAS ALREADY TAKEN, so a refusal half way through can put it back.
-    //
-    // Each credit is its own UPDATE and there is no transaction around the loop. When a concurrent
-    // request wins the race for the last half day, the UPDATEs that already succeeded STAY
-    // COMMITTED — and applyLeave() then abandons the request without writing a row. The old code
-    // returned "nothing was taken twice" and left those units consumed against a leave request that
-    // does not exist: comp off the person earned, silently gone, with nothing on any screen saying
-    // where. Declared before the loop that writes it; `const` is not hoisted.
-    let taken = 0;
-
-    for (const c of credits) {
-      if (need <= 0) break;
-      const left = round2(Math.max(0, (Number(c.units) || 0) - (Number(c.consumed_units) || 0)));
-      if (left <= 0) continue;
-      const take = round2(Math.min(left, need));
-      const wrote = rows(await db.execute(sql`
-        UPDATE hr_comp_off_credits
-           SET consumed_units = consumed_units + ${take},
-               note = COALESCE(note, ${note})
-         WHERE id = ${String(c.id)}::uuid
-           AND consumed_units + ${take} <= units
-        RETURNING id`));
-      if (wrote.length) {
-        need = round2(need - take);
-        taken = round2(taken + take);
-      }
-    }
-
-    if (need > 0) {
-      // Somebody else spent it between the read and the write. Hand back whatever THIS call did
-      // manage to take before returning the refusal — see the note on `taken` above.
-      if (taken > 0) {
-        const back = await refundCompOff(employeeId, taken);
-        if (!back.ok) {
-          return {
-            ok: false,
-            error: 'Your comp off was spent by another request a moment ago, and ' + taken +
-              ' day(s) this attempt had already taken could not be put back (' +
-              (back.error || 'no reason given') + '). Nothing was filed. Ask HR to check your comp-off ledger.',
-          };
-        }
-      }
-      return { ok: false, error: 'Your comp off was spent by another request a moment ago. Nothing was taken, and nothing was filed.' };
-    }
-    return { ok: true, changed: true };
   } catch (e: any) {
-    logFail('consumeCompOff', e);
-    return { ok: false, error: errText(e, 'The comp off could not be spent.') };
+    // Nothing has been read or written at this point, so this refusal is unambiguous. It is split
+    // out of the transaction's own catch only because ensureLeaveSchema() has to run outside it.
+    logFail('consumeCompOff.schema', e);
+    return {
+      ok: false,
+      error: 'The comp off could not be spent, so nothing was taken and nothing was filed. Reason: '
+        + errText(e, 'the leave tables could not be prepared.'),
+    };
   }
+
+  try {
+    await db.transaction(async (tx: any) => {
+      const credits = rows(await tx.execute(sql`
+        SELECT id, units, consumed_units
+          FROM hr_comp_off_credits
+         WHERE employee_id = ${employeeId}::uuid
+           AND expires_on >= (NOW() AT TIME ZONE ${LEAVE_TIME_ZONE})::date
+           AND units > consumed_units
+         ORDER BY expires_on ASC, earned_on ASC
+         LIMIT 60`));
+
+      const total = credits.reduce(
+        (sum, c) => sum + Math.max(0, (Number(c.units) || 0) - (Number(c.consumed_units) || 0)),
+        0,
+      );
+      if (round2(total) < need) {
+        // Nothing has been written yet, so the throw is only a way out of the callback. The sentence
+        // is unchanged from the version that returned early here.
+        throw new CompOffRefusal({
+          ok: false,
+          error: 'There is only ' + round2(total) + ' day(s) of comp off left, and this needs ' + need + '.',
+        });
+      }
+
+      for (const c of credits) {
+        if (need <= 0) break;
+        const left = round2(Math.max(0, (Number(c.units) || 0) - (Number(c.consumed_units) || 0)));
+        if (left <= 0) continue;
+        const take = round2(Math.min(left, need));
+        const wrote = rows(await tx.execute(sql`
+          UPDATE hr_comp_off_credits
+             SET consumed_units = consumed_units + ${take},
+                 note = COALESCE(note, ${note})
+           WHERE id = ${String(c.id)}::uuid
+             AND consumed_units + ${take} <= units
+          RETURNING id`));
+        if (wrote.length) need = round2(need - take);
+      }
+
+      if (need > 0) {
+        // Somebody else spent it between the read and the write. THE THROW IS THE COMPENSATION:
+        // rolling back is what puts back whatever this attempt had already taken, and unlike the
+        // JavaScript refund it replaces, it cannot itself fail half way and leave a person short.
+        throw new CompOffRefusal({
+          ok: false,
+          error: 'Your comp off was spent by another request a moment ago. Nothing was taken, and nothing was filed.',
+        });
+      }
+    });
+  } catch (e: any) {
+    if (e instanceof CompOffRefusal) return e.refusal;
+    // THE REASSURANCE LEADS AND IS UNCONDITIONAL, because it is now the one thing this branch can
+    // promise: every UPDATE this call made has been rolled back. errText() returns the Postgres
+    // reason whenever there is one, so passing this sentence as its FALLBACK — which is what the
+    // old code did — meant the person almost never saw it. The reason is kept after it, exactly as
+    // this file reports every other ledger failure.
+    logFail('consumeCompOff', e);
+    return {
+      ok: false,
+      error: 'The comp off could not be spent, so nothing was taken and nothing was filed. Reason: '
+        + errText(e, 'no reason was given.'),
+    };
+  }
+  return { ok: true, changed: true };
 }
 
 /** Give back comp off when an approved request is cancelled or a decision is reversed. */

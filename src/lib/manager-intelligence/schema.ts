@@ -36,7 +36,7 @@
 
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { ensureBatch, ensureOnce } from '@/lib/ensure-once';
+import { ensureBatch, ensureOnce, guardedDdl } from '@/lib/ensure-once';
 
 const MOD = 'manager-intelligence';
 
@@ -141,7 +141,22 @@ export function ensureManagerIntelligenceSchema(): Promise<void> {
   return ensureBatch('mti_v1', MTI_DDL).then(() => ensureOnce('mti_v1_append_only', async () => {
     try {
       const { sqlClient } = await import('@/lib/db');
-      await sqlClient().unsafe(APPEND_ONLY_DDL).simple();
+      // guardedDdl, LIKE EVERY OTHER .simple() BATCH IN THIS REPOSITORY. This was the one that sent
+      // raw DDL, and of all of them it is the one that could least afford to.
+      //
+      // APPEND_ONLY_DDL ends in CREATE TRIGGER ... BEFORE UPDATE OR DELETE ON mti_manager_actions,
+      // which takes an ACCESS EXCLUSIVE lock on that table. Without a lock_timeout it waits for as
+      // long as any open reader holds it — and a PENDING exclusive lock queues AHEAD of new readers,
+      // so every subsequent SELECT on the table stacks up behind it. That is not a hypothetical
+      // shape: it is precisely the mechanism src/lib/ensure-once.ts records taking this site down on
+      // 2026-08-23, which is why guardedDdl exists and why it is exported rather than private.
+      //
+      // It wraps the batch in BEGIN / SET LOCAL lock_timeout '3s' / SET LOCAL statement_timeout
+      // '20s' / COMMIT, so a contended run gives up in three seconds instead of holding the table.
+      // The catch below already treats a failed trigger as survivable — the tables work without it
+      // and schemaState() reports appendOnlyEnforced:false in words — so giving up is the answer
+      // this code was already written to accept.
+      await sqlClient().unsafe(guardedDdl(APPEND_ONLY_DDL)).simple();
     } catch (e: any) {
       // Logged and swallowed on purpose: the tables are usable without the trigger, and refusing to
       // load the module because a guarantee could not be installed would take the whole surface down

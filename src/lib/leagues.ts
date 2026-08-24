@@ -44,15 +44,27 @@ function ensureSchema(): Promise<void> {
 
 export async function ensureUserInLeague(userId: string): Promise<{ leagueId: string; tier: number; cohort: number; rank: number; memberCount: number } | null> {
   await ensureSchema();
-  // Get current week start (Monday)
-  const wsRow = rows(await db.execute(sql`SELECT date_trunc('week', CURRENT_DATE)::date::text AS w`))[0] as any;
-  const weekStart = wsRow.w;
+  // THE WEEK START IS A SQL EXPRESSION, NOT A ROUND TRIP.
+  //
+  // This was a whole statement whose only job was to fetch one string back across the network and
+  // hand it straight out again as a parameter on the next four statements. date_trunc is a Postgres
+  // function; asking Postgres for its answer so we can give the answer back to Postgres costs a full
+  // round trip - ~140ms warm on this deployment and ~950ms whenever it has to open a connection -
+  // for nothing. src/lib/attendance.ts and src/pages/portal/employee.astro both record removing the
+  // same pattern.
+  //
+  // It is NOT new Date() in JS: week_start is a DATE column the database writes and compares, on a
+  // session with no timezone set, so only Postgres's own week boundary agrees with what is stored.
+  // A FUNCTION, so every call site gets a FRESH fragment. Reusing one `sql` fragment object across
+  // statements is how this project already produced a parameter mis-bind under prepare:false, and
+  // although this fragment carries no parameters of its own, the rule is not worth re-testing.
+  const weekStart = () => sql`date_trunc('week', CURRENT_DATE)::date`;
 
   // Already in a league this week?
   const existing = rows(await db.execute(sql`
     SELECT l.id AS league_id, l.tier_level, l.cohort_number, l.member_count
     FROM league_memberships m JOIN leagues l ON m.league_id = l.id
-    WHERE m.user_id = ${userId} AND l.week_start = ${weekStart}
+    WHERE m.user_id = ${userId} AND l.week_start = ${weekStart()}
     LIMIT 1
   `))[0] as any;
 
@@ -69,16 +81,16 @@ export async function ensureUserInLeague(userId: string): Promise<{ leagueId: st
   // Find an open cohort at this tier this week, otherwise create a new one
   let cohort = rows(await db.execute(sql`
     SELECT id, cohort_number, member_count FROM leagues
-    WHERE week_start = ${weekStart} AND tier_level = ${tier} AND member_count < ${COHORT_SIZE}
+    WHERE week_start = ${weekStart()} AND tier_level = ${tier} AND member_count < ${COHORT_SIZE}
     ORDER BY cohort_number ASC LIMIT 1
   `))[0] as any;
 
   if (!cohort) {
-    const maxCohort = rows(await db.execute(sql`SELECT COALESCE(MAX(cohort_number), 0) AS m FROM leagues WHERE week_start = ${weekStart} AND tier_level = ${tier}`))[0] as any;
+    const maxCohort = rows(await db.execute(sql`SELECT COALESCE(MAX(cohort_number), 0) AS m FROM leagues WHERE week_start = ${weekStart()} AND tier_level = ${tier}`))[0] as any;
     const next = Number(maxCohort?.m || 0) + 1;
     const ins = rows(await db.execute(sql`
       INSERT INTO leagues (tier, tier_level, week_start, cohort_number, member_count)
-      VALUES (${tierDef.name}, ${tier}, ${weekStart}, ${next}, 0)
+      VALUES (${tierDef.name}, ${tier}, ${weekStart()}, ${next}, 0)
       ON CONFLICT (tier, tier_level, week_start, cohort_number) DO UPDATE SET tier = EXCLUDED.tier
       RETURNING id, cohort_number, member_count
     `));

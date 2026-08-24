@@ -144,7 +144,16 @@ export async function createRequest(input: CreateInput): Promise<{ ok: boolean; 
       RETURNING id`))[0];
     return { ok: true, id: r?.id };
   } catch (e: any) {
-    return { ok: false, error: e?.cause?.message || e?.message || 'Could not record the request.' };
+    // THE RAW POSTGRES REASON WENT TO A STRANGER. src/pages/offer/verify/[token]/request.astro
+    // renders `res.error` straight onto the page, and that page is PUBLIC — anybody holding an
+    // offer-verification link reaches it without signing in. e.cause is written by the driver, and
+    // on the failures that matter it carries table names, constraint names, and on a connection
+    // failure the pooler hostname and the database role. publicErrorSummary() exists for exactly
+    // this and is what /api/health uses; the unredacted reason goes to the log, where operators are.
+    const raw = e?.cause?.message || e?.message || 'unknown error';
+    console.error('[offer-verification] createRequest failed:', raw);
+    const { publicErrorSummary } = await import('@/lib/observability-health');
+    return { ok: false, error: 'Your request could not be recorded (' + publicErrorSummary(raw) + '). Nothing has been charged. Please try again in a moment.' };
   }
 }
 

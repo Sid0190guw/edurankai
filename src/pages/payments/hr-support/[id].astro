@@ -80,10 +80,24 @@ const kindMeta = SUPPORT_KINDS[reqRow.support_kind] || SUPPORT_KINDS.general;
         <>
           <button id="rzpBtn" type="button" class="w-full bg-sky hover:bg-sky/90 text-white font-semibold py-3 px-7 rounded-xl text-[0.95rem]">Pay 25 CHF →</button>
           <p class="text-[0.74rem] text-ink-soft mt-3 mb-0 text-center">Powered by Razorpay · cards · UPI · netbanking · wallets</p>
+          <p id="hrsMsg" class="text-[0.86rem] leading-relaxed mt-3 mb-0 text-center"></p>
 
           <script is:inline src="https://checkout.razorpay.com/v1/checkout.js"></script>
           <script is:inline define:vars={{ orderId: razorpayOrderId, publicKey, name: reqRow.candidate_name, email: reqRow.candidate_email, phone: reqRow.candidate_phone || '', requestId: String(id) }}>
-            document.getElementById('rzpBtn').addEventListener('click', function() {
+            var hrsBtn = document.getElementById('rzpBtn');
+            // Captured rather than re-typed so restoring the button after a dismissed checkout
+            // cannot drift from the label the page actually rendered.
+            var hrsBtnLabel = hrsBtn ? hrsBtn.textContent : 'Pay';
+            var hrsPaid = false;
+
+            function hrsSay(text, isError) {
+              var el = document.getElementById('hrsMsg');
+              if (!el) return;
+              el.style.color = isError ? '#b91c1c' : '#4b5563';
+              el.textContent = text;
+            }
+
+            hrsBtn.addEventListener('click', function() {
               var rzp = new Razorpay({
                 key: publicKey,
                 order_id: orderId,
@@ -91,7 +105,30 @@ const kindMeta = SUPPORT_KINDS[reqRow.support_kind] || SUPPORT_KINDS.general;
                 name: 'EduRankAI', description: 'HR Application Support (25 CHF)',
                 prefill: { name: name, email: email, contact: phone },
                 theme: { color: '#1045BB' },
+                // An abandoned checkout has to give the button back. Without this the candidate
+                // closes the Razorpay modal and is left staring at a disabled control.
+                modal: {
+                  ondismiss: function() {
+                    if (hrsPaid) return;
+                    if (hrsBtn) { hrsBtn.disabled = false; hrsBtn.textContent = hrsBtnLabel; }
+                    hrsSay('', false);
+                  },
+                },
                 handler: function(resp) {
+                  // By the time this fires the 25 CHF has already left the candidate's account.
+                  // The old chain was fetch().then(r.json()).then() with no .catch: when the verify
+                  // endpoint answered a gateway timeout (an HTML body, which r.json() rejects on)
+                  // the rejection went nowhere — no redirect, no message, and "Pay 25 CHF" still
+                  // live, which invites a SECOND payment for the same request. Every branch below
+                  // therefore has to distinguish "we could not confirm it" from "you have not paid".
+                  hrsPaid = true;
+                  if (hrsBtn) { hrsBtn.disabled = true; hrsBtn.textContent = 'Confirming payment...'; }
+                  var payId = (resp && resp.razorpay_payment_id) ? resp.razorpay_payment_id : '(see your Razorpay receipt)';
+                  function paidButUnconfirmed(why) {
+                    hrsSay('Payment received, but it could not be recorded: ' + why
+                      + '. Do not pay again — email hr@edurankai.in with payment id ' + payId
+                      + ' and reference ' + requestId + '.', true);
+                  }
                   fetch('/api/payments/hr-support/verify', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -101,9 +138,18 @@ const kindMeta = SUPPORT_KINDS[reqRow.support_kind] || SUPPORT_KINDS.general;
                       razorpay_payment_id: resp.razorpay_payment_id,
                       razorpay_signature: resp.razorpay_signature,
                     }),
-                  }).then(function(r){ return r.json(); }).then(function(d){
-                    if (d.ok) window.location.href = '/payments/hr-support/' + requestId;
-                    else alert('Payment verified but the server could not record it. Please email hr@edurankai.in with reference ' + requestId);
+                  }).then(function(r){
+                    // Parse defensively: a non-JSON body is a fact about the response, not a crash.
+                    return r.json().then(function(d){ return { s: r.status, d: d }; },
+                                         function(){ return { s: r.status, d: null }; });
+                  }).then(function(o){
+                    if (o.d && o.d.ok) { window.location.href = '/payments/hr-support/' + requestId; return; }
+                    // The endpoint's own reason ('bad signature', 'That payment does not belong to
+                    // this request.') is printed instead of the old blanket "verified but not
+                    // recorded", which stated the opposite of what had actually happened.
+                    paidButUnconfirmed((o.d && o.d.error) || ('the server answered ' + o.s));
+                  }).catch(function(){
+                    paidButUnconfirmed('we could not reach the server');
                   });
                 },
               });

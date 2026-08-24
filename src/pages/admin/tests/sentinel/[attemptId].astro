@@ -357,12 +357,65 @@ function dur() {
           setSig('sigNet', net, netCls);
         }
 
+        // THREE THINGS THIS POLL DID FOR AS LONG AS THE TAB WAS OPEN.
+        //
+        // It ran every three seconds FOREVER. Not until the attempt closed - the branch below sets
+        // the label to "Closed" and the timer carried on regardless - and not only while somebody was
+        // looking, because nothing checked document.hidden. A reviewer who opened this on a finished
+        // paper and walked away left twelve hundred requests an hour against a database-backed
+        // endpoint, on a deployment where a request that has to open a connection costs ~810ms.
+        //
+        // And both of its failure paths were silent: `if (!d.ok) return` and a bare
+        // `.catch(function(){})`. The pill kept saying LIVE over a stream that had stopped updating,
+        // which on a proctoring screen is the worst available lie - a reviewer reads "no new events"
+        // as "the candidate did nothing", and this is the screen where a human decides.
+        var pollTimer = null;
+        var pollDelay = 3000;
+        var stopped = false;
+
+        function stopPolling(label) {
+          stopped = true;
+          if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+          var live = document.getElementById('liveLabel');
+          if (live && label) live.textContent = label;
+          var pill = document.getElementById('livePill');
+          if (pill) { var d0 = pill.querySelector('.dot'); if (d0) d0.style.background = '#8a8579'; }
+        }
+
+        function feedStalled(why) {
+          // NOT stopPolling: the feed may come back, and this is a statement about the last attempt
+          // rather than about the attempt being over. The label is what stops the screen implying
+          // the stream is current.
+          var live = document.getElementById('liveLabel');
+          if (live) live.textContent = 'Not updating - ' + why + '. Retrying.';
+        }
+
+        function schedule() {
+          if (stopped) return;
+          // A hidden tab still polls, but slowly: nobody is reading it, and this endpoint costs a
+          // database round trip per tick.
+          var wait = pollDelay;
+          try { if (document.hidden) wait = Math.max(wait, 30000); } catch (e) {}
+          pollTimer = setTimeout(poll, wait);
+        }
+
         function poll() {
+          if (stopped) return;
           var url = '/api/admin/tests/attempt-events?id=' + encodeURIComponent(attemptId) + (lastTs ? '&since=' + encodeURIComponent(lastTs) : '');
           fetch(url, { credentials: 'same-origin' })
-            .then(function(r) { return r.json(); })
+            .then(function(r) { return r.json().catch(function() { return null; }); })
             .then(function(d) {
-              if (!d.ok) return;
+              if (!d || !d.ok) {
+                // Back off rather than hammering a database that has just failed to answer, and say
+                // so on the screen.
+                pollDelay = Math.min(30000, Math.max(6000, pollDelay * 2));
+                feedStalled((d && d.error) ? String(d.error) : 'the event feed could not be read');
+                schedule();
+                return;
+              }
+              pollDelay = 3000;
+              var live0 = document.getElementById('liveLabel');
+              if (live0 && live0.textContent.indexOf('Not updating') === 0) live0.textContent = 'LIVE - polling every 3s';
               if (d.events && d.events.length > 0) {
                 // Prepend new events (newest first)
                 d.events.forEach(function(e) {
@@ -395,14 +448,30 @@ function dur() {
                 updateSignals(d.events);
               }
               if (d.counters && d.counters.status && d.counters.status !== 'in_progress') {
-                document.getElementById('liveLabel').textContent = 'Closed - ' + d.counters.status;
-                var pill = document.getElementById('livePill');
-                var dotEl = pill.querySelector('.dot');
-                if (dotEl) dotEl.style.background = '#8a8579';
+                // THE ATTEMPT IS OVER. Stop, rather than setting a label and polling on for however
+                // long this tab stays open. Everything already on screen stays on screen.
+                stopPolling('Closed - ' + d.counters.status);
+                return;
               }
-            }).catch(function() {});
+              schedule();
+            })
+            .catch(function (e) {
+              // There was no .catch at all. A network failure or an invocation the platform killed
+              // rejected the chain, nothing handled it, and the pill went on saying LIVE.
+              pollDelay = Math.min(30000, Math.max(6000, pollDelay * 2));
+              feedStalled('the server could not be reached' + (e && e.message ? ' (' + e.message + ')' : ''));
+              schedule();
+            });
         }
-        setInterval(poll, 3000);
+        // Coming back to the tab polls at once rather than waiting out a backed-off timer.
+        try {
+          document.addEventListener('visibilitychange', function () {
+            if (stopped || document.hidden) return;
+            if (pollTimer) clearTimeout(pollTimer);
+            poll();
+          });
+        } catch (e) {}
+        schedule();
       })();
     </script>
   )}
