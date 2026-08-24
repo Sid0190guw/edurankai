@@ -1,8 +1,14 @@
 -- db/performance-alters-schema.sql
 -- THE 27 COLUMNS THE APPRAISAL SCREENS WRITE, AND THE ONLY FILE THAT RECORDS THEM.
 --
--- READ THIS HEADER BEFORE RUNNING ANY OF IT. This is the one file in db/ that is NOT safe to paste
--- in one go, and the reason is mechanical rather than cautious.
+-- SAFE TO RUN WITH psql, IN ONE COMMAND. NOT safe to paste into a SQL editor. That distinction is
+-- mechanical, not cautious, and it is the whole reason this file is shaped the way it is:
+--
+--     psql "<session-pooler string>" -v ON_ERROR_STOP=1 -f db/performance-alters-schema.sql
+--
+-- psql commits statement by statement, so each ALTER takes its lock and gives it straight back. A
+-- SQL-editor paste is ONE implicit transaction: every ACCESS EXCLUSIVE lock is held until the last
+-- statement commits, turning 27 instant ALTERs into one long lock across three tables at once.
 --
 -- ============================================================================================
 -- WHY THIS IS DIFFERENT FROM EVERY OTHER FILE HERE
@@ -70,24 +76,21 @@ SELECT e.tbl AS missing_from_table, e.col AS missing_column
  ORDER BY e.tbl, e.col;
 
 -- ============================================================================================
--- STEP 2. ADD THEM. Run ONLY the lines Step 1 named, ONE AT A TIME, when /admin/hr is idle.
+-- STEP 2. ADD THEM. Every statement is ADD COLUMN IF NOT EXISTS, so the ones Step 1 did NOT name
+-- are no-ops and the file can simply be run — there is no need to hand-pick lines. Re-running is a
+-- no-op too: nothing is dropped, no existing column is retyped, no row is rewritten.
 --
--- SET THE BOUND FIRST, in the same session, before any ALTER below:
---
---     SET lock_timeout = '3s';
---
--- With that set, an ALTER that cannot get its lock inside three seconds FAILS instead of building a
--- queue behind it. Failing is the good outcome — run it again in a quieter moment. Without it the
--- statement waits indefinitely and takes the table's readers down with it.
---
--- DO NOT PASTE THIS WHOLE SECTION INTO A SQL EDITOR. A pasted block is one implicit transaction:
--- every ACCESS EXCLUSIVE lock it takes is held until the LAST statement commits, so 27 instant
--- ALTERs become one long lock on three tables at once. Use psql, one statement per line, watching
--- each return — or paste one line at a time.
---
--- Every statement is ADD COLUMN IF NOT EXISTS. Re-running is a no-op, nothing is dropped, no
--- existing column is retyped, and no row is rewritten.
+-- The bound below is a real statement rather than advice in a comment, which is what makes running
+-- the whole file in one psql command safe. Prefer a quiet moment for /admin/hr anyway: the cost of
+-- being wrong is a three-second wait, not an outage, but a quiet moment costs nothing.
 -- ============================================================================================
+
+-- THE BOUND. This is a real statement, not a suggestion in a comment, so that running this file in
+-- one shot is safe. It applies for the rest of the session: any ALTER below that cannot get its
+-- ACCESS EXCLUSIVE lock within three seconds FAILS instead of queueing every reader behind it.
+-- With ON_ERROR_STOP=1 the file then stops, having changed nothing after that point — which is the
+-- correct outcome. Run it again in a quieter moment.
+SET lock_timeout = '3s';
 
 -- --------------------------------------------------------------------------------------------
 -- GOALS. The period a goal belongs to, who owns it, who may see it, and how far along it is.
