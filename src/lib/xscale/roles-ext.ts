@@ -363,15 +363,28 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
   // by the rows statement and the count statement is what produced "bind message supplies 36
   // parameters, but prepared statement requires 34" — see the long note above whereClause(). These
   // two build a fresh fragment per statement.
+  /**
+   * ONE TERM, MATCHED AGAINST EVERY COLUMN THE MAIN QUERY CAN SEE.
+   *
+   * Extracted so the WHERE clause and the relevance ORDER BY use the same definition of "matches".
+   * Two definitions of that would let a posting be selected by one and ordered by the other, which
+   * is the quiet way a relevance-ordered page fills up with rows nothing can explain.
+   *
+   * The jsonb_typeof guard is not optional: jsonb_array_elements_text throws a hard Postgres error
+   * on any row whose skills column is not an array, and because it runs per row across the whole
+   * table, ONE bad row once returned "0 results" for every search on /careers.
+   */
+  const wideMatch = (t: string) => {
+    const lk = '%' + t + '%';
+    return sql`(r.title ILIKE ${lk} OR r.function ILIKE ${lk} OR r.about ILIKE ${lk}
+                OR COALESCE(d.name, '') ILIKE ${lk} OR COALESCE(v.name, '') ILIKE ${lk}
+                OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(
+                     CASE WHEN jsonb_typeof(r.skills) = 'array' THEN r.skills ELSE '[]'::jsonb END
+                   ) AS s WHERE s ILIKE ${lk}))`;
+  };
+
   const termsFragment = () => (hasTerms
-    ? sql`(${sql.join(anyTerms.map((t) => {
-      const lk = '%' + t + '%';
-      return sql`(r.title ILIKE ${lk} OR r.function ILIKE ${lk} OR r.about ILIKE ${lk}
-                  OR COALESCE(d.name, '') ILIKE ${lk} OR COALESCE(v.name, '') ILIKE ${lk}
-                  OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(
-                       CASE WHEN jsonb_typeof(r.skills) = 'array' THEN r.skills ELSE '[]'::jsonb END
-                     ) AS s WHERE s ILIKE ${lk}))`;
-    }), sql` OR `)})`
+    ? sql`(${sql.join(anyTerms.map(wideMatch), sql` OR `)})`
     : sql`TRUE`);
 
   // `&&` is array overlap. Guarded by hasCatsAny so an empty list is a no-op rather than a
@@ -379,6 +392,46 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
   const catsFragment = () => (hasCatsAny
     ? sql`(COALESCE(r.skill_categories, ARRAY[]::text[]) && ${textArray(catsAny)})`
     : sql`TRUE`);
+
+  /**
+   * =================================================================================================
+   * RELEVANCE ORDERING, BECAUSE A PAGE RANKER CANNOT RANK ROWS IT WAS NEVER GIVEN
+   * =================================================================================================
+   *
+   * The predicates above decide WHICH postings match. This decides which of them land on the page
+   * that gets fetched — and without it the second half of the retrieve-then-rank split does nothing.
+   *
+   * MEASURED ON THE LIVE SITE, 2026-08-24. A profile of "artificial intelligence, research, python,
+   * pytorch, currently studying" matched 688 of the 1,017 open postings, correctly. The rows query
+   * then took the first 24 in catalogue order — is_featured, then sort_order — and handed those to
+   * the ranker, so the candidate was shown Category Manager Intern, Chief of Staff and a grants
+   * lead, three of them with no explanation at all because nothing about them matched anything they
+   * had said. The LLM Engineering Intern and the Senior AI Engineer were in the other 664.
+   *
+   * Ranking twenty-four arbitrary rows produces a well-explained arbitrary answer. So the database
+   * does the COARSE ordering, over the whole matching set, and the ranker does the fine ordering and
+   * the explanation over the page it is handed. That is the split working as intended rather than in
+   * name only.
+   *
+   * THE SCORE IS DELIBERATELY CRUDE AND READABLE: an explicit discipline tag outweighs a word in the
+   * title, which outweighs the same word buried in the description. It is not the match score — that
+   * does not exist, and rank.ts still produces the tier and the reasons. This only decides which
+   * rows are worth carrying out of the database.
+   *
+   * ABSENT WHEN THERE IS NOTHING TO ORDER BY, so an unpersonalised browse keeps the catalogue's own
+   * order and pays nothing for an expression it does not need.
+   */
+  const relevanceOrder = (matcher: (t: string) => any, includeCats: boolean) => {
+    const parts: any[] = [];
+    if (includeCats && hasCatsAny) parts.push(sql`CASE WHEN ${catsFragment()} THEN 3 ELSE 0 END`);
+    const scored = hasTerms ? anyTerms : (term === '' ? [] : [term]);
+    for (const t of scored) {
+      const lk = '%' + t + '%';
+      parts.push(sql`CASE WHEN r.title ILIKE ${lk} THEN 2 WHEN ${matcher(t)} THEN 1 ELSE 0 END`);
+    }
+    if (!parts.length) return sql``;
+    return sql`(${sql.join(parts, sql` + `)}) DESC, `;
+  };
 
   /**
    * THE TWO WIDENINGS ARE OR-ED WITH EACH OTHER, NOT AND-ED.
@@ -521,7 +574,7 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
         LEFT JOIN departments d ON d.id = r.department_id
         LEFT JOIN divisions v ON v.id = r.division_id
         ${whereClause()}
-       ORDER BY r.is_featured DESC, r.sort_order ASC, r.created_at DESC, r.title ASC
+       ORDER BY ${relevanceOrder(wideMatch, true)}r.is_featured DESC, r.sort_order ASC, r.created_at DESC, r.title ASC
        LIMIT ${limit} OFFSET ${offset}`);
 
     const cc = await db.execute(sql`
@@ -591,7 +644,7 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
           FROM roles r
           LEFT JOIN departments d ON d.id = r.department_id
         ${narrowWhere()}
-         ORDER BY r.is_featured DESC, r.sort_order ASC, r.title ASC
+         ORDER BY ${relevanceOrder(narrowMatch, false)}r.is_featured DESC, r.sort_order ASC, r.title ASC
          LIMIT ${limit} OFFSET ${offset}`);
       const list = rowsOf(fallback).map(mapOpportunity);
 

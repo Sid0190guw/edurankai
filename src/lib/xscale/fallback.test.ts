@@ -138,6 +138,42 @@ describe('the retry reports honestly', () => {
   });
 });
 
+describe('the database does the coarse relevance ordering', () => {
+  const order = region('const relevanceOrder = (', 'const discoveryFragment');
+
+  it('exists at all, because a page ranker cannot rank rows it was never given', () => {
+    // Live, 2026-08-24: a profile matching 688 of 1,017 postings got the first 24 in catalogue
+    // order, so an AI researcher was shown Category Manager Intern and Chief of Staff, three of
+    // them with no explanation because nothing about them matched anything they had said.
+    expect(/ORDER BY \$\{relevanceOrder\(wideMatch, true\)\}/.test(SRC)).toBe(true);
+    expect(/ORDER BY \$\{relevanceOrder\(narrowMatch, false\)\}/.test(SRC)).toBe(true);
+  });
+
+  it('orders by the SAME matcher the WHERE selects with', () => {
+    // Two definitions of "matches" would let a posting be selected by one and ordered by the other,
+    // which is the quiet way a relevance-ordered page fills with rows nothing can explain.
+    expect(/anyTerms\.map\(wideMatch\)/.test(SRC)).toBe(true);
+    expect(/matcher\(t\)/.test(order)).toBe(true);
+  });
+
+  it('never scores on a discipline column in the retry path', () => {
+    // relevanceOrder takes includeCats, and the retry passes false. Scoring on skill_categories
+    // there would reintroduce the exact defect the retry exists to survive.
+    expect(/includeCats && hasCatsAny/.test(order)).toBe(true);
+    expect(/relevanceOrder\(narrowMatch, false\)/.test(SRC)).toBe(true);
+  });
+
+  it('emits nothing when there is nothing to order by', () => {
+    // An unpersonalised browse keeps the catalogue's own order and pays for no expression.
+    expect(/if \(!parts\.length\) return sql``/.test(order)).toBe(true);
+  });
+
+  it('weights an explicit tag above a title word above a word in the description', () => {
+    expect(/THEN 3 ELSE 0 END/.test(order)).toBe(true);
+    expect(/THEN 2 WHEN .* THEN 1 ELSE 0 END/.test(order)).toBe(true);
+  });
+});
+
 describe('the two widenings are OR-ed with each other, not AND-ed', () => {
   it('guards the empty cases instead of folding them together', () => {
     // `cats OR TRUE` is TRUE, so an unconditional OR would silently discard a discipline filter
