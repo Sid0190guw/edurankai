@@ -115,8 +115,19 @@ export function isLive(status: InvitationStatus): boolean {
   return status === 'pending' || status === 'opened';
 }
 
+/**
+ * /invite/<token>, NOT /apply/invite/<token>.
+ *
+ * The first version of this lived under /apply, and every invitation link 302'd straight to the
+ * application gate without the landing page ever running — src/middleware.ts gates the whole
+ * `/apply` prefix, and its exemption list is matched EXACTLY and never by prefix, on purpose, so a
+ * path with a token segment in it can never be exempted there. Weakening that check to admit this
+ * page would trade a gate that is deny-by-default for one that is not, over a page that grants
+ * nothing. Living outside the prefix is the correct answer, and it costs nothing: the landing page
+ * hands off to /apply, which goes through the gate exactly as it should.
+ */
 export function inviteUrl(origin: string, token: string): string {
-  return String(origin || '').replace(/\/+$/, '') + '/apply/invite/' + encodeURIComponent(token);
+  return String(origin || '').replace(/\/+$/, '') + '/invite/' + encodeURIComponent(token);
 }
 
 export function ttlDays(input: unknown): number {

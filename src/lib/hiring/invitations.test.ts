@@ -5,6 +5,7 @@ import {
   statusOf, isLive, inviteUrl, ttlDays, parseInvite,
   DEFAULT_TTL_DAYS, MAX_TTL_DAYS,
 } from '@/lib/hiring/invitations';
+import { isGatedApplyPath } from '@/lib/talent/gate-pass';
 
 describe('token', () => {
   it('is long and unguessable, and never the same twice', () => {
@@ -30,8 +31,18 @@ describe('token', () => {
   });
 
   it('builds a link without doubling the slash', () => {
-    expect(inviteUrl('https://www.edurankai.in/', 'tok')).toBe('https://www.edurankai.in/apply/invite/tok');
-    expect(inviteUrl('https://www.edurankai.in', 'tok')).toBe('https://www.edurankai.in/apply/invite/tok');
+    expect(inviteUrl('https://www.edurankai.in/', 'tok')).toBe('https://www.edurankai.in/invite/tok');
+    expect(inviteUrl('https://www.edurankai.in', 'tok')).toBe('https://www.edurankai.in/invite/tok');
+  });
+
+  // THE REGRESSION THIS PINS ACTUALLY HAPPENED. The landing page first lived at
+  // /apply/invite/<token>, and every invitation link 302'd to the application gate without the page
+  // ever running: middleware gates the whole /apply prefix and its exemptions are matched EXACTLY,
+  // so a path with a token segment can never be exempted there. Asserting against the real gate
+  // predicate rather than against the string means moving either one breaks this test.
+  it('lands outside the gated apply prefix, or the link never reaches the page', () => {
+    const path = new URL(inviteUrl('https://www.edurankai.in', 'tok')).pathname;
+    expect(isGatedApplyPath(path)).toBe(false);
   });
 });
 
