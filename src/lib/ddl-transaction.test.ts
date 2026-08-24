@@ -35,6 +35,37 @@ function walk(dir: string, out: string[] = []): string[] {
   return out;
 }
 
+/**
+ * Every source file under src/, read once and stripped of whole-line comments once.
+ *
+ * MEMOISED BECAUSE THIS TEST TIMED OUT ON A CLEAN CHECKOUT AT 5,754ms AGAINST A 5,000ms BOUND.
+ *
+ * The two scans below each walked the whole tree, read every file, and rebuilt the comment-stripped
+ * copy of each one. The first warmed the filesystem cache and passed; the second paid the walk again
+ * and went over. It never failed in a warm working tree, which is why it shipped green — the failure
+ * needs a checkout nobody has read yet, and that is exactly what CI and a fresh clone are. The same
+ * shape had just been fixed in src/lib/job-handlers.test.ts.
+ *
+ * The scan is pure: same files, same answer. Doing it once is not a behaviour change, and the
+ * comment-stripping — a split, a filter and a join over several thousand files — was the larger half
+ * of the cost, not the reading.
+ */
+let cachedSources: { rel: string; code: string }[] | null = null;
+function sourceFiles(): { rel: string; code: string }[] {
+  if (cachedSources) return cachedSources;
+  cachedSources = [];
+  for (const file of walk(SRC)) {
+    if (/[\\/]node_modules[\\/]/.test(file)) continue;
+    const rel = file.slice(SRC.length).split('\\').join('/');
+    // This file names every forbidden shape in order to test for it.
+    if (rel.endsWith('ddl-transaction.test.ts')) continue;
+    const text = readFileSync(file, 'utf8');
+    // Comments discuss the old shape at length; only real calls matter.
+    cachedSources.push({ rel, code: text.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n') });
+  }
+  return cachedSources;
+}
+
 describe('the guarded DDL body carries no transaction control', () => {
   it('sets both bounds and opens no transaction of its own', () => {
     const body = guardedDdlBody('CREATE TABLE IF NOT EXISTS x (id int)');
@@ -73,13 +104,7 @@ describe('nothing sends DDL through the simple protocol on its own any more', ()
 
   it('has exactly one sender, and it opens its transaction through the driver', () => {
     const offenders: string[] = [];
-    for (const file of walk(SRC)) {
-      if (/[\\/]node_modules[\\/]/.test(file)) continue;
-      const rel = file.slice(SRC.length).split('\\').join('/');
-      if (rel.endsWith('ddl-transaction.test.ts')) continue;
-      const text = readFileSync(file, 'utf8');
-      // Comments discuss the old shape at length; only real calls matter.
-      const code = text.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    for (const { rel, code } of sourceFiles()) {
       if (!/\.simple\(\)/.test(code)) continue;
       if (ALLOWED[rel]) continue;
       offenders.push(rel);
@@ -103,13 +128,8 @@ describe('nothing sends DDL through the simple protocol on its own any more', ()
 
   it('leaves no BEGIN/COMMIT pair inside a string a DRIVER executes', () => {
     const offenders: string[] = [];
-    for (const file of walk(SRC)) {
-      if (/[\\/]node_modules[\\/]/.test(file)) continue;
-      const rel = file.slice(SRC.length).split('\\').join('/');
-      if (rel.endsWith('ddl-transaction.test.ts')) continue;
+    for (const { rel, code } of sourceFiles()) {
       if (ALLOWED_BEGIN[rel]) continue;
-      const text = readFileSync(file, 'utf8');
-      const code = text.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
       if (/`BEGIN;/.test(code) || /'BEGIN;/.test(code) || /"BEGIN;/.test(code)) offenders.push(rel);
     }
     expect(offenders).toEqual([]);
