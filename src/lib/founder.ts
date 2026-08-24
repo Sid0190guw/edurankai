@@ -154,8 +154,44 @@ async function takenStartSet(): Promise<Set<string>> {
   return set;
 }
 
-export async function getAvailableSlots(dateStr: string): Promise<{ iso: string; label: string }[]> {
-  const f = await getFounder();
+// =================================================================================================
+// NEITHER DATABASE READ DEPENDS ON THE DATE, SO NEITHER BELONGS INSIDE A LOOP OVER DATES
+// =================================================================================================
+//
+// getAvailableSlots() read the settings row and the booked-slot set on EVERY call, and
+// /api/founder/slots calls it once per day for the next twenty-one. Measured on the live site, that
+// endpoint answered in 5.1-5.2 SECONDS, four times running — forty-two round trips to fetch the same
+// two answers twenty-one times, at the ~130ms this deployment pays for each one.
+//
+// docs note in src/lib/db/index.ts: round-trip COUNT is the lever on this deployment, not distance.
+// The functions sit next to the database; what costs is asking it forty-two times.
+//
+// Everything between the two reads and the result is arithmetic — timezone conversion, window
+// walking, set membership. So the reads become a CONTEXT fetched once, and the arithmetic becomes a
+// pure function of (context, date). getAvailableSlots keeps its exact signature and behaviour for
+// the single-date callers; the calendar strip builds one context and maps over it.
+export interface SlotContext {
+  settings: FounderSettings;
+  /** Start times already taken, rounded to the minute — see takenStartSet(). */
+  taken: Set<string>;
+}
+
+/**
+ * The two reads, done once.
+ *
+ * Sequential rather than Promise.all: this pool holds a handful of connections per instance and two
+ * statements pipelined down one of them is the shape that produced "bind message supplies 36
+ * parameters" elsewhere in this codebase. Two round trips is already the fix.
+ */
+export async function slotContext(): Promise<SlotContext> {
+  const settings = await getFounder();
+  const taken = await takenStartSet();
+  return { settings, taken };
+}
+
+/** Pure. Same arithmetic that lived in getAvailableSlots, with the two reads lifted out. */
+export function slotsForDate(ctx: SlotContext, dateStr: string): { iso: string; label: string }[] {
+  const f = ctx.settings;
   const tz = f.timezone || 'Asia/Kolkata';
   const [y, mo, d] = (dateStr || '').split('-').map(Number);
   if (!y || !mo || !d) return [];
@@ -166,9 +202,11 @@ export async function getAvailableSlots(dateStr: string): Promise<{ iso: string;
   const now = Date.now();
   const minStart = now + (f.minNoticeHours || 0) * 3600e3;
   const maxStart = now + (f.maxDaysAhead || 30) * 86400e3;
-  const step = (f.slotMinutes || 30) + (f.bufferMinutes || 0);
+  // A NON-POSITIVE STEP IS AN INFINITE LOOP, and the loop below is inside a request. `|| 30` catches
+  // zero and null but not a negative, which the settings form can store; one clamp is cheaper than
+  // the hung invocation it prevents.
+  const step = Math.max(1, (f.slotMinutes || 30) + (f.bufferMinutes || 0));
   const dur = (f.slotMinutes || 30);
-  const taken = await takenStartSet();
   const out: { iso: string; label: string }[] = [];
   for (const w of windows) {
     const [sh, sm] = String(w[0]).split(':').map(Number);
@@ -178,19 +216,34 @@ export async function getAvailableSlots(dateStr: string): Promise<{ iso: string;
     for (; cur + dur * 60000 <= winEnd + 1000; cur += step * 60000) {
       if (cur < minStart || cur > maxStart) continue;
       const iso = roundMinIso(cur);
-      if (taken.has(iso)) continue;
+      if (ctx.taken.has(iso)) continue;
       out.push({ iso, label: labelInTz(cur, tz) });
     }
   }
   return out;
 }
 
+export async function getAvailableSlots(dateStr: string): Promise<{ iso: string; label: string }[]> {
+  return slotsForDate(await slotContext(), dateStr);
+}
+
+/** Every date in one pass, on ONE context. What the calendar strip wants. */
+export async function getAvailableSlotsForDates(
+  dates: string[],
+): Promise<Map<string, { iso: string; label: string }[]>> {
+  const ctx = await slotContext();
+  const out = new Map<string, { iso: string; label: string }[]>();
+  for (const d of dates) out.set(d, slotsForDate(ctx, d));
+  return out;
+}
+
 export async function isSlotAvailable(iso: string): Promise<boolean> {
   const t = new Date(iso); if (isNaN(t.getTime())) return false;
-  const f = await getFounder();
-  const dateStr = dateStrInTz(t.getTime(), f.timezone || 'Asia/Kolkata');
+  // One context, not getFounder() followed by a getAvailableSlots() that reads it again.
+  const ctx = await slotContext();
+  const dateStr = dateStrInTz(t.getTime(), ctx.settings.timezone || 'Asia/Kolkata');
   const target = roundMinIso(t.getTime());
-  return (await getAvailableSlots(dateStr)).some((s) => roundMinIso(new Date(s.iso).getTime()) === target);
+  return slotsForDate(ctx, dateStr).some((s) => roundMinIso(new Date(s.iso).getTime()) === target);
 }
 
 // Create a pending service record (text or consult). Returns the booking id so
