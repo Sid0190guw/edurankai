@@ -9,6 +9,25 @@ import { MessageSpool, newQueueEntry } from '../src/queue/message-spool.js';
 import { tempDir, removeDir } from './helpers/harness.js';
 import type { OutboundMessage } from '../src/contracts/index.js';
 
+
+/**
+ * A `now` for recoverStale() that is BOUNDED AT BOTH ENDS, and both bounds are load-bearing.
+ *
+ * ABOVE the clock tick: on Windows Date.now() advances in ~15.6ms steps while the filesystem stamps
+ * mtime far more finely, so a file written microseconds ago can carry an mtimeMs LATER than a
+ * Date.now() floored to the previous tick. recoverStale skips on `now - mtimeMs < leaseMs`, so with
+ * leaseMs 0 that difference goes negative and the orphan is left alone. That is the flake: the
+ * original `Date.now() + 1` failed two runs in three here.
+ *
+ * BELOW the claim window: recoverStale writes `entry.nextAttemptAt = now`, so whatever is passed
+ * here becomes the recovered message's due time. A margin of 60s made every one of these tests fail
+ * deterministically instead -- recoverStale succeeded, and then claimBatch(_, Date.now() + 1000)
+ * correctly found nothing due for another 59 seconds.
+ *
+ * 100ms clears the tick six times over and leaves the message due well inside the 1000ms window.
+ */
+const STALE_NOW = () => Date.now() + 100;
+
 function message(id: string, to: string[] = ['a@example.com']): OutboundMessage {
   return { messageId: id, from: 'sender@edurankai.in', to, subject: 'Subject ' + id, text: 'body' };
 }
@@ -80,7 +99,14 @@ describe('MessageSpool', () => {
     await fs.link(path.join(spool.dir('queue'), name), path.join(spool.dir('processing'), name));
     // ...and the process dies here, before the unlink.
 
-    expect(await spool.recoverStale(0, Date.now() + 1)).toBe(1);
+    // STALE_NOW, not Date.now() + 1. On Windows Date.now() ticks about every 15.6ms while the
+    // filesystem stamps mtime at a far finer resolution, so the file written microseconds ago can
+    // carry an mtimeMs LATER than a Date.now() that was floored to the previous tick. recoverStale
+    // skips on `now - mtimeMs < leaseMs`, so with leaseMs 0 that difference goes negative and the
+    // orphan is not recovered -- this assertion failed on two runs in three. The margin is not a
+    // fudge: leaseMs 0 already means "everything in processing/ is stale", so any `now` past the
+    // file's stamp expresses the same intent without depending on clock granularity.
+    expect(await spool.recoverStale(0, STALE_NOW())).toBe(1);
     const claimed = await spool.claimBatch(10, Date.now() + 1000);
     expect(claimed).toHaveLength(1);
     expect((await spool.stats(Date.now() + 1000)).total).toBe(1);
@@ -143,7 +169,14 @@ describe('MessageSpool', () => {
     // Nothing releases it — the worker is gone. Before the lease expires it stays put; after, it
     // comes back and is due immediately.
     expect(await spool.recoverStale(600_000, Date.now())).toBe(0);
-    expect(await spool.recoverStale(0, Date.now() + 1)).toBe(1);
+    // STALE_NOW, not Date.now() + 1. On Windows Date.now() ticks about every 15.6ms while the
+    // filesystem stamps mtime at a far finer resolution, so the file written microseconds ago can
+    // carry an mtimeMs LATER than a Date.now() that was floored to the previous tick. recoverStale
+    // skips on `now - mtimeMs < leaseMs`, so with leaseMs 0 that difference goes negative and the
+    // orphan is not recovered -- this assertion failed on two runs in three. The margin is not a
+    // fudge: leaseMs 0 already means "everything in processing/ is stale", so any `now` past the
+    // file's stamp expresses the same intent without depending on clock granularity.
+    expect(await spool.recoverStale(0, STALE_NOW())).toBe(1);
 
     const [recovered] = await spool.claimBatch(1, Date.now() + 1000);
     expect(recovered.entry.messageId).toBe('m1');

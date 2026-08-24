@@ -903,8 +903,17 @@ DO $mp$
   FOR t IN
   SELECT c.table_name FROM information_schema.columns c
   WHERE c.table_schema = 'public' AND c.column_name = 'updated_at' AND c.table_name LIKE 'mp\_%'
+  AND NOT EXISTS (
+  SELECT 1
+  FROM pg_trigger g
+  JOIN pg_class cl ON cl.oid = g.tgrelid
+  JOIN pg_namespace n ON n.oid = cl.relnamespace
+  WHERE n.nspname = 'public'
+  AND cl.relname = c.table_name
+  AND g.tgname = 'trg_' || c.table_name || '_touch'
+  AND NOT g.tgisinternal
+  )
   LOOP
-  EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I', 'trg_' || t.table_name || '_touch', t.table_name);
   EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION mp_touch_updated_at()',
   'trg_' || t.table_name || '_touch', t.table_name);
   END LOOP;

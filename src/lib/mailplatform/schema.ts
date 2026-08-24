@@ -876,14 +876,43 @@ export const MP_TRIGGERS: string[] = [
   `CREATE OR REPLACE FUNCTION mp_touch_updated_at() RETURNS trigger AS $mp$
      BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
    $mp$ LANGUAGE plpgsql`,
+  // CREATE THE MISSING ONES. DO NOT RE-CREATE THE PRESENT ONES.
+  //
+  // This used to DROP and then CREATE the trigger on every mp_ table it found, unconditionally. On
+  // this database that is 47 tables, so 94 DDL commands on every call — and Supabase installs an
+  // event trigger (extensions.pgrst_ddl_watch on ddl_command_end) that answers each one with a
+  // schema-reload notification to PostgREST. With 500+ relations each reload is an introspection
+  // query expensive enough to hit PostgREST's own statement timeout, and a failed load retries at
+  // 1-2-4-8-16s. Ninety-four of those from one function call is the reload storm in the 2026-08-24
+  // logs, and this was its single largest contributor.
+  //
+  // The NOT EXISTS against pg_trigger makes the loop body run only for a table that genuinely has no
+  // trigger yet. In steady state it executes NOTHING and fires NOTHING; on a first run it creates
+  // what is missing; when a new mp_ table is added it creates exactly one.
+  //
+  // tgisinternal is excluded because foreign keys and constraints are implemented as internal
+  // triggers — counting one of those as ours would skip a table that has no touch trigger at all.
+  //
+  // The db.execute chokepoint already refuses this whole block in production, so this is not what
+  // stops the storm today. It is what makes the block safe for the moment somebody sets
+  // SCHEMA_BOOTSTRAP=on to apply a migration, which is precisely when 94 notifications would land.
   `DO $mp$
    DECLARE t record;
    BEGIN
      FOR t IN
        SELECT c.table_name FROM information_schema.columns c
        WHERE c.table_schema = 'public' AND c.column_name = 'updated_at' AND c.table_name LIKE 'mp\\_%'
+         AND NOT EXISTS (
+           SELECT 1
+             FROM pg_trigger g
+             JOIN pg_class cl ON cl.oid = g.tgrelid
+             JOIN pg_namespace n ON n.oid = cl.relnamespace
+            WHERE n.nspname = 'public'
+              AND cl.relname = c.table_name
+              AND g.tgname = 'trg_' || c.table_name || '_touch'
+              AND NOT g.tgisinternal
+         )
      LOOP
-       EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I', 'trg_' || t.table_name || '_touch', t.table_name);
        EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION mp_touch_updated_at()',
                       'trg_' || t.table_name || '_touch', t.table_name);
      END LOOP;
