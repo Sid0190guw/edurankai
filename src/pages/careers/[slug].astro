@@ -3,7 +3,7 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 import BeforeYouApply from '@/components/BeforeYouApply.astro';
 import { db } from '@/lib/db';
 import { roles, departments } from '@/lib/db/schema';
-import { eq, and, ne } from 'drizzle-orm';
+import { eq, and, ne, sql } from 'drizzle-orm';
 import { getRoleAicte } from '@/lib/role-aicte';
 import {
   resolveEngagementPolicy, applyRoleOverrides, jobPostingWorkHours,
@@ -36,7 +36,28 @@ const r = found[0];
 //
 // The status comes from effectiveJobStatus(), which is deadline-aware: a posting whose deadline has
 // passed is closed whether or not anybody remembered to change its status.
-const roleExtension = await getRoleExtension(String(r.id));
+// THE THREE READS OF `roles` ON THIS PAGE WERE THREE ROUND TRIPS FOR ONE ROW.
+//
+// Measured on the live site: six postings, 1.88-2.23 SECONDS each, reproducibly. Nothing here is a
+// slow query — the page asked the database seven times in a row and paid ~130ms for each answer.
+// src/lib/db/index.ts spends its whole header arguing that the round-trip COUNT is the lever on this
+// deployment rather than the distance to the database, and this is what that costs on a page Google
+// indexes.
+//
+// The fee columns are added by a runtime ALTER and are not in the Drizzle schema, so they cannot ride
+// along on the select above. They CAN ride alongside the extension read, which is already asking this
+// same row for its other non-Drizzle columns. Two statements, one wait.
+//
+// SEPARATELY CONSTRUCTED, WHICH IS THE PART THAT MATTERS HERE. src/lib/xscale/roles-ext.ts carries a
+// long note about `bind message supplies 36 parameters, but prepared statement requires 34` — one
+// shared `sql` fragment reused by two statements pipelined down one connection under prepare:false.
+// These two share nothing: getRoleExtension builds its own statement, and the fee query is written
+// out below. Concurrency is safe when the fragments are not shared; it is only the sharing that bit.
+const [roleExtension, feeRow] = await Promise.all([
+  getRoleExtension(String(r.id)),
+  db.execute(sql`SELECT application_fee_amount, application_fee_currency FROM roles WHERE slug = ${slug} LIMIT 1`)
+    .catch(() => [] as any),
+]);
 const jobStatus = effectiveJobStatus({
   jobStatus: roleExtension.jobStatus,
   isOpen: r.isOpen,
@@ -59,30 +80,45 @@ const closedNote = jobStatus.publicNote;
 const workMode = resolveWorkMode(r.engagementType, r.level, r.location);
 const locationText = displayLocation(r.engagementType, r.level, r.location);
 
-// The application_fee_amount / application_fee_currency columns are added via
-// runtime ALTER and aren't in the Drizzle schema, so fetch them separately.
+// The application_fee_amount / application_fee_currency columns are added via a runtime ALTER and are
+// not in the Drizzle schema. The row was fetched alongside the extension above; this only reads it.
+// postgres-js resolves execute() to a PLAIN ARRAY — `r.rows[0]` has broken this project before.
 let roleFeeAmount: number | null = null;
 let roleFeeCurrency = 'CHF';
-try {
-  const { sql } = await import('drizzle-orm');
-  const feeRow = await db.execute(sql`SELECT application_fee_amount, application_fee_currency FROM roles WHERE slug = ${slug} LIMIT 1`);
+{
   const feeRs = (Array.isArray(feeRow) ? feeRow : ((feeRow as any)?.rows || [])) as any[];
   if (feeRs[0]) {
     roleFeeAmount = feeRs[0].application_fee_amount != null ? Number(feeRs[0].application_fee_amount) : null;
     roleFeeCurrency = feeRs[0].application_fee_currency || 'CHF';
   }
-} catch (_) {}
+}
 
-const deptResult = await db.select().from(departments).where(eq(departments.id, r.departmentId)).limit(1);
+// ---- FOUR INDEPENDENT READS, ONE WAIT --------------------------------------------------------
+//
+// The department, the AICTE fields, the division and the related postings do not depend on each
+// other. They were four sequential awaits, which on this deployment is four round trips and about
+// half a second of a two-second page, spent waiting rather than computing.
+//
+// The division is the only one that had to come after anything: it needs divisionId, which arrives
+// with the extension above. That is why this wave sits here rather than higher up.
+//
+// FOUR IS WITHIN THE POOL. src/lib/db/index.ts holds max:5 per instance, so these do not queue
+// against each other — and every one is a separately constructed statement, per the note above.
+//
+// `relatedRoles` moved up from further down the file for this. It is read only by the template, so
+// nothing between here and there depended on its position.
+const [deptResult, aicte, division, relatedRoles] = await Promise.all([
+  db.select().from(departments).where(eq(departments.id, r.departmentId)).limit(1),
+  getRoleAicte(r.id),
+  roleExtension.divisionId ? getDivisionById(roleExtension.divisionId) : Promise.resolve(null),
+  db.select({
+    slug: roles.slug,
+    title: roles.title,
+    level: roles.level,
+    engagementType: roles.engagementType,
+  }).from(roles).where(and(eq(roles.departmentId, r.departmentId), ne(roles.id, r.id), eq(roles.isOpen, true))).limit(4),
+]);
 const deptName = deptResult.length > 0 ? deptResult[0].name : 'EduRankAI';
-
-// AICTE-portal-format fields (optional; blank for most permanent/senior roles).
-const aicte = await getRoleAicte(r.id);
-
-// ---- RESEARCH FACETS (Extreme-Scale department; null on every other role) --------------------
-// getRoleExtension() was already called above, because the closed-state decision needs job_status
-// from it. Nothing here re-queries.
-const division = roleExtension.divisionId ? await getDivisionById(roleExtension.divisionId) : null;
 const classification = classificationDef(roleExtension.researchClassification);
 const evidence = classificationEvidence(
   roleExtension.researchClassification, roleExtension.scaleMinExp, roleExtension.scaleMaxExp,
@@ -131,13 +167,6 @@ const engagementCredits = aicteCreditEquivalent(engagement);
 const engagementHeading = engagementIsCounted
   ? 'How this ' + engagement.label.toLowerCase() + ' is structured'
   : 'How working time works at this level';
-
-const relatedRoles = await db.select({
-  slug: roles.slug,
-  title: roles.title,
-  level: roles.level,
-  engagementType: roles.engagementType
-}).from(roles).where(and(eq(roles.departmentId, r.departmentId), ne(roles.id, r.id), eq(roles.isOpen, true))).limit(4);
 
 const levelColors: Record<string, string> = {
   'C-Level': 'bg-plum-bg text-plum border-plum-border',
