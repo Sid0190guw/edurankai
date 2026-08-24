@@ -173,6 +173,136 @@ export function registerAbortedTransactionHealer(fn: AbortedTransactionHealer): 
   abortedTxnHealer = fn;
 }
 
+// -------------------------------------------------------------------------------------------------
+// THE WEDGED INSTANCE, AND WHY EVERYTHING ABOVE THIS LINE COULD NOT FIX IT
+// -------------------------------------------------------------------------------------------------
+//
+// MEASURED ON THE LIVE SITE, 2026-08-25, 01:35-01:50 IST. Twelve cache-busted requests to
+// /api/health, which is two statements and nothing else:
+//
+//   eleven answered in 129-138ms          -- warm connection, the database is entirely healthy
+//   one fresh instance                    -- dbCircuit.timeouts 1, on its very first read
+//
+// And in the same minutes, EVERY sequential request landed on one warm instance that answered:
+//
+//   {"status":"down","database":{"ok":false,"latencyMs":-1},"dbCircuit":{"timeouts":29,"open":true},
+//    "lastDbFailure":null}
+//
+// Twenty-nine timeouts on one instance, climbing, with `lastDbFailure` NULL. That null is the whole
+// diagnosis. recordDriverFailure() above fires on any rejection from the work promise, including the
+// abandoned one arriving late; a null after twenty-nine timeouts means the driver never errored and
+// never answered. Not CONNECT_TIMEOUT -- connect_timeout is 10s and would have rejected. Not
+// statement_timeout -- that is 30s in the startup packet and would have rejected. The statement
+// never reached Postgres at all: the transaction pooler accepted the connection, completed
+// authentication, and then swallowed the query, which is the exact failure src/lib/db/index.ts
+// documents at the top of its own header.
+//
+// WHAT THAT COSTS, AND WHY IT NEVER ENDS. withDbTimeout sheds the WAIT and not the WORK -- it says
+// so about itself. postgres-js does not cancel the statement and does not hand the connection back
+// until the server answers, and here the server never will. So each swallowed query permanently
+// removes one of POOL_MAX slots from that instance. Five of them and the instance can never read the
+// database again; Vercel keeps routing to it because it is warm; and NOTHING IN THIS CODEBASE COULD
+// REBUILD THE POOL. The circuit breaker made the failure fast. It never made it recoverable, and a
+// breaker on a pool that cannot heal is just a faster way to report a dead instance.
+//
+// From outside, that is a portal that renders its cards from the connections that still work and
+// shows "some of this page could not be read" for the ones that do not -- getting worse on every
+// request, for the life of the instance.
+//
+// SO THE POOL HAS TO BE REPLACEABLE, and only src/lib/db/index.ts can replace it. This module
+// imports nothing, deliberately, so it registers the same way the ROLLBACK sweep does.
+//
+// TWO TRIGGERS, BOTH NARROW:
+//
+//   1. `capacity` waits are abandoned AT ONCE. That is the wedge stated exactly -- every slot the
+//      pool has is held by a query that has not answered -- and it fires before the instance has
+//      failed anything else.
+//   2. The circuit opens. By then three consecutive bounded waits have timed out and every read in
+//      the instance is being refused anyway, so there is nothing left to protect.
+//
+// A RESET IS CHEAP AND A RESET IS NOT FREE, WHICH IS WHY BOTH TRIGGERS ARE NARROW. Rebuilding is
+// lazy -- no connection is opened until the next query -- but that next query then pays the ~810ms
+// handshake this deployment's whole pool configuration exists to avoid. It must never fire on a
+// database that is merely slow.
+// THE RESETTER REPORTS WHETHER IT ACTUALLY DISCARDED A POOL, and that return value is not a
+// courtesy. src/lib/db/index.ts debounces the rebuild by thirty seconds, so a request inside that
+// window is a no-op — and clearing the abandoned tally for a pool that was never replaced would hide
+// the wedge until five MORE slots were lost. On a refusal the tally stands, so the next abandonment
+// after the window asks again.
+type PoolResetter = (reason: string) => boolean;
+let poolResetter: PoolResetter | null = null;
+let poolCapacity = 0;
+let poolResets = 0;
+
+/**
+ * Called once by src/lib/db/index.ts, which owns the pool this replaces.
+ *
+ * `capacity` is POOL_MAX. It is passed rather than imported for the reason stated in this module's
+ * header: nothing here may reach the driver, and a second copy of the number would drift.
+ */
+export function registerPoolResetter(fn: PoolResetter, capacity: number): void {
+  poolResetter = fn;
+  poolCapacity = Math.max(1, Math.floor(capacity) || 1);
+}
+
+// -------------------------------------------------------------------------------------------------
+// HOW MANY WAITS ARE ABANDONED RIGHT NOW
+// -------------------------------------------------------------------------------------------------
+//
+// Incremented when a bound elapses, decremented if that work EVER settles afterwards. On a healthy
+// database it returns to zero within seconds of any slow query; on a wedged pool it climbs and stays
+// there, because the answer that would decrement it is the answer that is never coming.
+//
+// THE EPOCH IS NOT DECORATION. After a reset the old connections are destroyed, so the waits still
+// counted against them must not decrement the NEW pool's tally when their promises finally settle or
+// reject. Each waiter remembers the epoch it was counted in and only decrements its own.
+let abandonedNow = 0;
+let poolEpoch = 0;
+
+/** A bound elapsed. Returns the epoch this abandonment belongs to. */
+function noteAbandoned(): number {
+  abandonedNow += 1;
+  const epoch = poolEpoch;
+  if (poolCapacity > 0 && abandonedNow >= poolCapacity) {
+    requestPoolReset('every pool slot is held by a query that never answered');
+  }
+  return epoch;
+}
+
+/** That work finally settled, one way or the other. Only its own epoch's tally may move. */
+function noteAbandonReleased(epoch: number): void {
+  if (epoch !== poolEpoch) return;
+  abandonedNow = Math.max(0, abandonedNow - 1);
+}
+
+/**
+ * Replace the pool, if anything can.
+ *
+ * Never throws: it is called from failure paths only, and a recovery that can fail a request is
+ * worse than the fault it recovers from. The debounce lives in src/lib/db/index.ts next to the
+ * client it guards, so this may be called freely.
+ */
+function requestPoolReset(reason: string): void {
+  if (!poolResetter) return;
+  let applied = false;
+  try { applied = poolResetter(reason) === true; } catch { /* a recovery may not become the failure */ }
+  if (applied) {
+    poolEpoch += 1;
+    abandonedNow = 0;
+    poolResets += 1;
+  }
+  console.error(JSON.stringify({
+    ts: new Date().toISOString(), level: 'error', event: 'db.pool_reset_requested',
+    reason, applied, epoch: poolEpoch, resets: poolResets,
+    abandoned: abandonedNow, capacity: poolCapacity,
+  }));
+}
+
+/** For /api/health and /admin/ops: how often this process has had to throw its pool away. */
+export function dbPoolResetState(): { resets: number; abandoned: number; capacity: number } {
+  return { resets: poolResets, abandoned: abandonedNow, capacity: poolCapacity };
+}
+
 /** Is this the error that means the connection is unusable rather than the query wrong? */
 export function isAbortedTransaction(e: any): boolean {
   const code = String(e?.cause?.code || e?.code || '');
@@ -308,12 +438,17 @@ function noteTimeout(label: string, cosmetic = false): void {
   // Only the run of failures opens it. A single slow read is logged and otherwise costs nothing:
   // its own caller already received a DbTimeoutError and will degrade that one panel.
   const threshold = openAfter();
-  if (consecutiveTimeouts >= threshold) openedAt = Date.now();
+  const opening = consecutiveTimeouts >= threshold;
+  if (opening) openedAt = Date.now();
   console.error(JSON.stringify({
     ts: new Date().toISOString(), level: 'error', event: 'db.timeout',
     label, timeouts: timeoutCount, consecutive: consecutiveTimeouts,
-    opened: consecutiveTimeouts >= threshold, openAfter: threshold, cooldownMs: cooldownMs(),
+    opened: opening, openAfter: threshold, cooldownMs: cooldownMs(),
   }));
+  // TRIGGER 2. The circuit is open, so every read in this instance is already being refused without
+  // waiting — there is no working traffic left for a reset to interrupt. Debounced downstream, so an
+  // instance that re-opens the circuit every cooldown does not rebuild its pool every cooldown.
+  if (opening) requestPoolReset('the circuit opened after ' + consecutiveTimeouts + ' consecutive timeouts');
 }
 
 /**
@@ -360,16 +495,22 @@ export function withDbTimeout<T>(work: Promise<T>, label: string, ms: number = D
   const startedAt = Date.now();
   let settled = false;
   let timer: ReturnType<typeof setTimeout>;
+  // -1 until the bound elapses. It becomes the epoch this wait was abandoned in, which is the only
+  // tally a late answer is allowed to move — see noteAbandonReleased().
+  let abandonEpoch = -1;
   const observed = Promise.resolve(work).then(
     (v) => {
       if (!settled) { settled = true; noteSuccess(); return v; }
       // The abandoned attempt landing after its caller gave up. It must NOT close the circuit — the
       // paragraph above is entirely about why — but it is the difference between a database that is
-      // slow and one that is gone, and that is worth one line.
+      // slow and one that is gone, and that is worth one line. It DOES release the pool slot it was
+      // holding, which is the difference between a slot that is busy and a slot that is lost.
+      if (abandonEpoch >= 0) noteAbandonReleased(abandonEpoch);
       noteLateAnswer(label, Date.now() - startedAt, ms);
       return v;
     },
     (e) => {
+      if (settled && abandonEpoch >= 0) noteAbandonReleased(abandonEpoch);
       recordDriverFailure(label, e, Date.now() - startedAt, settled ? 'abandoned' : 'raced');
       throw e;
     },
@@ -380,6 +521,11 @@ export function withDbTimeout<T>(work: Promise<T>, label: string, ms: number = D
       timer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        // COUNTED BEFORE THE BREAKER IS TOLD, so trigger 1 (every slot lost) can fire on a pool that
+        // is wedged without the circuit ever having opened — which is the order the live failure
+        // actually happens in. A cosmetic wait still holds a real connection: it is excluded from the
+        // breaker's evidence, never from the pool's.
+        abandonEpoch = noteAbandoned();
         noteTimeout(label, opts?.cosmetic === true);
         reject(new DbTimeoutError(label, ms));
       }, ms);

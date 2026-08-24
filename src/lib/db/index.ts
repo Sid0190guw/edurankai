@@ -4,7 +4,7 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import * as schema from './schema';
 import { ddlPermitted, isDdlStatement, noteSuppressedDdl } from '@/lib/schema-bootstrap';
-import { registerAbortedTransactionHealer } from '@/lib/db-timeout';
+import { registerAbortedTransactionHealer, registerPoolResetter } from '@/lib/db-timeout';
 
 // Try .env on local dev
 try {
@@ -342,6 +342,72 @@ export function healAbortedTransactions(): Promise<number> {
   return _healing;
 }
 
+// -------------------------------------------------------------------------------------------------
+// THROWING THE POOL AWAY, BECAUSE A CONNECTION THAT IS NEVER ANSWERED IS NEVER GIVEN BACK
+// -------------------------------------------------------------------------------------------------
+//
+// The measurement and the reasoning are in src/lib/db-timeout.ts, above registerPoolResetter().
+// The short version, from the live site on 2026-08-25: one warm instance answering every request
+// with `{"database":{"ok":false,"latencyMs":-1},"dbCircuit":{"timeouts":29},"lastDbFailure":null}`
+// while eleven of twelve fresh instances read the same database in 129-138ms.
+//
+// `lastDbFailure: null` after twenty-nine timeouts is the proof: the driver never errored. The
+// pooler swallowed the queries, postgres-js is still waiting for answers that are not coming, and
+// every one of those waits is holding one of the five slots this file spends its entire header
+// arguing about. Neither connect_timeout (10s) nor statement_timeout (30s) can end a statement the
+// upstream server never received. healAbortedTransactions() above cannot help either — there is no
+// aborted transaction, and the ROLLBACK it would send would queue behind the same swallowed query.
+//
+// So the only recovery is to stop using those sockets. This is that.
+//
+// LAZY, WHICH IS WHAT MAKES IT SAFE. Nothing is reconnected here: `_client` and `_real` are dropped
+// and the next connect() builds a fresh pool on demand. If the instance is about to be recycled
+// anyway, the reset costs nothing at all.
+//
+// THE OLD CLIENT IS DESTROYED IN THE BACKGROUND AND NEVER AWAITED. end() without options waits for
+// in-flight queries to finish, and the queries in flight here are by definition the ones that never
+// finish — awaiting it would hang the very request that is trying to recover. `{ timeout: 0 }`
+// destroys the sockets immediately, and even that is fired and forgotten, because a recovery path
+// that can itself hang is not a recovery path.
+//
+// DEBOUNCED, and deliberately by a window longer than the circuit's own cooldown. An instance whose
+// database is genuinely gone re-opens the circuit every cooldown; without this it would rebuild its
+// pool every cooldown too, paying an ~810ms handshake each time to discover the same thing.
+const POOL_RESET_DEBOUNCE_MS = 30_000;
+let _poolResetAt = 0;
+let _poolResetCount = 0;
+
+/**
+ * Drop this instance's connection pool. The next query builds a new one.
+ *
+ * Returns true if a pool was actually discarded. Never throws: every caller is a failure path.
+ */
+export function resetDbPool(reason: string): boolean {
+  const now = Date.now();
+  if (now - _poolResetAt < POOL_RESET_DEBOUNCE_MS) return false;
+  const old = _client;
+  // Nothing to throw away. Not an error: an instance can open the circuit before it ever connected.
+  if (!old) return false;
+  _poolResetAt = now;
+  _poolResetCount += 1;
+  _client = null;
+  _real = null;
+  try {
+    Promise.resolve(old.end({ timeout: 0 })).catch(() => {});
+  } catch { /* the sockets are being abandoned either way */ }
+  console.error(JSON.stringify({
+    ts: new Date().toISOString(), level: 'error', event: 'db.pool_reset',
+    reason, resets: _poolResetCount, poolMax: POOL_MAX,
+    note: 'the pool was discarded; the next query opens a new one',
+  }));
+  return true;
+}
+
+/** For /api/health: how many times this instance has had to discard its pool. */
+export function dbPoolResets(): number {
+  return _poolResetCount;
+}
+
 // A DATABASE THAT NEVER ANSWERS MUST NOT BECOME A PAGE THAT NEVER LOADS.
 //
 // On 2026-08-23 at 07:01 UTC every route that queries Postgres stopped responding — not with an
@@ -370,6 +436,7 @@ export {
   isDbUnavailable,
   dbCircuitOpen,
   dbCircuitState,
+  dbPoolResetState,
   withDbTimeout,
   isAbortedTransaction,
 } from '@/lib/db-timeout';
@@ -381,3 +448,8 @@ export {
 // instead of turning it into "Sign-in is temporarily unavailable". Importing this module is already
 // unavoidable for anything that queries, so there is no path where a query runs and this has not.
 registerAbortedTransactionHealer(() => healAbortedTransactions());
+
+// AND SO IS THE POOL REPLACEMENT, for the same reason and by the same route. POOL_MAX is passed
+// rather than imported: db-timeout.ts imports nothing, and a second copy of that number in a module
+// that cannot see this one is a number that drifts.
+registerPoolResetter((reason: string) => resetDbPool(reason), POOL_MAX);

@@ -48,7 +48,7 @@ import { withDbTimeout } from '@/lib/db';
 // refused instantly rather than waited out), and is request-time DDL still being attempted by
 // bootstraps that never got onto ensureOnce. A guard nobody can see is the next invisible incident,
 // and this project has already shipped one bootstrap that reported success while doing nothing.
-import { dbCircuitState, lastDbFailure } from '@/lib/db-timeout';
+import { dbCircuitState, dbPoolResetState, lastDbFailure } from '@/lib/db-timeout';
 import { suppressedDdlState } from '@/lib/schema-bootstrap';
 
 export const prerender = false;
@@ -108,6 +108,10 @@ export const GET: APIRoute = async () => {
       // request path; the sample list names which statements, in the function logs.
       ddl: (() => { const d = suppressedDdlState(); return { bootstrapEnabled: d.bootstrapEnabled, suppressed: d.count, samples: d.samples.slice(0, 5) }; })(),
       dbCircuit: dbCircuitState(),
+      // How many times this instance has had to discard a pool whose connections were never
+      // answered, and how many waits are abandoned right now. A rising `resets` with a healthy
+      // `database` above is the wedged-instance recovery working, not a fault.
+      dbPool: dbPoolResetState(),
       lastDbFailure: publicDbFailure(),
       release: { commit: h.release.shortCommit, ref: h.release.ref, environment: h.release.environment, region: h.release.region, known: h.release.known },
       checks: h.checks.map((c) => ({
@@ -151,6 +155,10 @@ export const GET: APIRoute = async () => {
         ...(e?.label ? { label: String(e.label) } : {}),
       },
       dbCircuit: dbCircuitState(),
+      // How many times this instance has had to discard a pool whose connections were never
+      // answered, and how many waits are abandoned right now. A rising `resets` with a healthy
+      // `database` above is the wedged-instance recovery working, not a fault.
+      dbPool: dbPoolResetState(),
       lastDbFailure: publicDbFailure(),
       release: { commit: marker.shortCommit, ref: marker.ref, environment: marker.environment, region: marker.region, known: marker.known },
       checks: [{ name: 'database', ok: false, critical: true, detail: message }],

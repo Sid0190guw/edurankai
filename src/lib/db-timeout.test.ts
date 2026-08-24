@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   withDbRetry, withDbTimeout, DbTimeoutError, DbCircuitOpenError, isDbUnavailable, dbCircuitState,
-  lastDbFailure, clearDbFailure,
+  lastDbFailure, clearDbFailure, registerPoolResetter, dbPoolResetState,
 } from './db-timeout';
 
 const never = () => new Promise<never>(() => {});
@@ -213,5 +213,98 @@ describe('lastDbFailure', () => {
       if (prev === undefined) delete process.env.DB_CIRCUIT_OPEN_AFTER;
       else process.env.DB_CIRCUIT_OPEN_AFTER = prev;
     }
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// REPLACING A POOL WHOSE CONNECTIONS ARE NEVER ANSWERED
+// -------------------------------------------------------------------------------------------------
+//
+// The failure these guard is in src/lib/db-timeout.ts above registerPoolResetter(), measured on the
+// live site: one warm instance with twenty-nine timeouts, `lastDbFailure: null`, while the same
+// database answered every fresh instance in 130ms. Nothing could rebuild the pool, so the instance
+// stayed dead for its whole life.
+//
+// Two things here are load-bearing and both are the kind a refactor inverts. A reset must fire when
+// the pool has provably lost every slot EVEN IF the circuit never opened — a cosmetic wait is
+// excluded from the breaker's evidence but still holds a real connection. And a late answer must
+// give its slot back, or a database that is merely slow would rebuild its pool for nothing.
+describe('pool reset', () => {
+  let reasons: string[] = [];
+
+  beforeEach(async () => {
+    await resetCircuit();
+    reasons = [];
+    // Capacity 3 rather than the real POOL_MAX so a test does not have to strand five promises.
+    registerPoolResetter((r: string) => { reasons.push(r); return true; }, 3);
+    // Whatever a previous test stranded, clear it: three abandoned waits reach the capacity and the
+    // request zeroes the tally. Any reason recorded here belongs to the cleanup, not to the test.
+    while (dbPoolResetState().abandoned > 0) {
+      await withDbTimeout(never(), 'test.drain', 5, { cosmetic: true }).catch(() => {});
+    }
+    reasons = [];
+    await resetCircuit();
+  });
+  afterEach(async () => { await resetCircuit(); });
+
+  it('discards the pool once every slot is held by a wait that never answered', async () => {
+    // Cosmetic on purpose: these must NOT open the circuit, so the only thing that can request a
+    // reset here is the abandoned-slot count itself.
+    for (let i = 0; i < 3; i++) {
+      await withDbTimeout(never(), 'test.wedge' + i, 5, { cosmetic: true }).catch(() => {});
+    }
+    expect(dbCircuitState().open).toBe(false);
+    expect(reasons.length).toBe(1);
+    expect(reasons[0]).toMatch(/never answered/);
+    // The tally is zeroed by the request: those connections are gone, not busy.
+    expect(dbPoolResetState().abandoned).toBe(0);
+  });
+
+  it('does NOT discard the pool for a database that is merely slow', async () => {
+    // Each of these answers after its caller gave up. That is a late answer, not a lost slot, and
+    // the connection goes back to the pool — so however many there are, none may add up to a reset.
+    for (let i = 0; i < 5; i++) {
+      const late = settle(20).then(() => 'late');
+      await withDbTimeout(late, 'test.slow' + i, 5, { cosmetic: true }).catch(() => {});
+      await late;
+      // Give the late-answer handler its microtask before the next round is counted.
+      await settle(1);
+    }
+    expect(dbPoolResetState().abandoned).toBe(0);
+    expect(reasons).toEqual([]);
+  });
+
+  it('discards the pool when the circuit opens, which is the state with nothing left to protect', async () => {
+    const prev = process.env.DB_CIRCUIT_OPEN_AFTER;
+    process.env.DB_CIRCUIT_OPEN_AFTER = '2';
+    try {
+      await withDbTimeout(never(), 'test.gate1', 5).catch(() => {});
+      expect(reasons).toEqual([]);
+      await withDbTimeout(never(), 'test.gate2', 5).catch(() => {});
+      expect(dbCircuitState().open).toBe(true);
+      expect(reasons.length).toBe(1);
+      expect(reasons[0]).toMatch(/circuit opened/);
+    } finally {
+      if (prev === undefined) delete process.env.DB_CIRCUIT_OPEN_AFTER;
+      else process.env.DB_CIRCUIT_OPEN_AFTER = prev;
+    }
+  });
+
+  it('a late answer from a DISCARDED pool never credits a slot back to the new one', async () => {
+    // Two waits stranded, then a third that reaches capacity and requests the reset. The first two
+    // belong to the old pool; when they finally answer they must not make the new pool look emptier
+    // than it is, or the next genuine wedge would need extra losses to be seen.
+    const a = settle(40).then(() => 'a');
+    const b = settle(40).then(() => 'b');
+    await withDbTimeout(a, 'test.old-a', 5, { cosmetic: true }).catch(() => {});
+    await withDbTimeout(b, 'test.old-b', 5, { cosmetic: true }).catch(() => {});
+    expect(dbPoolResetState().abandoned).toBe(2);
+    await withDbTimeout(never(), 'test.old-c', 5, { cosmetic: true }).catch(() => {});
+    expect(reasons.length).toBe(1);
+    expect(dbPoolResetState().abandoned).toBe(0);
+    // Now the two stragglers land, against a pool that no longer exists.
+    await Promise.all([a, b]);
+    await settle(5);
+    expect(dbPoolResetState().abandoned).toBe(0);
   });
 });
