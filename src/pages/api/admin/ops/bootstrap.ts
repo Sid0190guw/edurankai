@@ -43,6 +43,14 @@ const MODULES: Array<{ name: string; run: () => Promise<unknown> }> = [
   // The erasure RECORD, not the erasure. Its table had no exported ensure until now, so its only
   // creator was somebody's first face deletion — the one moment you least want to find it missing.
   { name: 'face-erasure-log', run: async () => (await import('@/lib/auth/face-erasure')).ensureFaceErasureSchema() },
+  // THE FOUR THAT WERE MONITORED BUT NOT CREATABLE. /api/health has reported on these for a while
+  // and this endpoint could not make any of them, so the button's own label - "create the missing
+  // tables now" - was a promise it could not keep for a quarter of the list it verifies against. A
+  // label that overpromises is the same defect as an empty state that overclaims.
+  { name: 'daily-report', run: async () => (await import('@/lib/daily-report')).ensureDailyReportSchema() },
+  { name: 'learning-progress', run: async () => (await import('@/lib/learning-progress')).ensureLearningProgressSchema() },
+  { name: 'clock-out-checks', run: async () => (await import('@/lib/attendance-verify-clockout')).ensureClockOutSchema() },
+  { name: 'lms', run: async () => (await import('@/lib/lms/schema')).ensureLmsSchema() },
   // These two have no exported ensure; a harmless READ triggers the same internal bootstrap.
   { name: 'error-log', run: async () => (await import('@/lib/logger')).recentErrors(1) },
   { name: 'job-queue', run: async () => (await import('@/lib/job-queue')).claimBatch(0) },
