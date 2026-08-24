@@ -281,9 +281,25 @@ export function evaluate(profile: CareerProfile, role: MatchableRole): MatchResu
         weight: W.approach * need * sig.value * sig.confidence,
       });
     }
-  } else if (Object.keys(dims).length > 0) {
-    unknowns.push('This posting has no research classification recorded, so we could not compare it against how you said you like to work.');
   }
+  // AN UNKNOWN A CANDIDATE CANNOT ACT ON IS NOT THEIRS TO CARRY.
+  //
+  // This branch used to add "This posting has no research classification recorded, so we could not
+  // compare it against how you said you like to work." It is true, and it appeared on almost every
+  // card — research_classification is populated on the 179 postings imported from
+  // src/data/xscale-catalog.ts and on nothing else, so for the other eight hundred-odd it is true
+  // permanently and there is nothing the person reading it can do about it.
+  //
+  // That is OUR data-entry backlog wearing the clothes of a caveat about them. Read on a card it
+  // says "something is broken here", which is exactly how it was read.
+  //
+  // THE RULE, APPLIED FROM HERE ON: `unknowns` holds only things the CANDIDATE can resolve — that
+  // they have not said where they are in their career, that they have not said what they have
+  // worked with. Gaps in our own tagging belong on /admin/roles/intelligence, where somebody can
+  // actually fix them, and that page now reports the coverage directly from the database.
+  //
+  // Nothing is being hidden by this. The card still lists only contributions that really counted;
+  // it just no longer pads them with a confession about our bookkeeping.
 
   /* ---- stage ---- */
 

@@ -135,6 +135,59 @@ export async function openPostingCount(): Promise<number> {
   }
 }
 
+/* -------------------------------------------------------------------------------- tagging coverage */
+
+export interface TaggingCoverage {
+  open: number;
+  classified: number;
+  disciplined: number;
+  runged: number;
+  /** False means the read failed — NOT that nothing is tagged. */
+  readable: boolean;
+}
+
+/**
+ * HOW MUCH OF THE CATALOGUE THE RANKER CAN ACTUALLY USE.
+ *
+ * The approach signal — matching how somebody said they like to think against what kind of work a
+ * posting is — can only fire on a posting whose research_classification is recorded. That column is
+ * populated by the import at /admin/roles/divisions and by nothing else, so on a catalogue where
+ * the import has not run it is NULL everywhere and the strongest evidence the ranker has is
+ * permanently unavailable.
+ *
+ * This used to be reported to CANDIDATES, once per card, as "this posting has no research
+ * classification recorded". True, unactionable by them, and on most cards it read as a fault. It
+ * belongs here instead, where the person reading it can run the import.
+ *
+ * ONE QUERY, THREE COUNTS. FILTER is an aggregate filter, not a second scan.
+ */
+export async function taggingCoverage(): Promise<TaggingCoverage> {
+  const empty: TaggingCoverage = { open: 0, classified: 0, disciplined: 0, runged: 0, readable: false };
+  try {
+    const r = await db.execute(sql`
+      SELECT COUNT(*)::int AS open,
+             COUNT(*) FILTER (WHERE research_classification IS NOT NULL)::int AS classified,
+             COUNT(*) FILTER (WHERE COALESCE(array_length(skill_categories, 1), 0) > 0)::int AS disciplined,
+             COUNT(*) FILTER (WHERE career_level IS NOT NULL)::int AS runged
+        FROM roles
+       WHERE is_open = TRUE`);
+    const row = rowsOf(r)[0];
+    if (!row) return empty;
+    return {
+      open: Number(row.open) || 0,
+      classified: Number(row.classified) || 0,
+      disciplined: Number(row.disciplined) || 0,
+      runged: Number(row.runged) || 0,
+      readable: true,
+    };
+  } catch (e: any) {
+    // The additive columns may not exist at all, which is itself the answer: nothing is tagged.
+    // readable:false so the surface says "could not read" rather than "nothing is tagged".
+    console.error('[career-intel/retrieve] taggingCoverage failed:', reasonOf(e));
+    return empty;
+  }
+}
+
 /* ------------------------------------------------------------------------------ the discovery */
 
 export interface DiscoveryTeam {
