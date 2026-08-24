@@ -3,6 +3,19 @@ import { validateSessionToken } from '@/lib/auth/session';
 import { readSessionCookie, setSessionCookie, clearSessionCookie } from '@/lib/auth/cookie';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+// A DATABASE THAT WILL NOT ANSWER MUST PRODUCE A PAGE, NOT A GATEWAY TIMEOUT.
+//
+// Every gate below awaits the database, and none of them were bounded. postgres-js has no query
+// timeout, so when the transaction pooler accepts the connection and then never answers -- the
+// documented failure of 2026-08-23, and the shape of the /admin 504s -- these awaits never settled
+// and Vercel killed the function. The visitor got FUNCTION_INVOCATION_TIMEOUT from the platform;
+// nothing in the application ever decided anything.
+//
+// Bounded, they fail CLOSED and they fail FAST, which is the only honest answer: we cannot verify
+// who you are, so nothing is served and nothing is assumed. Deliberately not a redirect: sending an
+// unverifiable session to /admin/login would sign people out over a five-second blip, and the login
+// page needs the same database to do anything useful anyway.
+import { withDbTimeout, isDbUnavailable } from '@/lib/db-timeout';
 import { getViewableSectionKeys, can } from '@/lib/auth/permissions';
 import { canOpenAdmin } from '@/lib/auth/admin-access';
 import { logEvent } from '@/lib/logger';
@@ -222,12 +235,51 @@ function isGatedLab(path: string): boolean {
     || path.startsWith('/aquintutor/teach');
 }
 
-async function hasFaceEnrolled(userId: string): Promise<boolean> {
+// THREE ANSWERS, NOT TWO. `catch (_) { return false }` meant an unreachable database read as "this
+// person has not enrolled a face", and the gate below then bounced EVERY signed-in user -- staff and
+// applicants alike -- to face enrollment, a page that needs the same database to enroll anything. A
+// database blip became a site-wide dead end. 'unknown' is now its own answer and the gate refuses
+// rather than redirects.
+type FaceState = 'enrolled' | 'absent' | 'unknown';
+async function hasFaceEnrolled(userId: string): Promise<FaceState> {
   try {
-    const r = await db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${userId} AND is_active = true LIMIT 1`);
+    const r = await withDbTimeout(
+      db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${userId} AND is_active = true LIMIT 1`),
+      'middleware.faceEnrolled');
     const rows = Array.isArray(r) ? r : ((r as any)?.rows || []);
-    return rows.length > 0;
-  } catch (_) { return false; }
+    return rows.length > 0 ? 'enrolled' : 'absent';
+  } catch (e: any) {
+    if (isDbUnavailable(e)) return 'unknown';
+    // A real query error (a missing table on a fresh database) is still "not enrolled", which is what
+    // this has always done and what keeps first-run enrollment reachable.
+    return 'absent';
+  }
+}
+
+/**
+ * The one response for "we could not reach the database".
+ *
+ * 503 with Retry-After, never a redirect: a redirect to any page that also needs the database is how
+ * a database outage becomes ERR_TOO_MANY_REDIRECTS on top of an outage. no-store so a CDN cannot pin
+ * it after the database recovers. The text says what is actually true, because "something went wrong"
+ * has cost this project hours before.
+ */
+function dbUnavailable(where: string): Response {
+  console.error(JSON.stringify({
+    ts: new Date().toISOString(), level: 'error', event: 'middleware.db_unavailable', gate: where,
+  }));
+  return new Response(
+    '<!doctype html><meta charset="utf-8"><title>Temporarily unavailable</title>'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#0b0b0f;color:#e7e7ea;'
+    + 'display:grid;place-items:center;min-height:100vh;margin:0;padding:24px}div{max-width:34rem}'
+    + 'h1{font-size:1.25rem;margin:0 0 .75rem}p{line-height:1.6;color:#9aa6b6;margin:0 0 .75rem}'
+    + 'a{color:#FF7040}</style>'
+    + '<div><h1>We cannot reach the database right now</h1>'
+    + '<p>Your sign-in could not be verified, so nothing is being shown rather than something wrong. '
+    + 'This is a database problem on our side, not a problem with your account.</p>'
+    + '<p><a href="">Try again</a></p></div>',
+    { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Retry-After': '15', 'cache-control': 'no-store' } });
 }
 
 // Public pages safe to edge-cache for ANONYMOUS visitors so repeat hits are served
@@ -369,7 +421,10 @@ export const onRequest = defineMiddleware(async (context, next) => {
     const tokenEarly = readSessionCookie(context.cookies);
     let userEarly: any = null;
     if (tokenEarly) {
-      const v = await validateSessionToken(tokenEarly);
+      // Bounded like the main path below. A timeout here redirects to the access page rather than
+      // hanging; this branch already fails closed on every other error.
+      const v = await withDbTimeout(validateSessionToken(tokenEarly), 'middleware.session.visvambhara')
+        .catch(() => null);
       if (v) userEarly = v.user;
     }
     if (!userEarly) {
@@ -425,7 +480,18 @@ export const onRequest = defineMiddleware(async (context, next) => {
     }
     return next();
   }
-  const result = await validateSessionToken(token);
+  // BOUNDED, AND A TIMEOUT IS NOT THE SAME AS AN INVALID SESSION. Falling into the !result branch on
+  // an unreachable database would clear a perfectly good cookie and sign the whole company out over
+  // a pooler hiccup, so the two outcomes are kept apart: no session is a redirect, no answer is a 503.
+  let result: Awaited<ReturnType<typeof validateSessionToken>>;
+  try {
+    result = await withDbTimeout(validateSessionToken(token), 'middleware.session');
+  } catch (e: any) {
+    if (isDbUnavailable(e)) return dbUnavailable('session');
+    // Any other failure is treated as it always was: no valid session.
+    console.error('[middleware] session validation failed', e?.cause?.message || e?.message);
+    result = null as any;
+  }
   if (!result) {
     clearSessionCookie(context.cookies);
     context.locals.user = null;
@@ -512,7 +578,15 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // ERR_TOO_MANY_REDIRECTS and locked every wrongly-promoted intern out of the portal was exactly a
   // role test on one side and a rights test on the other.
   if (isAdminPath(path) && !isAdminGuardExempt(path)) {
-    const verdict = await canOpenAdmin(result.user as any);
+    // canOpenAdmin already fails closed on a query error (it returns deny('lookup-failed')). What it
+    // could not do is fail closed on NO ANSWER, and a deny-by-default gate that hangs is not a gate.
+    let verdict: Awaited<ReturnType<typeof canOpenAdmin>>;
+    try {
+      verdict = await withDbTimeout(canOpenAdmin(result.user as any), 'middleware.canOpenAdmin');
+    } catch (e: any) {
+      if (isDbUnavailable(e)) return dbUnavailable('admin-gate');
+      throw e;
+    }
     if (!verdict.allowed) {
       // Logged as a refused ATTEMPT, not an error: the path and the user id are what turn "someone
       // reported they can see the pipeline" into a specific account on a specific screen.
@@ -535,7 +609,15 @@ export const onRequest = defineMiddleware(async (context, next) => {
   if (result.user.role !== 'applicant' && path.startsWith('/admin/') && path !== '/admin/login' && path !== '/admin/logout') {
     const sectionKey = resolveAdminSection(path);
     if (sectionKey) {
-      const allowed = await getViewableSectionKeys(result.user);
+      // A section gate that cannot read the grants must not silently become allow-by-default (it
+      // returns null for "no gating"), and must not hang either. 503 on no answer.
+      let allowed: Awaited<ReturnType<typeof getViewableSectionKeys>>;
+      try {
+        allowed = await withDbTimeout(getViewableSectionKeys(result.user), 'middleware.sectionKeys');
+      } catch (e: any) {
+        if (isDbUnavailable(e)) return dbUnavailable('section-gate');
+        throw e;
+      }
       if (allowed && !allowed.has(sectionKey)) {
         return new Response(null, { status: 302, headers: { Location: '/admin?denied=' + encodeURIComponent(sectionKey) } });
       }
@@ -547,8 +629,12 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // every applicant must complete Face 2FA before accessing the portal.
   // Login / signup / enrollment flows are exempt via isExempt(path) above.
   if (!isExempt(path) && isProtected(path)) {
-    const hasFace = await hasFaceEnrolled(result.user.id);
-    if (!hasFace) {
+    const faceState = await hasFaceEnrolled(result.user.id);
+    // 'unknown' means the database did not answer. Bouncing to face enrollment on that would send
+    // every signed-in person to a page that cannot enroll anything, which is a dead end dressed up as
+    // a security step.
+    if (faceState === 'unknown') return dbUnavailable('face-2fa');
+    if (faceState === 'absent') {
       // For applicants, route them through the portal-styled face-setup
       // page so the back-link goes back to /portal. Staff use /enroll-face.
       const target = result.user.role === 'applicant'

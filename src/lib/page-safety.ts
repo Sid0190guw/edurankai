@@ -27,6 +27,55 @@
 //     failed SQL text; the real reason is on `.cause`.
 //
 // Nothing here touches a database, and nothing here decides authorization.
+//
+// -------------------------------------------------------------------------------------------------
+// EVERY READ HERE IS NOW BOUNDED, AND THAT IS THE POINT OF THIS PASS
+// -------------------------------------------------------------------------------------------------
+//
+// safeRows() caught errors. It did not bound the WAIT, and those are different failures. On
+// 2026-08-23 and again in the 504s on /admin, the transaction pooler accepted the connection and
+// authenticated fine, then never answered the query, because it had no upstream session to hand it
+// to. postgres-js has no query timeout of its own, so `await run()` never settled: no error to
+// catch, no empty list to report, just a render that hung until the platform killed the function and
+// served FUNCTION_INVOCATION_TIMEOUT. A helper whose entire reason for existing is "never confuse
+// unknown with none" was reporting neither.
+//
+// withDbTimeout() had existed for exactly this since the August incident and was used in ONE file on
+// the whole deployment (src/pages/api/health.ts), because it lived next to the postgres driver and a
+// module documented as touching no database could not import it. It now lives in
+// src/lib/db-timeout.ts, which imports nothing, so the bound reaches the place every guarded read on
+// this site actually goes: here.
+//
+// The circuit breaker in that module is what makes this enough on a page with a dozen reads. Bounding
+// each read at 8s turns a dead database into a dozen consecutive 8s waits, which is still a gateway
+// timeout -- so the FIRST timeout opens a circuit and the remaining reads are refused instantly.
+// A page with twelve reads costs one timeout, not twelve, and renders its "we could not read this"
+// states instead of dying. Nothing retries; the only thing that happens is that waiting stops.
+import { withDbTimeout } from '@/lib/db-timeout';
+
+/**
+ * One structured line per guarded read, for the slow ones and the failures only.
+ *
+ * WHY NOT EVERY READ. An admin page runs a dozen of these and the site runs thousands per minute;
+ * logging all of them buries the two lines that matter. A read that succeeded quickly is not
+ * information. A read that took over a second, or did not answer at all, is the whole story of an
+ * incident -- and until now neither was recorded anywhere with a duration attached.
+ *
+ * Never logs a value, only a label, a duration and a reason. Labels are written by us in this
+ * repository, never taken from a request.
+ */
+function noteRead(label: string, startedAt: number, ok: boolean, reason?: string): void {
+  const ms = Date.now() - startedAt;
+  if (ok && ms < 1000) return;
+  console.error(JSON.stringify({
+    ts: new Date().toISOString(),
+    level: ok ? 'warn' : 'error',
+    event: ok ? 'db.read_slow' : 'db.read_failed',
+    label,
+    ms,
+    ...(reason ? { reason: reason.slice(0, 300) } : {}),
+  }));
+}
 
 /** The real Postgres reason. `e.message` on a drizzle error is only the SQL that failed. */
 export function dbReason(e: any): string {
@@ -58,19 +107,23 @@ export function toRows<T = any>(r: any): T[] {
  * `label` is what gets logged, so make it the thing a human would search for
  * ("[hr-attendance] day roster"), not "query failed".
  */
-export async function safeRows<T = any>(label: string, run: () => Promise<any>): Promise<ReadResult<T>> {
+export async function safeRows<T = any>(label: string, run: () => Promise<any>, ms?: number): Promise<ReadResult<T>> {
+  const started = Date.now();
   try {
-    return { ok: true, rows: toRows<T>(await run()), error: null };
+    const res = { ok: true, rows: toRows<T>(await withDbTimeout(run(), label, ms)), error: null };
+    noteRead(label, started, true);
+    return res;
   } catch (e: any) {
     const reason = dbReason(e);
+    noteRead(label, started, false, reason);
     console.error(label + ' could not be read -', reason);
     return { ok: false, rows: [], error: reason };
   }
 }
 
 /** The single-row shape of the same idea. `row` is null both when there is none and when the read failed. */
-export async function safeRow<T = any>(label: string, run: () => Promise<any>): Promise<{ ok: boolean; row: T | null; error: string | null }> {
-  const res = await safeRows<T>(label, run);
+export async function safeRow<T = any>(label: string, run: () => Promise<any>, ms?: number): Promise<{ ok: boolean; row: T | null; error: string | null }> {
+  const res = await safeRows<T>(label, run, ms);
   return { ok: res.ok, row: res.rows[0] ?? null, error: res.error };
 }
 
