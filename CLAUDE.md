@@ -40,7 +40,10 @@ a read of employee PII is not a lesser act than a write.
 - **No emojis anywhere** — inline monochrome SVG only.
 - **Never name a competitor or any real company** in user-facing copy.
 - EduRankAI is **the technology platform**; accredited partners award credentials. Never claim to be
-  a university or to confer degrees. Internships are unpaid unless a stipend is explicitly recorded.
+  a university or to confer degrees. **Every internship and apprenticeship is unpaid.** The single exception is the flagship
+  LLM Engineering Internship (`llm-engineering-intern`). Paid/unpaid is decided by the slug
+  allowlist in `src/lib/compensation-text.ts` (`publicCompensation()`), never inferred from the
+  stored `roles.salary` text - a free-text row once advertised an unpaid intern role as paid.
 - Automated proctoring and detection are **advisory only** — a human decides.
 
 ## Traps that have caused production outages here

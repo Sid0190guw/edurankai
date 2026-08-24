@@ -2,7 +2,7 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { roles } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
-import { stripOwnershipPromise } from '@/lib/compensation-text';
+import { publicCompensation } from '@/lib/compensation-text';
 import { displayLocation, resolveWorkMode, workModeLabel } from '@/lib/work-mode';
 
 export const prerender = false;
@@ -73,7 +73,10 @@ export const GET: APIRoute = async () => {
         // distinction (on-site everywhere, hybrid available on trainee engagements only).
         remote: false,
         workMode: workModeLabel(resolveWorkMode(r.engagementType, r.level, r.location)),
-        salary: stripOwnershipPromise(r.salary),
+        // null for every internship and apprenticeship but the paid LLM programme. A board that
+        // mirrors this feed cannot be made to un-publish a pay figure, so an unpaid trainee role
+        // must never leave here carrying one, whatever /admin/roles has stored against it.
+        salary: publicCompensation(r),
         industry: 'Education',
         applyUrl: `${SITE}/careers/${r.slug}`,
         closesAt: r.applicationDeadline ? new Date(r.applicationDeadline as any).toISOString() : null,

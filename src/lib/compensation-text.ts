@@ -43,3 +43,65 @@ export function stripOwnershipPromise(raw: unknown): string | null {
   if (!cleaned || PROMISE.test(cleaned)) return null;
   return cleaned;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trainee pay policy
+//
+// Every internship and apprenticeship at EduRankAI is UNPAID. There is exactly one exception: the
+// flagship Large Language Model (LLM) Engineering Internship (src/data/catalog-flagship-ai.ts,
+// slug 'llm-engineering-intern'), whose performance-based stipend is part of its published terms.
+//
+// Paid/unpaid is decided HERE, from the slug, and never from the stored pay text. `roles.salary`
+// is free text typed into /admin/roles and imported from several catalog files, and a row for
+// 'ai-research-intern' carried "up to INR 3 LPA + research stipend" — which /careers/<slug> read as
+// "this trainee role genuinely pays" and published as a gold "This is a paid internship" callout,
+// and which /api/jobs-feed syndicated off-site, where a wrong pay claim cannot be recalled once a
+// board has mirrored it. Reading the intent out of free text means any edit, import or seed can
+// advertise an unpaid internship as paid. An allowlist cannot: a wrong row now renders as unpaid,
+// which is the truth for every internship but one.
+//
+// Adding a slug here is a compensation policy decision, not a code change.
+const PAID_TRAINEE_SLUGS = new Set(['llm-engineering-intern']);
+
+/** The word, not the prefix: "Internal Auditor" is not an internship, and \b will not match it
+ *  because "internal" continues into more word characters. Hyphens in a slug ARE word boundaries,
+ *  so 'visvambhara-aerospace-research-engineering-intern' matches. */
+const TRAINEE_WORD = /\b(?:intern|interns|internship|internships|apprentice|apprenticeship)\b/i;
+
+/** A role whose engagement is training: internship or apprenticeship.
+ *
+ *  Four fields are checked, not one, because they are stored independently and disagree in
+ *  production: 'visvambhara-aerospace-research-engineering-intern' is level 'Intern' with
+ *  engagementType 'Full-Time', and reading either field alone gets it wrong. The title and slug are
+ *  the last line: a row can be mislabelled in both structured fields, but a posting called
+ *  "... Intern" is an internship whatever the columns say. Every check only ever moves a role
+ *  towards unpaid, which is the safe direction - the cost of a false positive is a hidden pay band
+ *  on a permanent role, the cost of a false negative is advertising a stipend nobody will be paid. */
+export function isTraineeRole(
+  role: { level?: unknown; engagementType?: unknown; title?: unknown; slug?: unknown } | null | undefined,
+): boolean {
+  const level = String(role?.level ?? '').trim().toLowerCase();
+  const engagement = String(role?.engagementType ?? '').trim().toLowerCase();
+  if (level === 'intern' || level === 'apprentice') return true;
+  if (engagement === 'internship' || engagement === 'apprenticeship') return true;
+  return TRAINEE_WORD.test(String(role?.title ?? '')) || TRAINEE_WORD.test(String(role?.slug ?? ''));
+}
+
+/** True only for the one trainee programme that actually pays a stipend. */
+export function isPaidTrainee(slug: unknown): boolean {
+  return PAID_TRAINEE_SLUGS.has(String(slug ?? '').trim().toLowerCase());
+}
+
+/**
+ * The compensation string a public surface may publish for a role, or null when there is none to
+ * publish. Null means "show the unpaid notice / omit the field" — never "compensation unknown".
+ *
+ * Unpaid trainee roles return null whatever their stored salary says. Everything else is the
+ * ownership-sanitised pay string, so this is the single call a public surface needs.
+ */
+export function publicCompensation(
+  role: { slug?: unknown; level?: unknown; engagementType?: unknown; salary?: unknown } | null | undefined,
+): string | null {
+  if (isTraineeRole(role) && !isPaidTrainee(role?.slug)) return null;
+  return stripOwnershipPromise(role?.salary);
+}

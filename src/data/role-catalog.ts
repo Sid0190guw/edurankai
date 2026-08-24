@@ -968,7 +968,7 @@ const HAND_CURATED_ROLES: CatalogRole[] = [
     engagementType: 'Internship',
     location: TRAINEE_LOCATION,
     duration: '6 months',
-    salary: 'Stipend: INR 15,000 - 35,000 per month',
+    salary: 'Unpaid — internship certificate, mentorship, and real project experience',
     about: 'Our aerospace research programme explores autonomous swarm concepts across scales. As an intern you will do real research work — simulation, parametric analysis, documentation of engineering trades — alongside the team, with your contributions credited.',
     responsibilities: [
       'Run and document simulations (flight profiles, CFD-adjacent analysis).',
@@ -991,7 +991,7 @@ const HAND_CURATED_ROLES: CatalogRole[] = [
     engagementType: 'Internship',
     location: TRAINEE_LOCATION,
     duration: '3-6 months',
-    salary: 'Stipend: INR 10,000 - 20,000 per month',
+    salary: 'Unpaid — internship certificate, mentorship, and real project experience',
     about: 'You will design production screens across our ecosystem — not fake briefs. Expect real constraints (accessibility, performance, existing design system), real critique, and shipped work you can point to.',
     responsibilities: [
       'Design flows and screens under mentorship of senior designers.',
@@ -1014,8 +1014,8 @@ const HAND_CURATED_ROLES: CatalogRole[] = [
     engagementType: 'Internship',
     location: 'On-site — your own campus (India)',
     duration: '6 months (renewable)',
-    salary: 'Performance-based rewards + certificate + fee-waiver benefits',
-    about: 'Bring EduRankAI to your campus: run events, help peers use our free tools (resume builder, courses, assessments), and channel student feedback straight to the team. Top ambassadors earn rewards, recommendation letters, and priority consideration for internships.',
+    salary: 'Unpaid — certificate, verifiable credential, and fee-waiver benefits',
+    about: 'Bring EduRankAI to your campus: run events, help peers use our free tools (resume builder, courses, assessments), and channel student feedback straight to the team. It is an unpaid programme: top ambassadors earn recommendation letters, fee-waiver benefits, and priority consideration for internships.',
     responsibilities: [
       'Organise campus events, workshops, and challenges.',
       'Introduce peers to the platform honestly — no spam, no false claims.',
