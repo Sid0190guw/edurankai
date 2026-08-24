@@ -319,9 +319,18 @@ export function evaluate(profile: CareerProfile, role: MatchableRole): MatchResu
       }
     } else if (levelOk) {
       contributions.push({ kind: 'stage', signal: STAGE_TEXT[profile.stage], matched: 'Advertised at ' + role.level + ' level.', weight: W.stageExact * 0.7 * (profile.stageConfidence || 0.6) });
-    } else if (rung === null) {
-      unknowns.push('This posting does not record a career rung, so we could not check it against where you said you are.');
     }
+    // THE TWIN OF THE CLASSIFICATION UNKNOWN, AND IT WAS LEFT BEHIND WHEN THAT ONE WENT.
+    //
+    // This branch used to add "This posting does not record a career rung, so we could not check it
+    // against where you said you are." career_level is filled by the same import as
+    // research_classification and is NULL for the same reason, so it fails the same test: true,
+    // permanent until somebody runs an import, and nothing the person reading it can act on.
+    //
+    // Removing one instance of a pattern and leaving its twin is how a rule becomes a coincidence.
+    // The rung coverage is reported on /admin/roles/intelligence beside the classification coverage,
+    // where it can be fixed. See noCandidateFacingDataGaps() in rank.test.ts, which now enforces the
+    // rule over this whole function rather than trusting it to be remembered.
   } else {
     unknowns.push('You have not told us where you are in your career, which is the single thing that would sharpen this most.');
   }

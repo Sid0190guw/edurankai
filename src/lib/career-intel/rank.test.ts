@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { evaluate, rankAll, groupByTier, tierFor, TIERS, type MatchableRole } from './rank';
 import { explain, NOT_PERSONALISED, COULD_STRENGTHEN_NOTE } from './explain';
 import { emptyProfile, type CareerProfile } from './dimensions';
@@ -188,5 +190,50 @@ describe('it does not throw on anything a database can hand it', () => {
     const p = profileFrom('I like AI and Python.');
     expect(() => evaluate(p, bare)).not.toThrow();
     expect(evaluate(p, bare).tier).toBe('explore');
+  });
+});
+
+describe('an unknown belongs to whoever can resolve it', () => {
+  // =================================================================================================
+  // THE RULE, ENFORCED RATHER THAN REMEMBERED
+  // =================================================================================================
+  //
+  // `unknowns` is rendered to a candidate under "What we could not check". It may hold only things
+  // THEY can resolve — that they have not said where they are in their career, that they have not
+  // said what they have worked with. Both change the moment they answer.
+  //
+  // It may NOT hold gaps in our own data. research_classification and career_level are filled by
+  // the import at /admin/roles/divisions and by nothing else, so on a catalogue where that has not
+  // run they are NULL on every posting: true, permanent, and unactionable by the person reading it.
+  // On nearly every card that does not read as a caveat, it reads as "something is broken here" —
+  // which is exactly how it was read when it shipped.
+  //
+  // Both were removed one at a time, and removing the first while leaving the second is precisely
+  // why this is a scan and not two more assertions. A rule that has to be remembered at each new
+  // `unknowns.push` is a rule that lasts until the next one.
+  const SRC = readFileSync(join(process.cwd(), 'src', 'lib', 'career-intel', 'rank.ts'), 'utf8');
+
+  it('never pushes an unknown that describes the posting rather than the person', () => {
+    const pushes = SRC.match(/unknowns\.push\(\s*'([^']*)'/g) || [];
+    expect(pushes.length).toBeGreaterThan(0);
+    const offenders = pushes
+      .map((m) => (/unknowns\.push\(\s*'([^']*)'/.exec(m) || [])[1] || '')
+      .filter((text) => !/^You /.test(text));
+    // Named in the failure, so the next person sees WHICH sentence rather than a count.
+    expect(offenders.join(' | ')).toBe('');
+  });
+
+  it('says nothing about our own tagging on a posting with none of it', () => {
+    const bare = ROLE({ researchClassification: null, careerLevel: null, skillCategories: [] });
+    const p = profileFrom('I want research work and I am a final-year undergraduate.');
+    const joined = evaluate(p, bare).unknowns.join(' ');
+    expect(joined).not.toMatch(/research classification/i);
+    expect(joined).not.toMatch(/career rung/i);
+  });
+
+  it('still tells somebody what THEY have not said', () => {
+    const p = profileFrom('I want research work.');
+    const u = evaluate(p, ROLE()).unknowns.join(' ');
+    expect(u).toMatch(/you have not told us/i);
   });
 });
