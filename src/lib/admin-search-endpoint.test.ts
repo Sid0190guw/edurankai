@@ -10,10 +10,20 @@
 // because they are the kind that a later edit removes without any test noticing: a new `db.execute`
 // added straight into a block, or `cosmetic` dropped from the bound. A behaviour test cannot see
 // either.
+// IT LIVES IN src/lib BECAUSE ANYTHING UNDER src/pages IS A ROUTE.
+//
+// This file used to sit beside its subject at src/pages/api/admin/search.test.ts, which reads like
+// good co-location and is not. Astro routes by file path, so the test WAS an endpoint:
+// /api/admin/search.test, built into the server bundle and deployed. Worse, it imports vitest, so
+// vitest, @vitest/* and chai were traced into the production serverless function to satisfy an
+// import that only a test run should ever make.
+//
+// The subject is imported through the '@' alias instead of './search' — vitest.config.ts defines it,
+// and the readFileSync below already addressed the source by repo-relative path, so it is unchanged.
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { likeTerm } from './search';
+import { likeTerm } from '@/pages/api/admin/search';
 
 const SRC = readFileSync(join(process.cwd(), 'src', 'pages', 'api', 'admin', 'search.ts'), 'utf8');
 

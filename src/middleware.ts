@@ -339,6 +339,11 @@ const PUBLIC_CACHEABLE_EXACT = new Set([
   '/', '/careers', '/about', '/research', '/team', '/ecosystem',
   '/developers', '/faq', '/accessibility', '/policy', '/hei', '/events',
   '/resume',
+  // Added with the Fluid Active CPU pass. Same test as every entry above it: the page is public,
+  // it is the same bytes for every visitor, and it is not a form. /labs and /academy are catalogue
+  // indexes, /verify is the credential-check LANDING (the per-certificate /verify/<cert> page is
+  // one person's record and is deliberately NOT here), /products/meet is a product page.
+  '/labs', '/academy', '/verify', '/products/meet',
 ]);
 function isPublicCacheable(path: string): boolean {
   if (!path) return false;
@@ -348,6 +353,9 @@ function isPublicCacheable(path: string): boolean {
   if (/^\/ecosystem\/[^/]+$/.test(path)) return true;
   // Public role-detail pages (job descriptions); the two form pages stay dynamic.
   if (/^\/careers\/[^/]+$/.test(path) && path !== '/careers/fee-waiver' && path !== '/careers/hr-support') return true;
+  // Top-level product pages. One segment only: /products/visvambhara is a public description,
+  // /products/visvambhara/access is the gated door to it and must never be served from a cache.
+  if (/^\/products\/[^/]+$/.test(path)) return true;
   return false;
 }
 

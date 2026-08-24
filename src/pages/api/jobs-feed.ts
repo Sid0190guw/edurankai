@@ -49,12 +49,29 @@ function description(r: any): string {
 }
 
 function json(body: any, status = 200) {
+  // A FAILED FEED IS NEVER CACHED, AND THE REASON IS NOT PERFORMANCE.
+  //
+  // This helper served one header set for every status, so the catch below -- which answers a
+  // database failure with `{ count: 0, jobs: [] }` and a 500 -- went out as
+  // `public, s-maxage=3600`. Vercel's CDN caches on status, so one transient pooler hiccup pinned
+  // an EMPTY feed at the edge for an hour.
+  //
+  // Empty is not a neutral answer here. The mirror at www.vrittih.online reconciles against this
+  // URL: a role that stops appearing is deactivated there. An hour of cached emptiness would have
+  // read as "EduRankAI closed every posting" and unpublished the lot, from a blip that had already
+  // passed. The same rule the middleware applies to a degraded page render -- never let a broken
+  // response outlive the break -- applies to the feed a third party acts on.
+  //
+  // The happy path keeps the hour: the mirror only pulls daily, and stale-while-revalidate means a
+  // pull at minute 61 is served instantly from the edge while one request refreshes behind it.
+  const ok = status >= 200 && status < 300;
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       'content-type': 'application/json; charset=utf-8',
-      // Cache at the edge for an hour; the mirror only pulls daily.
-      'cache-control': 'public, max-age=3600, s-maxage=3600',
+      'cache-control': ok
+        ? 'public, max-age=0, s-maxage=3600, stale-while-revalidate=86400'
+        : 'no-store',
       'access-control-allow-origin': '*',
     },
   });

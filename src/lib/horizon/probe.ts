@@ -38,10 +38,32 @@ import {
   specifierMatches,
 } from '@/lib/orphan-detect';
 
-/** The repository root, resolved from this file rather than from process.cwd(). */
+/**
+ * The repository root.
+ *
+ * RESOLVED FROM process.cwd(), AND THE OLD import.meta.url VERSION SHIPPED 20 MB TO PRODUCTION.
+ *
+ * This used to be `new URL('../../../', import.meta.url)`. In a deployed build that resolves to the
+ * serverless function's own root, and @vercel/nft — which decides what to copy into the function by
+ * statically reading fs calls — could fold that constant, see readdirSync/readFileSync underneath
+ * it, and conclude the whole source tree was a runtime dependency. It copied 821 .astro files, 20 MB,
+ * into every deployment of this site, and then the probe below happily read them.
+ *
+ * So the page that renders this report has been contradicting its own header. It says: "A serverless
+ * bundle does not ship src/ as readable files, so the assessment degrades to `unknown` with the
+ * reason printed." That is the intended behaviour, and it was not the actual behaviour — the source
+ * WAS there, dragged along by this one line, on a plan that meters cold-start CPU.
+ *
+ * process.cwd() fixes both halves at once, and it is not a trick: it is what every other
+ * repo-reading module here already does (src/lib/career-intel/rank.test.ts,
+ * src/lib/xscale/fallback.test.ts, src/lib/era-export.test.ts). nft cannot constant-fold it, so
+ * nothing is copied; and cwd IS the repository root everywhere this probe is meant to run — vitest,
+ * astro dev, and `node dist/server/entry.mjs` started from the checkout. In a Vercel function cwd is
+ * the task directory, src/ is not under it, fileExists() returns false and collect.ts returns
+ * unreadableEvidence() — which is the documented answer, now actually reached.
+ */
 export function repoRoot(): string {
-  // src/lib/horizon/probe.ts -> three levels up.
-  return resolve(new URL('../../../', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+  return resolve(process.cwd());
 }
 
 function abs(repoRelPath: string): string {
