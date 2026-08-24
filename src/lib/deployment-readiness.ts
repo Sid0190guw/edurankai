@@ -8,12 +8,19 @@
 // succeeds, the site loads, the home page looks perfect — and three days later somebody notices that
 // no email has gone out since Tuesday, or that every employee photograph is a broken image.
 //
-// This codebase reads 48 environment variables. /admin/diagnostics checked eight of them. The other
-// forty were the ones nobody would think to re-enter.
+// /admin/diagnostics checked eight environment variables. The rest were the ones nobody would think
+// to re-enter, so this list was written to name every one of them.
 //
 // So each variable below carries the SENTENCE describing what stops working without it, because
 // "RESEND_API_KEY: missing" tells somebody nothing and "password reset emails will not send" tells
 // them whether they can go to bed.
+//
+// THE COUNT IS NOT WRITTEN DOWN HERE ANY MORE, DELIBERATELY. This header used to say "this codebase
+// reads 48 environment variables". By 2026-08-24 the list held 106 entries and the code read about
+// as many, so the sentence had become a confident, checkable, wrong statement in the one file whose
+// entire purpose is to be trusted during a migration. A number maintained by hand rots; the drift
+// gate in deployment-readiness.test.ts recomputes it from source on every `npm test` and fails when
+// the code reads a variable this list does not declare. Ask the gate, not this comment.
 //
 // =================================================================================================
 // THREE KINDS OF BROKEN, AND ONLY ONE OF THEM IS OBVIOUS
@@ -41,6 +48,15 @@ export interface EnvRequirement {
   accountBound?: string;
   /** Set when a NEW value silently invalidates data already stored. */
   mustMatchOld?: string;
+  /**
+   * The variable's real name is this string plus a suffix chosen at runtime, so there is no fixed
+   * key to look up: `DATA_ENCRYPTION_KEY_${keyId}`, `FEATURE_${flag}`. Presence means AT LEAST ONE
+   * matching variable is set — which is the only question that can honestly be asked here, and is
+   * why these carry the loudest mustMatchOld text in the file. A checker that can only compare exact
+   * names reports a whole class of variable as absent, or worse, never mentions it at all: the key
+   * material for every encrypted column in this database was in that blind spot until 2026-08-24.
+   */
+  prefix?: true;
 }
 
 export const REQUIREMENTS: readonly EnvRequirement[] = Object.freeze([
@@ -178,6 +194,23 @@ export const REQUIREMENTS: readonly EnvRequirement[] = Object.freeze([
   { name: 'ACTIVE_DATA_KEY_ID', severity: 'degraded',
     breaks: 'Field-level encryption cannot select its current key, so encrypted writes fail.',
     mustMatchOld: 'Data encrypted under an earlier key id cannot be read once this points elsewhere.' },
+  // THE ONLY UNRECOVERABLE ENTRY IN THIS FILE, AND IT HAD NO ENTRY AT ALL UNTIL 2026-08-24.
+  //
+  // Everything else here can be put right by pasting the correct value in afterwards, or costs a
+  // re-enrolment: new VAPID keys mean people resubscribe, a changed WEBAUTHN_ORIGINS means people
+  // re-enrol a passkey, a new SESSION_SECRET means everybody signs in again. Losing this one is not
+  // in that category. src/lib/crypto/keys.ts holds ONLY key metadata in Postgres — the 32 bytes that
+  // actually decrypt anything live nowhere but this environment variable. Ciphertext whose key
+  // material is gone is not recoverable by resetting anything, because there is nothing left to
+  // reset it from. crypto_keys will still list the key id, which makes the loss look like a
+  // configuration problem right up until somebody works out that it is not.
+  //
+  // Its absence was a blind spot in this checker rather than an oversight in the list: the name is
+  // built at runtime as `DATA_ENCRYPTION_KEY_${keyId}`, and readEnvStatus() could only look up fixed
+  // names, so no exact-name entry could ever have been written for it.
+  { name: 'DATA_ENCRYPTION_KEY_', severity: 'degraded', prefix: true,
+    breaks: 'Field-level encryption has no key material, so every encrypted read and write throws: DKIM private keys for sending domains, and the foundational and intake records that use the envelope.',
+    mustMatchOld: 'CARRY THE EXACT BASE64 VALUES ACROSS, DO NOT GENERATE NEW ONES. This is the one variable in this file whose loss is permanent: the key material exists only here, Postgres holds nothing but the key id, and ciphertext written under a key you no longer have cannot be decrypted by any later fix. Copy DATA_ENCRYPTION_KEY_<keyId> for EVERY key id still referenced by crypto_keys, not just the active one — old rows are still encrypted under retired keys.' },
   { name: 'PUBLIC_RAZORPAY_KEY_ID', severity: 'degraded',
     breaks: 'The payment widget cannot initialise in the browser, so checkout never opens. This is the public half and must match RAZORPAY_KEY_ID.' },
   { name: 'RAZORPAYX_ACCOUNT_NUMBER', severity: 'optional',
@@ -191,6 +224,12 @@ export const REQUIREMENTS: readonly EnvRequirement[] = Object.freeze([
   { name: 'PROCTORING_VENDOR_BASE_URL', severity: 'optional', breaks: 'No external proctoring vendor is called.' },
   { name: 'PROCTORING_WEBHOOK_SECRET', severity: 'optional', breaks: 'Vendor proctoring webhooks are refused.' },
   { name: 'WALLET_BASE_CURRENCY', severity: 'optional', breaks: 'The wallet falls back to its default base currency.' },
+  // Genuinely optional, and listed only so the drift gate has something to match: a flag's value is
+  // a DB override first, this env var second, the catalogue default third (src/lib/feature-flags.ts),
+  // so an environment that sets none of these still resolves every flag. Worth carrying across only
+  // if a surface is being deliberately held shut by one.
+  { name: 'FEATURE_', severity: 'optional', prefix: true,
+    breaks: 'Nothing. Feature flags fall back to their admin toggle, then to the catalogue default.' },
 
   // ---- the transactional email API (src/lib/mailapi) ----
   // MAILAPI_TRACK_SECRET is 'degraded' rather than 'optional' on purpose: without it three
@@ -325,6 +364,20 @@ export const REQUIREMENTS: readonly EnvRequirement[] = Object.freeze([
     breaks: 'Nothing to set — the host injects it. The health endpoint and the metrics payload cannot say which commit is serving, which is the first question asked when two deployments behave differently.' },
 ]);
 
+/**
+ * What to print for a requirement on a screen.
+ *
+ * A prefix entry's `name` is not a variable anybody can set: nothing is called
+ * DATA_ENCRYPTION_KEY_. Printed raw it reads as a truncated name or a typo, and the person it was
+ * written for is on a migration screen looking for something to paste a value into. The suffix is
+ * shown as a placeholder so the shape is obvious at a glance.
+ *
+ * Kept here rather than in the page so every surface renders these the same way.
+ */
+export function displayName(r: EnvRequirement): string {
+  return r.prefix ? `${r.name}<suffix>` : r.name;
+}
+
 export interface EnvStatus extends EnvRequirement {
   present: boolean;
   /** Set when the value is present but suspect — trailing whitespace, most often. */
@@ -338,9 +391,29 @@ export interface EnvStatus extends EnvRequirement {
  * that prints secrets is a worse problem than the one it was built to solve. The one exception is a
  * SHAPE warning (whitespace), which is reported without the value.
  */
+/**
+ * The value to judge a prefix requirement by, or undefined when nothing matches.
+ *
+ * Prefers a match with leading or trailing whitespace, so one damaged key among five is not hidden
+ * behind four good ones — that is the whole reason the shape warning exists. Otherwise any match
+ * will do, because presence is the only thing being claimed.
+ */
+function prefixValue(prefix: string): string | undefined {
+  const values = Object.keys(process.env)
+    .filter((k) => k.startsWith(prefix) && k.length > prefix.length)
+    .map((k) => process.env[k])
+    .filter((v): v is string => typeof v === 'string' && v.length > 0);
+  return values.find((v) => v !== v.trim()) ?? values[0];
+}
+
 export function readEnvStatus(): EnvStatus[] {
   return REQUIREMENTS.map((r) => {
-    const raw = process.env[r.name];
+    // A prefix requirement has no single key to read. Presence is "at least one variable starting
+    // with this", and the whitespace check runs over every match, because the one with a stray
+    // newline is exactly the one nobody would look at.
+    // `const`, not `let`. The narrowing that lets `raw.trim()` below type-check is TypeScript's
+    // aliased-condition analysis through `present`, and that applies only to a const binding.
+    const raw = r.prefix ? prefixValue(r.name) : process.env[r.name];
     const present = typeof raw === 'string' && raw.length > 0;
     let warning: string | null = null;
     if (present && raw !== raw.trim()) {
