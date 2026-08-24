@@ -397,6 +397,18 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   { module: 'Career profiles', table: 'career_profiles', owner: 'src/lib/career-intel/store.ts' },
   { module: 'Career recommendation feedback', table: 'career_feedback_events', owner: 'src/lib/career-intel/store.ts' },
 
+  // INVITATIONS TO APPLY, REGISTERED WITH THE FEATURE FOR THE SAME REASON AS THE TWO ABOVE.
+  //
+  // Created by db/application-invitations-schema.sql, run by hand. The ensure in
+  // src/lib/hiring/invitations.ts is the local-development path and creates nothing in production.
+  //
+  // ITS ABSENCE IS VISIBLE ON TWO SURFACES AND SILENT ON NEITHER, which is why it is worth naming
+  // here rather than relying on that: /admin/applications/invitations reports the failed read
+  // instead of rendering an empty list, and an invitation link resolves to the same "not usable"
+  // page every dead link gets. What absence would NOT do is break an ordinary application — the
+  // fee-waiver lookup falls through to the paid path it would have taken anyway.
+  { module: 'Invitations to apply', table: 'application_invitations', owner: 'src/lib/hiring/invitations.ts' },
+
   // ============================================================================================
   // THE PAGES A PERSON CAN ACTUALLY OPEN, ADDED 2026-08-24 AFTER A REPO-WIDE SWEEP
   // ============================================================================================

@@ -137,6 +137,13 @@ export async function materialiseFromIntent(intentId: string, opts: { paid: bool
   // Shared post-insert work: drop the intent + write the 0-value waiver receipt.
   const finalise = async (newId: string): Promise<string> => {
     await db.execute(sql`DELETE FROM application_intents WHERE id = ${intent.id}`).catch(() => {});
+    // If this person was invited to apply, the invitation is now spent. Bookkeeping only, and it
+    // runs after the application exists — a failure here must never cost somebody their application,
+    // which is why markAppliedForEmail swallows its own errors.
+    try {
+      const { markAppliedForEmail } = await import('@/lib/hiring/invitations');
+      await markAppliedForEmail(String(d.email || intent.email || ''), newId);
+    } catch (_) { /* the module itself logs the reason */ }
     if (opts.waiverGranted) {
       const orderId = 'WAIVER-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
       const notes = JSON.stringify({ waiver: true, waiverReason: opts.waiverReason || 'Application fee waived' });

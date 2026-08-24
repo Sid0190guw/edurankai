@@ -36,6 +36,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
     if (intentId && !appId) {
       const intentRows = await db.execute(sql`
         SELECT i.id, i.role_id, i.level, i.email, i.first_name, i.last_name, i.role_title_snapshot,
+               r.slug AS role_slug,
                r.application_fee_amount AS role_fee, r.engagement_type AS role_engagement
         FROM application_intents i
         LEFT JOIN roles r ON i.role_id = r.id
@@ -56,6 +57,35 @@ export const POST: APIRoute = async ({ request, locals }) => {
           if (newId) return json({ ok: true, alreadyPaid: true, free: true, redirect: '/apply/confirmation?id=' + newId });
         } catch (_) {}
         return json({ ok: true, alreadyPaid: true, free: true, redirect: '/portal' });
+      }
+
+      // INVITED-WITH-THE-FEE-WAIVED SHORT-CIRCUIT. An administrator can waive the fee for one named
+      // person when inviting them (/admin/applications/invitations). The waiver is looked up HERE,
+      // server-side, from the intent's own email — never from anything the browser sent — because a
+      // waiver read from the client is a free application for anyone who edits a request. The
+      // invitation is then marked spent, which is what turns the admin list from a list of sent mail
+      // into a record of who actually applied.
+      try {
+        const { liveInvitationFor, markApplied } = await import('@/lib/hiring/invitations');
+        const invite = await liveInvitationFor(String(intentRow.email || ''), String(intentRow.role_slug || ''));
+        if (invite && invite.waiveFee) {
+          const { materialiseFromIntent } = await import('@/lib/fee-waiver');
+          const newId = await materialiseFromIntent(intentRow.id, {
+            paid: false,
+            waiverGranted: true,
+            waiverReason: 'Application fee waived on the invitation issued by ' + (invite.invitedByName || 'an administrator') + '.',
+          });
+          if (newId) {
+            await markApplied(invite.id, newId);
+            return json({ ok: true, alreadyPaid: true, free: true, invited: true, redirect: '/apply/confirmation?id=' + newId });
+          }
+        }
+      } catch (e: any) {
+        // A failed waiver lookup must never charge somebody who was told they would not be charged,
+        // but it also must not strand them: fall through to the ordinary paid path, which is the
+        // same path they would have walked without an invitation. The reason is logged so the
+        // administrator can grant the waiver by hand from /admin/fee-waivers.
+        console.error('[start-application-fee] invitation waiver:', e?.cause?.message || e?.message);
       }
 
       // IDEMPOTENCY (prevents the double-charge): if this intent already has a

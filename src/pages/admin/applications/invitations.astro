@@ -1,0 +1,383 @@
+---
+// /admin/applications/invitations — invite a named person to apply.
+//
+// THE SCREEN'S ONE HONEST CLAIM. Everything here reports what actually happened rather than what was
+// attempted: whether the mail went, and if not why, and whether the list you are reading is the real
+// list or a failed read. A list screen that renders an empty table on a failed query tells you
+// "nobody has been invited", which is a different sentence from "I could not find out".
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { can, canAccessSection } from '@/lib/auth/permissions';
+import { listInvitations, ensureInvitationSchema, type Invitation } from '@/lib/hiring/invitations';
+
+export const prerender = false;
+
+// Declared before anything below uses them: `const` is not hoisted, and a handler reaching a later
+// declaration has taken pages down on this project.
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user as any, 'admin.access')) return Astro.redirect('/portal');
+
+// An invitation can carry a fee waiver and puts our name in somebody's inbox, so it is `applications`
+// EDIT — the same claim the API checks. A viewer who can only read applications does not get this.
+const mayInvite = await canAccessSection(user as any, 'applications', 'edit');
+if (!mayInvite) return Astro.redirect('/admin/applications');
+
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+try { await ensureInvitationSchema(); } catch { /* production has this from the hand-run .sql */ }
+
+// THE LIST. A thrown read is kept as a thrown read; see the note at the top of the file.
+let invitations: Invitation[] = [];
+let listError = '';
+try {
+  invitations = await listInvitations(300);
+} catch (e: any) {
+  listError = e?.cause?.message || e?.message || 'The invitations could not be read.';
+}
+
+// Open postings for the dropdown. A failure here narrows the form to "any role" rather than taking
+// the page down: inviting somebody without naming a posting is a supported invitation.
+let roleOptions: { slug: string; title: string }[] = [];
+try {
+  const r = await db.execute(sql`
+    SELECT slug, title FROM roles
+     WHERE COALESCE(is_active, TRUE) = TRUE
+     ORDER BY title ASC LIMIT 500`);
+  roleOptions = rowsOf(r).map((x: any) => ({ slug: String(x.slug || ''), title: String(x.title || '') }))
+    .filter((x) => x.slug && x.title);
+} catch (e: any) {
+  console.error('[invitations] roles:', e?.cause?.message || e?.message);
+}
+
+const preRole = Astro.url.searchParams.get('role') || '';
+
+// Counters computed in the frontmatter — a comparison operator inside a JSX expression breaks the
+// Astro parser on this project, so nothing below counts inline.
+const nLive = invitations.filter((i) => i.status === 'pending' || i.status === 'opened').length;
+const nApplied = invitations.filter((i) => i.status === 'applied').length;
+const nFailed = invitations.filter((i) => i.emailError !== '').length;
+
+const STATUS_COLOR: any = {
+  pending: '#8a8a94', opened: '#60a5fa', applied: '#10b981', revoked: '#ef4444', expired: '#6b7280',
+};
+const dateOnly = (s: string | null) => (s ? String(s).slice(0, 10) : '');
+---
+
+<AdminLayout title="Invitations to apply" activeNav="applications">
+<div style="padding-bottom:80px;">
+
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;position:sticky;top:0;z-index:10;">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+      <div>
+        <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">Recruiting</p>
+        <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">Invitations to apply</h1>
+        <p style="font-size:11.5px;color:#8a8a94;margin:4px 0 0;max-width:62ch;line-height:1.5;">
+          Ask a named person to apply. They still fill in the application and a person still reads it
+          &mdash; an invitation is not an offer and does not decide the outcome.
+        </p>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+        <a href="/admin/applications" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;text-decoration:none;font-size:11px;font-weight:600;padding:6px 10px;border-radius:6px;">Applications</a>
+        <a href="/admin/roles" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;text-decoration:none;font-size:11px;font-weight:600;padding:6px 10px;border-radius:6px;">Roles</a>
+      </div>
+    </div>
+    <div style="display:flex;gap:14px;margin-top:10px;font-size:11px;color:#8a8a94;font-family:'Geist Mono',monospace;">
+      <span>{nLive} live</span>
+      <span style="color:#10b981;">{nApplied} applied</span>
+      {nFailed ? <span style="color:#fbbf24;">{nFailed} not delivered</span> : null}
+    </div>
+  </div>
+
+  <div style="padding:16px;max-width:1100px;">
+
+    {listError ? (
+      <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px;padding:12px 14px;margin-bottom:16px;">
+        <p style="color:#fca5a5;font-size:12.5px;font-weight:600;margin:0 0 4px;">The invitations could not be read.</p>
+        <p style="color:#8a8a94;font-size:11.5px;margin:0;line-height:1.5;">
+          {listError} &mdash; the list below is empty because the read failed, not because nobody has
+          been invited. If this says the table does not exist, run
+          <code style="color:#FF7040;">db/application-invitations-schema.sql</code> against production.
+        </p>
+      </div>
+    ) : null}
+
+    <!-- ── THE FORM ───────────────────────────────────────────────────────────────────────── -->
+    <div style="background:#0d0d10;border:1px solid #1a1a1f;border-radius:12px;padding:16px;margin-bottom:20px;">
+      <h2 style="font-size:14px;font-weight:700;color:#fff;margin:0 0 12px;">Invite someone</h2>
+
+      <form id="inviteForm" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <label style="display:flex;flex-direction:column;gap:5px;">
+          <span style="font-size:11px;font-weight:600;color:#8a8a94;">Email address</span>
+          <input name="email" type="email" required autocomplete="off" placeholder="name@example.org"
+                 style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;color:#fff;font-size:13px;outline:none;" />
+        </label>
+
+        <label style="display:flex;flex-direction:column;gap:5px;">
+          <span style="font-size:11px;font-weight:600;color:#8a8a94;">Their name (optional)</span>
+          <input name="fullName" type="text" autocomplete="off" placeholder="Ananya Kumar"
+                 style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;color:#fff;font-size:13px;outline:none;" />
+        </label>
+
+        <label style="display:flex;flex-direction:column;gap:5px;">
+          <span style="font-size:11px;font-weight:600;color:#8a8a94;">Role</span>
+          <select name="roleSlug"
+                  style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;color:#fff;font-size:13px;outline:none;">
+            <option value="">Any role &mdash; they choose</option>
+            {roleOptions.map((r) => (
+              <option value={r.slug} selected={r.slug === preRole}>{r.title}</option>
+            ))}
+          </select>
+        </label>
+
+        <label style="display:flex;flex-direction:column;gap:5px;">
+          <span style="font-size:11px;font-weight:600;color:#8a8a94;">Link expires in</span>
+          <select name="days"
+                  style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;color:#fff;font-size:13px;outline:none;">
+            <option value="7">7 days</option>
+            <option value="14">14 days</option>
+            <option value="30" selected>30 days</option>
+            <option value="90">90 days</option>
+          </select>
+        </label>
+
+        <label style="display:flex;flex-direction:column;gap:5px;grid-column:1 / -1;">
+          <span style="font-size:11px;font-weight:600;color:#8a8a94;">A line to them (optional)</span>
+          <textarea name="note" rows="2" maxlength="1000" placeholder="Why you are inviting them. Shown in the email and on the page they land on."
+                    style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;color:#fff;font-size:13px;outline:none;resize:vertical;font-family:inherit;"></textarea>
+        </label>
+
+        <label style="display:flex;align-items:flex-start;gap:8px;grid-column:1 / -1;cursor:pointer;">
+          <input name="waiveFee" type="checkbox" style="margin-top:2px;accent-color:#FF4F00;width:15px;height:15px;" />
+          <span style="font-size:12px;color:#e8e8ee;line-height:1.5;">
+            Waive the application fee for this person
+            <span style="display:block;font-size:11px;color:#8a8a94;margin-top:2px;">
+              Off by default. Being invited does not waive a fee on its own &mdash; this is a decision
+              recorded against the invitation, and it is applied when they reach the fee step.
+            </span>
+          </span>
+        </label>
+
+        <label style="display:flex;align-items:center;gap:8px;grid-column:1 / -1;cursor:pointer;">
+          <input name="sendEmail" type="checkbox" checked style="accent-color:#FF4F00;width:15px;height:15px;" />
+          <span style="font-size:12px;color:#e8e8ee;">Email the invitation as well as giving me the link</span>
+        </label>
+
+        <div style="grid-column:1 / -1;display:flex;gap:8px;align-items:center;">
+          <button type="submit" id="inviteBtn"
+                  style="background:#FF4F00;border:none;color:#fff;font-size:12.5px;font-weight:600;padding:9px 18px;border-radius:8px;cursor:pointer;">
+            Create invitation
+          </button>
+          <span id="inviteMsg" style="font-size:12px;color:#8a8a94;" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+
+      <!-- The link is shown ONCE. It is stored as a hash, so this box is the only place it exists. -->
+      <div id="linkBox" style="display:none;margin-top:14px;background:#15151a;border:1px solid #3a2419;border-radius:10px;padding:12px;">
+        <p style="font-size:11px;font-weight:700;color:#FF7040;margin:0 0 6px;letter-spacing:0.06em;text-transform:uppercase;">The link &mdash; shown once</p>
+        <p style="font-size:11.5px;color:#8a8a94;margin:0 0 8px;line-height:1.5;">
+          Copy it now if you want to send it yourself. It is stored as a hash, so it cannot be shown
+          again &mdash; issuing a replacement withdraws this one.
+        </p>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <input id="linkText" readonly
+                 style="flex:1;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;color:#fff;font-size:12px;font-family:'Geist Mono',monospace;outline:none;min-width:0;" />
+          <button type="button" id="copyBtn"
+                  style="background:#15151a;border:1px solid #1a1a1f;color:#fff;font-size:12px;font-weight:600;padding:9px 14px;border-radius:8px;cursor:pointer;white-space:nowrap;">Copy</button>
+        </div>
+        <p id="mailState" style="font-size:11.5px;margin:8px 0 0;"></p>
+      </div>
+    </div>
+
+    <!-- ── THE LIST ───────────────────────────────────────────────────────────────────────── -->
+    {invitations.length ? (
+      <div style="background:#0d0d10;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
+        <div style="overflow-x:auto;">
+          <table style="width:100%;border-collapse:collapse;font-size:12px;min-width:820px;">
+            <thead>
+              <tr style="background:#08080a;">
+                <th style="text-align:left;padding:10px 12px;color:#8a8a94;font-weight:600;font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;">Person</th>
+                <th style="text-align:left;padding:10px 12px;color:#8a8a94;font-weight:600;font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;">Role</th>
+                <th style="text-align:left;padding:10px 12px;color:#8a8a94;font-weight:600;font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;">Status</th>
+                <th style="text-align:left;padding:10px 12px;color:#8a8a94;font-weight:600;font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;">Mail</th>
+                <th style="text-align:left;padding:10px 12px;color:#8a8a94;font-weight:600;font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;">Invited by</th>
+                <th style="text-align:left;padding:10px 12px;color:#8a8a94;font-weight:600;font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;">Expires</th>
+                <th style="text-align:right;padding:10px 12px;color:#8a8a94;font-weight:600;font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;">&nbsp;</th>
+              </tr>
+            </thead>
+            <tbody>
+              {invitations.map((inv) => (
+                <tr style="border-top:1px solid #1a1a1f;" data-inv-row={inv.id}>
+                  <td style="padding:10px 12px;color:#fff;">
+                    <span style="display:block;font-weight:600;">{inv.fullName || inv.email}</span>
+                    {inv.fullName ? <span style="display:block;color:#8a8a94;font-size:11px;">{inv.email}</span> : null}
+                    {inv.waiveFee ? <span style="display:inline-block;margin-top:3px;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.3);color:#10b981;font-size:10px;font-weight:600;padding:1px 7px;border-radius:100px;">fee waived</span> : null}
+                  </td>
+                  <td style="padding:10px 12px;color:#e8e8ee;">{inv.roleTitle || 'Any role'}</td>
+                  <td style="padding:10px 12px;">
+                    <span style={`color:${STATUS_COLOR[inv.status] || '#8a8a94'};font-weight:600;`}>{inv.status}</span>
+                  </td>
+                  <td style="padding:10px 12px;">
+                    {inv.emailError
+                      ? <span title={inv.emailError} style="color:#fbbf24;">not delivered</span>
+                      : (inv.emailSent ? <span style="color:#8a8a94;">sent</span> : <span style="color:#6b7280;">link only</span>)}
+                  </td>
+                  <td style="padding:10px 12px;color:#8a8a94;">{inv.invitedByName || '&mdash;'}</td>
+                  <td style="padding:10px 12px;color:#8a8a94;font-family:'Geist Mono',monospace;font-size:11px;">{dateOnly(inv.expiresAt)}</td>
+                  <td style="padding:10px 12px;text-align:right;white-space:nowrap;">
+                    {inv.status === 'pending' || inv.status === 'opened' ? (
+                      <button type="button" data-revoke={inv.id}
+                              style="background:#15151a;border:1px solid rgba(239,68,68,0.3);color:#fca5a5;font-size:11px;font-weight:600;padding:5px 10px;border-radius:6px;cursor:pointer;">Withdraw</button>
+                    ) : null}
+                    <button type="button" data-reinvite={inv.id} data-email={inv.email} data-role={inv.roleSlug}
+                            style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;font-size:11px;font-weight:600;padding:5px 10px;border-radius:6px;cursor:pointer;margin-left:5px;">New link</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    ) : (
+      <p style="color:#8a8a94;font-size:12.5px;padding:20px 0;">
+        {listError ? 'Nothing can be listed until the read above succeeds.' : 'Nobody has been invited yet.'}
+      </p>
+    )}
+
+  </div>
+</div>
+
+<script>
+  // Kept at the top level and out of any conditional: a script inside a JSX conditional breaks the
+  // Astro parser on this project.
+  const form = document.getElementById('inviteForm');
+  const btn = document.getElementById('inviteBtn');
+  const msg = document.getElementById('inviteMsg');
+  const linkBox = document.getElementById('linkBox');
+  const linkText = document.getElementById('linkText');
+  const copyBtn = document.getElementById('copyBtn');
+  const mailState = document.getElementById('mailState');
+
+  function say(text, tone) {
+    if (!msg) return;
+    msg.textContent = text || '';
+    msg.style.color = tone === 'err' ? '#fca5a5' : (tone === 'ok' ? '#10b981' : '#8a8a94');
+  }
+
+  async function post(payload) {
+    const res = await fetch('/api/admin/applications/invite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    // A non-JSON body means the request never reached the handler (a redirect to the login page is
+    // the usual one). Saying so beats "Unexpected token < in JSON".
+    const text = await res.text();
+    try {
+      return { status: res.status, data: JSON.parse(text) };
+    } catch (e) {
+      return { status: res.status, data: { ok: false, error: 'The server did not answer with JSON. Your session may have expired &mdash; reload and sign in again.' } };
+    }
+  }
+
+  function showLink(data) {
+    if (!linkBox || !linkText || !mailState) return;
+    linkBox.style.display = 'block';
+    linkText.value = data.url || '';
+    if (data.emailed) {
+      mailState.textContent = 'The invitation email was sent.';
+      mailState.style.color = '#10b981';
+    } else if (data.emailError) {
+      mailState.textContent = 'The email did NOT go: ' + data.emailError + ' Send the link yourself.';
+      mailState.style.color = '#fbbf24';
+    } else {
+      mailState.textContent = 'No email was sent. Share the link yourself.';
+      mailState.style.color = '#8a8a94';
+    }
+    linkBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  if (form && btn) {
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const fd = new FormData(form);
+      const payload = {
+        action: 'create',
+        email: String(fd.get('email') || ''),
+        fullName: String(fd.get('fullName') || ''),
+        roleSlug: String(fd.get('roleSlug') || ''),
+        note: String(fd.get('note') || ''),
+        days: String(fd.get('days') || '30'),
+        waiveFee: fd.get('waiveFee') === 'on',
+        sendEmail: fd.get('sendEmail') === 'on',
+      };
+      btn.disabled = true;
+      say('Creating...', '');
+      try {
+        const out = await post(payload);
+        if (out.data && out.data.ok) {
+          say('Invitation created.', 'ok');
+          showLink(out.data);
+          setTimeout(() => window.location.reload(), 2500);
+        } else {
+          say((out.data && out.data.error) || 'The invitation was not created.', 'err');
+          btn.disabled = false;
+        }
+      } catch (e) {
+        say('Could not reach the server. Check your connection and try again.', 'err');
+        btn.disabled = false;
+      }
+    });
+  }
+
+  if (copyBtn && linkText) {
+    copyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(linkText.value);
+        copyBtn.textContent = 'Copied';
+        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+      } catch (e) {
+        // Clipboard is blocked in some contexts. Selecting the text is the honest fallback.
+        linkText.select();
+        copyBtn.textContent = 'Press Ctrl+C';
+        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 2500);
+      }
+    });
+  }
+
+  document.querySelectorAll('[data-revoke]').forEach((el) => {
+    el.addEventListener('click', async () => {
+      const id = el.getAttribute('data-revoke');
+      if (!id) return;
+      if (!window.confirm('Withdraw this invitation? The link stops working immediately.')) return;
+      el.disabled = true;
+      const out = await post({ action: 'revoke', id });
+      if (out.data && out.data.ok) window.location.reload();
+      else {
+        el.disabled = false;
+        say((out.data && out.data.error) || 'It could not be withdrawn.', 'err');
+      }
+    });
+  });
+
+  document.querySelectorAll('[data-reinvite]').forEach((el) => {
+    el.addEventListener('click', async () => {
+      const email = el.getAttribute('data-email') || '';
+      const role = el.getAttribute('data-role') || '';
+      if (!window.confirm('Issue a new link for ' + email + '? The previous one is withdrawn.')) return;
+      el.disabled = true;
+      say('Issuing a new link...', '');
+      const out = await post({ action: 'resend', email, roleSlug: role, sendEmail: true });
+      if (out.data && out.data.ok) {
+        say('New link issued. The previous one is withdrawn.', 'ok');
+        showLink(out.data);
+        setTimeout(() => window.location.reload(), 3000);
+      } else {
+        el.disabled = false;
+        say((out.data && out.data.error) || 'A new link could not be issued.', 'err');
+      }
+    });
+  });
+</script>
+</AdminLayout>
