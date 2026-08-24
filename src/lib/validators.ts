@@ -1,4 +1,11 @@
 import { z } from 'zod';
+import {
+  isTraineeRole,
+  isPaidTrainee,
+  declaresUnpaid,
+  UNPAID_INTERN_SALARY,
+  UNPAID_APPRENTICE_SALARY,
+} from '@/lib/compensation-text';
 
 export const levelSchema = z.enum(['C-Level', 'Lead', 'Senior', 'Mid', 'Junior', 'Intern', 'Apprentice']);
 // THESE THREE ARE THE ONLY VALUES THE DATABASE ACCEPTS.
@@ -32,7 +39,31 @@ export const roleSchema = z.object({
   isOpen: z.boolean().default(true),
   isFeatured: z.boolean().default(false),
   sortOrder: z.number().int().default(0)
-});
+})
+  // POLICY, enforced at the one place both admin write paths go through
+  // (/admin/roles/new and /admin/roles/[id] each call roleSchema.safeParse).
+  //
+  // Every internship and apprenticeship is unpaid except 'llm-engineering-intern'. This field is
+  // free text, and what an admin typed into it is how 49 rows came to advertise stipends on roles
+  // that pay nothing - "up to INR 3 LPA", "Full-time stipend: up to INR 25,000/mo". The public
+  // pages already refuse to publish those, but /admin/roles, the offer stage and every export read
+  // the column raw, so the wrong value still misleads whoever reads it next.
+  //
+  // It NORMALISES rather than rejects, deliberately. Rejecting would block an admin from so much as
+  // closing a posting whose salary was already wrong - the row cannot be saved without first fixing
+  // a field they may not have been editing - and that turns a policy into an obstacle. Normalising
+  // heals the row on any save instead.
+  //
+  // The test is the "Unpaid" PREFIX, not equality: a trainee row that already says
+  // "Unpaid - certificate, verifiable credential and fee-waiver benefits" is more specific than the
+  // generic line and is left exactly as it is.
+  .transform((role) => {
+    if (!isTraineeRole(role)) return role;
+    if (isPaidTrainee(role.slug)) return role;
+    if (declaresUnpaid(role.salary)) return role;
+    const apprentice = role.level === 'Apprentice' || role.engagementType === 'Apprenticeship';
+    return { ...role, salary: apprentice ? UNPAID_APPRENTICE_SALARY : UNPAID_INTERN_SALARY };
+  });
 
 export const departmentSchema = z.object({
   id: z.string().min(2).max(50).regex(/^[a-z0-9-]+$/, 'ID: lowercase letters, numbers, hyphens only'),

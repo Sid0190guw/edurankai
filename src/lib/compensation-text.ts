@@ -68,6 +68,19 @@ const PAID_TRAINEE_SLUGS = new Set(['llm-engineering-intern']);
  *  so 'visvambhara-aerospace-research-engineering-intern' matches. */
 const TRAINEE_WORD = /\b(?:intern|interns|internship|internships|apprentice|apprenticeship)\b/i;
 
+/** The stored pay line for an unpaid trainee role. Exported so the admin write path, the catalogs
+ *  and db/unpaid-internships.sql all write the SAME string rather than three near-misses.
+ *  Nothing tests for equality with these - the stored-value contract is the "Unpaid" PREFIX, which
+ *  is what lets the Extreme-Scale and Campus Ambassador lines say something more specific and
+ *  survive. These are only what to write when there is nothing better. */
+export const UNPAID_INTERN_SALARY = 'Unpaid — internship certificate, mentorship, and real project experience';
+export const UNPAID_APPRENTICE_SALARY = 'Unpaid — apprenticeship certificate, mentorship, and real project experience';
+
+/** True when a stored pay string already declares itself unpaid. The PREFIX is the contract. */
+export function declaresUnpaid(salary: unknown): boolean {
+  return /^\s*unpaid\b/i.test(String(salary ?? ''));
+}
+
 /** A role whose engagement is training: internship or apprenticeship.
  *
  *  Four fields are checked, not one, because they are stored independently and disagree in
