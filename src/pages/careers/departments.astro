@@ -13,40 +13,74 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { departments } from '@/lib/db/schema';
 import { sql, asc } from 'drizzle-orm';
+import { safeRows } from '@/lib/page-safety';
 import { listDivisions, openRoleCountByDivision } from '@/lib/xscale/divisions';
 import { XSCALE_DEPARTMENT_ID } from '@/data/xscale-catalog';
 import { SCALE_DISCLAIMER_SHORT } from '@/lib/xscale/taxonomy';
 
-const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const tally = (rows: any[]): Record<string, number> =>
+  Object.fromEntries(rows.map((x) => [String(x.department_id), Number(x.n || 0)]));
 
-let allDepts: any[] = [];
-let deptsReadable = true;
-try {
-  allDepts = await db.select().from(departments)
+const deptRead = await safeRows('[careers/departments] directory', () =>
+  db.select().from(departments)
     .where(sql`is_visible = TRUE`)
-    .orderBy(asc(departments.sortOrder), asc(departments.name));
-} catch (e: any) {
-  deptsReadable = false;
-  console.error('[departments] list failed:', e?.cause?.message || e?.message);
-}
+    .orderBy(asc(departments.sortOrder), asc(departments.name)));
+const allDepts: any[] = deptRead.rows;
+const deptsReadable = deptRead.ok;
 
 // Open-role counts for every department at once. Respects the same public visibility rule the
 // listing query uses: open, PUBLISHED, and not past its deadline.
+//
+// AND IT RETRIES WITHOUT job_status, BECAUSE THAT COLUMN IS NOT GUARANTEED TO EXIST.
+//
+// job_status is an ADDITIVE column (src/lib/xscale/schema.ts, applied by hand from
+// db/xscale-schema.sql - SCHEMA_BOOTSTRAP is off in production). On a database where that migration
+// has not been run the column is absent, this query dies with 42703, every department falls to a
+// count of zero, and the markup below then prints "these departments exist and have no open posting
+// today" over the whole organisation. A missing column was being published as a factual claim about
+// hiring. Every other public reader of these columns already retries narrowed (listOpportunities in
+// src/lib/xscale/roles-ext.ts); this page was the one that did not.
+//
+// When the column is genuinely absent the two queries are EXACTLY equivalent - COALESCE(NULL,
+// 'PUBLISHED') = 'PUBLISHED' holds for every row - so nothing is lost and there is nothing to
+// disclaim. When the first query failed for any OTHER reason the column may exist and hold
+// PAUSED/CLOSED values, so the retry can over-count, and that is said out loud on the page rather
+// than smoothed over.
 let counts: Record<string, number> = {};
 let countsReadable = true;
-try {
-  const r = await db.execute(sql`
+let countsDegraded = false;
+
+const fullCounts = await safeRows('[careers/departments] open-role counts', () => db.execute(sql`
+  SELECT department_id, COUNT(*)::int AS n
+    FROM roles
+   WHERE is_open = TRUE
+     AND COALESCE(job_status, 'PUBLISHED') = 'PUBLISHED'
+     AND (application_deadline IS NULL OR application_deadline > NOW())
+     AND department_id IS NOT NULL
+   GROUP BY department_id`));
+
+if (fullCounts.ok) {
+  counts = tally(fullCounts.rows);
+} else if (fullCounts.unavailable) {
+  // The database did not answer, so a retry would only buy a second eight-second wait on a page that
+  // is already late. There is nothing narrower to ask; the page says it does not know.
+  countsReadable = false;
+} else {
+  const reason = String(fullCounts.error || '');
+  const columnAbsent = /job_status/.test(reason) && /does not exist/i.test(reason);
+  const baseCounts = await safeRows('[careers/departments] open-role counts (no job_status)', () => db.execute(sql`
     SELECT department_id, COUNT(*)::int AS n
       FROM roles
      WHERE is_open = TRUE
-       AND COALESCE(job_status, 'PUBLISHED') = 'PUBLISHED'
        AND (application_deadline IS NULL OR application_deadline > NOW())
        AND department_id IS NOT NULL
-     GROUP BY department_id`);
-  counts = Object.fromEntries(rowsOf(r).map((x) => [String(x.department_id), Number(x.n || 0)]));
-} catch (e: any) {
-  countsReadable = false;
-  console.error('[departments] counts failed:', e?.cause?.message || e?.message);
+     GROUP BY department_id`));
+  if (baseCounts.ok) {
+    counts = tally(baseCounts.rows);
+    countsDegraded = !columnAbsent;
+  } else {
+    countsReadable = false;
+  }
 }
 
 const divisionList = await listDivisions({});
@@ -76,8 +110,11 @@ const cards = allDepts.map((d) => {
   };
 });
 
-const withOpen = cards.filter((c) => c.hasOpen);
-const withoutOpen = cards.filter((c) => !c.hasOpen);
+// GUARDED ON countsReadable. Without that guard an unreadable count sends every department into
+// "Not hiring at the moment", which is the page asserting something it does not know.
+const withOpen = countsReadable ? cards.filter((c) => c.hasOpen) : [];
+const withoutOpen = countsReadable ? cards.filter((c) => !c.hasOpen) : [];
+const countsUnknown = !countsReadable;
 const totalOpen = Object.values(counts).reduce((a, b) => a + b, 0);
 const departmentCount = cards.length;
 const nothingAtAll = departmentCount === 0;
@@ -98,6 +135,7 @@ const metaDescription =
       {countsReadable
         ? totalOpen + ' open ' + (totalOpen === 1 ? 'role' : 'roles') + ' across ' + departmentCount + ' departments.'
         : departmentCount + ' departments. Open-role counts could not be read just now.'}
+      {countsDegraded ? ' These are every open posting: the published-status filter could not be applied just now, so a paused posting may be counted.' : ''}
       {anyDivisions ? ' Research departments are organised into divisions, each stating the scale it works at.' : ''}
     </p>
 
@@ -130,6 +168,22 @@ const metaDescription =
 
   {deptsReadable && !nothingAtAll && (
     <section class="px-[5vw] pb-12 max-w-7xl mx-auto">
+      {countsUnknown && (
+        <div class="mb-2">
+          <h2 class="font-display text-[1.25rem] font-semibold text-ink mb-1">Every department</h2>
+          <p class="text-[0.82rem] text-ink-soft mb-3 max-w-2xl">
+            We could not read which departments are hiring just now. This is the full list, and nothing here
+            says a department has nothing open &mdash; every open posting is on
+            <a href="/careers" class="text-burn font-semibold no-underline hover:underline"> the careers page</a>.
+          </p>
+          <div class="flex flex-wrap gap-2">
+            {cards.map((c) => (
+              <a href={`/careers/department/${c.id}`} class="text-[0.78rem] text-ink-2 bg-cream-2 border border-ink/10 rounded-lg px-3 py-1.5 no-underline hover:border-ink/25 transition-colors">{c.name}</a>
+            ))}
+          </div>
+        </div>
+      )}
+
       {withOpen.length > 0 && (
         <h2 class="font-display text-[1.25rem] font-semibold text-ink mb-3">Departments hiring now</h2>
       )}

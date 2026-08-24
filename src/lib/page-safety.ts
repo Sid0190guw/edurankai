@@ -51,7 +51,7 @@
 // timeout -- so the FIRST timeout opens a circuit and the remaining reads are refused instantly.
 // A page with twelve reads costs one timeout, not twelve, and renders its "we could not read this"
 // states instead of dying. Nothing retries; the only thing that happens is that waiting stops.
-import { withDbTimeout } from '@/lib/db-timeout';
+import { withDbTimeout, isDbUnavailable } from '@/lib/db-timeout';
 
 /**
  * One structured line per guarded read, for the slow ones and the failures only.
@@ -94,6 +94,17 @@ export type ReadResult<T = any> = {
   rows: T[];
   /** Present only when ok is false. The real Postgres reason, already unwrapped from `.cause`. */
   error: string | null;
+  /**
+   * True when the read failed because THE DATABASE did not answer - a bounded wait that timed out,
+   * or a read the open circuit refused - rather than because the statement was wrong.
+   *
+   * Optional, so every existing caller and every existing literal is untouched. It exists for the
+   * one decision that needs it: whether retrying a narrowed version of the same query is worth
+   * anything. Against a wrong statement (a missing column) the retry is the whole fix; against a
+   * database that is not answering it is a second eight-second wait on a page that is already late,
+   * and two of those in series is how a degraded read becomes a gateway timeout.
+   */
+  unavailable?: boolean;
 };
 
 /** postgres-js hands back a plain array; drizzle's own driver wraps it in `.rows`. Accept both. */
@@ -110,14 +121,14 @@ export function toRows<T = any>(r: any): T[] {
 export async function safeRows<T = any>(label: string, run: () => Promise<any>, ms?: number): Promise<ReadResult<T>> {
   const started = Date.now();
   try {
-    const res = { ok: true, rows: toRows<T>(await withDbTimeout(run(), label, ms)), error: null };
+    const res = { ok: true, rows: toRows<T>(await withDbTimeout(run(), label, ms)), error: null, unavailable: false };
     noteRead(label, started, true);
     return res;
   } catch (e: any) {
     const reason = dbReason(e);
     noteRead(label, started, false, reason);
     console.error(label + ' could not be read -', reason);
-    return { ok: false, rows: [], error: reason };
+    return { ok: false, rows: [], error: reason, unavailable: isDbUnavailable(e) };
   }
 }
 

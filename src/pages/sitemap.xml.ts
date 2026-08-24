@@ -57,8 +57,8 @@ export const GET: APIRoute = async () => {
   // does not exist on a database where db/xscale-schema.sql has not been run yet.
   let departmentIds: string[] = [];
   let divisionSlugs: string[] = [];
+  const { sql: s1 } = await import('drizzle-orm');
   try {
-    const { sql: s1 } = await import('drizzle-orm');
     const dr: any = await db.execute(s1`
       SELECT DISTINCT d.id
         FROM departments d
@@ -68,7 +68,23 @@ export const GET: APIRoute = async () => {
          AND COALESCE(r.job_status, 'PUBLISHED') = 'PUBLISHED'
          AND (r.application_deadline IS NULL OR r.application_deadline > NOW())`);
     departmentIds = (Array.isArray(dr) ? dr : (dr?.rows || [])).map((x: any) => String(x.id));
-  } catch (_) { /* no department pages in the sitemap; the rest of it still ships */ }
+  } catch (_) {
+    // job_status is an additive column that only exists once db/xscale-schema.sql has been applied
+    // by hand. Without this retry the sitemap silently ships with ZERO department URLs on a
+    // database that has every one of those pages live - the failure is invisible because a short
+    // sitemap still validates. Where the column is absent the predicate is a no-op anyway
+    // (COALESCE(NULL,'PUBLISHED') = 'PUBLISHED'), so dropping it changes nothing but the outcome.
+    try {
+      const dr2: any = await db.execute(s1`
+        SELECT DISTINCT d.id
+          FROM departments d
+          JOIN roles r ON r.department_id = d.id
+         WHERE d.is_visible = TRUE
+           AND r.is_open = TRUE
+           AND (r.application_deadline IS NULL OR r.application_deadline > NOW())`);
+      departmentIds = (Array.isArray(dr2) ? dr2 : (dr2?.rows || [])).map((x: any) => String(x.id));
+    } catch (_2) { /* no department pages in the sitemap; the rest of it still ships */ }
+  }
   try {
     const { sql: s2 } = await import('drizzle-orm');
     const vr: any = await db.execute(s2`
