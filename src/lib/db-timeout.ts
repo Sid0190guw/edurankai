@@ -233,16 +233,28 @@ export function withDbTimeout<T>(work: Promise<T>, label: string, ms: number = D
 //   - An ordinary query error is NOT: a missing table or a bad column will fail identically the
 //     second time, and this must never re-run a statement that failed for a reason of its own.
 //
-// TWO SHORTER BOUNDS, NOT TWO EIGHT-SECOND ONES. Nothing healthy on this deployment takes longer
-// than about a second — 154ms warm, 991ms cold — so three seconds is already generous for the first
-// attempt, and the pair costs less wall-clock than the single DB_TIMEOUT_MS wait it replaces at the
-// gates. That keeps the whole gate inside a serverless invocation's budget with room for the page
-// behind it.
+// THE PAIR COSTS EXACTLY WHAT THE SINGLE WAIT COST, AND THAT IS DELIBERATE — 5000 + 3000 = the
+// DB_TIMEOUT_MS 8000 it replaces at the gates. No gate can become slower than it is today, and the
+// retry is bought entirely out of the budget the first attempt was already allowed to spend.
+//
+// THE FIRST BOUND IS 5s AND NOT 3s, WHICH THE FIRST DRAFT OF THIS GOT WRONG. Three seconds looks
+// generous against a healthy read (154ms warm, 991ms cold) and it is — but a burst of fourteen
+// requests through the real session gate on the live site produced three that took 3.09-3.22s end to
+// end and every one of them SUCCEEDED. A 3s bound would have converted those into timeouts, and a
+// timeout is not free: it increments the breaker's consecutive counter, three in a row open the
+// circuit, and an open circuit refuses every read in that instance instantly. Tightening the bound
+// past the observed success tail would have manufactured exactly the instance-wide refusal this is
+// here to stop. 5s sits above everything measured that works and below the 5s+ population that does
+// not, which is the only place the line can honestly go.
 
-/** First attempt's bound. Generous against a measured worst healthy case of ~1s. */
-export const DB_TRY_MS = Number(process.env.DB_TRY_MS || 3000);
-/** Second attempt's bound. Longer, because by now a connection is usually in flight for it to reuse. */
-export const DB_RETRY_MS = Number(process.env.DB_RETRY_MS || 4000);
+/** First attempt's bound. Above the slowest measured SUCCESS (~3.2s), below the population that stalls. */
+export const DB_TRY_MS = Number(process.env.DB_TRY_MS || 5000);
+/**
+ * Second attempt's bound. Shorter, so the pair spends no more than the single DB_TIMEOUT_MS wait it
+ * replaces — and it does not need more: a connection is usually in flight for it to reuse by now,
+ * and opening a fresh one measured ~950ms.
+ */
+export const DB_RETRY_MS = Number(process.env.DB_RETRY_MS || 3000);
 
 /**
  * Bound a database read, and if it TIMES OUT, run it once more.
