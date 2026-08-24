@@ -127,6 +127,15 @@ export const POST: APIRoute = async ({ request }) => {
     });
   }
 
+  // ------------------------------------------------------- just tell me where this profile stands
+  //
+  // What a returning visitor calls. Their profile came out of their own browser and this is the
+  // first the server has seen of it, so it needs reading before there is a next question or an
+  // understanding panel to render. Nothing is recorded and nothing changes.
+  if (action === 'state') {
+    return state(profile);
+  }
+
   // ------------------------------------------------------------------------------------- skipping
   if (action === 'skip') {
     const questionId = String(body?.questionId || '').slice(0, 60);

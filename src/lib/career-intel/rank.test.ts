@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { evaluate, rankAll, groupByTier, strengthenFit, tierFor, TIERS, type MatchableRole } from './rank';
-import { explain, NOT_PERSONALISED } from './explain';
+import { evaluate, rankAll, groupByTier, tierFor, TIERS, type MatchableRole } from './rank';
+import { explain, NOT_PERSONALISED, COULD_STRENGTHEN_NOTE } from './explain';
 import { emptyProfile, type CareerProfile } from './dimensions';
 import { recordAnswer } from './profile';
 
@@ -142,10 +142,15 @@ describe('gaps are honest and never a promise', () => {
   });
 
   it('never says doing them leads to being hired', () => {
+    expect(COULD_STRENGTHEN_NOTE).toMatch(/not a route to an offer/i);
+    expect(COULD_STRENGTHEN_NOTE).not.toMatch(/will be hired|guarantee/i);
+  });
+
+  it('carries the caveat ON the explanation, so a renderer cannot show the list without it', () => {
     const p = profileFrom('I have used Python.');
-    const s = strengthenFit(evaluate(p, ROLE()));
-    expect(s.note).toMatch(/not a route to an offer/i);
-    expect(s.note).not.toMatch(/will be hired|guarantee/i);
+    const e = explain(evaluate(p, ROLE()));
+    expect(e.couldDevelop.length).toBeGreaterThan(0);
+    expect(e.couldDevelopNote).toBe(COULD_STRENGTHEN_NOTE);
   });
 });
 

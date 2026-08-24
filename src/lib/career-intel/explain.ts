@@ -29,6 +29,8 @@ export interface Explanation {
   aligned: { signal: string; matched: string }[];
   needMoreInfo: string[];
   couldDevelop: string[];
+  /** The caveat that must travel with couldDevelop. Never rendered without it. */
+  couldDevelopNote: string;
   /** True when the posting ranked with no positive contribution at all. */
   nothingMatched: boolean;
   /** Present only when something was demoted, so a lower position is never silent. */
@@ -54,10 +56,23 @@ export function explain(m: MatchResult): Explanation {
     aligned: positive.slice(0, 6).map((c) => ({ signal: c.signal, matched: c.matched })),
     needMoreInfo: m.unknowns.slice(0, 3),
     couldDevelop: m.gaps.slice(0, 5),
+    couldDevelopNote: COULD_STRENGTHEN_NOTE,
     nothingMatched: positive.length === 0,
     demotedBecause: negative.map((c) => c.signal + ' ' + c.matched),
   };
 }
+
+/**
+ * THE CAVEAT THAT TRAVELS WITH "what could strengthen my fit" — section 15.
+ *
+ * It lives here, beside the list it qualifies, and is carried ON the Explanation rather than being
+ * typed into whichever renderer happens to show the list. A gap list is a statement about a
+ * posting's requirements; without this sentence beside it, it reads as a route to being hired, and
+ * a candidate acting on that would be acting on a promise nobody in this system can make.
+ */
+export const COULD_STRENGTHEN_NOTE =
+  'These could strengthen your alignment with what this posting asks for. They are not a checklist '
+  + 'and completing them is not a route to an offer — every application here is read by a person.';
 
 /**
  * The single line at the top of a personalised card.

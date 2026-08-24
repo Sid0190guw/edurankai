@@ -75,6 +75,9 @@
     lastQuestion: null,
     understood: null,
     panelOpen: false,
+    // A domain the person pressed on the career map. Their choice, so it may narrow the results —
+    // and it is cleared by pressing the same node again, or the button that says so.
+    domain: null,
   };
 
   /* ------------------------------------------------------------------------------ elements */
@@ -90,6 +93,7 @@
     panelToggle: document.getElementById('ci-panel-toggle'),
     status: document.getElementById('ci-status'),
     intro: document.getElementById('ci-intro'),
+    map: document.getElementById('ci-map'),
   };
   if (!els.form || !els.input || !els.thread || !els.results) return;
 
@@ -156,7 +160,10 @@
     yes.addEventListener('click', function () {
       confirmAll('confirm');
       state.understood = null;
-      renderThread();
+      // A REFRESH, NOT JUST A RE-RENDER. Confirming raises the confidence on every signal it
+      // touched, which changes what the next question is worth asking and how the openings rank.
+      // Re-drawing the thread from the old response would show none of that until the next answer.
+      send({ action: 'state' });
       say('Noted.', 'ok');
     });
 
@@ -226,9 +233,11 @@
     box.appendChild(ta);
 
     var row = el('div', 'ci-actions');
-    var send = el('button', 'ci-btn ci-btn-primary', 'Continue');
-    send.type = 'button';
-    send.addEventListener('click', function () {
+    // NOT named `send`: that shadows the module-level send() inside this function, and the day
+    // somebody adds a direct send() call in here it would be calling a button element.
+    var go = el('button', 'ci-btn ci-btn-primary', 'Continue');
+    go.type = 'button';
+    go.addEventListener('click', function () {
       var sel = Object.keys(picked);
       if (!sel.length && !ta.value.trim()) { say('Pick something, or write anything at all.', 'warn'); ta.focus(); return; }
       answer(q.id, sel, ta.value);
@@ -246,10 +255,16 @@
       loadMatches(0);
     });
 
-    row.appendChild(send);
+    row.appendChild(go);
     row.appendChild(skip);
     row.appendChild(enough);
     box.appendChild(row);
+
+    // WHAT HAPPENS IF YOU SKIP, SAID OUT LOUD. One of the five questions the brief says a person
+    // should never have to guess the answer to, and the only one a button label cannot carry.
+    box.appendChild(el('p', 'ci-q-why',
+      'Skipping is fine. We will not ask again, and it does not limit anything you can see.'));
+
     els.thread.appendChild(box);
   }
 
@@ -315,12 +330,16 @@
     if (!append) {
       var head = el('div', 'ci-results-head');
       var count = el('p', 'ci-count');
-      var totalText = data.total === 1 ? '1 opening matches' : data.total + ' openings match';
       count.appendChild(el('strong', null, String(data.total)));
-      count.appendChild(document.createTextNode(
-        ' of ' + (data.catalogueTotal > 0 ? data.catalogueTotal : '') + ' open ' +
-        (data.total === 1 ? 'position' : 'positions') + (data.personalised ? ' — ranked for what you told us' : '')));
-      count.setAttribute('aria-label', totalText);
+      // TWO NUMBERS, NEVER ONE STANDING IN FOR THE OTHER. `total` is how many matched; the
+      // catalogue total is how many are open. Letting one be printed as the other is exactly what
+      // made the old page report its own fetch cap as the size of the catalogue. And -1 is not a
+      // count: openPostingCount returns it when the count FAILED, so the phrase is dropped rather
+      // than rendered as "of  open positions".
+      var tail = (data.total === 1 ? ' opening' : ' openings');
+      if (data.catalogueTotal > 0) tail += ' of ' + data.catalogueTotal + ' open';
+      if (data.personalised) tail += ', ranked for what you told us';
+      count.appendChild(document.createTextNode(tail));
       head.appendChild(count);
       els.results.appendChild(head);
 
@@ -342,7 +361,19 @@
       }
     }
 
-    (data.groups || []).forEach(function (g) { els.results.appendChild(renderGroup(g)); });
+    // APPEND INTO THE EXISTING GROUP, DO NOT ADD A SECOND ONE WITH THE SAME HEADING. Rendering a
+    // fresh section per response gave two "Strong alignment" headings after Show more, which reads
+    // as two different things rather than more of one.
+    if (!append) renderMap(data.map, data.mapBands, data.focusedDomain);
+
+    (data.groups || []).forEach(function (g) {
+      var existing = els.results.querySelector('[data-tier="' + g.tier + '"] .ci-cards');
+      if (append && existing) {
+        g.matches.forEach(function (m) { existing.appendChild(renderCard(m, g.tier)); });
+        return;
+      }
+      els.results.appendChild(renderGroup(g));
+    });
 
     var more = els.results.querySelector('.ci-more');
     if (more) more.remove();
@@ -356,6 +387,66 @@
     }
   }
 
+  /* ------------------------------------------------------------ rendering: the career map
+   *
+   * A LIST WITH HEADINGS. There is no canvas, no force layout and no animation — the brief asks for
+   * lightweight, keyboard navigable and understandable without motion, and headed lists of buttons
+   * are all three without needing an accessible alternative bolted on beside them.
+   *
+   * Each node narrows the results to that domain, which is a real server-side query, and the
+   * narrowing is undone by one clearly-labelled button that is always present while it is active.
+   */
+  function renderMap(map, bands, focused) {
+    if (!els.map) return;
+    els.map.innerHTML = '';
+    if (!map || !map.nodes || !map.nodes.length || !map.meaningful) {
+      els.map.hidden = true;
+      return;
+    }
+    els.map.hidden = false;
+    els.map.appendChild(el('h2', 'ci-map-title', 'Your career map'));
+    els.map.appendChild(el('p', 'ci-map-caption', map.caption));
+
+    (bands || []).forEach(function (band) {
+      var nodes = map.nodes.filter(function (n) { return n.band === band.key; });
+      if (!nodes.length) return;
+      var sec = el('div', 'ci-map-band');
+      sec.appendChild(el('p', 'ci-map-band-h', band.label));
+      sec.appendChild(el('p', 'ci-map-band-note', band.note));
+      var ul = el('ul', 'ci-map-nodes');
+      nodes.forEach(function (n) {
+        var li = el('li');
+        // An anchor, so it works without this script and opens in a new tab if somebody wants it —
+        // and intercepted here so a click narrows the results in place instead of navigating away.
+        var a = el('a', 'ci-map-node');
+        a.href = n.href;
+        a.setAttribute('data-band', n.band);
+        if (focused && focused.key === n.key) {
+          a.classList.add('is-on');
+          a.setAttribute('aria-current', 'true');
+        }
+        a.appendChild(el('span', 'ci-map-node-label', n.label));
+        a.appendChild(el('span', 'ci-map-node-why', n.because));
+        a.addEventListener('click', function (ev) {
+          ev.preventDefault();
+          state.domain = (focused && focused.key === n.key) ? null : n.key;
+          loadMatches(0);
+        });
+        li.appendChild(a);
+        ul.appendChild(li);
+      });
+      sec.appendChild(ul);
+      els.map.appendChild(sec);
+    });
+
+    if (focused) {
+      var clear = el('button', 'ci-btn ci-btn-quiet ci-map-clear', 'Showing ' + focused.label + ' only — show everything again');
+      clear.type = 'button';
+      clear.addEventListener('click', function () { state.domain = null; loadMatches(0); });
+      els.map.appendChild(clear);
+    }
+  }
+
   function note(text, tone) {
     var n = el('p', 'ci-note ci-note-' + (tone || 'quiet'), text);
     return n;
@@ -363,6 +454,7 @@
 
   function renderGroup(g) {
     var sec = el('section', 'ci-group');
+    sec.setAttribute('data-tier', g.tier);
     var h = el('h3', 'ci-group-title', g.label);
     sec.appendChild(h);
     sec.appendChild(el('p', 'ci-group-meaning', g.meaning));
@@ -408,7 +500,7 @@
         });
         det.appendChild(ul);
       }
-      if (e.nothingMatched) det.appendChild(el('p', 'ci-why-none', boot.matchedNothing || ''));
+      if (e.nothingMatched) det.appendChild(el('p', 'ci-why-none', boot.matchedNothing || 'Nothing you have told us so far lines up with this one. It is here so the list is not narrower than you are.'));
       if (e.needMoreInfo.length) {
         det.appendChild(el('p', 'ci-why-h', 'What we could not check'));
         var ul2 = el('ul', 'ci-list');
@@ -418,8 +510,9 @@
       if (e.couldDevelop.length) {
         det.appendChild(el('p', 'ci-why-h', 'What could strengthen your alignment'));
         det.appendChild(el('p', 'ci-why-note', e.couldDevelop.join(' · ')));
-        det.appendChild(el('p', 'ci-why-note ci-why-caveat',
-          'These are not a checklist and completing them is not a route to an offer. Every application here is read by a person.'));
+        // THE CAVEAT COMES WITH THE DATA. Typing a copy of it here is how the two drift and how a
+        // gap list eventually appears on a screen without the sentence that makes it honest.
+        det.appendChild(el('p', 'ci-why-note ci-why-caveat', e.couldDevelopNote || ''));
       }
       if (e.demotedBecause.length) {
         det.appendChild(el('p', 'ci-why-h', 'Why it is lower down'));
@@ -554,7 +647,9 @@
       state.understood = null;
       state.lastQuestion = null;
       state.matches = null;
+      state.domain = null;
       els.results.innerHTML = '';
+      if (els.map) { els.map.innerHTML = ''; els.map.hidden = true; }
       renderThread();
       renderPanel(null);
       if (els.intro) els.intro.hidden = false;
@@ -648,7 +743,12 @@
     return fetch(API + 'matches', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ profile: state.profile, offset: offset || 0, limit: 12 }),
+      body: JSON.stringify({
+        profile: state.profile,
+        offset: offset || 0,
+        limit: 24,
+        domain: state.domain || undefined,
+      }),
     })
       .then(function (r) { return r.json(); })
       .then(function (data) {
@@ -720,9 +820,11 @@
   /* --------------------------------------------------------------------------- resuming a visit */
 
   if (state.profile && state.profile.rawResponses && state.profile.rawResponses.length) {
-    // Somebody who has been here before comes back to what they said, not to a blank slate.
+    // Somebody who has been here before comes back to what they said, not to a blank slate. The
+    // server has never seen this profile — it came out of this browser — so 'state' is the request
+    // that reads it and returns the next question and the understanding panel. It records nothing.
     if (els.intro) els.intro.hidden = true;
-    send({ action: 'skip', questionId: '' });
+    send({ action: 'state' });
     say('Picking up where you left off. Everything you told us is in this browser only.', 'quiet');
   }
 })();

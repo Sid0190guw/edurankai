@@ -416,24 +416,3 @@ export function groupByTier(matches: MatchResult[]): RankedGroup[] {
     }))
     .filter((g) => g.matches.length > 0);
 }
-
-/**
- * "What could strengthen my fit?" — section 15.
- *
- * WHAT IT SAYS AND WHAT IT REFUSES TO SAY. It lists what the posting names that we have no evidence
- * of, and it calls that "could strengthen your alignment". It does not say doing these things leads
- * to an offer, because that is a promise nobody in this system is in a position to make and a
- * candidate acting on it would be acting on a fiction.
- */
-export function strengthenFit(m: MatchResult): { aligned: string[]; couldStrengthen: string[]; note: string } {
-  const aligned = m.contributions
-    .filter((c) => c.weight > 0)
-    .map((c) => c.signal)
-    .slice(0, 6);
-  return {
-    aligned,
-    couldStrengthen: m.gaps,
-    note: 'These could strengthen your alignment with what this posting asks for. '
-      + 'They are not a checklist and completing them is not a route to an offer — every application here is read by a person.',
-  };
-}

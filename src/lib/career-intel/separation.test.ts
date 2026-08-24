@@ -41,6 +41,12 @@ describe('the reflection layer is unreachable from matching', () => {
     expect(read('explain.ts')).not.toMatch(/from\s+['"]\.\/reflection['"]/);
   });
 
+  it('is not imported by the career map either', () => {
+    // The map is the newest thing that reads a profile and puts domains in front of somebody. It is
+    // exactly the kind of surface an optional reflection layer drifts into, so it is named here.
+    expect(read('map.ts')).not.toMatch(/from\s+['"]\.\/reflection['"]/);
+  });
+
   it('produces an identical ranking with and without a birth date', () => {
     const role: MatchableRole = {
       id: 'r1', slug: 'r1', title: 'Research Engineer', level: 'Mid',
@@ -113,6 +119,13 @@ describe('the ranker reads dimensions through one door only', () => {
 
   it('does not import the exploration accessor at all', () => {
     expect(read('rank.ts')).not.toMatch(/explorationDimensions/);
+  });
+
+  it('holds the career map to the same door', () => {
+    const src = read('map.ts');
+    expect(src).not.toMatch(/profile\.dimensions/);
+    expect(src).toMatch(/relevanceDimensions\(profile\)/);
+    expect(src).not.toMatch(/explorationDimensions/);
   });
 });
 

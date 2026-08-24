@@ -22,6 +22,15 @@
 //
 // PAGED, LIKE EVERYTHING ELSE. `offset` walks the same predicate; `total` is the SQL count over it.
 // A person can page through every posting that matched, and the number at the top is the number.
+//
+// AND ONE HONEST LIMIT, STATED RATHER THAN GLOSSED. Ranking orders the page that was FETCHED, not
+// the whole matching set: postings 25-48 are ranked against each other, not against 1-24. Ranking
+// the full set would mean pulling every matching row into a serverless function to display twelve,
+// which is the exact problem this rebuild exists to remove. What makes the trade acceptable is that
+// SELECTION already happened in SQL — the compiled discipline and term predicates are what decide
+// which postings are in the set at all — so ranking is ordering relevant things, not sifting the
+// catalogue. Nothing is hidden by it either way: `total` counts the whole matching set and the
+// pages walk all of it.
 
 import type { APIRoute } from 'astro';
 import { json, toMatchCard } from '@/lib/career-intel/wire';
@@ -31,7 +40,8 @@ import { rankAll, TIERS, type MatchableRole } from '@/lib/career-intel/rank';
 import { NOT_PERSONALISED } from '@/lib/career-intel/explain';
 import { profileReadiness } from '@/lib/career-intel/dimensions';
 import { shouldOfferResume } from '@/lib/career-intel/questions';
-import { domainLabel } from '@/lib/career-intel/ontology';
+import { domainLabel, DOMAIN_BY_KEY } from '@/lib/career-intel/ontology';
+import { buildCareerMap, MAP_BANDS } from '@/lib/career-intel/map';
 import type { OpportunityRow } from '@/lib/xscale/roles-ext';
 
 export const prerender = false;
@@ -74,11 +84,21 @@ export const POST: APIRoute = async ({ request }) => {
   // The person's own explicit choices — a search box, a department they clicked — are the only
   // things allowed to REMOVE postings from the result. They travel separately from the profile so
   // that distinction is visible at the call site rather than buried in the compiler.
+  //
+  // A DOMAIN CLICKED ON THE CAREER MAP IS AN EXPLICIT CHOICE, not an inference, so it belongs here
+  // and it is allowed to narrow the result set. It is also reversible in one click, which is what
+  // makes narrowing acceptable: the map node the person pressed is still on screen beside the
+  // results, and pressing nothing returns the whole set.
+  const domainKey = typeof body?.domain === 'string' ? body.domain.slice(0, 40).toUpperCase() : '';
+  const domain = DOMAIN_BY_KEY[domainKey];
+
   const explicit = {
     q: typeof body?.q === 'string' ? body.q.trim().slice(0, 120) : undefined,
     departmentId: typeof body?.dept === 'string' ? body.dept.slice(0, 60) : undefined,
     level: typeof body?.level === 'string' ? body.level.slice(0, 30) : undefined,
     engagementType: typeof body?.type === 'string' ? body.type.slice(0, 30) : undefined,
+    skillCategory: domain?.skillCategory || undefined,
+    terms: domain && !domain.skillCategory ? domain.terms.slice(0, 4) : undefined,
   };
 
   const pool = await retrieveForProfile(profile, { limit, offset, explicit });
@@ -146,6 +166,12 @@ export const POST: APIRoute = async ({ request }) => {
     nextOffset: nextOffset < pool.total ? nextOffset : null,
     readiness: profileReadiness(profile),
     offerResume: shouldOfferResume(profile),
+    // THE CAREER MAP TRAVELS WITH THE RESULTS AND COSTS NOTHING. It is computed from the profile
+    // alone — no query — so showing it is free, and it cannot drift from what the results were
+    // ranked on because both were built from the same document in the same request.
+    map: buildCareerMap(profile),
+    mapBands: MAP_BANDS,
+    focusedDomain: domain ? { key: domain.key, label: domain.label } : null,
     groups,
   }, 200, 'no-store');
 };
