@@ -57,6 +57,28 @@
 // DEPARTMENT IDS ARE TEXT. `departments.id` is varchar(50) (a slug) in src/lib/db/schema.ts and
 // UUID in db/hr-schema.sql. Every department column here is TEXT and every comparison is ::text.
 // A ::uuid cast throws on the first slug that arrives.
+//
+// CREATE TABLE IF NOT EXISTS PROTECTS THE TABLE. IT DOES NOT PROTECT ITS SHAPE.
+//
+// This is the trap that broke the whole batch in production and it is worth stating plainly, because
+// every statement here looks idempotent and one of them was not. If the table already exists,
+// CREATE TABLE IF NOT EXISTS is a NO-OP — Postgres does not compare the definition, does not add the
+// missing columns, and does not warn. Anything later in the batch that names one of those columns
+// then fails with 42703, and because a batch is one transaction, EVERY statement in it is rolled
+// back, including the ones with nothing to do with that table.
+//
+// That is exactly what happened. hr_performance_reviews exists on the live database in a shape older
+// than the definition below, without cycle_id. The CREATE did nothing, the index on cycle_id threw
+// `column "cycle_id" does not exist`, and hr_skills, hr_employee_skills, hr_learning_assignments,
+// hr_training_events and hr_training_signups — none of which have anything to do with review cycles
+// — were never created at all. They had to be recovered by hand from db/capability-spine-schema.sql
+// and db/performance-remainder-schema.sql. The reason was invisible for as long as it was, because
+// ensureOnce() swallows and nothing kept what it swallowed.
+//
+// SO EVERY COLUMN A LATER STATEMENT DEPENDS ON IS ASSERTED WITH ADD COLUMN IF NOT EXISTS, whether or
+// not the CREATE above it already declares it. On a fresh database those ALTERs are no-ops. On a
+// database that has been alive for a while they are the only thing that makes the rest of the batch
+// reachable. src/lib/ddl-transaction.test.ts enforces the rule for this file.
 import { ensureBatch } from '@/lib/ensure-once';
 // The base hr_employee_goals table has exactly ONE definition, and it is in hr-lifecycle.ts. This
 // module adds columns to it and must never re-declare it: two CREATE TABLE statements for one table
@@ -108,6 +130,10 @@ const PERFORMANCE_DDL = [
   // different product decision and inventing it here would publish people's targets by default.
   `ALTER TABLE hr_employee_goals ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) NOT NULL DEFAULT 'manager';`,
   `ALTER TABLE hr_employee_goals ADD COLUMN IF NOT EXISTS last_progress_at TIMESTAMPTZ;`,
+  // hr-lifecycle.ts owns this column and this file has never declared it, which is precisely the
+  // assumption that lost five tables further down: the index below is only as safe as the shape of a
+  // table another module created. Asserting it costs a no-op ALTER and removes the assumption.
+  `ALTER TABLE hr_employee_goals ADD COLUMN IF NOT EXISTS employee_id UUID;`,
   `CREATE INDEX IF NOT EXISTS hr_goals_period_idx ON hr_employee_goals(employee_id, period_end DESC);`,
 
   // The measurable half of an OKR. A separate table because an objective has MANY key results
@@ -125,6 +151,11 @@ const PERFORMANCE_DDL = [
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );`,
+  // The two columns the index below sorts on, asserted rather than assumed. See the note above
+  // PERFORMANCE_DDL: a CREATE TABLE IF NOT EXISTS over an existing table of an older shape is a
+  // silent no-op, and the index is then built against columns that were never added.
+  `ALTER TABLE hr_goal_key_results ADD COLUMN IF NOT EXISTS goal_id UUID;`,
+  `ALTER TABLE hr_goal_key_results ADD COLUMN IF NOT EXISTS sort_order INT NOT NULL DEFAULT 0;`,
   `CREATE INDEX IF NOT EXISTS hr_goal_kr_goal_idx ON hr_goal_key_results(goal_id, sort_order);`,
 
   // ---------------------------------------------------------------------------------------
@@ -165,6 +196,20 @@ const PERFORMANCE_DDL = [
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT hr_performance_reviews_cycle_emp_key UNIQUE (cycle_id, employee_id)
   );`,
+  // THIS IS THE STATEMENT THAT WAS FAILING IN PRODUCTION, AND THESE TWO LINES ARE THE FIX.
+  //
+  // /admin/setup reported `performance_v1: column "cycle_id" does not exist` on 2026-08-24. The
+  // live hr_performance_reviews predates the definition above and has no cycle_id, so the CREATE
+  // TABLE IF NOT EXISTS did nothing and the index below asked for a column the table has never
+  // had. That is a 42703, and it took the whole batch with it — which is why hr_skills,
+  // hr_employee_skills and everything under them had to be created by hand from
+  // db/capability-spine-schema.sql instead.
+  //
+  // NULLABLE, unlike the column in the CREATE. On a fresh database the CREATE has already made it
+  // NOT NULL and these are no-ops; on the existing table an ADD COLUMN ... NOT NULL would fail on
+  // the first row. A nullable column is the honest additive outcome.
+  `ALTER TABLE hr_performance_reviews ADD COLUMN IF NOT EXISTS cycle_id UUID;`,
+  `ALTER TABLE hr_performance_reviews ADD COLUMN IF NOT EXISTS employee_id UUID;`,
   `CREATE INDEX IF NOT EXISTS hr_performance_reviews_cycle_idx ON hr_performance_reviews (cycle_id);`,
 
   // The stage a cycle is IN, which the original `status` (draft|active|closed) cannot say. A
@@ -232,6 +277,12 @@ const PERFORMANCE_DDL = [
     visible_to_manager BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );`,
+  // The four columns the three indexes below read. No REFERENCES on the ALTER: validating a
+  // foreign key against rows that already exist can fail, and this must not be able to.
+  `ALTER TABLE hr_feedback ADD COLUMN IF NOT EXISTS subject_employee_id UUID;`,
+  `ALTER TABLE hr_feedback ADD COLUMN IF NOT EXISTS cycle_id UUID;`,
+  `ALTER TABLE hr_feedback ADD COLUMN IF NOT EXISTS author_user_id UUID;`,
+  `ALTER TABLE hr_feedback ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`,
   `CREATE INDEX IF NOT EXISTS hr_feedback_subject_idx ON hr_feedback(subject_employee_id, created_at DESC);`,
   `CREATE INDEX IF NOT EXISTS hr_feedback_cycle_idx ON hr_feedback(cycle_id);`,
   `CREATE INDEX IF NOT EXISTS hr_feedback_author_idx ON hr_feedback(author_user_id, created_at DESC);`,
@@ -250,6 +301,7 @@ const PERFORMANCE_DDL = [
   );`,
   // Case-insensitive uniqueness: "TypeScript" and "typescript" are one skill, and letting them
   // be two silently halves every count on the department matrix.
+  `ALTER TABLE hr_skills ADD COLUMN IF NOT EXISTS name VARCHAR(120);`,
   `CREATE UNIQUE INDEX IF NOT EXISTS hr_skills_name_key ON hr_skills(lower(name));`,
 
   `CREATE TABLE IF NOT EXISTS hr_employee_skills (
@@ -265,6 +317,8 @@ const PERFORMANCE_DDL = [
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT hr_employee_skills_key UNIQUE (employee_id, skill_id)
   );`,
+  `ALTER TABLE hr_employee_skills ADD COLUMN IF NOT EXISTS skill_id UUID;`,
+  `ALTER TABLE hr_employee_skills ADD COLUMN IF NOT EXISTS level INT NOT NULL DEFAULT 1;`,
   `CREATE INDEX IF NOT EXISTS hr_employee_skills_skill_idx ON hr_employee_skills(skill_id, level);`,
 
   // ---------------------------------------------------------------------------------------
@@ -290,6 +344,8 @@ const PERFORMANCE_DDL = [
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT hr_learning_assignments_key UNIQUE (employee_id, course_id)
   );`,
+  `ALTER TABLE hr_learning_assignments ADD COLUMN IF NOT EXISTS employee_id UUID;`,
+  `ALTER TABLE hr_learning_assignments ADD COLUMN IF NOT EXISTS due_on DATE;`,
   `CREATE INDEX IF NOT EXISTS hr_learning_assign_due_idx ON hr_learning_assignments(employee_id, due_on);`,
 
   // ---------------------------------------------------------------------------------------
@@ -315,6 +371,7 @@ const PERFORMANCE_DDL = [
     created_by_user_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );`,
+  `ALTER TABLE hr_training_events ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ;`,
   `CREATE INDEX IF NOT EXISTS hr_training_events_when_idx ON hr_training_events(starts_at);`,
 
   `CREATE TABLE IF NOT EXISTS hr_training_signups (
@@ -326,6 +383,7 @@ const PERFORMANCE_DDL = [
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT hr_training_signups_key UNIQUE (event_id, employee_id)
   );`,
+  `ALTER TABLE hr_training_signups ADD COLUMN IF NOT EXISTS employee_id UUID;`,
   `CREATE INDEX IF NOT EXISTS hr_training_signups_emp_idx ON hr_training_signups(employee_id);`,
 ].join('\n');
 

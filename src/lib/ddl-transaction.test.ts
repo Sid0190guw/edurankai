@@ -136,6 +136,51 @@ describe('nothing sends DDL through the simple protocol on its own any more', ()
   });
 });
 
+describe('a batch never indexes a column it has not asserted', () => {
+  // THE SECOND HALF OF THE 2026-08-24 FAULT, AND THE HALF THAT ACTUALLY LOST THE TABLES.
+  //
+  // The aborted transaction explains why twenty things reported an error. THIS explains why one
+  // thing failed in the first place: `CREATE TABLE IF NOT EXISTS` over a table that already exists in
+  // an older shape is a silent no-op. Postgres does not compare the definition and does not add the
+  // missing column. The live hr_performance_reviews had no cycle_id, so the index on cycle_id threw
+  // 42703 — and because a batch is one transaction, hr_skills, hr_employee_skills,
+  // hr_learning_assignments, hr_training_events and hr_training_signups, which have nothing to do
+  // with review cycles, were rolled back with it and had to be created by hand from db/*.sql.
+  //
+  // The rule: every column a CREATE INDEX names must be asserted with ADD COLUMN IF NOT EXISTS
+  // EARLIER in the same batch. A CREATE TABLE above it is not an assertion.
+  //
+  // SCOPED TO THE FILE WHERE THE DEFECT IS PROVEN. Widening it to every ensureBatch() in the
+  // repository is the right end state and is its own pass — it would flag modules nobody has
+  // enumerated against the live database, and a gate that lands red teaches people to skip it.
+  const GUARDED_FILES = ['performance-schema.ts'];
+
+  for (const name of GUARDED_FILES) {
+    it(`${name}: every indexed column is asserted before the index that reads it`, () => {
+      const text = readFileSync(join(SRC, 'lib', name), 'utf8');
+      const asserted = new Set<string>();
+      const offenders: string[] = [];
+      // One pass, in order, so "earlier in the batch" is what is actually checked.
+      for (const line of text.split('\n')) {
+        if (/^\s*\/\//.test(line)) continue;
+        const alter = /ALTER TABLE\s+(\w+)\s+ADD COLUMN IF NOT EXISTS\s+(\w+)/i.exec(line);
+        if (alter) { asserted.add(`${alter[1].toLowerCase()}.${alter[2].toLowerCase()}`); continue; }
+        const idx = /CREATE\s+(?:UNIQUE\s+)?INDEX IF NOT EXISTS\s+\w+\s+ON\s+(\w+)\s*\(([^)]*)\)/i.exec(line);
+        if (!idx) continue;
+        const table = idx[1].toLowerCase();
+        for (const raw of idx[2].split(',')) {
+          // `created_at DESC` -> created_at; `lower(name)` -> name.
+          const words = raw.match(/[a-z_][a-z0-9_]*/gi) || [];
+          const col = (words.filter((w) => !/^(desc|asc|lower|upper|coalesce|nulls|first|last)$/i.test(w))[0] || '').toLowerCase();
+          if (!col) continue;
+          if (!asserted.has(`${table}.${col}`)) offenders.push(`${table}.${col}`);
+        }
+      }
+      expect(offenders).toEqual([]);
+    });
+  }
+});
+
 describe('25P02 is recognised as a fact about the connection, not about the query', () => {
   it('reads the SQLSTATE off the driver error, wherever the driver put it', () => {
     expect(isAbortedTransaction({ code: '25P02' })).toBe(true);
