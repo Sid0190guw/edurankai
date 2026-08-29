@@ -38,7 +38,21 @@ import { sql } from 'drizzle-orm';
 // own error into a per-card flag, which means the Promise.all barriers can never REJECT: they can
 // only never settle. That is precisely the shape that turns this screen — the resolved Home for
 // anyone with an employee record — into a gateway timeout with nothing in the logs naming a cause.
-import { withDbTimeout, DB_TIMEOUT_MS } from '@/lib/db-timeout';
+import { DB_TIMEOUT_MS } from '@/lib/db-timeout';
+// AND THE THING withDbTimeout ALONE COULD NOT DO: STOP.
+//
+// The two waves below used to be arrays of STARTED promises — `batch.push((async () => {...})())`
+// invokes on the spot — so by the time the barrier existed all twenty-one were already in flight.
+// A bound over that array sheds the WAIT and nothing else: when the circuit opened midway, when the
+// breaker had already concluded the database was gone and every OTHER read in the instance was
+// being refused without waiting, this page's remaining reads carried on being sent to it, holding
+// connections that src/lib/db-timeout.ts's wedge diagnosis shows may never come back. The page was
+// not merely failing; it was feeding the failure.
+//
+// runFanout() takes THUNKS and therefore gets to decline them. Same single bound, same single label
+// in the breaker's evidence — plus a concurrency cap, a deadline the DISPATCHER also respects, and
+// the names of the reads that never happened.
+import { runFanout, type FanoutMember } from '@/lib/db-fanout';
 // THE DECIDER. src/lib/workforce/composer.ts answers "what should this person see" ONCE, from the
 // real gates, and this page renders its answer. Nothing below branches on a role, a permission, a
 // department or an engagement type — the moment a second surface answers that question it answers it
@@ -695,7 +709,15 @@ const dbToday = composed.context.today || '';
 //      one block under `await Promise.all(batch)`. A const left up here would be computed from an
 //      empty array before its read had finished, which is silently wrong rather than loudly broken.
 // =================================================================================================
-const batch: Promise<void>[] = [];
+// EVERY MEMBER IS A THUNK AND ITS GATE IS OUTSIDE IT. Both halves matter.
+//
+// A thunk can be declined; a started promise cannot, and that is the entire defect runFanout() was
+// written for. And the widget gate now sits on the PUSH — `if (has('timelog.today')) batch.push(...)`
+// — rather than as an `if` inside the body, so an ineligible widget contributes no member at all.
+// That keeps three things honest that a gate-inside-the-body quietly broke: the concurrency cap is
+// spent on reads that exist, `unread` names only reads that were actually wanted, and a person for
+// whom nothing is eligible is not told part of their page could not be read.
+const batch: FanoutMember[] = [];
 
 // MY TASKS. src/lib/employee-tasks.ts owns the table, the scoping and the schema ensure; this page
 // only asks it for one person's rows and is handed the hr_employees id, which is what every hr_*
@@ -726,8 +748,7 @@ let tasksFailed = false;
 // board at /portal/tasks, which resolves viewerRoles per row in SQL. A narrower role here can only
 // offer fewer moves, never more, and the write re-derives the right inside its own UPDATE anyway.
 let taskMoves: Record<string, { value: string; label: string }[]> = {};
-batch.push((async () => {
-if (wantTaskView) {
+if (wantTaskView) batch.push({ label: 'tasks', run: async () => {
   try {
     const {
       myTasksView, allowedTransitionsFor, STATUS_LABELS, canonicalStatus,
@@ -748,8 +769,7 @@ if (wantTaskView) {
   } catch (e: any) {
     logFail('tasks', e);
   }
-}
-})());
+} });
 // TODAY'S CLOCK — READ BY THE SAME ENGINE THAT WRITES IT.
 //
 // hr_clock_events for this person only: it stores GPS, IP, device and a selfie per punch, and no
@@ -784,11 +804,10 @@ let punchOptions: string[] = [];
 // hours", which is indistinguishable from a failed read — and the strip at the top of the page
 // states today's clock position as a fact.
 let clockReadFailed = false;
-batch.push((async () => {
-if (employeeId && has('clock.today')) {
+if (employeeId && has('clock.today')) batch.push({ label: 'clock events', run: async () => {
   try {
     const {
-      today: attendanceToday, punchesOn, punchLog, computeDay, allowedPunches,
+      today: attendanceToday, punchLog, computeDay, allowedPunches,
     } = await import('@/lib/attendance');
     // The day the ATTENDANCE module cuts, not the one this process would. Null means the read did
     // not happen, and a day-partitioned claim must not be made on a guess.
@@ -796,11 +815,17 @@ if (employeeId && has('clock.today')) {
     if (!day) {
       clockReadFailed = true;
     } else {
-      // punchLog() for the visible list (it carries the location and the verification badge the rows
-      // render), computeDay() over the kinds and times for the totals. One extra read against the
-      // same table, and it buys a page that cannot disagree with the timesheet.
+      // ONE READ, NOT TWO. punchLog() and punchesOn() are the same SELECT over hr_clock_events —
+      // same employee, same day boundaries in ATTENDANCE_TIME_ZONE, same ORDER BY, same LIMIT — and
+      // punchLog simply asks for more columns. PunchRow extends PunchEvent, so computeDay() takes
+      // the log directly and gets a row set that is not merely equivalent to punchesOn's but
+      // identical to it, which is stronger than what two separate reads could promise: two reads a
+      // few hundred milliseconds apart can straddle a punch and disagree about the day.
+      //
+      // The saving is one round trip out of roughly thirty on this page, and it is the cheap kind —
+      // no type changes anything downstream can notice, because the objects are the same objects.
       const log = await punchLog(employeeId, day);
-      const totals = computeDay(await punchesOn(employeeId, day));
+      const totals = computeDay(log);
       // A positional id, not the timestamp: the markup builds an element id from it, and an ISO
       // string carries colons. The live-time script selects on [data-ts] rather than by id, so this
       // is about the markup being well formed rather than about anything working.
@@ -823,8 +848,7 @@ if (employeeId && has('clock.today')) {
     clockReadFailed = true;
     logFail('clock events', e);
   }
-}
-})());
+} });
 
 // Today's time logs (period tracking)
 let timeLogs: any[] = [];
@@ -834,8 +858,7 @@ let loggedHours = 0;
 // on this page with no read-failure state at all. A person who logged four hours this morning and
 // is shown 0h logged re-enters them.
 let timeLogsUnread = false;
-batch.push((async () => {
-if (employeeId && has('timelog.today')) {
+if (employeeId && has('timelog.today')) batch.push({ label: 'time logs', run: async () => {
   try {
     // The same day the write above used. These two must never be resolved from different clocks:
     // the read decides what the card shows, and the write decides what exists.
@@ -846,22 +869,19 @@ if (employeeId && has('timelog.today')) {
     timeLogsUnread = true;
     logFail('time logs', e);
   }
-}
-})());
+} });
 
 // Today's clock-out task summaries. Sparse by construction: the only writer is the clock_out branch
 // above, and only when the text field is non-empty.
 let taskLogs: any[] = [];
-batch.push((async () => {
-if (employeeId && has('worklog.today')) {
+if (employeeId && has('worklog.today')) batch.push({ label: 'session summaries', run: async () => {
   try {
     const r = await db.execute(sql`SELECT task, status, percent, details, created_at FROM hr_task_log WHERE employee_id = ${employeeId} AND log_date = CURRENT_DATE ORDER BY created_at DESC`);
     taskLogs = rowsOf(r);
   } catch (e: any) {
     logFail('session summaries', e);
   }
-}
-})());
+} });
 
 // TODAY'S REPORT — READ HERE, WRITTEN NOWHERE ON THIS PAGE ANY MORE. See the long note beside the
 // card for what the write used to do and why it had to stop.
@@ -873,8 +893,7 @@ if (employeeId && has('worklog.today')) {
 // column onto a page that shows none of them.
 let todayReport: any = null;
 let reportReadFailed = false;
-batch.push((async () => {
-if (employeeId && has('dailyreport.today')) {
+if (employeeId && has('dailyreport.today')) batch.push({ label: 'daily report', run: async () => {
   try {
     const r = await db.execute(sql`
       SELECT report_url, work_done, blockers, revision_count, reviewed_at
@@ -886,14 +905,12 @@ if (employeeId && has('dailyreport.today')) {
     reportReadFailed = true;
     logFail('daily report', e);
   }
-}
-})());
+} });
 
 // Payslips. Listed straight from hr_payslips and NEVER through hr-payslip.ts's reader, which SELECTs
 // e.work_email — a column with no writer at all.
 let payslips: any[] = [];
-batch.push((async () => {
-if (employeeId && has('payslips.mine')) {
+if (employeeId && has('payslips.mine')) batch.push({ label: 'payslips', run: async () => {
   try {
     const r = await db.execute(sql`
       SELECT ps.*, pr.month, pr.year
@@ -907,8 +924,7 @@ if (employeeId && has('payslips.mine')) {
   } catch (e: any) {
     logFail('payslips', e);
   }
-}
-})());
+} });
 
 // MY TEAM LEADER. reporting_manager_id holds a USERS id, not an hr_employees id — hr-wallet.ts
 // compares it straight to the signed-in user.id — so the lookup is on user_id. Joining it to
@@ -939,8 +955,7 @@ if (employeeId && has('payslips.mine')) {
 let manager: any = null;
 let managerReadFailed = false;
 let managerSource: string = 'none';
-batch.push((async () => {
-if (employeeId && has('manager.card')) {
+if (employeeId && has('manager.card')) batch.push({ label: 'manager', run: async () => {
   try {
     const { reportingManagerCard } = await import('@/lib/workforce/loaders');
     const found = await reportingManagerCard(employeeId, composed.context.reportingManagerUserId);
@@ -952,8 +967,7 @@ if (employeeId && has('manager.card')) {
     managerSource = 'failed';
     logFail('manager', e);
   }
-}
-})());
+} });
 
 // WAITING ON MY SIGN-OFF, AND WAITING ON MY REVIEW.
 //
@@ -969,8 +983,7 @@ if (employeeId && has('manager.card')) {
 let boardOk = false;
 let signOffTasks: any[] = [];
 let reviewTasks: any[] = [];
-batch.push((async () => {
-if (wantBoard && user?.id) {
+if (wantBoard && user?.id) batch.push({ label: 'board', run: async () => {
   try {
     const { listBoard } = await import('@/lib/employee-tasks');
     const board = await listBoard(user.id, { limit: 400 });
@@ -988,8 +1001,7 @@ if (wantBoard && user?.id) {
   } catch (e: any) {
     logFail('board', e);
   }
-}
-})());
+} });
 
 // LEAVE AND WITHDRAWAL REQUESTS WAITING ON A DECISION.
 //
@@ -1005,8 +1017,7 @@ if (wantBoard && user?.id) {
 let pendingLeave = 0;
 let pendingWithdrawals = 0;
 let hrQueueFailed = false;
-batch.push((async () => {
-if (wantLeaveQueue || wantWithdrawalQueue) {
+if (wantLeaveQueue || wantWithdrawalQueue) batch.push({ label: 'approver queue', run: async () => {
   try {
     const [{ pendingLeaveForApprover }, { pendingWithdrawalsForApprover }] = await Promise.all([
       import('@/lib/hr-leave'),
@@ -1023,8 +1034,7 @@ if (wantLeaveQueue || wantWithdrawalQueue) {
     hrQueueFailed = true;
     logFail('approver queue', e);
   }
-}
-})());
+} });
 
 // EVERYTHING ELSE ROUTED TO THIS PERSON — the queue this page could not see.
 //
@@ -1044,8 +1054,7 @@ if (wantLeaveQueue || wantWithdrawalQueue) {
 let routedCount = 0;
 let routedRows: any[] = [];
 let routedFailed = false;
-batch.push((async () => {
-if (wantRoutedQueue && user?.id) {
+if (wantRoutedQueue && user?.id) batch.push({ label: 'routed approvals', run: async () => {
   try {
     const { routedApprovals } = await import('@/lib/workforce/loaders');
     const routed = await routedApprovals(String(user.id));
@@ -1056,8 +1065,7 @@ if (wantRoutedQueue && user?.id) {
     routedFailed = true;
     logFail('routed approvals', e);
   }
-}
-})());
+} });
 // MEETINGS TODAY — and this page used to deny they could be shown at all.
 //
 // WHAT WAS WRONG. The "Today" section carried the flat sentence "Scheduled meetings are not shown:
@@ -1075,8 +1083,7 @@ if (wantRoutedQueue && user?.id) {
 // says so rather than implying a complete calendar.
 let meetingsToday: any[] = [];
 let meetingsOk = false;
-batch.push((async () => {
-if (has('meetings.today') && user?.id && dbToday) {
+if (has('meetings.today') && user?.id && dbToday) batch.push({ label: 'meetings today', run: async () => {
   try {
     const { buildCalendar } = await import('@/lib/calendar-hub');
     const model = await buildCalendar(
@@ -1094,8 +1101,7 @@ if (has('meetings.today') && user?.id && dbToday) {
   } catch (e: any) {
     logFail('meetings today', e);
   }
-}
-})());
+} });
 
 // JOINING DOCUMENTS, MINE — the ones a reviewer sent back.
 //
@@ -1106,8 +1112,7 @@ if (has('meetings.today') && user?.id && dbToday) {
 // than returning [] on failure, which is exactly what this needs.
 let rejectedDocs = 0;
 let docsFailed = false;
-batch.push((async () => {
-if (wantMyDocs && user?.id) {
+if (wantMyDocs && user?.id) batch.push({ label: 'joining documents', run: async () => {
   try {
     const { listDocs } = await import('@/lib/hr-onboarding');
     const docs = await listDocs(String(user.id));
@@ -1116,8 +1121,7 @@ if (wantMyDocs && user?.id) {
     docsFailed = true;
     logFail('joining documents', e);
   }
-}
-})());
+} });
 
 // JOINING DOCUMENTS WAITING FOR A REVIEW. onboarding.review requires admin.access AND the employees
 // section at 'edit' — the same test /api/portal/onboarding/documents uses to authorise the review,
@@ -1126,8 +1130,7 @@ if (wantMyDocs && user?.id) {
 // returns names and email addresses for up to 150 people. Own rows are excluded.
 let docsToReview = 0;
 let docReviewFailed = false;
-batch.push((async () => {
-if (wantDocReview && user?.id) {
+if (wantDocReview && user?.id) batch.push({ label: 'joining document reviews', run: async () => {
   try {
     const r = await db.execute(sql`
       SELECT COUNT(*)::int AS n FROM hr_onboarding_documents
@@ -1137,8 +1140,7 @@ if (wantDocReview && user?.id) {
     docReviewFailed = true;
     logFail('joining document reviews', e);
   }
-}
-})());
+} });
 
 // THE CREDIT POSITION, AND THE GUARD THAT IS NO LONGER HERE.
 //
@@ -1158,8 +1160,7 @@ if (wantDocReview && user?.id) {
 let credit: any = null;
 let creditTerms: any = null;
 let weeksLeft: number | null = null;
-batch.push((async () => {
-if (employeeId && (has('credit.position') || has('credit.weeksLeft'))) {
+if (employeeId && (has('credit.position') || has('credit.weeksLeft'))) batch.push({ label: 'credit', run: async () => {
   try {
     const { ledgerFor, termsFor } = await import('@/lib/credit-ledger');
     creditTerms = await termsFor(employeeId);
@@ -1171,8 +1172,7 @@ if (employeeId && (has('credit.position') || has('credit.weeksLeft'))) {
     // stops appearing is exactly the kind of absence nobody reports and nobody notices.
     logFail('credit', e);
   }
-}
-})());
+} });
 // CHAT. Two numbers, and nothing else is possible. chat_messages stores `ciphertext` and `iv`;
 // there is no plaintext column, and the private key is generated in the browser and never leaves
 // localStorage, so no server-rendered page can show what was said. chat_threads.last_message_preview
@@ -1188,8 +1188,7 @@ if (employeeId && (has('credit.position') || has('credit.weeksLeft'))) {
 let chatThreads = 0;
 let chatUnread = 0;
 let chatReady = false;
-batch.push((async () => {
-if (composed.ok && user?.id) {
+if (composed.ok && user?.id) batch.push({ label: 'chat counts', run: async () => {
   try {
     const r = await db.execute(sql`
       SELECT COUNT(*)::int AS threads,
@@ -1209,8 +1208,7 @@ if (composed.ok && user?.id) {
   } catch (e: any) {
     logFail('chat counts', e);
   }
-}
-})());
+} });
 
 // COMMUNITY. visibleGroupsFor() is the only permitted way to list groups, and this page does not go
 // near the work_groups table itself. It returns the groups this person belongs to plus the
@@ -1222,16 +1220,14 @@ if (composed.ok && user?.id) {
 // the moment of access. Nothing below renders a link, and there is no total count of anything unseen
 // — that would be the same map by another route.
 let myGroups: any[] = [];
-batch.push((async () => {
-if (has('groups.mine') && user?.id) {
+if (has('groups.mine') && user?.id) batch.push({ label: 'groups', run: async () => {
   try {
     const { visibleGroupsFor } = await import('@/lib/work-groups');
     myGroups = await visibleGroupsFor(user.id);
   } catch (e: any) {
     logFail('groups', e);
   }
-}
-})());
+} });
 // =================================================================================================
 // THE HOME WIDGETS. Same two rules as everything above: gated on has(...) BEFORE the read, and every
 // one of them reports whether the read HAPPENED.
@@ -1249,16 +1245,14 @@ if (has('groups.mine') && user?.id) {
 // href:null and each ROW is rendered against its own notifications.action_url. This card is that
 // missing surface, and it is why the registry's note exists.
 let notifs: any = { ok: false, items: [], unread: 0 };
-batch.push((async () => {
-if (has('notifications.unread') && user?.id) {
+if (has('notifications.unread') && user?.id) batch.push({ label: 'notifications', run: async () => {
   try {
     const { myNotifications } = await import('@/lib/workforce/loaders');
     notifs = await myNotifications(String(user.id), 5);
   } catch (e: any) {
     logFail('notifications', e);
   }
-}
-})());
+} });
 
 // DIRECT REPORTS. ctx.managesPeople has been true for reporting managers all along and
 // reports.direct has been registered all along, but NOTHING ANYWHERE LOADED IT — a manager with
@@ -1271,8 +1265,7 @@ if (has('notifications.unread') && user?.id) {
 // the four answers apart and this page renders a different sentence for each; only ONE of them is
 // allowed to say that nobody reports to them.
 let reports: any = { ok: true, people: [], more: 0, source: 'none' };
-batch.push((async () => {
-if (has('reports.direct') && user?.id) {
+if (has('reports.direct') && user?.id) batch.push({ label: 'direct reports', run: async () => {
   try {
     const { directReportsView } = await import('@/lib/workforce/loaders');
     reports = await directReportsView(String(user.id), employeeId, 6);
@@ -1280,16 +1273,14 @@ if (has('reports.direct') && user?.id) {
     logFail('direct reports', e);
     reports = { ok: false, people: [], more: 0, source: 'failed' };
   }
-}
-})());
+} });
 // THE DEPARTMENT A LEAD MAY QUERY. Narrowed by departmentFilter() inside the loader, from
 // ctx.scopeDepartmentId — which comes from the session (users.assigned_department_id) and never from
 // a query string. ctx.departmentId is NOT passed and must never be: that is the person's OWN
 // department, display-only, and handing it to the filter would manufacture a peer list for an
 // ordinary employee — a new authorisation decision smuggled in as a rendering one.
 let roster: any = { ok: true, people: [], more: 0 };
-batch.push((async () => {
-if (has('team.roster') && composed.context.scopeDepartmentId) {
+if (has('team.roster') && composed.context.scopeDepartmentId) batch.push({ label: 'department roster', run: async () => {
   try {
     const { departmentRoster } = await import('@/lib/workforce/loaders');
     roster = await departmentRoster({ scopeDepartmentId: composed.context.scopeDepartmentId }, 6);
@@ -1297,35 +1288,30 @@ if (has('team.roster') && composed.context.scopeDepartmentId) {
     logFail('department roster', e);
     roster = { ok: false, people: [], more: 0 };
   }
-}
-})());
+} });
 // THIS MONTH'S ATTENDANCE. Days RECORDED, never a percentage against a target — the target framing
 // belongs to credit.position, which is internship-only, and putting a completion bar here is exactly
 // the defect the widget registry exists to fix.
 let attMonth: any = { ok: false, present: 0, leave: 0, other: 0, daysRecorded: 0, hours: null };
-batch.push((async () => {
-if (employeeId && has('attendance.month')) {
+if (employeeId && has('attendance.month')) batch.push({ label: 'attendance month', run: async () => {
   try {
     const { attendanceMonth } = await import('@/lib/workforce/loaders');
     attMonth = await attendanceMonth(employeeId);
   } catch (e: any) {
     logFail('attendance month', e);
   }
-}
-})());
+} });
 
 // APPROVED LEAVE COVERING TODAY — one of the three things "Today" can honestly say.
 let leaveToday: any = { ok: false, days: [] };
-batch.push((async () => {
-if (employeeId && has('schedule.today')) {
+if (employeeId && has('schedule.today')) batch.push({ label: 'leave today', run: async () => {
   try {
     const { leaveCovering } = await import('@/lib/workforce/loaders');
     leaveToday = await leaveCovering(employeeId, composed.context.today);
   } catch (e: any) {
     logFail('leave today', e);
   }
-}
-})());
+} });
 // THE BARRIER. Everything above ran at once; nothing below may assume any of it until this line.
 //
 // AND IT IS THE BARRIER THAT IS BOUNDED, NOT THE MEMBERS. Bounding each read individually is the
@@ -1338,17 +1324,21 @@ if (employeeId && has('schedule.today')) {
 // `let`, and declared BEFORE the wait rather than after it: `const` is not hoisted, and the flag has
 // to exist whichever way this settles because the markup reads it either way.
 let batchDegraded = false;
-try {
-  await withDbTimeout(Promise.all(batch), 'portalEmployee.batch', DB_TIMEOUT_MS);
-} catch (e: any) {
-  // Nothing is lost and nothing is re-run — withDbTimeout sheds the WAIT, not the work. What we
-  // know here is only that some of the reads above had not answered yet, so their cards are still
-  // holding the empty defaults they were declared with. An empty default rendered without this flag
-  // reads as "you have none", which on a screen that states today's clock position, logged hours,
-  // tasks and pending approvals is a claim rather than an absence. The banner at the top of the page
-  // is what stops it being read that way.
-  batchDegraded = true;
-  logFail('batch barrier', e);
+{
+  // Nothing is lost and nothing is re-run. What a degraded wave tells us is only that some of the
+  // reads above did not answer — they were skipped before being sent, or they were still in flight
+  // when the bound elapsed — so their cards are still holding the empty defaults they were declared
+  // with. An empty default rendered without this flag reads as "you have none", which on a screen
+  // that states today's clock position, logged hours, tasks and pending approvals is a claim rather
+  // than an absence. The banner at the top of the page is what stops it being read that way.
+  //
+  // THE FLAG NOW COVERS A CASE THE try/catch COULD NOT SEE. A member that was never dispatched —
+  // because the circuit opened partway through the wave — used to leave no trace whatsoever: the
+  // barrier only rejected if the WAIT ran out, so a wave that finished early with half its reads
+  // declined reported success and the page printed empty cards as fact. runFanout reports it.
+  const wave = await runFanout(batch, { label: 'portalEmployee.batch', ms: DB_TIMEOUT_MS });
+  batchDegraded = wave.degraded;
+  if (wave.error) logFail('batch barrier', wave.error);
 }
 
 // =================================================================================================
@@ -1466,7 +1456,7 @@ const reportsProvenance =
 // costs one round trip, not two, and for most people it costs none at all because neither condition
 // holds.
 // =================================================================================================
-const batch2: Promise<void>[] = [];
+const batch2: FanoutMember[] = [];
 
 // HOW THIS PERSON LAST CLOCKED IN, so the form does not ask them the same question about themselves
 // twice a day forever.
@@ -1483,8 +1473,7 @@ const batch2: Promise<void>[] = [];
 // the caller's own employee id like every other read on this page, and a failure leaves the old
 // 'remote' default in place rather than breaking the form.
 let lastWorkMode = '';
-batch2.push((async () => {
-if (employeeId && has('clock.today') && currentStatus === 'clocked_out') {
+if (employeeId && has('clock.today') && currentStatus === 'clocked_out') batch2.push({ label: 'last work mode', run: async () => {
   try {
     const r = await db.execute(sql`
       SELECT work_mode FROM hr_clock_events
@@ -1496,8 +1485,7 @@ if (employeeId && has('clock.today') && currentStatus === 'clocked_out') {
   } catch (e: any) {
     logFail('last work mode', e);
   }
-}
-})());
+} });
 
 // RECENT ACTIVITY, CAPPED HARD AND ON PURPOSE. listTaskActivity() is PER TASK and there is no
 // cross-task personal activity reader in this codebase; building one means exporting visibleToSql()
@@ -1505,8 +1493,7 @@ if (employeeId && has('clock.today') && currentStatus === 'clocked_out') {
 // dashboard card gets to force. So it runs for a handful of tasks this page has ALREADY read and
 // this person has ALREADY been authorised for, and says so when there were more.
 let activity: any = { ok: true, entries: [], partial: false };
-batch2.push((async () => {
-if (has('tasks.activity') && user?.id && openTasks.length > 0) {
+if (has('tasks.activity') && user?.id && openTasks.length > 0) batch2.push({ label: 'task activity', run: async () => {
   try {
     const { recentTaskActivity } = await import('@/lib/workforce/loaders');
     activity = await recentTaskActivity(
@@ -1518,19 +1505,22 @@ if (has('tasks.activity') && user?.id && openTasks.length > 0) {
     logFail('task activity', e);
     activity = { ok: false, entries: [], partial: false };
   }
-}
-})());
+} });
 // The second barrier, bounded for the same reason and with the same shape. Both of these thunks
 // swallow to a local too, so this wait is equally incapable of rejecting on its own.
-try {
-  await withDbTimeout(Promise.all(batch2), 'portalEmployee.batch2', DB_TIMEOUT_MS);
-} catch (e: any) {
+{
   // The SAME flag as the first barrier, deliberately. From the reader's side there is one question —
   // is what I am looking at complete — and two banners answering it would be two ways of saying one
-  // thing. Expect DbCircuitOpenError here whenever the first barrier was the timeout that opened the
-  // breaker: that is the breaker working, and it still leaves a degraded page rather than a dead one.
-  batchDegraded = true;
-  logFail('batch2 barrier', e);
+  // thing. Expect every member here to be SKIPPED whenever the first wave was what opened the
+  // breaker: that is the breaker working, and it still leaves a degraded page rather than a dead
+  // one — and it now costs nothing, because a skipped member sends no statement at all.
+  //
+  // `||=`, not `=`: the first wave's verdict must not be overwritten by a second wave that had
+  // nothing to do. An empty batch2 is not degraded, and assigning it would erase the banner the
+  // first wave had already earned.
+  const wave2 = await runFanout(batch2, { label: 'portalEmployee.batch2', ms: DB_TIMEOUT_MS });
+  batchDegraded = batchDegraded || wave2.degraded;
+  if (wave2.error) logFail('batch2 barrier', wave2.error);
 }
 
 // Only a value the select actually offers. Anything else — an old code, a null, a value written by a

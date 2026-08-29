@@ -4,7 +4,8 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import * as schema from './schema';
 import { ddlPermitted, isDdlStatement, noteSuppressedDdl } from '@/lib/schema-bootstrap';
-import { registerAbortedTransactionHealer, registerPoolResetter } from '@/lib/db-timeout';
+import { DbCircuitOpenError, dbCircuitOpen, registerAbortedTransactionHealer, registerPoolResetter } from '@/lib/db-timeout';
+import { currentDbScope, scopeRefusesQuery } from '@/lib/db-scope';
 
 // Try .env on local dev
 try {
@@ -244,6 +245,24 @@ type RealDb = ReturnType<typeof drizzle<typeof schema>>;
 // statement is EXECUTED. A guard that silently drops a write it merely failed to classify would be a
 // far worse outage than the one it is here to prevent.
 function guardedExecute(real: any, query: any): Promise<any> {
+  // THE SCOPED REFUSAL, ASKED FIRST AND ASKED OF ALMOST NOBODY.
+  //
+  // Outside a scope opened by src/lib/db-scope.ts this is one undefined lookup and nothing else, so
+  // every ordinary query in the deployment is unaffected — which is the entire design constraint.
+  // Inside one, it is what stops a fan-out member that was ALREADY RUNNING when the circuit opened
+  // from sending its second and third statements into a database every other read is being refused
+  // for. src/lib/db-fanout.ts opens the scope; src/lib/db-scope.ts explains why the alternative — a
+  // gate on this function for everyone, writes included — is the wrong shape.
+  //
+  // BEFORE THE DDL GUARD, deliberately. A refused statement must not be classified, counted as
+  // suppressed DDL, or reported as an empty result: the caller asked for a read and is owed an error
+  // it can degrade on, not silence.
+  try {
+    const scope = currentDbScope();
+    if (scope && scopeRefusesQuery(dbCircuitOpen(), scope)) {
+      return Promise.reject(new DbCircuitOpenError(scope.label));
+    }
+  } catch { /* a guard may never become the failure; fall through and run the statement */ }
   try {
     if (ddlPermitted()) return real.execute(query);
     const text = typeof query === 'string' ? query : String(real.dialect.sqlToQuery(query).sql || '');

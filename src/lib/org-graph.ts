@@ -350,16 +350,45 @@ function mapEdge(row: any): OrgEdge {
  * A screen that shows the second when the first is true is telling every employee they report to
  * nobody. Returns false on any error, which lands on the honest message rather than a blank chart.
  */
+// CONCURRENT CALLERS SHARE ONE READ, AND ONLY CONCURRENT ONES.
+//
+// /portal/employee asks this twice in the same wave — reportingManagerCard() asks it to decide
+// whether "nobody manages you" is a fact or a gap, and directReportsView() asks it for the mirror
+// image — so one page load paid two identical round trips for one global fact, at the same instant,
+// against a pool of five connections whose scarcity is what src/lib/db/index.ts's entire header is
+// about.
+//
+// THE IN-FLIGHT PROMISE IS MEMOISED, NOT THE ANSWER, and that distinction is the whole safety
+// argument. Caching the boolean would make a warm instance go on reporting "the graph is empty"
+// after db/org-graph-backfill.sql had been run — a stale claim about the company's records, which is
+// exactly the kind of confident-and-wrong this codebase keeps having to undo. Sharing only the
+// promise that is running RIGHT NOW changes nothing observable: two callers a millisecond apart
+// would have received the same answer from two queries anyway, and the next call after it settles
+// asks the database again.
+//
+// The same shape src/lib/ensure-once.ts uses and for the same stated reason: "concurrent callers on
+// a cold process share a single DDL run instead of each firing their own".
+let _initInFlight: Promise<boolean> | null = null;
+
 export async function isInitialized(): Promise<boolean> {
+  if (_initInFlight) return _initInFlight;
+  _initInFlight = (async () => {
+    try {
+      await ensureOrgGraphSchema();
+      const r = await (await database()).execute(
+        sql`SELECT 1 AS ok FROM org_relationships WHERE status = 'active' LIMIT 1`,
+      );
+      return rows(r).length > 0;
+    } catch (e: any) {
+      logFail('isInitialized', e);
+      return false;
+    }
+  })();
   try {
-    await ensureOrgGraphSchema();
-    const r = await (await database()).execute(
-      sql`SELECT 1 AS ok FROM org_relationships WHERE status = 'active' LIMIT 1`,
-    );
-    return rows(r).length > 0;
-  } catch (e: any) {
-    logFail('isInitialized', e);
-    return false;
+    return await _initInFlight;
+  } finally {
+    // Cleared whichever way it settled, so nothing is remembered past the moment it was true.
+    _initInFlight = null;
   }
 }
 
