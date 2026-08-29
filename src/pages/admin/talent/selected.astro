@@ -20,6 +20,12 @@ import { can } from '@/lib/auth/permissions';
 import { logAudit } from '@/lib/audit';
 import { selectedCandidatesBoard, approveForOnboarding, withdrawSelection, type SelectedRow } from '@/lib/talent/selection';
 import { issueCode, revokeCode, listCodes } from '@/lib/talent/codes';
+import { sendCodeByEmail } from '@/lib/talent/code-delivery';
+import {
+  defaultMessageHtml, defaultMessageText, missingTokens, TOKEN_HELP,
+  type CodeMessageContext,
+} from '@/lib/talent/code-message';
+import RichMessageComposer from '@/components/admin/RichMessageComposer.astro';
 
 // EVERY const IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted, and a handler reaching a
 // later declaration threw on its first line every time while the page reported success — that is a
@@ -46,6 +52,12 @@ let issuedFor = '';
 let issuedUntil = '';
 let issuedEmail = '';
 let issuedOpportunity = '';
+// DECLARED HERE, ABOVE THE HANDLER, for the reason stated at the top of this file: `const` is not
+// hoisted, and `origin` used to sit at line 189 - below the POST handler that now needs it.
+const origin = Astro.url.origin;
+let sendNote = '';
+let sendOk = false;
+let strippedFromMessage: { kind: string; name: string; reason: string }[] = [];
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
@@ -65,6 +77,17 @@ if (Astro.request.method === 'POST') {
         err = 'You do not hold the authority to issue onboarding codes.';
       } else {
         const days = parseInt(String(fd.get('validityDays') || '14'), 10) || 14;
+        const wantsEmail = String(fd.get('sendEmail') || '') === 'on';
+        const composedBody = String(fd.get('messageHtml') || '');
+
+        // CHECKED BEFORE ISSUING, NOT AFTER. issueCode() revokes any previous code in the same act,
+        // so refusing a message afterwards would leave the candidate holding nothing at all. A body
+        // with no {{code}} in it is a selection letter that cannot let anybody in.
+        const missing = wantsEmail ? missingTokens(composedBody) : [];
+        if (missing.length) {
+          err = 'The message no longer contains ' + missing.join(', ')
+            + ', so no code was issued. Put it back, or send the message by hand instead.';
+        } else {
         const r = await issueCode({ selectionId, issuedByUserId: user.id, validityDays: days });
         if (r.ok && r.secret) {
           issuedSecret = r.secret;
@@ -81,8 +104,34 @@ if (Astro.request.method === 'POST') {
             entity: 'tal_onboarding_code', entityId: r.code ? r.code.id : '',
             ipAddress: Astro.clientAddress,
           });
+
+          // THE SEND. Never in the audit diff, never in a log line: the plaintext goes from the
+          // issue result into the message body and nowhere else.
+          if (wantsEmail && r.code) {
+            const out = await sendCodeByEmail({
+              codeRowId: r.code.id,
+              bodyHtml: composedBody,
+              context: {
+                personName: issuedFor, boundEmail: issuedEmail,
+                opportunityTitle: issuedOpportunity, validUntil: issuedUntil,
+                origin, code: r.secret,
+              },
+            });
+            sendNote = out.message;
+            sendOk = out.sent;
+            strippedFromMessage = out.removed;
+            await logAudit({
+              userId: user.id,
+              action: out.sent ? 'onboarding.code.emailed' : 'onboarding.code.email_failed',
+              entity: 'tal_onboarding_code', entityId: r.code.id,
+              // The reason, never the code. sendCodeByEmail is built so it has nothing else to give.
+              diff: { to: issuedEmail, sent: out.sent, note: out.message },
+              ipAddress: Astro.clientAddress,
+            });
+          }
         } else {
           err = r.error || 'Could not issue a code.';
+        }
         }
       }
     } else if (action === 'revoke') {
@@ -143,24 +192,13 @@ try {
 // must type it and the gateway URL and bound address are the real ones rather than remembered ones.
 // The address matters as much as the code: the gate checks BOTH, and "it says my code is invalid" is
 // almost always somebody entering a different address from the one their code was bound to.
-const origin = Astro.url.origin;
-const shareMessage = issuedSecret
-  ? [
-      'Dear ' + (issuedFor || 'candidate') + ',',
-      '',
-      'You have been selected' + (issuedOpportunity ? ' for ' + issuedOpportunity : '') + '. Your onboarding authorization code is:',
-      '',
-      issuedSecret,
-      '',
-      'To use it, go to ' + origin + '/apply/gateway , choose "I have an authorization code", and enter',
-      'the code together with this email address: ' + issuedEmail,
-      '',
-      'The code can be used once and it expires on ' + issuedUntil + '. Please do not forward it to anyone,',
-      'and do not send it in the same message as any other document.',
-      '',
-      'EduRankAI People Operations',
-    ].join('\n')
-  : '';
+const codeCtx: CodeMessageContext = {
+  personName: issuedFor, boundEmail: issuedEmail, opportunityTitle: issuedOpportunity,
+  validUntil: issuedUntil, origin, code: issuedSecret,
+};
+// One definition, in src/lib/talent/code-message.ts. This sentence used to be written out twice,
+// byte for byte, here and in codes.astro; adding a composer would have made it three.
+const shareMessage = issuedSecret ? defaultMessageText(codeCtx) : '';
 
 // Counts computed in the frontmatter. `<` and comparisons inside JSX expressions break .astro
 // parsing on this project, so every number the template needs is finished here.
@@ -207,7 +245,19 @@ const rows = board.map((r) => {
     {msg && <div class="note note--ok">{msg}</div>}
     {err && <div class="note note--err">{err}</div>}
 
-    {issuedSecret && (
+    {sendNote && (
+    <div class={sendOk ? 'note note--ok' : 'note note--err'}>
+      <p>{sendNote}</p>
+      {strippedFromMessage.length > 0 && (
+        <p class="note__stripped">
+          Some markup was removed before sending: {strippedFromMessage.map((x) => x.name).join(', ')}.
+          The message went out without it.
+        </p>
+      )}
+    </div>
+  )}
+
+  {issuedSecret && (
       <div class="secret">
         <p class="secret__eyebrow">Onboarding code issued{issuedFor ? ' for ' + issuedFor : ''}</p>
         <p class="secret__code" id="secret-code">{issuedSecret}</p>
@@ -305,6 +355,29 @@ const rows = board.map((r) => {
                         <input type="number" name="validityDays" value="14" min="1" max="60" />
                         days
                       </label>
+                      <details class="compose">
+                        <summary>Write the message and email it</summary>
+                        <p class="compose__why">
+                          The code is written into the message at the moment it is issued, so it is
+                          never typed here and never travels back from your browser. Leave this
+                          closed to issue a code without sending anything.
+                        </p>
+                        <label class="compose__send">
+                          <input type="checkbox" name="sendEmail" />
+                          Email this to the address on the selection
+                        </label>
+                        <RichMessageComposer
+                          id={'compose-' + r.selectionId}
+                          name="messageHtml"
+                          label="Message"
+                          hint="Type it, or paste formatted text or HTML - the recipient sees normal formatted text."
+                          tokens={TOKEN_HELP}
+                          value={defaultMessageHtml({
+                            personName: r.personName, boundEmail: '',
+                            opportunityTitle: r.opportunityTitle, validUntil: '', origin,
+                          })}
+                        />
+                      </details>
                       <button type="submit" class="btn btn--go">Issue code</button>
                     </form>
                   )}
@@ -404,4 +477,12 @@ const rows = board.map((r) => {
   .revoke input[type=text] { width: 140px; }
   .muted { color: #6f757e; font-size: 12px; }
   .empty { color: #9aa0aa; font-size: 13px; max-width: 70ch; line-height: 1.6; }
+
+  /* The compose panel. Closed by default: issuing without sending stays a one-click act. */
+  .compose { margin-top: 10px; }
+  .compose > summary { cursor: pointer; font-size: 12px; color: #b9b9c2; }
+  .compose > summary:hover { color: #fff; }
+  .compose__why { margin: 8px 0; font-size: 12px; line-height: 1.55; color: #8a8a94; }
+  .compose__send { display: flex; gap: 8px; align-items: center; font-size: 13px; margin-bottom: 10px; }
+  .note__stripped { margin: 6px 0 0; font-size: 12px; opacity: 0.85; }
 </style>

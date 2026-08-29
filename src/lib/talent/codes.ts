@@ -856,6 +856,40 @@ export async function codeCounts(): Promise<CodeCounts> {
 }
 
 /**
+ * Record that an attempted send FAILED, and why.
+ *
+ * The column existed from the start and nothing ever wrote it: markCodeDelivered() only ever sets
+ * delivery_error back to NULL. A register that can say "sent" but never "tried and failed" pushes an
+ * operator into the exact guess this table exists to prevent - a code that was issued, silently
+ * bounced, and looks unsent, so a second one gets minted for somebody already holding a working one.
+ *
+ * THE REASON IS A TRANSPORT REASON, never the code. Callers pass the SMTP error; nothing about the
+ * secret may be written here, and the send path is built so it has nothing to pass.
+ */
+export async function markCodeDeliveryFailed(
+  codeRowId: string,
+  reason: string,
+): Promise<{ ok: boolean; error?: string }> {
+  // Trimmed hard: an SMTP server may answer with a whole response body, and this column is read on a
+  // register row that has to stay legible.
+  const why = String(reason || 'The message could not be sent.').slice(0, 500);
+  try {
+    const { db, sql } = await ctx();
+    // delivered_at is deliberately NOT touched. A failed attempt is not a delivery, and writing a
+    // timestamp here would put a "sent" tick beside a message nobody received.
+    const r = rowsOf(await db.execute(sql`
+      UPDATE tal_onboarding_code
+         SET delivery_error = ${why}
+       WHERE id = ${codeRowId}::uuid AND status = 'active'
+       RETURNING id`));
+    if (!r.length) return { ok: false, error: 'That code is no longer active.' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: reasonOf(e) };
+  }
+}
+
+/**
  * Record that a code was handed to the candidate, and by which route.
  *
  * WHAT THIS IS AND IS NOT. It is the operator's note that they sent it. This product has no delivery

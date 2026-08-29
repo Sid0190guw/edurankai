@@ -35,6 +35,12 @@ import {
   DELIVERY_CHANNELS, DELIVERY_CHANNEL_LABELS,
   type CodeRegisterRow, type CodeCounts,
 } from '@/lib/talent/codes';
+import { sendCodeByEmail } from '@/lib/talent/code-delivery';
+import {
+  defaultMessageHtml, defaultMessageText, missingTokens, TOKEN_HELP,
+  type CodeMessageContext,
+} from '@/lib/talent/code-message';
+import RichMessageComposer from '@/components/admin/RichMessageComposer.astro';
 
 // EVERY const IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted, and a handler reaching a
 // later declaration threw on its first line every time while the page reported success — that is a
@@ -90,6 +96,10 @@ let issuedFor = '';
 let issuedEmail = '';
 let issuedOpportunity = '';
 let issuedUntil = '';
+// Above the handler on purpose - `const` is not hoisted and this page says so at line 39.
+let sendNote = '';
+let sendOk = false;
+let strippedFromMessage: { kind: string; name: string; reason: string }[] = [];
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
@@ -125,8 +135,16 @@ if (Astro.request.method === 'POST') {
     } else if (action === 'reissue') {
       const selectionId = String(fd.get('selectionId') || '');
       const reason = String(fd.get('reason') || '').trim();
+      const wantsEmail = String(fd.get('sendEmail') || '') === 'on';
+      const composedBody = String(fd.get('messageHtml') || '');
+      // Checked BEFORE issuing. A reissue revokes the live code in the same act, so refusing the
+      // message afterwards would leave the candidate with nothing that works.
+      const missing = wantsEmail ? missingTokens(composedBody) : [];
       if (!reason) {
         err = 'A reissue needs a written reason. It revokes the previous code, and the register has to say why.';
+      } else if (missing.length) {
+        err = 'The message no longer contains ' + missing.join(', ')
+          + ', so no new code was issued and the existing one is untouched.';
       } else {
         const days = parseInt(String(fd.get('validityDays') || '14'), 10) || 14;
         const r = await issueCode({ selectionId, issuedByUserId: user.id, validityDays: days, replaceReason: reason });
@@ -143,6 +161,29 @@ if (Astro.request.method === 'POST') {
             diff: { selectionId, reason, replaced: r.replacedCodeRef || null },
             ipAddress: Astro.clientAddress,
           });
+
+          if (wantsEmail && r.code) {
+            const out = await sendCodeByEmail({
+              codeRowId: r.code.id,
+              bodyHtml: composedBody,
+              context: {
+                personName: issuedFor, boundEmail: issuedEmail,
+                opportunityTitle: issuedOpportunity, validUntil: issuedUntil,
+                origin, code: r.secret,
+              },
+            });
+            sendNote = out.message;
+            sendOk = out.sent;
+            strippedFromMessage = out.removed;
+            await logAudit({
+              userId: user.id,
+              action: out.sent ? 'onboarding.code.emailed' : 'onboarding.code.email_failed',
+              entity: 'tal_onboarding_code', entityId: r.code.id,
+              // The transport reason only. The plaintext never reaches an audit row.
+              diff: { to: issuedEmail, sent: out.sent, note: out.message },
+              ipAddress: Astro.clientAddress,
+            });
+          }
         } else {
           err = r.error || 'Could not issue a code.';
         }
@@ -250,23 +291,13 @@ const isFiltered = q.length > 0 || status !== 'active';
 // type it, and so the gateway URL and the bound email are the real ones rather than remembered.
 // The email address matters as much as the code: the gate checks both, and "it says invalid" is
 // almost always somebody entering a different address from the one the code was bound to.
-const shareMessage = issuedSecret
-  ? [
-      'Dear ' + (issuedFor || 'candidate') + ',',
-      '',
-      'You have been selected' + (issuedOpportunity ? ' for ' + issuedOpportunity : '') + '. Your onboarding authorization code is:',
-      '',
-      issuedSecret,
-      '',
-      'To use it, go to ' + origin + '/apply/gateway , choose "I have an authorization code", and enter',
-      'the code together with this email address: ' + issuedEmail,
-      '',
-      'The code can be used once and it expires on ' + issuedUntil + '. Please do not forward it to anyone,',
-      'and do not send it in the same message as any other document.',
-      '',
-      'EduRankAI People Operations',
-    ].join('\n')
-  : '';
+const codeCtx: CodeMessageContext = {
+  personName: issuedFor, boundEmail: issuedEmail, opportunityTitle: issuedOpportunity,
+  validUntil: issuedUntil, origin, code: issuedSecret,
+};
+// One definition, in src/lib/talent/code-message.ts - this block was byte-identical to the one in
+// selected.astro, and two copies of the sentence that lets somebody into onboarding is one too many.
+const shareMessage = issuedSecret ? defaultMessageText(codeCtx) : '';
 ---
 
 <AdminLayout title="Onboarding codes" activeNav="talent-codes">
@@ -299,7 +330,19 @@ const shareMessage = issuedSecret
     {msg && <div class="note note--ok">{msg}</div>}
     {err && <div class="note note--err">{err}</div>}
 
-    {issuedSecret && (
+    {sendNote && (
+    <div class={sendOk ? 'note note--ok' : 'note note--err'}>
+      <p>{sendNote}</p>
+      {strippedFromMessage.length > 0 && (
+        <p class="note__stripped">
+          Some markup was removed before sending: {strippedFromMessage.map((x) => x.name).join(', ')}.
+          The message went out without it.
+        </p>
+      )}
+    </div>
+  )}
+
+  {issuedSecret && (
       <div class="secret">
         <p class="secret__eyebrow">New onboarding code{issuedFor ? ' for ' + issuedFor : ''}</p>
         <p class="secret__code" id="secret-code">{issuedSecret}</p>
@@ -459,6 +502,28 @@ const shareMessage = issuedSecret
                         <input type="number" name="validityDays" value="14" min="1" max="60" />
                         days
                       </label>
+                      <details class="compose">
+                        <summary>Write the message and email it</summary>
+                        <p class="compose__why">
+                          The new code is written into the message as it is issued. Leave this closed
+                          to reissue without sending anything.
+                        </p>
+                        <label class="compose__send">
+                          <input type="checkbox" name="sendEmail" />
+                          Email it to {r.boundEmail}
+                        </label>
+                        <RichMessageComposer
+                          id={'compose-' + r.selectionId}
+                          name="messageHtml"
+                          label="Message"
+                          hint="Type it, or paste formatted text or HTML - the recipient sees normal formatted text."
+                          tokens={TOKEN_HELP}
+                          value={defaultMessageHtml({
+                            personName: r.personName, boundEmail: r.boundEmail,
+                            opportunityTitle: r.opportunityTitle, validUntil: '', origin,
+                          })}
+                        />
+                      </details>
                       <button type="submit" class="btn btn--go">Reissue</button>
                     </form>
                   )}
@@ -578,4 +643,11 @@ const shareMessage = issuedSecret
   .revoke input[type=text], .reissue input[type=text] { width: 150px; }
   .muted { color: #6f757e; font-size: 12px; }
   .empty { color: #9aa0aa; font-size: 13px; max-width: 70ch; line-height: 1.6; }
+
+  .compose { margin-top: 10px; }
+  .compose > summary { cursor: pointer; font-size: 12px; color: #b9b9c2; }
+  .compose > summary:hover { color: #fff; }
+  .compose__why { margin: 8px 0; font-size: 12px; line-height: 1.55; color: #8a8a94; }
+  .compose__send { display: flex; gap: 8px; align-items: center; font-size: 13px; margin-bottom: 10px; }
+  .note__stripped { margin: 6px 0 0; font-size: 12px; opacity: 0.85; }
 </style>
