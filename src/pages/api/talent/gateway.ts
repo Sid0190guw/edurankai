@@ -4,6 +4,15 @@
 //   { door: 'code', code, email, opportunityId? }  -> redeem, then a pass carrying the selection
 //   { door: 'open', email }                        -> a pass permitting an ordinary application
 //
+// THE CODE DOOR ANSWERS TO TWO CODE FAMILIES, and that is a fix, not a loosening. ERA-SEL means
+// selected and opens onboarding. ERA-INV means invited to apply and opens the ordinary application -
+// the same thing the open door beside it grants to anybody with no code at all. Before this, an
+// invited person typing the only code they held into the only code box on the screen was told to go
+// to /invite, which is where the link in their mail had just sent them: a closed loop. Which family
+// an entry belongs to is decided from its PREFIX ALONE (looksLikeInviteCode), so a mistyped ERA-SEL
+// code still falls through to redeemAtGate() and its uniform refusal, and the rule that a FAILED
+// code never silently becomes an application is untouched.
+//
 // Deliberately unauthenticated, because an external candidate has no account yet. That is exactly
 // why the rate limiter runs before any lookup and why every code refusal returns one sentence and
 // one status — see redeemAtGate() in src/lib/talent/gateway.ts and UNIFORM_REJECTION in types.ts.
@@ -12,6 +21,7 @@
 // carries its own controls in full and assumes nothing upstream of it.
 import type { APIRoute } from 'astro';
 import { redeemAtGate, issuePass, gateCookieHeader, gateUnavailable } from '@/lib/talent/gateway';
+import { looksLikeInviteCode, openDoorForInviteCode, ensureInvitationSchema } from '@/lib/hiring/invitations';
 import { logAudit } from '@/lib/audit';
 
 // Declared before the handler that uses them: `const` is not hoisted, and a handler reaching a later
@@ -67,6 +77,38 @@ export const POST: APIRoute = async ({ request, clientAddress, locals, url }) =>
   }
 
   if (door !== 'code') return j({ ok: false, error: 'Choose whether you hold an onboarding code.' }, 400);
+
+  // -----------------------------------------------------------------------------------------
+  // DOOR 1a — AN INVITATION CODE (ERA-INV) IN THE SAME BOX. See the header of this file.
+  //
+  // Taken BEFORE redeemAtGate() rather than as a rescue after it fails, so an invitation is never
+  // recorded as a failed selection attempt against the onboarding-code limiter. It has its own
+  // limiter, inside resolveInvitation().
+  // -----------------------------------------------------------------------------------------
+  if (looksLikeInviteCode(body.code)) {
+    // Local development creates the table on demand; production has it from the hand-run .sql.
+    try { await ensureInvitationSchema(); } catch { /* the lookup below reports the real problem */ }
+    const inv = await openDoorForInviteCode({
+      rawCode: String(body.code || ''), claimedEmail: email, ip: ip || '', userId: user?.id || null,
+    });
+    if (!inv.ok || !inv.token) {
+      await logAudit({
+        userId: user?.id || null, action: 'talent.gate.invite_refused', entity: 'application_invitation',
+        diff: { emailTried: email }, ipAddress: ip || undefined,
+      });
+      const headers: Record<string, string> = {};
+      if (inv.retryAfterSeconds) headers['Retry-After'] = String(inv.retryAfterSeconds);
+      return j({ ok: false, error: inv.error }, inv.status || 400, headers);
+    }
+    await logAudit({
+      userId: user?.id || null, action: 'talent.gate.invite_accepted', entity: 'application_invitation',
+      entityId: inv.invitation?.id, diff: { role: inv.invitation?.roleSlug || '(any)' }, ipAddress: ip || undefined,
+    });
+    // door: 'open' on the wire as well as in the pass. An invitation is not a selection and the
+    // response must not read as one.
+    return j({ ok: true, door: 'open', next: inv.next || '/apply/step-1' }, 200,
+      { 'Set-Cookie': gateCookieHeader(inv.token, secure) });
+  }
 
   // -----------------------------------------------------------------------------------------
   // DOOR 1 — a code. The whole ladder is in redeemAtGate(): limit, format, lookup by hash, the

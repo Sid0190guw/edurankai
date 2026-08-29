@@ -35,6 +35,15 @@ export interface GatePass {
   personId?: string;
   /** The signed-in user, when the applicant was internal. */
   userId?: string;
+  /**
+   * Present when the pass was earned by an INVITATION to apply (ERA-INV) rather than by declaring
+   * "I have no code". Both are the 'open' door and both grant exactly the same thing - an ordinary
+   * application - so this is provenance, never permission. It is what lets the flow put the person
+   * on the posting they were invited to, and lets the application close the invitation's loop.
+   */
+  invitationId?: string;
+  /** The posting the invitation named, so the role survives the walk to /apply. */
+  roleSlug?: string;
   issuedAt: number;
   expiresAt: number;
 }
@@ -99,6 +108,7 @@ export function verifyGatePass(token: string | null | undefined, now: Date = new
 export function issuePass(args: {
   door: GateDoor; email: string; userId?: string | null;
   codeId?: string; selectionId?: string; opportunityId?: string; personId?: string;
+  invitationId?: string | null; roleSlug?: string | null;
   now?: Date;
 }): { token: string | null; pass: GatePass } {
   const now = args.now || new Date();
@@ -109,6 +119,10 @@ export function issuePass(args: {
     expiresAt: now.getTime() + GATE_TTL_MINUTES * 60 * 1000,
   };
   if (args.userId) pass.userId = args.userId;
+  // Carried on the OPEN door too, because that is the door an invitation opens. Neither field is
+  // read as an authorization anywhere - see the note on GatePass.invitationId.
+  if (args.invitationId) pass.invitationId = String(args.invitationId);
+  if (args.roleSlug) pass.roleSlug = String(args.roleSlug);
   if (args.door === 'code') {
     pass.codeId = args.codeId;
     pass.selectionId = args.selectionId;

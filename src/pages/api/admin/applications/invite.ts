@@ -17,7 +17,7 @@ import { sendEmail, brandedEmail } from '@/lib/email';
 import { sanitizeEmailHtmlString, htmlToPlainText, OUTBOUND } from '@/lib/mailsec/html';
 import {
   parseInvite, createInvitation, revokeInvitation, recordSend, inviteUrl,
-  ensureInvitationSchema, type CleanInvite, type Invitation,
+  ensureInvitationSchema, hasVisibleNote, type CleanInvite, type Invitation,
 } from '@/lib/hiring/invitations';
 import { publicOrigin } from '@/lib/public-origin';
 
@@ -52,7 +52,15 @@ async function lookupRole(slug: string): Promise<{ id: string | null; title: str
   }
 }
 
-function invitationEmail(inv: Invitation, url: string, code: string, fromName: string): { subject: string; html: string; text: string } {
+/**
+ * The invitation message, both parts of it.
+ *
+ * EXPORTED SO IT CAN BE TESTED. It is pure - it takes an invitation and returns strings, opens no
+ * connection and sends nothing - and the thing most worth asserting about it is what it does NOT
+ * contain: an empty quote block for a note nobody wrote. Only GET/POST/etc. are treated as route
+ * handlers, so an extra named export here changes nothing about the endpoint.
+ */
+export function invitationEmail(inv: Invitation, url: string, code: string, fromName: string): { subject: string; html: string; text: string } {
   const forRole = inv.roleTitle ? ' for ' + inv.roleTitle : '';
   const subject = inv.roleTitle
     ? 'You are invited to apply — ' + inv.roleTitle
@@ -61,23 +69,38 @@ function invitationEmail(inv: Invitation, url: string, code: string, fromName: s
   const greeting = inv.fullName ? 'Hello ' + esc(inv.fullName) + ',' : 'Hello,';
   const who = fromName ? esc(fromName) : 'Somebody on the team';
 
+  // THE NOTE, DECIDED ONCE FOR BOTH PARTS OF THE MESSAGE.
+  //
+  // SANITISED, NOT ESCAPED. esc() here meant an administrator who wrote or pasted formatted text got
+  // their markup delivered as literal angle brackets in somebody's inbox. The note goes through the
+  // same OUTBOUND profile every other outgoing body uses - which strips script, style, iframes,
+  // event handlers and javascript: URLs, and is a stricter control than escaping was, not a looser one.
+  //
+  // AND THE BOX IS DECIDED ON THE SANITISED OUTPUT, NOT ON `inv.note` BEING A NON-EMPTY STRING. That
+  // is the fix for a real invitation that went out with an empty bordered box sitting between two
+  // paragraphs. Two ways a non-empty column renders as nothing: a contenteditable that was focused
+  // and then emptied stores '<p><br></p>' or '<span></span>', and a note whose entire content the
+  // sanitiser removed leaves ''. Either way the operator wrote no message, so no message block may
+  // appear - an empty quote box in a mail that is meant to read as though a person wrote it reads
+  // instead as a template that misfired.
+  //
+  // ONE DECISION, BOTH PARTS. The text/plain half is omitted on exactly the same condition, so the
+  // two halves of one message can never disagree about whether a note was written.
+  const noteHtml = inv.note ? sanitizeEmailHtmlString(inv.note, OUTBOUND) : '';
+  const noteVisible = hasVisibleNote(noteHtml);
+  const noteText = noteVisible ? htmlToPlainText(noteHtml) : '';
+
   const bodyParts = [
     '<p style="margin:0 0 14px;">' + greeting + '</p>',
     '<p style="margin:0 0 14px;">' + who + ' has invited you to apply' + esc(forRole) +
       ' at EduRankAI. Opening the link below takes you straight to the application.</p>',
   ];
-  if (inv.note) {
-    // SANITISED, NOT ESCAPED. esc() here meant an administrator who wrote or pasted formatted text
-    // got their markup delivered as literal angle brackets in somebody's inbox. The note is now
-    // written in a composer, so it goes through the same OUTBOUND profile every other outgoing body
-    // uses - which strips script, style, iframes, event handlers and javascript: URLs, and is a
-    // stricter control than escaping was, not a looser one.
-    //
+  if (noteVisible) {
     // A div, not a p: the note may now hold block elements of its own, and a list inside a
     // paragraph is invalid markup that mail clients lay out inconsistently.
     bodyParts.push(
       '<div style="margin:0 0 14px;padding:12px 14px;background:#f6f5f1;border-left:3px solid #FF4F00;' +
-      'border-radius:4px;">' + sanitizeEmailHtmlString(inv.note, OUTBOUND) + '</div>',
+      'border-radius:4px;">' + noteHtml + '</div>',
     );
   }
   if (inv.waiveFee) {
@@ -118,8 +141,8 @@ function invitationEmail(inv: Invitation, url: string, code: string, fromName: s
     '',
     (fromName || 'Somebody on the team') + ' has invited you to apply' + forRole + ' at EduRankAI.',
     // The text part gets the same note with its markup flattened, rather than quoting raw source
-    // back at a plain-text client.
-    inv.note ? '\n"' + htmlToPlainText(inv.note) + '"\n' : '',
+    // back at a plain-text client. Same condition as the HTML box - see noteVisible above.
+    noteText ? '\n"' + noteText + '"\n' : '',
     inv.waiveFee ? 'The application fee has been waived for you.' : '',
     '',
     'Open the application: ' + url,

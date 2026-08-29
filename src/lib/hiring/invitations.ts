@@ -39,6 +39,17 @@ import { publicOrigin } from '@/lib/public-origin';
 // forbidden.
 import { CODE_ALPHABET, CODE_GROUP_LEN, CODE_GROUPS, CODE_BODY_LEN } from '@/lib/talent/types';
 import { countAttempt } from '@/lib/auth/two-factor';
+// THE POSTING CATALOGUE, resolved the same way /careers and /apply resolve it. An invitation names a
+// posting by slug; the title stored beside it is a snapshot taken when the invitation was sent, so
+// anything that wants to know whether that posting is STILL open has to ask the roles table.
+import { effectiveJobStatus } from '@/lib/xscale/taxonomy';
+// textIn, NEVER `= ANY(${jsArray})`. postgres-js serialises a JS array as a record literal, so that
+// pattern renders ANY(($1, $2)) and Postgres refuses the statement - src/lib/pg-array.ts documents
+// the five places it silently broke, and a repo-wide scan in its test fails the build over a new one.
+import { textIn } from '@/lib/pg-array';
+// The gate pass. gate-pass.ts imports nothing but node:crypto, so this costs the bundle nothing and
+// keeps the "who may reach /apply" decision in the one module that owns it.
+import { issuePass, GATE_TTL_MINUTES } from '@/lib/talent/gate-pass';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 const fail = (where: string, e: any) => console.error('[invitations] ' + where + ':', e?.cause?.message || e?.message);
@@ -251,6 +262,68 @@ export interface CleanInvite {
 export const NOTE_MAX = 8000;
 
 /**
+ * Does this note actually say anything?
+ *
+ * WHY THIS IS A QUESTION AT ALL. The note is written in a contenteditable composer, and a field that
+ * was focused and then emptied does not come back as ''. It comes back as '<br>', '<p><br></p>',
+ * '<span></span>' or a paragraph holding one non-breaking space - every one of those is a perfectly
+ * non-empty STRING and none of them is a message. The composer strips the first two on the way out;
+ * it cannot strip every shape, and it never sees a note written before it shipped.
+ *
+ * THE FAILURE THIS FIXES IS VISIBLE TO THE PERSON WE INVITED. An invitation went out with an empty
+ * quote block sitting between two paragraphs - a bordered box with nothing in it, in a message that
+ * is supposed to read as though a person wrote it. The same box rendered on the landing page.
+ *
+ * DECIDED FROM THE TEXT, NOT FROM THE MARKUP, so it survives whatever tags a paste brought with it.
+ * An image-only note counts as content: a picture with no words is still something somebody chose
+ * to send.
+ */
+export function hasVisibleNote(html: unknown): boolean {
+  const raw = String(html ?? '');
+  if (!raw.trim()) return false;
+  if (/<\s*(img|hr)\b/i.test(raw)) return true;
+  // Tags out, then the entities that render as blank out, then look for one printable character.
+  const text = raw
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;|&#160;|&#xa0;/gi, ' ')
+    .replace(/&amp;|&lt;|&gt;|&quot;|&#39;/gi, 'x')
+    .replace(/\s+/g, '');
+  return text.length > 0;
+}
+
+/** The note as it should be STORED: capped, and empty when it says nothing. See hasVisibleNote(). */
+export function cleanNote(input: unknown): string {
+  const trimmed = String(input ?? '').trim().slice(0, NOTE_MAX);
+  return hasVisibleNote(trimmed) ? trimmed : '';
+}
+
+/**
+ * Was this typed as an INVITATION code rather than a selection code?
+ *
+ * Used by /apply/gateway, which has one code box and gets both families typed into it. It answers
+ * from the PREFIX ALONE and never from the body, on purpose: a mistyped ERA-SEL code has to keep
+ * falling through to the selection path and its uniform refusal, or the gate's oldest rule - that a
+ * failed code never silently becomes an application - would be back on the table. Somebody who types
+ * a bare body with no prefix at that box is taken to mean the box they are standing in.
+ */
+export function looksLikeInviteCode(input: unknown): boolean {
+  const bare = String(input ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  return bare.startsWith('ERAINV') && bare.length === 'ERAINV'.length + CODE_BODY_LEN;
+}
+
+/**
+ * Where an invitation sends somebody: the application, carrying the posting it named.
+ *
+ * THE ROLE HAS TO TRAVEL WITH THEM. Without ?role= the invited person lands on a blank application
+ * and picks a posting out of a list, which is not what "you are invited to apply for Executive
+ * Assistant to CEO" promised them - and it loses the role match the fee-waiver lookup makes later.
+ */
+export function inviteApplyHref(roleSlug: string): string {
+  const slug = String(roleSlug || '').trim();
+  return '/apply' + (slug ? '?role=' + encodeURIComponent(slug) : '');
+}
+
+/**
  * Validate and clean one invitation. Returns the problem as a sentence a person can act on, or the
  * cleaned record — never both, and never a half-cleaned one.
  */
@@ -267,7 +340,9 @@ export function parseInvite(input: InviteInput): { error: string } | { value: Cl
       // paragraph of prose wrapped in tags is several times its own length - a 1000-char cap
       // silently truncated formatted notes mid-tag. It is still a cap: the note goes into an
       // email and onto a landing page, and neither is a document store.
-      note: String(input.note ?? '').trim().slice(0, NOTE_MAX),
+      // cleanNote, not a bare trim. A composer that was focused and then emptied hands back markup
+      // for a message nobody wrote, and storing that put an empty quote box in a real invitation.
+      note: cleanNote(input.note),
       waiveFee: input.waiveFee === true || input.waiveFee === 'true' || input.waiveFee === 'on',
       days: ttlDays(input.days),
     },
@@ -606,6 +681,203 @@ export async function markAppliedForEmail(email: string, applicationId: string |
   } catch (e2: any) {
     fail('markAppliedForEmail', e2);
   }
+}
+
+// =================================================================================================
+// THE POSTING AN INVITATION NAMED — resolved live, including for invitations sent long ago
+// =================================================================================================
+//
+// WHY LIVE AND NOT THE STORED SNAPSHOT. role_title is written onto the invitation row when it is
+// sent, which is right for the record: renaming a posting must not rewrite the history of who was
+// invited to what. But two things the stored snapshot cannot tell anybody:
+//
+//   * whether the posting still accepts applications, and
+//   * the title at all, for a row written before role_title was populated, or by an import that
+//     only carried the slug - which is every "past" invitation on this deployment.
+//
+// So the record keeps its snapshot and the SCREEN asks the catalogue. That is the same rule the
+// invite form at /admin/applications/invitations already follows for its dropdown, which is why the
+// two cannot drift apart.
+
+export interface LivePosting {
+  slug: string;
+  /** The title as the careers portal shows it today. Empty when the posting no longer exists. */
+  title: string;
+  /** Whether an application started right now would be accepted. */
+  acceptsApplications: boolean;
+  /** The sentence to show when it would not. */
+  publicNote: string;
+}
+
+/**
+ * Resolve several slugs in ONE query. Round-trip count is the lever on this deployment, so the list
+ * screen must not ask the database once per row.
+ *
+ * NARROWED RETRY, because job_status arrives from db/xscale-schema.sql - a hand-run file that a given
+ * database may not have had run against it. The retry names ONLY columns `roles` has always had, so
+ * it cannot fail for the same reason the wide query did.
+ *
+ * A FAILED READ IS NOT AN EMPTY CATALOGUE. It returns null so the caller can say "not checked"
+ * rather than rendering "this posting is closed" over a database hiccup.
+ */
+export async function livePostings(slugs: string[]): Promise<Map<string, LivePosting> | null> {
+  const wanted = Array.from(new Set(slugs.map((s) => String(s || '').trim()).filter(Boolean)));
+  if (!wanted.length) return new Map();
+  const read = async (wide: boolean) => {
+    const r = wide
+      ? await db.execute(sql`SELECT slug, title, is_open, job_status, application_deadline
+                               FROM roles WHERE slug IN ${textIn(wanted)}`)
+      : await db.execute(sql`SELECT slug, title, is_open, application_deadline
+                               FROM roles WHERE slug IN ${textIn(wanted)}`);
+    return rows(r);
+  };
+  let raw: any[];
+  try {
+    raw = await read(true);
+  } catch (e: any) {
+    try {
+      raw = await read(false);
+    } catch (e2: any) {
+      fail('livePostings', e2);
+      return null;
+    }
+  }
+  const out = new Map<string, LivePosting>();
+  for (const x of raw) {
+    const status = effectiveJobStatus({
+      jobStatus: x.job_status, isOpen: x.is_open, applicationDeadline: x.application_deadline,
+    });
+    out.set(String(x.slug), {
+      slug: String(x.slug),
+      title: String(x.title || ''),
+      acceptsApplications: !!status.acceptsApplications,
+      publicNote: String((status as any).publicNote || ''),
+    });
+  }
+  return out;
+}
+
+/** One slug. Null means "no such posting"; the thrown-read case is reported as null too - see above. */
+export async function livePosting(slug: string): Promise<LivePosting | null> {
+  const s = String(slug || '').trim();
+  if (!s) return null;
+  const map = await livePostings([s]);
+  return map ? (map.get(s) || null) : null;
+}
+
+/**
+ * The title to SHOW for an invitation: the catalogue's, then the snapshot, then nothing.
+ *
+ * This is the "synced for the past too" rule in one line. An invitation sent before the title was
+ * being stored - or one whose posting has since been renamed - names the position correctly on
+ * every screen, without any backfill having to run.
+ */
+export function displayRoleTitle(inv: { roleSlug: string; roleTitle: string }, live: LivePosting | null): string {
+  return String(live?.title || inv.roleTitle || '');
+}
+
+// =================================================================================================
+// THE GATE PASS AN INVITATION EARNS
+// =================================================================================================
+//
+// THE BUG THIS EXISTS TO CLOSE. /apply and /onboarding are both behind the application gate, and a
+// browser without a pass is redirected to /apply/gateway. So an invited person clicked "Open the
+// application", read the landing page, pressed Continue - and was bounced to a screen asking for an
+// ERA-SEL onboarding code, which an invitation is not and never was. The only code they held was
+// the ERA-INV one in their email, so they typed that, and were told it was the wrong kind of code
+// and to go to /invite, where they had just come from. A closed loop with our name on it.
+//
+// WHY THIS IS THE 'open' DOOR AND NOT A THIRD ONE. An invitation means exactly "please apply", which
+// is what the open door grants, and it is a door anybody can walk through from /careers with no code
+// at all. So this GRANTS NOTHING NEW. What it removes is a question we already knew the answer to:
+// the invitation names the email address, so making the person retype it at a gate proves nothing.
+//
+// AND IT STILL IS NOT A SELECTION. door stays 'open', so applyGateRedirect() keeps this pass out of
+// /onboarding exactly as before. An invitation cannot become a selection by walking through here -
+// that separation is the whole reason the gate exists and nothing in this file weakens it.
+export function invitationPassTtlSeconds(): number {
+  return GATE_TTL_MINUTES * 60;
+}
+
+/**
+ * Sign an open-door pass for the person this invitation was sent to.
+ *
+ * The email comes from the INVITATION, never from the request: a forwarded link must not let
+ * somebody bind a pass to an address the invitation does not name, because the fee waiver is later
+ * looked up by that address.
+ *
+ * Returns null when the gate cannot sign - a missing SESSION_SECRET - and the caller must then send
+ * the person to the gate screen, which renders its own honest "not available" state.
+ */
+export function invitationPass(inv: Invitation, userId?: string | null): string | null {
+  const { token } = issuePass({
+    door: 'open',
+    email: inv.email,
+    userId: userId || null,
+    invitationId: inv.id,
+    roleSlug: inv.roleSlug || null,
+  });
+  return token;
+}
+
+export interface InviteDoorResult {
+  ok: boolean;
+  /** One sentence, safe to show. Never says which of wrong, spent, withdrawn or expired it was. */
+  error?: string;
+  status?: number;
+  retryAfterSeconds?: number;
+  /** The signed gate pass, on success. The caller sets the cookie. */
+  token?: string;
+  /** Where to send them: the application, on the posting they were invited to. */
+  next?: string;
+  invitation?: Invitation;
+}
+
+/**
+ * An ERA-INV code typed at /apply/gateway, taken seriously instead of refused.
+ *
+ * WHAT WENT WRONG WITHOUT THIS. The gate has one code box and it is labelled ERA-SEL, so an invited
+ * person typed the only code they had into it and was told: "That is an invitation code, not an
+ * onboarding code ... Enter it at /invite instead." Which is where the link in their email had just
+ * sent them. Two correct sentences, one dead end, and the person's conclusion is that our hiring
+ * process is broken.
+ *
+ * THIS IS NOT THE "FAILED CODE SILENTLY BECOMES AN APPLICATION" TRAP. That rule exists so a MISTYPED
+ * selection code cannot leave one hire holding both a selection and a contradictory application, and
+ * it is untouched: the caller only reaches this function for input that carries the ERA-INV prefix
+ * (looksLikeInviteCode), which no typo in an ERA-SEL code produces. What arrives here is a valid
+ * credential of the other family, and honouring it is not a fallback - it is reading the code.
+ *
+ * THE EMAIL MUST MATCH THE INVITATION'S. Not as a barrier - the open door next to this one lets
+ * anybody in with any address - but because the pass is bound to an email and the fee waiver is
+ * looked up by it later. A pass bound to an address the invitation does not name would quietly fail
+ * to carry the waiver the person was promised. A mismatch gets the SAME sentence as a wrong code, so
+ * this cannot be used to test whether a given address was invited.
+ */
+export async function openDoorForInviteCode(args: {
+  rawCode: string;
+  claimedEmail: string;
+  ip: string;
+  userId?: string | null;
+}): Promise<InviteDoorResult> {
+  const resolved = await resolveInvitation(args.rawCode, args.ip);
+  if (resolved.rateLimited) {
+    return { ok: false, error: RATE_LIMITED_CODE, status: 429, retryAfterSeconds: CODE_ATTEMPT_WINDOW_SECONDS };
+  }
+  const inv = resolved.invitation;
+  if (!inv || !isLive(inv.status)) return { ok: false, error: INVALID_CODE, status: 400 };
+  if (normaliseEmail(args.claimedEmail) !== inv.email) return { ok: false, error: INVALID_CODE, status: 400 };
+
+  const token = invitationPass(inv, args.userId);
+  if (!token) {
+    return {
+      ok: false, status: 503,
+      error: 'The application gate could not issue a pass just now. Please try again in a moment.',
+    };
+  }
+  // Bookkeeping, and it must never be able to stop the person walking through the door.
+  await markOpened(inv.id);
+  return { ok: true, token, next: inviteApplyHref(inv.roleSlug), invitation: inv };
 }
 
 /** Close the loop for one known invitation. */
