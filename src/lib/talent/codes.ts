@@ -141,8 +141,12 @@ export function formatProblem(input: string): string | null {
   // has nowhere else to try theirs, and they do. Its prefix is stripped for the count for the same
   // reason ERA-SEL's is: the message has to describe the part the person can actually fix.
   //
-  // The prefix is written out rather than imported because src/lib/hiring/invitations.ts reaches the
-  // database at module scope, and this module is pulled into the middleware bundle.
+  // The prefix is written out rather than imported from src/lib/hiring/invitations.ts to keep the
+  // dependency pointing one way: the selection code module must not import the invitation module,
+  // because only one of the two may ever decide a redemption and a shared import invites a caller to
+  // reach for the wrong normaliseCode(). The cost of the copy is that a rename of INVITE_CODE_PREFIX
+  // would leave this stale - it would degrade to the old character-count message, not to a wrong
+  // door, and the test below is what would notice.
   const invitePfx = 'ERAINV';
   const looksInvite = bare.startsWith(invitePfx) && bare.length !== CODE_BODY_LEN;
   const stripped = looksInvite
