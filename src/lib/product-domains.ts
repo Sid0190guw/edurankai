@@ -142,6 +142,19 @@ export const PRODUCT_DOMAINS: ProductDomain[] = [
   },
 
   // Ventures with no hiring domain of their own. Listed, not omitted — see the header.
+  {
+    slug: 'akasha-q',
+    aliases: ['akashaq', 'akasha'],
+    departments: [],
+    note:
+      'Quantum-secure communications. UNSTAFFED, and quantum-tech is exactly the department the rule '
+      + 'of evidence keeps off this page: it holds Quantum Finance and Quantum Chemistry postings, '
+      + 'and not one of them mentions key distribution, free-space optics, pointing systems or '
+      + 'Akasha-Q. It was already removed from Visvambhara for that reason during the review recorded '
+      + 'above, and separating this programme onto its own page is not new evidence. The roles this '
+      + 'programme would actually hire — optomechanical and pointing-systems engineering — have no '
+      + 'department of their own yet, so the honest answer is none.',
+  },
   { slug: 'sancharan', aliases: [], departments: [], note: 'Travel. No department is staffed against it; the page correctly shows nothing.' },
   { slug: 'sampark', aliases: [], departments: [], note: 'CRM. No department is staffed against it; the page correctly shows nothing.' },
   { slug: 'sambandh', aliases: [], departments: [], note: 'Identity-verified matchmaking. No department is staffed against it; the page correctly shows nothing.' },

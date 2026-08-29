@@ -35,6 +35,47 @@ export async function ensureVisvambharaProduct(): Promise<void> {
   } catch (_) { /* swallow - listing pages should never 500 because of seed */ }
 }
 
+let akashaSeeded = false;
+
+/**
+ * Akasha-Q — the quantum-secure communications programme. It shipped as a page nothing linked to:
+ * the copy called it a subsystem of Viśvambhara, so it was never given a products row, so it never
+ * appeared on /ecosystem or the homepage grid and could only be reached by typing the URL. It is
+ * its own programme with its own ladder (bench, metro, HAPS relay, CubeSat, LEO, constellation),
+ * and this row is what makes it reachable.
+ *
+ * `external_url` points at the custom page for the same reason Viśvambhara's does — the generic
+ * /ecosystem/[slug] detail page reads it as the "visit" target, so both surfaces lead somewhere.
+ */
+export async function ensureAkashaQProduct(): Promise<void> {
+  if (akashaSeeded) return;
+  try {
+    await db.execute(sql`
+      INSERT INTO products (slug, name, emphasis_word, status, short_description, long_description, external_url, icon_key, sort_order)
+      VALUES (
+        'akasha-q',
+        'Akasha-Q',
+        'quantum-secure',
+        'research',
+        'Quantum-secure communications, ground to orbit: entropy at the terminal, key distribution that does not rest on an unproven hardness assumption, an authenticated command channel, and an evidence chain that stays defensible for decades.',
+        'Akasha-Q is EduRankAI''s quantum-secure communications programme — a platform, not a satellite. Five layers (entropy, key exchange, command, evidence, timing) on a six-rung ladder that reaches as far as the link has to go: an optical bench, a metro span, a high-altitude relay, a CubeSat demonstrator, an operational LEO satellite, and finally a constellation. Post-quantum cryptography in software is the floor under every deployment; quantum key distribution is what gets added where key exchange must rest on physics. Every rung is a design study — nothing has flown. The Viśvambhara autonomous swarm is the first platform designed to carry a terminal, not the reason the programme exists.',
+        '/products/akasha-q',
+        'quantum',
+        41
+      )
+      ON CONFLICT (slug) DO UPDATE SET
+        name = EXCLUDED.name,
+        emphasis_word = EXCLUDED.emphasis_word,
+        status = EXCLUDED.status,
+        short_description = EXCLUDED.short_description,
+        long_description = EXCLUDED.long_description,
+        external_url = EXCLUDED.external_url,
+        is_visible = true
+    `);
+    akashaSeeded = true;
+  } catch (_) { /* swallow - listing pages should never 500 because of seed */ }
+}
+
 // Canonical copy for the three consumer ventures. The DB rows previously
 // carried education-flavored placeholder text (Sancharan as "communication
 // infrastructure", Sampark as "bridge between learning and work", Sambandh as

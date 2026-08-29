@@ -724,6 +724,10 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // reproduced here so the menu is unchanged. Both are gated identically, so the duplication is
       // cosmetic; collapsing it is a product decision, not a permissions one.
       { id: 'visvambhara-access', label: 'Access control', href: '/admin/visvambhara-access', icon: 'shield', section: 'settings' },
+      // Akasha-Q is a separate programme with its own public page, gated by the SAME approval record
+      // as Viśvambhara — one access list, two programmes. It sits in this group for that reason, not
+      // because it is part of the swarm.
+      { id: 'akasha-q-public', label: 'Akasha-Q public page', href: '/products/akasha-q', icon: 'globe', section: 'products' },
     ],
   },
   { id: 'content', label: 'Content Pages', href: '/admin/content', icon: 'document', section: 'content' },

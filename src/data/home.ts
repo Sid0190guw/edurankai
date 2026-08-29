@@ -52,14 +52,24 @@ export const PRODUCTS = [
     description: 'A virtual institution by EduRankAI - personalised AI tutoring, gamified assessments, verifiable credentials. Six schools across computing, mathematics, the liberal arts, business, design, and a foundational core. Free where possible.'
   },
   {
-    // Akasha-Q is Viśvambhara's own confidential quantum-secure command/control/communications
-    // layer, not a separate peer-level product — folded into this one entry, not listed on its own.
+    // Akasha-Q used to be folded into this entry as "Viśvambhara's own backbone". It is its own
+    // programme — a communications platform with its own ladder from an optical bench to a
+    // constellation — and it now has its own card below and its own page at /products/akasha-q.
+    // This description names it as a separate programme rather than describing it as a feature.
     name: 'Viśvambhara',
     status: 'Live',
     statusVariant: 'launch',
     href: '/products/visvambhara',
     external: false,
-    description: 'VESPER autonomous aerospace swarm — Bee micro-UAV, Mother SSTO, Grandmother interplanetary command vessel — with a quantum-secure command, control & communications backbone (Akasha-Q). Restricted-access programme.'
+    description: 'VESPER autonomous aerospace swarm — Bee micro-UAV, Mother SSTO, Grandmother interplanetary command vessel. Designed to fly against the Akasha-Q quantum-secure command channel. Restricted-access programme.'
+  },
+  {
+    name: 'Akasha-Q',
+    status: 'Research',
+    statusVariant: 'research',
+    href: '/products/akasha-q',
+    external: false,
+    description: 'Quantum-secure communications, ground to orbit. Entropy at the terminal, key distribution that does not rest on an unproven hardness assumption, an authenticated command channel, and an evidence chain that survives the decade. Design study across six rungs, bench to constellation.'
   },
   {
     name: 'Workspace',

@@ -44,8 +44,14 @@ const rolesPerDept = (() => {
  * to be cross-company (Data Analytics, Business Intelligence, MLOps, and a Multimodal AI role whose
  * own text is about AquinTutor). Removing it left this venture with no department of its own, and
  * an empty list is the honest answer — see RULE OF EVIDENCE in src/lib/product-domains.ts.
+ *
+ * akasha-q joins them for the same reason and with a specific temptation attached: quantum-tech
+ * LOOKS like its department and is not. That department holds Quantum Finance and Quantum Chemistry
+ * postings, none of which mention key distribution, free-space optics or pointing systems — it was
+ * already removed from Visvambhara on exactly that evidence, and giving the quantum-communications
+ * programme its own page is not new evidence for mapping it back.
  */
-const UNSTAFFED = new Set(['sancharan', 'sampark', 'sambandh', 'foundational-models']);
+const UNSTAFFED = new Set(['sancharan', 'sampark', 'sambandh', 'foundational-models', 'akasha-q']);
 
 describe('the mapping points at departments that exist', () => {
   it('every department id is a real catalogue department', () => {
