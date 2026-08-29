@@ -7,6 +7,7 @@ import {
   isUnpaidTrainee,
   stripTraineePayProse,
   stripTraineePayItems,
+  offerCompensationFor, UNPAID_APPRENTICE_SALARY,
 } from '@/lib/compensation-text';
 
 describe('stripOwnershipPromise', () => {
@@ -210,5 +211,57 @@ describe('pay claims in prose', () => {
     expect(stripTraineePayProse(undefined)).toBe('');
     expect(stripTraineePayItems(null)).toEqual([]);
     expect(stripTraineePayItems('not an array')).toEqual([]);
+  });
+});
+
+
+// THE OFFER PATH HAD NO GUARD AT ALL. publicCompensation()/isTraineeRole() were imported by the
+// careers pages, the jobs feed and the apply form - and by nothing in the offer path. These pin the
+// policy on the document the candidate actually signs.
+describe('offerCompensationFor', () => {
+  const INTERN = { level: 'Intern', engagementType: 'Internship', title: 'Research Intern', slug: 'research-intern' };
+
+  it('refuses to state a stipend on an unpaid internship, whatever was typed', () => {
+    expect(offerCompensationFor(INTERN, 'INR 30L')).toMatch(/^Unpaid/);
+    expect(offerCompensationFor(INTERN, '25 LPA INR')).toMatch(/^Unpaid/);
+    expect(offerCompensationFor(INTERN, 'stipend of 25,000/mo')).toMatch(/^Unpaid/);
+  });
+
+  // The exact production shape isTraineeRole was written for: level says Intern, engagement says
+  // Full-Time. The old one-field test on the offer form read level alone and let this through.
+  it('catches a trainee whose engagementType disagrees with its level', () => {
+    const odd = { level: 'Intern', engagementType: 'Full-Time', title: 'Aerospace Research Engineering Intern', slug: 'visvambhara-aerospace-research-engineering-intern' };
+    expect(offerCompensationFor(odd, '25 LPA INR')).toMatch(/^Unpaid/);
+  });
+
+  it('catches a trainee identified only by its title or slug', () => {
+    expect(offerCompensationFor({ title: 'Design Intern' }, 'INR 30L')).toMatch(/^Unpaid/);
+    expect(offerCompensationFor({ slug: 'design-intern' }, 'INR 30L')).toMatch(/^Unpaid/);
+  });
+
+  it('says apprenticeship, not internship, for an apprentice', () => {
+    expect(offerCompensationFor({ level: 'Apprentice' }, 'INR 5L')).toBe(UNPAID_APPRENTICE_SALARY);
+  });
+
+  // The single exception, and it is decided by the slug allowlist and nothing else.
+  it('leaves the one paid internship alone', () => {
+    const paid = { level: 'Intern', engagementType: 'Internship', title: 'LLM Engineering Intern', slug: 'llm-engineering-intern' };
+    expect(offerCompensationFor(paid, 'INR 60,000 per month')).toBe('INR 60,000 per month');
+  });
+
+  it('leaves a permanent role exactly as typed', () => {
+    const perm = { level: 'Senior', engagementType: 'Full-Time', title: 'Staff Engineer', slug: 'staff-engineer' };
+    expect(offerCompensationFor(perm, 'INR 45L')).toBe('INR 45L');
+  });
+
+  // Already unpaid, possibly in more specific words than the generic line: not overwritten.
+  it('keeps a more specific unpaid wording', () => {
+    const specific = 'Unpaid - certificate, mentorship and a verifiable credential';
+    expect(offerCompensationFor(INTERN, specific)).toBe(specific);
+  });
+
+  // An unknown slug must land on the unpaid side, because that is the only safe direction here.
+  it('treats a trainee with no slug as unpaid rather than as an exception', () => {
+    expect(offerCompensationFor({ level: 'Intern' }, 'INR 30L')).toMatch(/^Unpaid/);
   });
 });

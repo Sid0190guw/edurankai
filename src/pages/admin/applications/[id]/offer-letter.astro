@@ -2,7 +2,9 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { randomBytes, createHmac } from 'node:crypto';
 import { db } from '@/lib/db';
-import { applications, offerLetters, users, applicationMessages } from '@/lib/db/schema';
+import { applications, offerLetters, users, applicationMessages, roles } from '@/lib/db/schema';
+// The offer path had NO compensation guard at all - see the doc comment on offerCompensationFor.
+import { offerCompensationFor } from '@/lib/compensation-text';
 import { generateInternalHandle } from '@/lib/auth/handle';
 import { eq } from 'drizzle-orm';
 import { resolveEngagementPolicy, shortCommitment } from '@/lib/engagement-policy';
@@ -18,6 +20,9 @@ import { offerClock } from '@/lib/offer-clock';
 // apprenticeships. The same module the careers pages use decides it here, so an offer letter cannot
 // promise terms the job posting does not.
 import { allowedWorkModes, workModeTitle, resolveWorkMode } from '@/lib/work-mode';
+import RichMessageComposer from '@/components/admin/RichMessageComposer.astro';
+import { sendLetterEmail, LETTER_TOKENS } from '@/lib/hr/letter-mail';
+import { publicUrl } from '@/lib/public-origin';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -39,6 +44,25 @@ let stageNotMoved = '';
 const found = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
 if (found.length === 0) return Astro.redirect('/admin/applications');
 const app: any = found[0];
+
+// THE SLUG IS THE ONLY THING THAT MAY MAKE A TRAINEE PAID (the allowlist in compensation-text.ts),
+// and applications stores no slug snapshot - only roleId and roleTitleSnapshot. One lookup, so the
+// offer letter is judged by the same four fields the job advert is. A general application carries no
+// roleId and a failed read leaves the slug empty; both land on the unpaid side, which is the only
+// safe direction for a document somebody signs.
+let payRoleSlug = '';
+if (app.roleId) {
+  try {
+    const rr = await db.select({ slug: roles.slug }).from(roles).where(eq(roles.id, app.roleId)).limit(1);
+    if (rr.length > 0) payRoleSlug = String(rr[0].slug || '');
+  } catch (e: any) {
+    console.error('[offer-letter] role slug lookup -', e?.cause?.message || e?.message);
+  }
+}
+const payRole = {
+  level: app.level, engagementType: app.engagementType,
+  title: app.roleTitleSnapshot, slug: payRoleSlug,
+};
 
 const existing = await db.select().from(offerLetters).where(eq(offerLetters.applicationId, id)).limit(1);
 let existingOffer = existing.length > 0 ? existing[0] : null;
@@ -122,6 +146,25 @@ async function createUserAccount(email: string, fullName: string, plaintextPw: s
     return null;
   }
 }
+
+// THE LETTER COULD NOT BE SENT TO THE PERSON IT WAS ABOUT.
+//
+// This page generates a real record — offer_letters, with a token, a reference number and an
+// integrity hash — moves the application to "offer", creates the portal account and pushes a
+// notification. It said so about itself, in its own comment forty lines below: "this file sends no
+// email either. The candidate learned about their offer only if an admin told them by hand."
+//
+// A push notification reaches a device that has granted permission and installed the app. An offer
+// is the one message a candidate reads in their inbox. So this is the missing step, and it is a
+// LINK rather than a copy of the letter on purpose: the offer at /portal/offer/<token> is the
+// signable document, and a candidate who treats an emailed copy as the artefact is a candidate who
+// never signs.
+//
+// Declared ABOVE the POST handler that assigns them. `const` is not hoisted and this page's own
+// header says what that has cost here before.
+let letterSendOk = '';
+let letterSendErr = '';
+let letterSendRemoved: { kind: string; name: string; reason: string }[] = [];
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
@@ -209,6 +252,34 @@ if (Astro.request.method === 'POST') {
       }
       app.status = 'offer';
       successMsg = 'Offer extension confirmed. Application stage is now "Offer". Send the formal letter below when ready.';
+    } else if (action === 'email_offer') {
+      // Only ever for a letter that already exists and has already been issued. Emailing a DRAFT
+      // would hand somebody a link to a document the desk has not finished writing.
+      if (!existingOffer) {
+        errorMsg = 'There is no offer letter to email yet. Generate and send it first.';
+      } else if (existingOffer.status === 'draft') {
+        errorMsg = 'That offer is still a draft. Send it first, then email the candidate their link.';
+      } else {
+        const out = await sendLetterEmail({
+          actorUserId: user.id,
+          typeKey: 'offer:offer',
+          noteHtml: String(fd.get('noteHtml') || ''),
+          // NO letterHtml. The letter lives at its token URL, where it can be read AND SIGNED; a
+          // copy in the message body would be the same words with none of the consequence.
+          ctx: {
+            recipientName: existingOffer.candidateName || '',
+            recipientEmail: String(fd.get('recipientEmail') || existingOffer.candidateEmail || '').trim(),
+            roleTitle: existingOffer.roleTitle || '',
+            department: existingOffer.department || '',
+            refNumber: existingOffer.refNumber || '',
+            issueDate: existingOffer.offerDate || '',
+            letterUrl: publicUrl('/portal/offer/' + existingOffer.token),
+          },
+        });
+        letterSendRemoved = out.removed;
+        if (out.sent) letterSendOk = out.message;
+        else letterSendErr = out.message;
+      }
     } else if (action === 'generate') {
       const candidateName = ((fd.get('candidateName') as string) || '').trim();
       const candidateEmail = ((fd.get('candidateEmail') as string) || '').trim();
@@ -233,7 +304,11 @@ if (Astro.request.method === 'POST') {
       const workMode = workModeTitle(resolveWorkMode(employmentType, app.level, submittedWorkMode));
       const duration = ((fd.get('duration') as string) || '').trim();
       const hoursCommitment = ((fd.get('hoursCommitment') as string) || '').trim();
-      const compensation = ((fd.get('compensation') as string) || 'Unpaid').trim();
+      // NORMALISED, not trusted. This box is free text and an operator can type a stipend into it
+      // for a role that pays nothing - which is exactly how 49 job rows came to advertise stipends
+      // before roleSchema started healing them. The offer letter is the document the candidate acts
+      // on, so it gets the same treatment.
+      const compensation = offerCompensationFor(payRole, ((fd.get('compensation') as string) || 'Unpaid').trim());
       const reportingTo = ((fd.get('reportingTo') as string) || '').trim();
       const candidatePhone = ((fd.get('candidatePhone') as string) || '').trim();
       const candidateCity = ((fd.get('candidateCity') as string) || '').trim();
@@ -245,6 +320,9 @@ if (Astro.request.method === 'POST') {
       const signatoryTitle = ((fd.get('signatoryTitle') as string) || '').trim();
       const customNote = ((fd.get('customNote') as string) || '').trim();
       const refNumber = ((fd.get('refNumber') as string) || '').trim();
+      // The operator's covering message, written in the composer on the generate form. Read here
+      // with every other field; the send below is the only thing that uses it.
+      const offerNoteHtml = String((fd.get('noteHtml') as string) || '');
       const saveDraft = fd.get('saveDraft') === '1';
       // The Founder's wellbeing remark is optional per offer — some candidates would not welcome
       // it. The checkbox is unchecked by default, so it is only added when the sender opts in.
@@ -358,9 +436,47 @@ if (Astro.request.method === 'POST') {
               // Admin-side notice only — never blocks the offer, but never silent either.
               console.error('[offer-letter] admin notification failed -', e?.cause?.message || e?.message);
             }
+
+            // THE SEND. Placed here, inside if (wasDraft && sendingNow), because that is the only
+            // branch where an offer is actually ISSUED: a draft save and a re-save of an
+            // already-sent letter both reach this action and neither may mail the candidate.
+            // The record is committed and the stage is moved by this point, which is why
+            // sendLetterEmail() is contractually incapable of throwing - a failure here must not
+            // undo work that has already happened.
+            //
+            // NOTHING DERIVED FROM successMsg. That string interpolates the plaintext temporary
+            // password one line below, and LetterContext has no password field precisely so a
+            // credential cannot ride along with a letter. The covering note is the operator's own
+            // text and nothing else.
+            {
+              const out = await sendLetterEmail({
+                actorUserId: user.id,
+                typeKey: 'offer:offer',
+                noteHtml: offerNoteHtml,
+                ctx: {
+                  recipientName: candidateName,
+                  recipientEmail: candidateEmail,
+                  roleTitle,
+                  department,
+                  refNumber,
+                  issueDate: offerDate,
+                  signatoryName,
+                  signatoryTitle,
+                  letterUrl: publicUrl('/portal/offer/' + existingOffer.token),
+                },
+              });
+              letterSendRemoved = out.removed;
+              if (out.sent) letterSendOk = out.message;
+              else letterSendErr = out.message;
+            }
+
+            // "Issued", not "sent". The offer record is committed either way, but whether anything
+            // reached the candidate is now a real question with a real answer, and it is appended to
+            // this line by the folding at the foot of the handler. A green banner reading "sent"
+            // beside a red one reading "not sent" is the contradiction this wording removes.
             successMsg = acct?.isNew
-              ? 'Offer sent. TEMPORARY PASSWORD (copy now, shown once): ' + tempPw + ' — email ' + candidateEmail + (acct.handle ? ' OR handle ' + acct.handle : '') + '. Token: ' + existingOffer.token + '.'
-              : 'Offer sent. Token: ' + existingOffer.token + '.';
+              ? 'Offer issued. TEMPORARY PASSWORD (copy now, shown once): ' + tempPw + ' — email ' + candidateEmail + (acct.handle ? ' OR handle ' + acct.handle : '') + '. Token: ' + existingOffer.token + '.'
+              : 'Offer issued. Token: ' + existingOffer.token + '.';
           } else {
             successMsg = saveDraft ? 'Draft saved (not sent). Token: ' + existingOffer.token : 'Offer updated. Token: ' + existingOffer.token;
           }
@@ -467,10 +583,43 @@ if (Astro.request.method === 'POST') {
               // Admin-side notice only — never blocks the offer, but never silent either.
               console.error('[offer-letter] admin notification failed -', e?.cause?.message || e?.message);
             }
+
+            // THE SEND. Placed here, inside the else of if (saveDraft), because that is the only
+            // branch where an offer is actually ISSUED: a draft save and a re-save of an
+            // already-sent letter both reach this action and neither may mail the candidate.
+            // The record is committed and the stage is moved by this point, which is why
+            // sendLetterEmail() is contractually incapable of throwing - a failure here must not
+            // undo work that has already happened.
+            //
+            // NOTHING DERIVED FROM successMsg. That string interpolates the plaintext temporary
+            // password one line below, and LetterContext has no password field precisely so a
+            // credential cannot ride along with a letter. The covering note is the operator's own
+            // text and nothing else.
+            {
+              const out = await sendLetterEmail({
+                actorUserId: user.id,
+                typeKey: 'offer:offer',
+                noteHtml: offerNoteHtml,
+                ctx: {
+                  recipientName: candidateName,
+                  recipientEmail: candidateEmail,
+                  roleTitle,
+                  department,
+                  refNumber,
+                  issueDate: offerDate,
+                  signatoryName,
+                  signatoryTitle,
+                  letterUrl: publicUrl('/portal/offer/' + token),
+                },
+              });
+              letterSendRemoved = out.removed;
+              if (out.sent) letterSendOk = out.message;
+              else letterSendErr = out.message;
+            }
             if (accountIsNew) {
-              successMsg = 'Offer letter sent. Login at edurankai.in/admin/login with email ' + candidateEmail + (internalHandle ? ' OR handle ' + internalHandle : '') + '. TEMPORARY PASSWORD (shown once, copy now and send to the candidate): ' + plaintextPw + ' — they should change it after first sign-in. Offer token: ' + token + '.';
+              successMsg = 'Offer letter issued. Login at edurankai.in/admin/login with email ' + candidateEmail + (internalHandle ? ' OR handle ' + internalHandle : '') + '. TEMPORARY PASSWORD (shown once, copy now and send to the candidate): ' + plaintextPw + ' — they should change it after first sign-in. Offer token: ' + token + '.';
             } else {
-              successMsg = 'Offer letter sent. Token: ' + token + '. Existing account — the candidate keeps their current password (handle ' + (internalHandle || candidateEmail) + ').';
+              successMsg = 'Offer letter issued. Token: ' + token + '. Existing account — the candidate keeps their current password (handle ' + (internalHandle || candidateEmail) + ').';
             }
           }
         }
@@ -546,10 +695,39 @@ if (Astro.request.method === 'POST') {
   // reported separately when it did not happen.
   if (candidateNotTold) errorMsg = (errorMsg ? errorMsg + ' ' : '') + candidateNotTold;
   if (stageNotMoved) errorMsg = (errorMsg ? errorMsg + ' ' : '') + stageNotMoved;
+  // Kept as its OWN pair rather than folded into successMsg/errorMsg: "the offer was issued" and
+  // "the candidate has it in their inbox" are different facts, and this page's history is entirely
+  // about the second one being assumed from the first.
+  if (letterSendOk) successMsg = (successMsg ? successMsg + ' ' : '') + letterSendOk;
+  if (letterSendErr) errorMsg = (errorMsg ? errorMsg + ' ' : '') + letterSendErr;
 
   const refresh = await db.select().from(offerLetters).where(eq(offerLetters.applicationId, id)).limit(1);
   existingOffer = refresh.length > 0 ? refresh[0] : null;
 }
+
+// The covering message the composer opens with, so the operator is never handed a blank box on the
+// one screen where the wording matters most.
+//
+// IT TELLS THEM HOW TO GET IN, and that is not padding. /portal/offer/[token].astro:16 redirects
+// anyone who is not signed in to /portal/login, and an owner check refuses the token to anybody
+// else - so the link in this email is NOT self-authenticating. For a candidate whose account was
+// created seconds ago by this very page, the only credential is a temporary password printed once
+// on the admin's screen. An email that just says "here is your offer, click here" walks that person
+// into a login wall with nothing to type. The reset link works because the account already exists
+// under their address, so it is the one route they can complete alone.
+//
+// {{tokens}} rather than values: the composer substitutes them server-side after sanitising.
+const offerNoteDefault = [
+  '<p>Dear {{name}},</p>',
+  '<p>We are glad to offer you the position of {{role}}. Your offer letter is ready and is waiting '
+    + 'for you to read and sign.</p>',
+  '<p>Open it using the button below and sign in with this email address. If you have not set a '
+    + 'password yet, choose &ldquo;Forgot password&rdquo; on the sign-in page and we will send you a '
+    + 'link to set one.</p>',
+  '<p>The letter carries the reference {{ref}} and is dated {{date}}. Please read it in full before '
+    + 'signing, and reply to this message if anything in it is not what you expected.</p>',
+  '<p>{{signatory}}<br/>EduRankAI People Operations</p>',
+].join(String.fromCharCode(10));
 
 const currentOffer = existingOffer;
 const shortId = id.substring(0, 8).toUpperCase();
@@ -583,7 +761,11 @@ const fallbackDefaults = {
     engagementType: app.engagementType,
     roleTitle: app.roleTitleSnapshot,
   })),
-  compensation: (app.level === 'Intern' || app.level === 'Apprentice') ? 'Unpaid' : (app.compensation || 'To be discussed'),
+  // app.compensation is the CANDIDATE'S OWN EXPECTED CTC (schema.ts:180, written by apply/step-5
+  // from a field placeheld "e.g. 25 LPA INR"), so it may never reach a trainee offer: the old
+  // one-field level test missed 'Intern' rows stored with engagementType 'Full-Time', and the
+  // internship template then printed "This internship carries a stipend of 25 LPA INR".
+  compensation: offerCompensationFor(payRole, app.compensation || 'To be discussed'),
   reportingTo: '',
   // THE DATE ON THE OFFER, CUT IN THE WRONG CALENDAR. `new Date().toISOString()` is the UTC day on a
   // UTC server whose candidates and signatories are in IST, so between 00:00 and 05:29 IST this
@@ -649,6 +831,18 @@ const clockTone = clock.state === 'expired' || clock.state === 'overdue' ? '#f87
 
   {errorMsg && <div class="bg-red-500/10 border border-red-500/30 text-red-300 rounded-lg p-3 mb-4 text-[0.85rem]">{errorMsg}</div>}
   {successMsg && <div class="bg-leaf-bg/20 border border-leaf-border/50 text-leaf rounded-lg p-3 mb-4 text-[0.85rem]">{successMsg}</div>}
+  {/*
+    The sanitiser's report. It was being assigned and rendered nowhere, which meant an operator
+    could paste something into the covering message, have part of it removed on the way out, and
+    never learn that the copy the candidate received differs from the one they wrote. Shown the way
+    /admin/hr/recommendation.astro shows it, so the two desks answer the same question the same way.
+  */}
+  {letterSendRemoved.length > 0 && (
+    <div class="bg-gold-bg/20 border border-gold-border/50 text-gold-deep rounded-lg p-3 mb-4 text-[0.82rem] leading-relaxed">
+      Some markup was removed from the covering message before sending, so the emailed copy is not
+      byte-identical to what you wrote: {letterSendRemoved.map((x) => x.name).join(', ')}.
+    </div>
+  )}
 
   <div class="mb-5 pb-4 border-b border-white/8">
     <p class="font-mono text-[0.7rem] text-white/40">{shortId}</p>
@@ -701,6 +895,36 @@ const clockTone = clock.state === 'expired' || clock.state === 'overdue' ? '#f87
             <a href={'/portal/offer/' + currentOffer.token} target="_blank" class="text-[0.76rem] text-burn hover:underline font-mono">Applicant link &rarr;</a>
             <a href={'/offer/verify/' + currentOffer.token} target="_blank" class="text-[0.76rem] text-sky hover:underline font-mono">Public verify &rarr;</a>
           </div>
+
+          {/* EMAIL IT. One click, from the same panel that holds the link — because the link being
+              on this screen and the candidate having it are two different things, and until now
+              only the first one ever happened. */}
+          {currentOffer.status !== 'draft' && (
+            <details class="mt-3 border-t border-white/10 pt-3">
+              <summary class="text-[0.78rem] text-burn cursor-pointer select-none">Email this offer to the candidate</summary>
+              <form method="POST" class="mt-2">
+                <input type="hidden" name="action" value="email_offer" />
+                <label class="block text-[0.7rem] font-semibold uppercase tracking-wide text-white/55 mb-1.5" for="offerSendTo">Send to</label>
+                <input
+                  id="offerSendTo"
+                  name="recipientEmail"
+                  type="email"
+                  value={currentOffer.candidateEmail || ''}
+                  class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-[0.85rem] mb-3"
+                />
+                <RichMessageComposer
+                  id="offer-note"
+                  name="noteHtml"
+                  label="Your message"
+                  hint="Written above the link. Leave it empty and a plain covering note is used instead."
+                  tokens={LETTER_TOKENS}
+                  value={'<p>Dear {{name}},</p><p>We are glad to offer you the role of {{role}}. Your offer letter is linked below &mdash; please read it in full and sign it there.</p>'}
+                />
+                <button type="submit" class="mt-3 w-full bg-burn hover:bg-burn/90 text-white font-semibold py-2 px-4 rounded-lg text-[0.85rem]">Send the offer by email</button>
+                <p class="text-[0.7rem] text-white/45 mt-2 leading-relaxed">The message links to the signable copy. Nothing is attached, so there is no second version of the letter in circulation.</p>
+              </form>
+            </details>
+          )}
 
           {/* REVOKE. The handler for this has existed, complete and tested against its own failure
               modes, since the page was written — and no form ever submitted it, so no letter on this
@@ -845,6 +1069,23 @@ const clockTone = clock.state === 'expired' || clock.state === 'overdue' ? '#f87
           </div>
         </div>
       </div>
+
+      <details class="mb-5 rounded-lg border border-ink/15 bg-white/[0.02] p-4">
+        <summary class="cursor-pointer text-[0.85rem] text-white/70">The message that goes with it</summary>
+        <p class="mt-2 mb-3 text-[0.78rem] leading-relaxed text-white/50">
+          Sent with the offer letter when it is issued. Nothing is emailed on a draft save, or when
+          you update a letter that has already gone out. The letter itself is not attached: the
+          candidate opens the signable copy on the site, which is the version that can be signed.
+        </p>
+        <RichMessageComposer
+          id="offer-note"
+          name="noteHtml"
+          label="Covering message"
+          hint="Type it, or paste formatted text or HTML - the candidate sees normal formatted text, not tags."
+          tokens={LETTER_TOKENS}
+          value={offerNoteDefault}
+        />
+      </details>
 
       <div class="flex gap-3 flex-wrap">
         <button type="submit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 px-6 rounded-lg text-[0.95rem]">

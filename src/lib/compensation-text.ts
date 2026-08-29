@@ -151,6 +151,38 @@ function isPayClaim(segment: string): boolean {
 }
 
 /**
+ * The compensation an OFFER LETTER may state for a role.
+ *
+ * The same policy roleSchema already enforces on the job advert (src/lib/validators.ts:60), applied
+ * to the binding document. It was missing there entirely: publicCompensation() and isTraineeRole()
+ * had no caller anywhere in the offer path, so the allowlist that guards what a posting may CLAIM
+ * did not guard what an offer may PROMISE - and the offer form pre-filled its compensation box from
+ * applications.compensation, which is the candidate's own expected CTC ("e.g. 25 LPA INR", the
+ * placeholder on apply/step-5). An unpaid internship could therefore be offered a stipend of
+ * whatever the applicant had asked for, and the internship template renders exactly that sentence:
+ * "This internship carries a stipend of ...".
+ *
+ * NORMALISES RATHER THAN REJECTS, for the reason given on roleSchema: refusing the save would stop
+ * an operator correcting an unrelated field on an offer whose pay string was already wrong.
+ *
+ * The slug is the ONLY thing that may make a trainee paid, and an unknown slug is treated as unpaid,
+ * because every check here may only ever move a role towards unpaid.
+ */
+export function offerCompensationFor(
+  role: { level?: unknown; engagementType?: unknown; title?: unknown; slug?: unknown } | null | undefined,
+  typed: unknown,
+): string {
+  const t = String(typed ?? '').trim();
+  if (!isTraineeRole(role)) return t;
+  if (isPaidTrainee(role?.slug)) return t;
+  // Already says unpaid, possibly in more specific words than the generic line. Left alone.
+  if (declaresUnpaid(t)) return t;
+  const apprentice = String(role?.level ?? '').trim().toLowerCase() === 'apprentice'
+    || String(role?.engagementType ?? '').trim().toLowerCase() === 'apprenticeship';
+  return apprentice ? UNPAID_APPRENTICE_SALARY : UNPAID_INTERN_SALARY;
+}
+
+/**
  * Remove money-promising sentences from free prose stored against an unpaid trainee role.
  *
  * Sentence-level, because that is the smallest unit droppable without leaving half a claim behind.
