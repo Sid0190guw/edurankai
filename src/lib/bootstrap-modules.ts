@@ -91,6 +91,21 @@ export const BOOTSTRAP_MODULE_LIST: BootstrapModule[] = [
   { name: 'person-spine', run: async () => (await import('@/lib/person-spine')).ensureSpineSchema() },
   { name: 'capability-readings', run: async () => (await import('@/lib/match')).ensureMatchSchema() },
   { name: 'hiring-decision', run: async () => (await import('@/lib/hiring-decision')).ensureHiringDecisionSchema() },
+  // THE HR INTELLIGENCE DESK AND ITS ACCESS LOG. Registered 2026-08-29, and the same story as
+  // hiring-decision above: six hri_* tables whose only creator is ensureHrIntelSchema(), named in no
+  // db/*.sql, so on a deployment that refuses request-path DDL they have never been created and the
+  // one button an operator has for "create what is missing" could not create them either.
+  //
+  // IT IS THE ACCESS LOG THAT MAKES THIS URGENT RATHER THAN UNTIDY. recordAccess() writes the row
+  // that says who opened somebody's development record and why, and /admin/hr/intelligence/[id]
+  // refuses to assemble anything when that write fails — correctly, because an unlogged read of a
+  // person's record is not offered as a fallback. So a missing hri_access_log does not degrade the
+  // feature, it closes it, and the sentence the operator gets says the access could not be recorded
+  // without saying that the table it would go in does not exist.
+  //
+  // NO ORDER DEPENDENCY. The only REFERENCES inside this module point at hri_development_plans,
+  // which its own DDL creates first; nothing here references another module's table.
+  { name: 'hr-intelligence', run: async () => (await import('@/lib/hr-intelligence/schema')).ensureHrIntelSchema() },
   // These two have no exported ensure; a harmless READ triggers the same internal bootstrap.
   { name: 'error-log', run: async () => (await import('@/lib/logger')).recentErrors(1) },
   { name: 'job-queue', run: async () => (await import('@/lib/job-queue')).claimBatch(0) },
