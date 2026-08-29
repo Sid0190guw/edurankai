@@ -4,7 +4,7 @@ import {
   generateToken, hashToken, tokenPrefixOf, normaliseEmail, isEmail,
   statusOf, isLive, inviteUrl, ttlDays, parseInvite,
   generateCode, normaliseCode, formatCode, hashCode, codePrefixOf,
-  DEFAULT_TTL_DAYS, MAX_TTL_DAYS,
+  DEFAULT_TTL_DAYS, MAX_TTL_DAYS, NOTE_MAX,
 } from '@/lib/hiring/invitations';
 import { isGatedApplyPath } from '@/lib/talent/gate-pass';
 
@@ -172,8 +172,8 @@ describe('parseInvite', () => {
   });
 
   it('truncates rather than rejecting an over-long note', () => {
-    const out = parseInvite({ email: 'a@b.co', note: 'x'.repeat(5000) }) as { value: { note: string } };
-    expect(out.value.note).toHaveLength(1000);
+    const out = parseInvite({ email: 'a@b.co', note: 'x'.repeat(20000) }) as { value: { note: string } };
+    expect(out.value.note).toHaveLength(NOTE_MAX);
   });
 });
 

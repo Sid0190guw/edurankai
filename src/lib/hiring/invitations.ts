@@ -247,6 +247,9 @@ export interface CleanInvite {
   days: number;
 }
 
+/** Cap on the invitation note. Generous because it may now be formatted markup, not prose. */
+export const NOTE_MAX = 8000;
+
 /**
  * Validate and clean one invitation. Returns the problem as a sentence a person can act on, or the
  * cleaned record — never both, and never a half-cleaned one.
@@ -260,7 +263,11 @@ export function parseInvite(input: InviteInput): { error: string } | { value: Cl
       email,
       fullName: String(input.fullName ?? '').trim().slice(0, 120),
       roleSlug: String(input.roleSlug ?? '').trim().slice(0, 200),
-      note: String(input.note ?? '').trim().slice(0, 1000),
+      // 8000, not 1000. The note is now written in a composer and may carry markup, and a
+      // paragraph of prose wrapped in tags is several times its own length - a 1000-char cap
+      // silently truncated formatted notes mid-tag. It is still a cap: the note goes into an
+      // email and onto a landing page, and neither is a document store.
+      note: String(input.note ?? '').trim().slice(0, NOTE_MAX),
       waiveFee: input.waiveFee === true || input.waiveFee === 'true' || input.waiveFee === 'on',
       days: ttlDays(input.days),
     },

@@ -14,6 +14,7 @@ import { sql } from 'drizzle-orm';
 import { denyAdminApi } from '@/lib/auth/api-guard';
 import { logAudit } from '@/lib/audit';
 import { sendEmail, brandedEmail } from '@/lib/email';
+import { sanitizeEmailHtmlString, htmlToPlainText, OUTBOUND } from '@/lib/mailsec/html';
 import {
   parseInvite, createInvitation, revokeInvitation, recordSend, inviteUrl,
   ensureInvitationSchema, type CleanInvite, type Invitation,
@@ -66,9 +67,17 @@ function invitationEmail(inv: Invitation, url: string, code: string, fromName: s
       ' at EduRankAI. Opening the link below takes you straight to the application.</p>',
   ];
   if (inv.note) {
+    // SANITISED, NOT ESCAPED. esc() here meant an administrator who wrote or pasted formatted text
+    // got their markup delivered as literal angle brackets in somebody's inbox. The note is now
+    // written in a composer, so it goes through the same OUTBOUND profile every other outgoing body
+    // uses - which strips script, style, iframes, event handlers and javascript: URLs, and is a
+    // stricter control than escaping was, not a looser one.
+    //
+    // A div, not a p: the note may now hold block elements of its own, and a list inside a
+    // paragraph is invalid markup that mail clients lay out inconsistently.
     bodyParts.push(
-      '<p style="margin:0 0 14px;padding:12px 14px;background:#f6f5f1;border-left:3px solid #FF4F00;' +
-      'border-radius:4px;font-style:italic;">' + esc(inv.note) + '</p>',
+      '<div style="margin:0 0 14px;padding:12px 14px;background:#f6f5f1;border-left:3px solid #FF4F00;' +
+      'border-radius:4px;">' + sanitizeEmailHtmlString(inv.note, OUTBOUND) + '</div>',
     );
   }
   if (inv.waiveFee) {
@@ -108,7 +117,9 @@ function invitationEmail(inv: Invitation, url: string, code: string, fromName: s
     greeting,
     '',
     (fromName || 'Somebody on the team') + ' has invited you to apply' + forRole + ' at EduRankAI.',
-    inv.note ? '\n"' + inv.note + '"\n' : '',
+    // The text part gets the same note with its markup flattened, rather than quoting raw source
+    // back at a plain-text client.
+    inv.note ? '\n"' + htmlToPlainText(inv.note) + '"\n' : '',
     inv.waiveFee ? 'The application fee has been waived for you.' : '',
     '',
     'Open the application: ' + url,
