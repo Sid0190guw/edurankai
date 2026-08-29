@@ -35,9 +35,30 @@ if (activeRoleSlug) {
   }
 }
 
+// THE FORM BODY IS READ BEFORE ANY OF THE QUERIES BELOW, and that ordering is the whole fix.
+// Choosing a department submits this form so the server can load that department's roles. The
+// department the person just chose therefore arrives in the POST body and NOWHERE ELSE - it is not
+// in the draft yet, because only a completed step is saved. Reading it after the roles query (which
+// is what this page used to do) meant the query ran against the OLD department every time, so the
+// role select stayed on "Select a department first" no matter what was picked, and the handler
+// then rejected the same submission with "Please select a role." for not carrying one.
+// `const` is not hoisted, so this has to sit above its first use rather than beside the handler.
+const isPost = Astro.request.method === 'POST';
+const fd = isPost ? await Astro.request.formData() : null;
+// 'dept' is set by the department select's onchange before it submits. It is what separates "I am
+// changing department, load its roles" from "I am done, continue" - the two submissions are
+// otherwise identical, and treating the first as the second is what produced the error banner.
+const intent = ((fd?.get('intent') as string) || 'continue').trim();
+const submittedDeptId = ((fd?.get('departmentId') as string) || '').trim();
+
 // Only load departments and roles list when there's NO pre-selected role
 const allDepts = preselected ? [] : await db.select().from(departments).orderBy(asc(departments.sortOrder));
-const selectedDeptId = preselected?.departmentId || s2.departmentId || '';
+// draft.deptChoice, NOT draft.step2. step2 is the flag steps 3-6 read as "a role was chosen and
+// validated" (`if (!draft.step2?.roleSlug) ...`), so a department picked on the way to choosing a
+// role cannot be stored in it - writing a role-less step2 would let somebody who only opened the
+// department dropdown walk through the rest of the application and stage a submission with no role.
+const selectedDeptId = preselected?.departmentId
+  || submittedDeptId || s2.departmentId || draft.deptChoice?.departmentId || '';
 
 let rolesInSelectedDept: { id: string; title: string; slug: string; level: string }[] = [];
 if (!preselected && selectedDeptId) {
@@ -47,12 +68,32 @@ if (!preselected && selectedDeptId) {
 }
 
 let errorMsg = '';
+// Read by the radio group at the foot of the form. Held in its own variable rather than written
+// back onto s2, because s2 is the same object as draft.step2 and mutating it here would edit the
+// draft that the branch below spreads.
+let openToOtherForRender = String(s2.openToOther || draft.deptChoice?.openToOther || '');
 
-if (Astro.request.method === 'POST') {
-  const fd = await Astro.request.formData();
+// A department change is not an attempt to continue, so it must not be answered with a validation
+// error. The roles for the chosen department are already loaded above; re-rendering is all it needs.
+if (isPost && intent === 'dept' && !preselected) {
+  // Nothing else here writes the chosen department, and without this a refresh or a Back would drop
+  // it. Saved at step 2 - the step the person is still on - so this never advances the draft.
+  // The radio answer travels in this same POST, so it is carried across rather than reset: losing
+  // an answer the person already gave is exactly what makes a reloading form feel broken.
+  openToOtherForRender = ((fd?.get('openToOther') as string) || openToOtherForRender).trim();
+  await saveDraft(user.id, user.email, {
+    ...draft, deptChoice: { departmentId: selectedDeptId, openToOther: openToOtherForRender }
+  }, 2);
+}
+
+if (isPost && intent !== 'dept' && fd) {
   // If pre-selected, use the locked role. Otherwise read from form.
   const submittedRoleSlug = preselected ? preselected.slug : ((fd.get('roleSlug') as string || '').trim());
   const openToOther = (fd.get('openToOther') as string || '').trim();
+  // Kept for the re-render as well as the save. Every branch below can set errorMsg and fall through
+  // to render, and without this the radio group comes back unchecked on the same screen that tells
+  // the person something went wrong - losing an answer they had just given.
+  openToOtherForRender = openToOther || openToOtherForRender;
 
   if (submittedRoleSlug) {
     const roleCheck = await db.select({ id: roles.id, title: roles.title, departmentId: roles.departmentId, level: roles.level })
@@ -93,7 +134,7 @@ if (Astro.request.method === 'POST') {
   }
 }
 
-const initOpenToOther = s2.openToOther || '';
+const initOpenToOther = openToOtherForRender;
 const isInternOrApprentice = !!preselected && isTraineeRole(preselected);
 // Every internship and apprenticeship is unpaid except the flagship LLM Engineering Internship,
 // which is decided by slug in src/lib/compensation-text.ts. This screen used to read the stored
@@ -132,6 +173,10 @@ const levelChipClass = preselected ? (levelColors[preselected.level] || 'bg-crea
 
   <form method="POST" class="flex flex-col gap-5">
 
+    <!-- Read by the frontmatter to tell a department change apart from a Continue. The department
+         select rewrites it to 'dept' before submitting; the Continue button leaves it alone. -->
+    <input type="hidden" name="intent" value="continue" />
+
     {preselected ? (
       <div class="bg-cream-2 border-2 border-burn-dim rounded-xl p-5 flex flex-col gap-3">
         <div class="flex items-start justify-between gap-3">
@@ -164,7 +209,7 @@ const levelChipClass = preselected ? (levelColors[preselected.level] || 'bg-crea
       <>
         <div>
           <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Department <span class="text-burn">*</span></label>
-          <select name="departmentId" required onchange="this.form.submit()" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2">
+          <select name="departmentId" required onchange="this.form.intent.value='dept';this.form.submit()" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2">
             <option value="">Select a department...</option>
             {allDepts.map((d) => {
               const sel = selectedDeptId === d.id;

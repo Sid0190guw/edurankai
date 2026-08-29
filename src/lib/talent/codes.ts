@@ -134,7 +134,30 @@ export function formatProblem(input: string): string | null {
   // not 18 is what makes the message act on the part the candidate can actually fix.
   const bare = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
   const pfx = CODE_DISPLAY_PREFIX.replace(/[^A-Z0-9]/g, '');
-  const stripped = bare.startsWith(pfx) && bare.length !== CODE_BODY_LEN ? bare.slice(pfx.length) : bare;
+
+  // THE OTHER CODE FAMILY. ERA-INV-XXXXX-XXXXX-XXXXX is an invitation to APPLY; ERA-SEL means
+  // already selected. The gate keeps those two doors apart on purpose (see the header of
+  // src/lib/hiring/invitations.ts) - but /apply/gateway has only ONE code box, so an invited person
+  // has nowhere else to try theirs, and they do. Its prefix is stripped for the count for the same
+  // reason ERA-SEL's is: the message has to describe the part the person can actually fix.
+  //
+  // The prefix is written out rather than imported because src/lib/hiring/invitations.ts reaches the
+  // database at module scope, and this module is pulled into the middleware bundle.
+  const invitePfx = 'ERAINV';
+  const looksInvite = bare.startsWith(invitePfx) && bare.length !== CODE_BODY_LEN;
+  const stripped = looksInvite
+    ? bare.slice(invitePfx.length)
+    : (bare.startsWith(pfx) && bare.length !== CODE_BODY_LEN ? bare.slice(pfx.length) : bare);
+
+  // A WRONG DOOR IS NOT A MALFORMED CODE. A complete invitation code is a perfectly good code that
+  // was typed in the wrong place; answering it with "this one has 21 characters" is true, useless,
+  // and reads as "your code is broken" when nothing is wrong with it. Checked only when the body
+  // behind the prefix is full length, so a genuinely mistyped one still falls through to the count.
+  if (looksInvite && stripped.length === CODE_BODY_LEN) {
+    return 'That is an invitation code, not an onboarding code. An invitation is an invitation to '
+      + 'apply - it does not skip the application. Enter it at /invite instead.';
+  }
+
   if (stripped.length !== CODE_BODY_LEN) {
     return `An onboarding code has ${CODE_BODY_LEN} characters, shown in three groups of ${CODE_GROUP_LEN}. This one has ${stripped.length}.`;
   }

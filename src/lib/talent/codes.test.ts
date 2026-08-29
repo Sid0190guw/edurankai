@@ -116,6 +116,22 @@ describe('formatProblem', () => {
     expect(msg).not.toContain('has 18');
   });
 
+  // The code from the screenshot that started this: an invited person typed their ERA-INV code into
+  // the only code box on /apply/gateway and was told it "has 21 characters" - true, and useless.
+  // The two families are deliberately distinct, so the wrong one gets the right door, not a count.
+  it('sends an ERA-INV invitation code to /invite instead of counting its characters', () => {
+    const msg = formatProblem('ERA-INV-AMM7R-NFE69-ZMD2C') || '';
+    expect(msg).toContain('/invite');
+    expect(msg).toContain('invitation code');
+    expect(msg).not.toContain('21');
+  });
+
+  // The wrong-door branch must not swallow the ordinary length error: only an ERA-INV prefix with a
+  // full-length body behind it is an invitation code. Anything else is still just malformed.
+  it('still counts characters for a mistyped code that merely starts with those letters', () => {
+    expect(formatProblem('ERA-INV-AMM7R-NFE69') || '').toContain('has 10');
+  });
+
   it('names the excluded characters that were actually used, and never names L', () => {
     const msg = formatProblem('ABCDE-23456-FGHI0') || '';
     expect(msg).toContain('"I"');
