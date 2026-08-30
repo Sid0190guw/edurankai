@@ -15,9 +15,13 @@
 //      or slower than 3.5s — which is exactly offline / flaky-network time.
 // v11: precache the aerospace labs so the engineering tools work fully
 //      offline (they are self-contained pages with zero runtime API calls).
-const CACHE = 'edurankai-v19';
-const STATIC_CACHE = 'edurankai-static-v19';
-const PAGE_CACHE = 'edurankai-pages-v19';
+// v20: /invite, /apply and /onboarding are never cached - see the fetch handler.
+//      The bump also EVICTS the stale pre-deploy copies already sitting in
+//      edurankai-pages-v19 on candidates' devices; activate() deletes every
+//      cache not in `keep`, which is the only thing that clears them.
+const CACHE = 'edurankai-v20';
+const STATIC_CACHE = 'edurankai-static-v20';
+const PAGE_CACHE = 'edurankai-pages-v20';
 // Pre-cache a couple of useful pages so the very first offline launch works.
 const PRECACHE = ['/', '/resume', '/portal/worklog', '/careers', '/ecosystem',
   '/aquintutor/labs', '/aquintutor/labs/flight-sim', '/aquintutor/labs/cad-bench', '/aquintutor/labs/vesper-bench',
@@ -59,6 +63,26 @@ self.addEventListener('fetch', (event) => {
   // API and the admin panel stay online-only (admin data must never be served
   // from a stale cache). Portal pages are cached for offline employee work.
   if (path.startsWith('/api/') || path.startsWith('/admin')) return;
+
+  // AND SO DOES THE HIRING FRONT DOOR. /invite, /apply and /onboarding are not
+  // documents. They are a credential flow whose answer depends on a cookie, and
+  // whose HTML is only half of what the server sends:
+  //
+  //   * /invite/<token> SIGNS THE GATE PASS IN A Set-Cookie HEADER. Replaying a
+  //     cached copy gives the page without the header, so Continue bounces the
+  //     invited person to the gate - the exact failure this flow was just fixed
+  //     for, re-created by our own cache.
+  //   * /apply/gateway redirects anyone already holding a pass; a cached copy
+  //     shows somebody a door they have already walked through.
+  //   * /onboarding spends a single-use code.
+  //
+  // It is also how a candidate kept seeing the PRE-DEPLOY gate. Page fetches fall
+  // back to the cache after 3.5s, and the caches.match() below passes
+  // ignoreSearch, so on a slow connection the stale copy won and no query string
+  // could bust it. A video call in another tab is enough to cross 3.5s.
+  if (path === '/invite' || path.startsWith('/invite/') ||
+      path === '/apply' || path.startsWith('/apply/') ||
+      path === '/onboarding' || path.startsWith('/onboarding/')) return;
 
   const isStatic = path.startsWith('/era/') || path.startsWith('/_astro/') ||
     /\.(css|js|svg|woff2?|png|jpg|jpeg|gif|webp|ico|json|txt)$/i.test(path);
