@@ -42,6 +42,10 @@ export const PILLARS = [
   }
 ];
 
+// DEAD CONSTANT. Its only importer is src/components/home/Products.astro, which is itself imported
+// by nothing — so nothing below reaches a visitor. HERO, MISSION and PILLARS above ARE live
+// (src/pages/index.astro reads them); this export is not. The live venture list is the `products`
+// table, rendered by /ecosystem and editable at /admin/products — add a venture THERE.
 export const PRODUCTS = [
   {
     name: 'AquinTutor',
@@ -101,7 +105,7 @@ export const PRODUCTS = [
     statusVariant: 'launch',
     href: '/products/atlas-proctoring',
     external: false,
-    description: 'Honorlock-class proctoring as a service. 28+ event types, 14 KB JS SDK, REST API. Used by EduRankAI\'s own tests; available to any LMS or hiring tool.'
+    description: 'Enterprise-grade proctoring as a service. 28+ event types, 14 KB JS SDK, REST API. Used by EduRankAI\'s own tests; available to any LMS or hiring tool.'
   },
   {
     name: 'Sambandh',
