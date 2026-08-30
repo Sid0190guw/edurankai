@@ -224,7 +224,7 @@ export async function listApplicantRequests(userId: string) {
     ORDER BY COALESCE(last_message_at, created_at) DESC
   `)).map((r: any) => ({
     ...r,
-    title: 'Vis-vambhara access',
+    title: 'Restricted research access',
     href: '/portal/requests/visvambhara/' + r.id,
   }));
   // A FAILED READ IS NOT AN ABSENCE OF REQUESTS. This ended in `catch (_) {}` over an empty array,

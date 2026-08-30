@@ -9,12 +9,20 @@ function json(d: any, s = 200) {
 }
 
 export const GET: APIRoute = async ({ request, locals }) => {
-  // /admin/visvambhara-access is absent from PATH_SECTION, so no section key exists to convert to.
-  // canOpenAdmin is the gate the page already has and the one /api/* was missing.
-  const denied = await denyAdminApi(locals, { label: 'visvambhara-access.thread' });
+  // /admin/visvambhara-access is now mapped to the 'settings' section in middleware.ts PATH_SECTION,
+  // matching what src/lib/admin-nav.ts has always declared for it. Passing the key here keeps the API
+  // and the page on the same gate; canOpenAdmin still runs underneath.
+  const denied = await denyAdminApi(locals, { section: 'settings', label: 'visvambhara-access.thread' });
   if (denied) return denied;
   const id = new URL(request.url).searchParams.get('id') || '';
   if (!id) return json({ ok: false, error: 'id required' }, 400);
-  const messages = await getThread('visvambhara_access', id);
+  // An empty thread and an unreadable one must not both render as "no messages".
+  let messages;
+  try {
+    messages = await getThread('visvambhara_access', id);
+  } catch (e: any) {
+    console.error('[admin/visvambhara-access/thread] read failed:', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'temporarily unavailable' }, 503);
+  }
   return json({ ok: true, messages });
 };

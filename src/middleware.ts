@@ -162,6 +162,13 @@ const PATH_SECTION: [string, string][] = ([
   ['/admin/audit', 'audit'],
   ['/admin/settings', 'settings'],
   ['/admin/diagnostics', 'settings'],
+  // THE REVIEW DESK WAS UNMAPPED, AND UNMAPPED MEANS ALLOWED (see the header of this array).
+  // src/lib/admin-nav.ts:334 and :726 both declare this page `section: 'settings'`, which only
+  // super_admin holds — so the SIDEBAR showed it to one role while the URL admitted every other
+  // non-applicant role, and the page's own guard is just `role === 'applicant'`. That desk lists
+  // every applicant's name, email, CV link and full 300-word note. This entry does not change the
+  // policy; it makes the URL enforce the policy the navigation already declares.
+  ['/admin/visvambhara-access', 'settings'],
 ] as [string, string][]).sort((a, b) => b[0].length - a[0].length);
 
 function resolveAdminSection(path: string): string | null {
@@ -497,8 +504,22 @@ export const onRequest = defineMiddleware(async (context, next) => {
     }
     try {
       const { hasApprovedAccess } = await import('@/lib/visvambhara-access');
-      // Non-applicant staff (admins, HR, editors) can always view internal research.
-      if (userEarly.role === 'applicant') {
+      // ASK FOR THE CAPABILITY, NOT FOR "NOT AN APPLICANT".
+      //
+      // `research.restricted.view` is a capability this repo declares, describes in
+      // src/lib/auth/registry.ts as "Open the internal research deep modules", marks sensitive, and
+      // lets an admin grant, revoke and audit in the role editor — while no code read it.
+      // permissions.ts:1095 names THIS gate as its call site.
+      //
+      // THIS IS NOT A NARROWING. Every non-applicant role holds the key today (the three
+      // AquinTutor-facing ones via `[...INTERNAL_ROLE_KEYS]`), so the population admitted is
+      // unchanged. What changes is that the capability is now load-bearing: revoking it from a role
+      // takes effect, where the role literal ignored it. Whether `partner` SHOULD read confidential
+      // research is a policy question for the owner, pinned by a test rather than decided here.
+      //
+      // The applicant arm stays a ROW, not a role: anyone without the capability still gets in with
+      // an approved access request, which is how an external researcher is meant to arrive.
+      if (!can(userEarly, 'research.restricted.view')) {
         const ok = await hasApprovedAccess(userEarly.id);
         if (!ok) return new Response(null, { status: 302, headers: { Location: '/products/visvambhara/access' } });
       }

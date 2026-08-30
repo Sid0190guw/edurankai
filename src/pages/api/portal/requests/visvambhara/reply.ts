@@ -21,7 +21,15 @@ export const POST: APIRoute = async ({ request, locals }) => {
   if (!requestId) return json({ ok: false, error: 'requestId required' }, 400);
 
   // Verify the request belongs to this user
-  const req = rows(await db.execute(sql`SELECT id, user_id FROM visvambhara_access_requests WHERE id = ${requestId} LIMIT 1`))[0] as any;
+  // 404 must stay strictly "the query ran and matched nothing" — an unreachable database is 503.
+  // Collapsing the two told an applicant their own request did not exist.
+  let req: any;
+  try {
+    req = rows(await db.execute(sql`SELECT id, user_id FROM visvambhara_access_requests WHERE id = ${requestId} LIMIT 1`))[0];
+  } catch (e: any) {
+    console.error('[portal/requests/visvambhara/reply] lookup failed:', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'temporarily unavailable' }, 503);
+  }
   if (!req || req.user_id !== user.id) return json({ ok: false, error: 'request not found' }, 404);
 
   const r = await postMessage({

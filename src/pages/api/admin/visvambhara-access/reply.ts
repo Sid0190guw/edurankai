@@ -13,9 +13,9 @@ function json(d: any, s = 200) {
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request, locals }) => {
-  // See thread.ts: no section key exists for this surface, so this is canOpenAdmin — the same gate
-  // /admin/visvambhara-access has, applied to the URL that was reachable without it.
-  const denied = await denyAdminApi(locals, { label: 'visvambhara-access.reply' });
+  // See thread.ts: the surface is mapped to the 'settings' section now, so the API asks for the same
+  // key the page and the sidebar declare, on top of canOpenAdmin.
+  const denied = await denyAdminApi(locals, { section: 'settings', label: 'visvambhara-access.reply' });
   if (denied) return denied;
   const user = (locals as any)?.user;
   let body: any = {};
@@ -23,7 +23,14 @@ export const POST: APIRoute = async ({ request, locals }) => {
   const requestId = (body.requestId || '').toString();
   if (!requestId) return json({ ok: false, error: 'requestId required' }, 400);
 
-  const req = rows(await db.execute(sql`SELECT id, user_id FROM visvambhara_access_requests WHERE id = ${requestId} LIMIT 1`))[0] as any;
+  // See the applicant endpoint: 503 for "could not look", 404 only for "looked and found none".
+  let req: any;
+  try {
+    req = rows(await db.execute(sql`SELECT id, user_id FROM visvambhara_access_requests WHERE id = ${requestId} LIMIT 1`))[0];
+  } catch (e: any) {
+    console.error('[admin/visvambhara-access/reply] lookup failed:', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'temporarily unavailable' }, 503);
+  }
   if (!req) return json({ ok: false, error: 'request not found' }, 404);
 
   const r = await postMessage({

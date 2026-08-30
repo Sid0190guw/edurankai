@@ -716,7 +716,11 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   { id: 'products', label: 'Products', href: '/admin/products', icon: 'package', section: 'products' },
   {
     groupId: 'visvambhara-group',
-    label: 'Viśvambhara',
+    // Labelled for the LINE, not for one of its two programmes. The group holds the Akasha-Q public
+    // page as well, and a sidebar reading "Visvambhara > Akasha-Q public page" renders Akasha-Q as a
+    // child of the swarm — the exact framing the separation removed. groupId is unchanged so no
+    // stored menu state moves.
+    label: 'Restricted research',
     icon: 'package',
     children: [
       { id: 'visvambhara-public', label: 'Public page', href: '/products/visvambhara', icon: 'globe', section: 'products' },
