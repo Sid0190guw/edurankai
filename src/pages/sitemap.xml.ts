@@ -36,6 +36,12 @@ const STATIC_ROUTES: Array<{ path: string; changefreq: string; priority: string 
   // Visvambhara aerospace research product
   { path: '/products/visvambhara', changefreq: 'weekly', priority: '0.9' },
   { path: '/products/akasha-q', changefreq: 'weekly', priority: '0.9' },
+  // Akasha-Q programme charter. Artifact pages are intentionally NOT listed: 28 dense research
+  // documents would dominate the sitemap, and they are reachable from the two Part pages.
+  { path: '/akasha-q', changefreq: 'weekly', priority: '0.8' },
+  { path: '/akasha-q/charter/master-system-architecture', changefreq: 'monthly', priority: '0.7' },
+  { path: '/akasha-q/charter/demonstration-and-credibility', changefreq: 'monthly', priority: '0.7' },
+  { path: '/akasha-q/demo', changefreq: 'monthly', priority: '0.7' },
 ];
 
 export const GET: APIRoute = async () => {
