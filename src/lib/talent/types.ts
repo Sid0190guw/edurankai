@@ -378,6 +378,23 @@ export const CODE_BODY_LEN = CODE_GROUP_LEN * CODE_GROUPS;
  */
 export const CODE_DISPLAY_PREFIX = 'ERA-SEL';
 
+/**
+ * The heading of the code door on /apply/gateway. Defined HERE because two surfaces say it aloud.
+ *
+ * THE FAILURE THIS PREVENTS HAS ALREADY HAPPENED ONCE. The onboarding-code email tells a selected
+ * candidate to open the gate and choose a control BY NAME. That sentence was a hand-copied duplicate
+ * of the page's own <h2>, so when the gate was reworked to read both code families and the heading
+ * became "I was sent a code", every ERA-SEL message still in flight was sending people to hunt for
+ * a control that no longer existed on the page. The two read as different features, which is exactly
+ * how "the system got confused between the application code and the onboarding code" is experienced
+ * from the outside.
+ *
+ * An email that narrates another page's labels has to IMPORT them. This file is the right home: it
+ * touches no database, so the gate page can read it without pulling a connection into a screen that
+ * renders without one.
+ */
+export const GATE_CODE_HEADING = 'I was sent a code';
+
 export const CODE_LIMITS = {
   /** Per IP, per window. Spec 16.5. */
   perIpAttempts: 5,

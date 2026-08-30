@@ -24,6 +24,9 @@
 // The share message was written out twice, byte for byte, in src/pages/admin/talent/codes.astro and
 // src/pages/admin/talent/selected.astro. Adding a composer to both would have made three copies of
 // one sentence about how somebody is let into onboarding. There is now one.
+// The gate's own heading, imported rather than retyped — a hand-copied duplicate of it here once
+// outlived the page it described, and the candidate was the one who found out. See ./types.
+import { GATE_CODE_HEADING } from './types';
 import { sanitizeEmailHtml, htmlToPlainText, OUTBOUND } from '@/lib/mailsec/html';
 import { brandedEmail } from '@/lib/email';
 
@@ -96,9 +99,15 @@ export function defaultMessageHtml(ctx: CodeMessageContext): string {
     '<p>Dear {{name}},</p>',
     '<p>You have been selected' + forRole + '. Your onboarding authorization code is:</p>',
     '<p><strong>{{code}}</strong></p>',
-    '<p>To use it, open <a href="{{gateway_url}}">{{gateway_url}}</a>, choose '
-      + '&ldquo;I have an authorization code&rdquo;, and enter the code together with this email '
-      + 'address: <strong>{{email}}</strong>.</p>',
+    // THE HEADING IS IMPORTED, NOT RETYPED. See GATE_CODE_HEADING in ./types — a hand-copied label
+    // here once outlived the page it described. And the sentence now says what that URL IS: it
+    // lives under /apply, so an operator reading this message back could reasonably conclude we
+    // had sent a selected candidate to the ordinary application. They are not being sent to it.
+    '<p>To use it, open <a href="{{gateway_url}}">{{gateway_url}}</a> &mdash; that is the '
+      + 'application gate, not the application itself &mdash; and enter the code in the box headed '
+      + '&ldquo;' + esc(GATE_CODE_HEADING) + '&rdquo;, together with this email address: '
+      + '<strong>{{email}}</strong>. The code takes you straight to onboarding, with no application '
+      + 'to fill in.</p>',
     '<p>The code can be used once and it expires on {{expires}}. Please do not forward it to anyone, '
       + 'and do not send it in the same message as any other document.</p>',
     '<p>EduRankAI People Operations</p>',
@@ -120,8 +129,10 @@ export function defaultMessageText(ctx: CodeMessageContext): string {
     '',
     ctx.code || '',
     '',
-    'To use it, go to ' + gatewayUrl(ctx.origin) + ' , choose "I have an authorization code", and enter',
-    'the code together with this email address: ' + ctx.boundEmail,
+    'To use it, go to ' + gatewayUrl(ctx.origin) + ' — that is the application gate, not the',
+    'application itself — and enter the code in the box headed "' + GATE_CODE_HEADING + '",',
+    'together with this email address: ' + ctx.boundEmail,
+    'The code takes you straight to onboarding, with no application to fill in.',
     '',
     'The code can be used once and it expires on ' + ctx.validUntil + '. Please do not forward it to anyone,',
     'and do not send it in the same message as any other document.',

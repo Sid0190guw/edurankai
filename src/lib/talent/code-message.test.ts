@@ -135,3 +135,52 @@ describe('composeCodeEmail', () => {
     expect(out.text).toContain('First');
   });
 });
+
+// =================================================================================================
+// THE EMAIL AND THE PAGE MUST NAME THE SAME CONTROL
+// =================================================================================================
+//
+// An onboarding-code message tells a selected candidate to open /apply/gateway and enter their code
+// in a box it names BY ITS HEADING. That sentence used to be a hand-copied duplicate of the page's
+// own <h2>. When the gate was reworked to read both code families the heading changed, the email did
+// not, and every ERA-SEL message in flight was sending people to look for a control that no longer
+// existed on the page — which from outside is indistinguishable from the onboarding code being
+// broken. These two assertions are what would have caught it.
+describe('the gate heading is defined once', () => {
+  it('is the heading the onboarding-code message actually tells people to look for', async () => {
+    const { GATE_CODE_HEADING } = await import('./types');
+    const ctx: CodeMessageContext = {
+      personName: 'A Candidate',
+      boundEmail: 'candidate@example.org',
+      opportunityTitle: 'Platform Engineer',
+      validUntil: '2026-12-31',
+      origin: 'https://www.edurankai.in',
+      code: 'ERA-SEL-ABCDE-FGHJK-LMNPQ',
+    };
+    expect(defaultMessageHtml(ctx)).toContain(GATE_CODE_HEADING);
+    expect(defaultMessageText(ctx)).toContain(GATE_CODE_HEADING);
+  });
+
+  it('is rendered by the gate page from the constant, never retyped as a literal', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const src = readFileSync(join(process.cwd(), 'src/pages/apply/gateway.astro'), 'utf8');
+    // The page must READ the shared constant...
+    expect(src).toContain('GATE_CODE_HEADING');
+    expect(src).toContain('{GATE_CODE_HEADING}');
+    // ...and must not carry a second, hand-typed copy of any heading for that door. A literal here
+    // is how the email and the page drifted apart the first time.
+    expect(src).not.toContain('>I was sent a code<');
+    expect(src).not.toContain('I have an authorization code');
+  });
+
+  it('leaves no stale copy of the old heading anywhere the candidate is written to', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const msg = readFileSync(join(process.cwd(), 'src/lib/talent/code-message.ts'), 'utf8');
+    // Everything after the import line must go through the constant.
+    const body = msg.slice(msg.indexOf('export function defaultMessageHtml'));
+    expect(body).not.toContain('I have an authorization code');
+    expect(body).not.toContain('I was sent a code');
+  });
+});
