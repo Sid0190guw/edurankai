@@ -117,3 +117,48 @@ describe('a card cannot advertise remote work', () => {
     expect(c.location).toBe('On-site — your own campus');
   });
 });
+
+// -------------------------------------------------------------------------------------------
+// A LITERAL KEYWORD THE LEXICON DOES NOT KNOW.
+//
+// Reported from the live site: typing "QA junior" into the explore box on /careers returned no QA
+// roles, while browsing the catalogue showed them. Two separate causes, both here:
+//
+//   1. compileQuery built `terms` ONLY from CONFIRMED interests and skills — tags the interpreter
+//      had matched against its own lexicon. "QA" matches no tag, so nothing reached the query and
+//      the search silently became the generic unpersonalised catalogue: "we did not look for it",
+//      rendered as "there is nothing like that here".
+//   2. extractQueryTerms dropped any word of three characters or fewer, so even the fallback that
+//      DID exist could never have carried "QA", "AI", "ML" or "UX".
+describe('a literal keyword still searches, even when no tag matched it', () => {
+  it('carries a two-letter abbreviation nobody has a lexicon entry for', () => {
+    const q = compileQuery(from('QA junior'));
+    const terms = (q.filters.terms || []).map((t) => t.toLowerCase());
+    expect(terms).toContain('qa');
+    expect(q.unpersonalised).toBe(false);
+  });
+
+  it('carries the longer words of the same query too', () => {
+    const q = compileQuery(from('QA junior'));
+    const terms = (q.filters.terms || []).map((t) => t.toLowerCase());
+    expect(terms).toContain('junior');
+  });
+
+  it('still reports what it looked for, so the search is not a black box', () => {
+    const q = compileQuery(from('QA junior'));
+    expect(q.terms.length).toBeGreaterThan(0);
+  });
+
+  it('does not resurrect a keyword the person rejected, even though the sentence still holds it', () => {
+    // The raw text is kept verbatim forever; a correction made after the fact has to win over it.
+    let p = from('I like finance.');
+    p = { ...p, interests: p.interests.map((t) => ({ ...t, confirmation: 'rejected' as const })) };
+    const q = compileQuery(p);
+    expect(JSON.stringify(q.filters.terms || []).toLowerCase()).not.toContain('finance');
+  });
+
+  it('does not turn a stated avoidance into something to search FOR', () => {
+    const q = compileQuery(from('I want AI. I am not interested in finance.'));
+    expect(JSON.stringify(q.filters.terms || []).toLowerCase()).not.toContain('finance');
+  });
+});

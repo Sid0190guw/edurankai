@@ -23,7 +23,8 @@
 
 import type { OpportunityFilters } from '@/lib/xscale/roles-ext';
 import { DOMAIN_BY_KEY } from './ontology';
-import type { CareerProfile } from './dimensions';
+import { ownWords, type CareerProfile } from './dimensions';
+import { extractQueryTerms } from './interpret';
 
 export interface CompiledQuery {
   filters: OpportunityFilters;
@@ -71,7 +72,34 @@ export function compileQuery(profile: CareerProfile, explicit: Partial<Opportuni
   }
 
   const cappedDisciplines = disciplines.slice(0, 6);
-  const cappedTerms = terms.slice(0, 6);
+
+  // A KEYWORD THE INTERPRETER DID NOT RECOGNISE IS NOT A KEYWORD THAT WAS NEVER SAID.
+  //
+  // Everything above comes from CONFIRMED interests and skills — tags the interpreter matched
+  // against its own lexicon. Somebody who typed "QA", a role title, or any word that lexicon does
+  // not know produced no tag at all, so it never reached `terms`, and the search fell back to the
+  // generic, unpersonalised catalogue with no trace of what was actually typed. It reads as "there
+  // is nothing like that here" when the honest answer is "we did not look for it".
+  //
+  // What was typed is not lost, though — RawResponse.text keeps it "EXACTLY what was typed. Never
+  // normalised, never rewritten, never replaced." ownWords() returns it newest first, and
+  // extractQueryTerms() is the SAME stopword-filtered extraction the interpret endpoint already
+  // runs on every turn (see interpretation.queryTerms) — re-run here so a literal keyword search
+  // works the moment it reaches this compiler, without a client round trip to carry it separately.
+  // A CORRECTION THE PERSON ALREADY MADE MUST NOT BE UNDONE BY READING THE SAME SENTENCE AGAIN.
+  // "I like finance", rejected afterwards, or "I am not interested in finance" (which lands in
+  // `avoid`, never `interests`) must not have "finance" reappear as a search term just because the
+  // word is still sitting in rawResponses.text — re-extracting from raw text is otherwise blind to
+  // a rejection or a stated avoidance made about the very same word.
+  const excludedLabels = new Set(
+    [...(profile.interests || []), ...(profile.skills || []), ...(profile.avoid || [])]
+      .filter((t) => t.confirmation === 'rejected' || (profile.avoid || []).includes(t))
+      .map((t) => t.label.toLowerCase()),
+  );
+  const lastTyped = ownWords(profile)[0]?.text || '';
+  const literalFallback = extractQueryTerms(lastTyped, interests, (profile.skills || []).filter((t) => t.confirmation !== 'rejected'))
+    .filter((w) => !excludedLabels.has(w) && ![...excludedLabels].some((label) => label.includes(w) || w.includes(label)));
+  const cappedTerms = Array.from(new Set([...terms, ...literalFallback])).slice(0, 6);
 
   // BOTH ARE SENT, AND listOpportunities OR-s THEM WITH EACH OTHER.
   //

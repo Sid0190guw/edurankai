@@ -381,6 +381,21 @@ export function extractQueryTerms(
   skills: { label: string }[] = [],
 ): string[] {
   const named = [...skills.map((s) => s.label), ...interests.map((i) => i.label)];
+
+  // A DELIBERATE SHORT ABBREVIATION READS DIFFERENTLY FROM SHORT NOISE, AND THE DIFFERENCE IS THE
+  // CASE IT WAS TYPED IN. "QA", "AI", "ML", "UX", "HR" are exactly the kind of thing somebody types
+  // into a search box and means literally — and at two or three letters they were being discarded
+  // outright by the length filter below, before the ORIGINAL text is lowercased for that pass. So
+  // this reads the ORIGINAL text first: a 2-5 letter run of capital letters, standing as its own
+  // word, is kept regardless of length. Checked against STOPWORDS too (lowercased), so an
+  // ALL-CAPS sentence someone is typed does not smuggle "THE" or "AND" through as an acronym.
+  const acronyms = String(text || '')
+    .split(/\s+/)
+    .map((w) => w.replace(/[^A-Za-z0-9+#]/g, ''))
+    .filter((w) => w.length >= 2 && w.length <= 5 && w === w.toUpperCase() && /[A-Z]/.test(w))
+    .map((w) => w.toLowerCase())
+    .filter((w) => !STOPWORDS.has(w));
+
   const words = String(text || '')
     .toLowerCase()
     .replace(/[^a-z0-9+#/\s-]/g, ' ')
@@ -391,7 +406,7 @@ export function extractQueryTerms(
   const ranked = Array.from(counted.entries())
     .sort((a, b) => (b[1] - a[1]) || (b[0].length - a[0].length))
     .map(([w]) => w);
-  return uniq([...named, ...ranked]).slice(0, 6);
+  return uniq([...named, ...acronyms, ...ranked]).slice(0, 6);
 }
 
 /* -------------------------------------------------------------------------- the confirmation text */
