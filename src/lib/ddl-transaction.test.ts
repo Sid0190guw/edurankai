@@ -50,8 +50,8 @@ function walk(dir: string, out: string[] = []): string[] {
  * comment-stripping — a split, a filter and a join over several thousand files — was the larger half
  * of the cost, not the reading.
  */
-let cachedSources: { rel: string; code: string }[] | null = null;
-function sourceFiles(): { rel: string; code: string }[] {
+let cachedSources: { rel: string; raw: string }[] | null = null;
+function sourceFiles(): { rel: string; raw: string }[] {
   if (cachedSources) return cachedSources;
   cachedSources = [];
   for (const file of walk(SRC)) {
@@ -59,11 +59,49 @@ function sourceFiles(): { rel: string; code: string }[] {
     const rel = file.slice(SRC.length).split('\\').join('/');
     // This file names every forbidden shape in order to test for it.
     if (rel.endsWith('ddl-transaction.test.ts')) continue;
-    const text = readFileSync(file, 'utf8');
-    // Comments discuss the old shape at length; only real calls matter.
-    cachedSources.push({ rel, code: text.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n') });
+    cachedSources.push({ rel, raw: readFileSync(file, 'utf8') });
   }
   return cachedSources;
+}
+
+/**
+ * The comment-stripped copy, built ONLY for a file that could match — which is the whole speed of it.
+ *
+ * The memoisation above already stopped this file walking the tree twice. What it did not stop was
+ * building the stripped copy of all 2,421 files, and THAT is the expensive half: a split, a filter
+ * and a join over 42MB. Measured, this one test cost 17,344ms against the suite's 20,000ms bound —
+ * 87% of the budget spent by a passing test, which is precisely the shape vitest.config.ts describes
+ * as the reason the gate flapped. Under any load it went over, on a different file each run.
+ *
+ * Stripping only ever REMOVES whole lines, so it can never introduce a token the raw text did not
+ * already contain. That makes a `.test()` on the raw text a sound pre-filter: if the raw file has no
+ * `.simple()` in it at all, neither does its stripped form, and there is nothing to build. Almost no
+ * file contains either token, so almost none is stripped. The answer is identical — a file that does
+ * contain the token is still stripped and still judged on the stripped copy, which is what keeps a
+ * mention inside a comment from counting as a call.
+ */
+/**
+ * What the two scans below are allowed to cost.
+ *
+ * The suite-wide bound is 20,000ms (vitest.config.ts) and it is sized for tests of pure functions.
+ * These two read the repository. After the pre-filter above, the first — which warms the cache for
+ * both — measures 6,253ms warm, down from 17,344ms; the second is then 18ms. 6.2s against a 20s
+ * bound is 31% of the budget rather than 87%, but a full-suite run has a dozen workers competing for
+ * the same disk, and this test still timed out there while passing alone.
+ *
+ * So it gets a bound sized to what it IS, exactly as src/lib/job-handlers.test.ts does for the same
+ * reason. 30 seconds is not a licence to be slow: warm, this is six seconds, and if it ever
+ * approaches this number the scan itself has gone wrong.
+ */
+const SCAN_TIMEOUT_MS = 30_000;
+
+const strippedCache = new Map<string, string>();
+function withoutComments(rel: string, raw: string): string {
+  const hit = strippedCache.get(rel);
+  if (hit !== undefined) return hit;
+  const code = raw.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+  strippedCache.set(rel, code);
+  return code;
 }
 
 describe('the guarded DDL body carries no transaction control', () => {
@@ -104,13 +142,14 @@ describe('nothing sends DDL through the simple protocol on its own any more', ()
 
   it('has exactly one sender, and it opens its transaction through the driver', () => {
     const offenders: string[] = [];
-    for (const { rel, code } of sourceFiles()) {
-      if (!/\.simple\(\)/.test(code)) continue;
+    for (const { rel, raw } of sourceFiles()) {
+      if (!/\.simple\(\)/.test(raw)) continue;          // cheap: raw cannot hide what stripping removes
       if (ALLOWED[rel]) continue;
+      if (!/\.simple\(\)/.test(withoutComments(rel, raw))) continue;   // only a mention in a comment
       offenders.push(rel);
     }
     expect(offenders).toEqual([]);
-  });
+  }, SCAN_TIMEOUT_MS);
 
   // WHERE `BEGIN;` AS TEXT IS STILL CORRECT, AND IT IS ONE PLACE ONLY: a .sql FILE FOR A HUMAN.
   //
@@ -128,12 +167,14 @@ describe('nothing sends DDL through the simple protocol on its own any more', ()
 
   it('leaves no BEGIN/COMMIT pair inside a string a DRIVER executes', () => {
     const offenders: string[] = [];
-    for (const { rel, code } of sourceFiles()) {
+    for (const { rel, raw } of sourceFiles()) {
+      if (!/BEGIN;/.test(raw)) continue;               // same pre-filter, same reason
       if (ALLOWED_BEGIN[rel]) continue;
+      const code = withoutComments(rel, raw);
       if (/`BEGIN;/.test(code) || /'BEGIN;/.test(code) || /"BEGIN;/.test(code)) offenders.push(rel);
     }
     expect(offenders).toEqual([]);
-  });
+  }, SCAN_TIMEOUT_MS);
 });
 
 describe('a batch never indexes a column it has not asserted', () => {

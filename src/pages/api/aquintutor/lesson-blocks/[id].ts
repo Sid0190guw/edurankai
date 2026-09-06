@@ -1,6 +1,7 @@
 import type { APIRoute } from 'astro';
 import { updateBlock, deleteBlock } from '@/lib/aquintutor-authoring';
 import { can } from '@/lib/auth/permissions';
+import { apiFail } from '@/lib/api-fail';
 
 function json(b: any, s = 200) { return new Response(JSON.stringify(b), { status: s, headers: { 'content-type': 'application/json' } }); }
 
@@ -21,7 +22,7 @@ export const PATCH: APIRoute = async ({ request, locals, params }) => {
   try {
     await updateBlock(id, { kind: body.kind, content: body.content, position: body.position });
     return json({ ok: true });
-  } catch (e: any) { return json({ ok: false, error: String(e?.message || e).slice(0, 240) }, 500); }
+  } catch (e: any) { return apiFail('[lesson-blocks] update', e, 'That block could not be saved, so nothing was changed.'); }
 };
 
 export const DELETE: APIRoute = async ({ locals, params }) => {
@@ -30,5 +31,5 @@ export const DELETE: APIRoute = async ({ locals, params }) => {
   const id = params.id as string;
   if (!id) return json({ ok: false, error: 'block id required' }, 400);
   try { await deleteBlock(id); return json({ ok: true }); }
-  catch (e: any) { return json({ ok: false, error: String(e?.message || e).slice(0, 240) }, 500); }
+  catch (e: any) { return apiFail('[lesson-blocks] delete', e, 'That block could not be deleted, so nothing was removed.'); }
 };

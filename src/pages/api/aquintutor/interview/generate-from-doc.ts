@@ -13,6 +13,7 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { generateInterviewQuestions, isLlmConfigured } from '@/lib/llm';
 import { can } from '@/lib/auth/permissions';
+import { apiFail } from '@/lib/api-fail';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
@@ -83,7 +84,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
   let questions;
   try { questions = await generateInterviewQuestions(genOpts); }
-  catch (e: any) { return json({ ok: false, error: 'Generation failed: ' + String(e?.message || e).slice(0, 160) }, 500); }
+  catch (e: any) { return apiFail('[interview generate] model call', e, 'The questions could not be generated. Try a clearer document, or paste the text.'); }
   if (!questions || questions.length === 0) return json({ ok: false, error: 'The model returned no questions. Try a clearer document or paste the text.' }, 502);
 
   // insert as seeds after the current max sort_order
@@ -103,7 +104,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
         `).catch(() => {});
       });
     }
-  } catch (e: any) { return json({ ok: false, error: 'Saved generation but DB insert failed: ' + String(e?.message || e).slice(0, 160) }, 500); }
+  } catch (e: any) { return apiFail('[interview generate] save seeds', e, 'The questions were generated but could not be saved to this template. Nothing was added.'); }
 
   return json({ ok: true, added: questions.length, docUrl, questions });
 };

@@ -84,6 +84,9 @@ export async function generateInterviewQuestions(opts: {
     if (!resp.ok) { console.error('generateInterviewQuestions: api error', resp.status, await resp.text().catch(() => '')); return []; }
     const data = await resp.json() as any;
     return parseQuestions(data.content?.[0]?.text || '');
+  // Not a database catch: this wraps the HTTP call to the model provider and the parse of its
+  // reply. There is no e.cause to unwrap.
+  // lint-mail-ignore: error-cause
   } catch (e: any) { console.error('generateInterviewQuestions:', e?.message || e); return []; }
 }
 

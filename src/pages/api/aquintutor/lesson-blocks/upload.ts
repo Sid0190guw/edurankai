@@ -7,6 +7,7 @@ import type { APIRoute } from 'astro';
 // (~17 minutes) and no request timeout. See src/lib/blob-upload.ts.
 import { putBounded as put } from '@/lib/blob-upload';
 import { can } from '@/lib/auth/permissions';
+import { apiFail } from '@/lib/api-fail';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -53,5 +54,5 @@ export const POST: APIRoute = async ({ request, locals }) => {
     const safeName = (file.name || 'file').replace(/[^a-zA-Z0-9._-]+/g, '-').slice(-60);
     const blob = await put('lesson-media/' + Date.now() + '-' + safeName, file, { access: 'public', contentType: spec.mime, addRandomSuffix: true });
     return json({ ok: true, url: blob.url, name: file.name, mime: spec.mime, isImage });
-  } catch (e: any) { return json({ ok: false, error: e?.message || 'upload failed' }, 500); }
+  } catch (e: any) { return apiFail('[lesson-blocks] upload', e, 'That file could not be uploaded, so nothing was added to the lesson.'); }
 };

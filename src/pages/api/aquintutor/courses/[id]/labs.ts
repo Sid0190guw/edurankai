@@ -1,6 +1,7 @@
 import type { APIRoute } from 'astro';
 import { getCourseLabs, setCourseLabs } from '@/lib/aquintutor-authoring';
 import { can } from '@/lib/auth/permissions';
+import { apiFail } from '@/lib/api-fail';
 
 function json(b: any, s = 200) { return new Response(JSON.stringify(b), { status: s, headers: { 'content-type': 'application/json' } }); }
 
@@ -16,7 +17,7 @@ export const GET: APIRoute = async ({ locals, params }) => {
   const id = params.id as string;
   if (!id) return json({ ok: false, error: 'id required' }, 400);
   try { return json({ ok: true, labs: await getCourseLabs(id) }); }
-  catch (e: any) { return json({ ok: false, error: String(e?.message || e).slice(0, 240) }, 500); }
+  catch (e: any) { return apiFail('[course-labs] read', e, 'The labs for this course could not be read just now. Try again in a moment.'); }
 };
 
 // POST { labs: [slug] } -> replace the course's attached labs
@@ -31,5 +32,5 @@ export const POST: APIRoute = async ({ locals, params, request }) => {
   try {
     await setCourseLabs(id, body.labs);
     return json({ ok: true, labs: await getCourseLabs(id) });
-  } catch (e: any) { return json({ ok: false, error: String(e?.message || e).slice(0, 240) }, 500); }
+  } catch (e: any) { return apiFail('[course-labs] save', e, 'The labs could not be saved, so this course is unchanged.'); }
 };

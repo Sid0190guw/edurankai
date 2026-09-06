@@ -1,5 +1,6 @@
 import type { APIRoute } from 'astro';
 import { recordQuizAttempt } from '@/lib/aquintutor-authoring';
+import { apiFail } from '@/lib/api-fail';
 
 function json(b: any, s = 200) { return new Response(JSON.stringify(b), { status: s, headers: { 'content-type': 'application/json' } }); }
 
@@ -12,5 +13,5 @@ export const POST: APIRoute = async ({ request, locals }) => {
   try {
     await recordQuizAttempt({ userId: user.id, lessonId: body.lessonId, blockId: body.blockId, chosen: body.chosen, isCorrect: !!body.isCorrect });
     return json({ ok: true });
-  } catch (e: any) { return json({ ok: false, error: String(e?.message || e).slice(0, 240) }, 500); }
+  } catch (e: any) { return apiFail('[quiz-attempt] record', e, 'Your answer could not be recorded. Try again.'); }
 };

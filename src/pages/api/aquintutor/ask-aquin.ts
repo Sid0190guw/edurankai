@@ -64,8 +64,16 @@ export const POST: APIRoute = async ({ request, locals }) => {
       let full = '';
       const onToken = (tok: string) => { full += tok; try { controller.enqueue(enc.encode(tok)); } catch { /* client gone */ } };
       let res;
+      // THE LEARNER READS `res.error` — it is enqueued into the reply stream on the next line, so
+      // whatever is in it appears in the chat as the tutor's answer. A raw provider error ("401 from
+      // https://…/v1/messages", a model id, a quota string) is not an answer and is not a learner's
+      // to see. Keep the real reason in `detail` for the log below and the visible text a sentence.
       try { res = await chatStream(system, incoming, cfg, onToken, request.signal); }
-      catch (e: any) { res = { ok: false, text: '', error: e?.message || 'error' }; }
+      catch (e: any) {
+        const detail = String(e?.cause?.message || e?.message || e);
+        console.error('[ask-aquin] the model call failed -', detail);
+        res = { ok: false, text: '', error: 'The tutor is unavailable right now. Try again in a moment.', detail };
+      }
       if (!res.ok && !full) controller.enqueue(enc.encode(res.error || 'The tutor is unavailable right now.'));
       try {
         await logTutorTurn(sessionId, user.id, koId, 'user', lastUser);

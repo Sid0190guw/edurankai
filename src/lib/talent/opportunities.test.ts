@@ -89,6 +89,12 @@ describe('the vocabulary is complete and internally consistent', () => {
    *
    * Imported dynamically: onboarding.ts reaches the database through its own import chain, and a
    * failure to load it should read as this one assertion failing, not as the whole file going dark.
+   *
+   * AND IT NEEDS ITS OWN TIMEOUT, because that is the cost of the choice above. onboarding.ts pulls
+   * in ./schema, ./codes and @/lib/hr-onboarding, and transforming that chain measured ~50s on a
+   * cold run here — so under the 20s default this test failed with "Test timed out", which reads as
+   * a broken mapping when the mapping is fine. The assertions below take milliseconds; the wait is
+   * entirely the transform, so the timeout is set to what loading actually costs.
    */
   it('maps every employment type it accepts to the identity that engagement produces', async () => {
     const { identityTypeFromEmployment } = await import('@/lib/talent/onboarding');
@@ -106,7 +112,7 @@ describe('the vocabulary is complete and internally consistent', () => {
       expect(identityTypeFromEmployment(employment)).toBe(identity);
       expect(IDENTITY_TYPES).toContain(identity as any);
     }
-  });
+  }, 120_000);
 });
 
 describe('the status lattice', () => {

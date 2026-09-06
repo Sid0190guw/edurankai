@@ -6,6 +6,7 @@ import type { APIRoute } from 'astro';
 // putBounded, not put: @vercel/blob retries TEN times with an unbounded backoff
 // (~17 minutes) and no request timeout. See src/lib/blob-upload.ts.
 import { putBounded as put } from '@/lib/blob-upload';
+import { apiFail } from '@/lib/api-fail';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -37,5 +38,5 @@ export const POST: APIRoute = async ({ request, locals }) => {
       access: 'public', contentType: spec.mime, addRandomSuffix: true,
     });
     return json({ ok: true, url: blob.url });
-  } catch (e: any) { return json({ ok: false, error: e?.message || 'upload failed' }, 500); }
+  } catch (e: any) { return apiFail('[profile-photo] upload', e, 'That photo could not be uploaded, so your photo is unchanged. Try again.'); }
 };

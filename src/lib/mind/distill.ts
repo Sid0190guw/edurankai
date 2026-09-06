@@ -128,6 +128,9 @@ export async function classifyIntent(text: string): Promise<IntentResult> {
   if (!net) return bail();
   let vec: number[] | null = null;
   try { vec = (await encoder.encode([text]))[0] || null; }
+  // Not a database catch: the encoder runs in-process. There is no e.cause, and the fallback
+  // below is the point - a failed encode routes with the rules rather than refusing.
+  // lint-mail-ignore: error-cause
   catch (e: any) { console.error('[mind/distill] encoding failed; routing with the rules:', e?.message); return bail(); }
   const p = net.predict(intentFeatures(text, vec));
   let top = 0;

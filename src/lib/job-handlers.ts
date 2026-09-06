@@ -133,6 +133,9 @@ const CORE_HANDLERS: Record<string, JobHandler> = {
   },
   async push(payload, job) {
     try { const push = await import('@/lib/push'); if ((push as any).sendPush) await (push as any).sendPush(payload.userId, payload); await logDelivery(job.id, 'push', 'push', 'sent'); }
+    // Not a database catch: what can throw here is the dynamic import of @/lib/push or the push
+    // provider call. There is no e.cause, and the reason is written into the delivery log below.
+    // lint-mail-ignore: error-cause
     catch (e: any) { await logDelivery(job.id, 'push', 'push', 'skip', e?.message || 'push unavailable'); }
   },
 };

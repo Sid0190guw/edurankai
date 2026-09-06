@@ -1,6 +1,7 @@
 import type { APIRoute } from 'astro';
 import { requestReview } from '@/lib/aquintutor-authoring';
 import { can } from '@/lib/auth/permissions';
+import { apiFail } from '@/lib/api-fail';
 
 function json(b: any, s = 200) { return new Response(JSON.stringify(b), { status: s, headers: { 'content-type': 'application/json' } }); }
 
@@ -13,5 +14,5 @@ export const POST: APIRoute = async ({ locals, params }) => {
   const id = params.id as string;
   if (!id) return json({ ok: false, error: 'id required' }, 400);
   try { await requestReview(id); return json({ ok: true }); }
-  catch (e: any) { return json({ ok: false, error: String(e?.message || e).slice(0, 240) }, 500); }
+  catch (e: any) { return apiFail('[lesson] request review', e, 'The review request could not be recorded, so nothing was sent.'); }
 };

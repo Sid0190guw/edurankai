@@ -55,6 +55,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
   let mined;
   try { mined = await mineUniversities({ country, limit, offset }); }
+  // Not a database catch: this is the HTTP call out to the public knowledge graph, so there is no
+  // e.cause to unwrap. The network reason IS the diagnostic an operator running this import needs,
+  // which is why it is returned under stage:'mine' rather than replaced with a generic sentence.
+  // lint-mail-ignore: error-cause
   catch (e: any) { return j({ ok: false, stage: 'mine', error: e?.message || 'knowledge graph unreachable' }, 200); }
 
   if (dryRun) return j({ ok: true, dryRun: true, country, mined: mined.length, sample: mined.slice(0, 10), ms: Date.now() - started });

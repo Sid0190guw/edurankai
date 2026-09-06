@@ -21,7 +21,11 @@ export const GET: APIRoute = async ({ request, locals }) => {
   if (!dag.nodes.includes(target)) return j({ ok: false, error: 'target not in graph' }, 404);
 
   let path: string[];
+  // Not a database catch: learningPath() is pure and runs against the DAG already loaded above, so
+  // there is no e.cause to unwrap. What it throws is a domain refusal ("a cycle blocks the path"),
+  // written to be read by the caller, and that is what is returned.
   try { path = learningPath(dag, target, mastered); }
+  // lint-mail-ignore: error-cause
   catch (e: any) { return j({ ok: false, error: e?.message || 'cycle blocks the path' }, 400); }
 
   const labelMap = await loadNodeLabels(nodeType);

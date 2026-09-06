@@ -50,6 +50,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
   let parsed;
   try { parsed = await fetchNirf(category, year, band); }
+  // Not a database catch: this is the HTTP fetch of an external publisher's file, so there is no
+  // e.cause to unwrap. The network reason IS the diagnostic an operator running this import needs,
+  // which is why it is returned under stage:'fetch' rather than replaced with a generic sentence.
+  // lint-mail-ignore: error-cause
   catch (e: any) { return j({ ok: false, stage: 'fetch', url: nirfUrl(category, year, band), error: e?.message || 'source unreachable' }, 200); }
   if (!parsed.length) return j({ ok: false, stage: 'parse', url: nirfUrl(category, year, band), error: 'no rows parsed — the publisher may have changed its markup' }, 200);
 

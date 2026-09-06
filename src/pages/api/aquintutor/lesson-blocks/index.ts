@@ -1,6 +1,7 @@
 import type { APIRoute } from 'astro';
 import { createBlock } from '@/lib/aquintutor-authoring';
 import { can } from '@/lib/auth/permissions';
+import { apiFail } from '@/lib/api-fail';
 
 function json(b: any, s = 200) { return new Response(JSON.stringify(b), { status: s, headers: { 'content-type': 'application/json' } }); }
 
@@ -18,5 +19,5 @@ export const POST: APIRoute = async ({ request, locals }) => {
   try {
     const block = await createBlock(body.lessonId, { kind: body.kind, content: body.content || {} });
     return json({ ok: true, block });
-  } catch (e: any) { return json({ ok: false, error: String(e?.message || e).slice(0, 240) }, 500); }
+  } catch (e: any) { return apiFail('[lesson-blocks] create', e, 'That block could not be created, so nothing was added to the lesson.'); }
 };

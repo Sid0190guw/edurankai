@@ -59,6 +59,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
   let metrics;
   try { metrics = await fetchIpedsMetrics(year); }
+  // Not a database catch: this is the HTTP fetch of an external publisher's file, so there is no
+  // e.cause to unwrap. The network reason IS the diagnostic an operator running this import needs,
+  // which is why it is returned under stage:'fetch' rather than replaced with a generic sentence.
+  // lint-mail-ignore: error-cause
   catch (e: any) { return j({ ok: false, stage: 'fetch', error: e?.message || 'source unreachable' }, 200); }
   if (!metrics.length) return j({ ok: false, stage: 'parse', error: 'no metrics parsed — the publisher may have changed the files' }, 200);
 

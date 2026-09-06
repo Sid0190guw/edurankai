@@ -8,6 +8,7 @@ import { putBounded as put } from '@/lib/blob-upload';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { guardInterviewSession } from '@/lib/aquin/interview-session';
+import { apiFail } from '@/lib/api-fail';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -42,12 +43,12 @@ export const POST: APIRoute = async ({ request, cookies }) => {
   try {
     const blob = await put('interview-id-docs/' + sessionId + '-' + Date.now() + '.' + (ext === 'jpeg' ? 'jpg' : ext), file, { access: 'public', contentType: mime, addRandomSuffix: true });
     url = blob.url;
-  } catch (e: any) { return json({ ok: false, error: 'Upload failed: ' + String(e?.message || e).slice(0, 140) }, 500); }
+  } catch (e: any) { return apiFail('[interview id-doc] upload', e, 'That file could not be uploaded, so nothing was attached. Try again.'); }
 
   // self-heal the column, then save it on the session
   await db.execute(sql`ALTER TABLE ai_interview_sessions ADD COLUMN IF NOT EXISTS id_doc_url TEXT`).catch(() => {});
   try {
     await db.execute(sql`UPDATE ai_interview_sessions SET id_doc_url = ${url} WHERE id = ${sessionId}`);
-  } catch (e: any) { return json({ ok: false, error: 'Saved file but could not link it: ' + String(e?.message || e).slice(0, 140) }, 500); }
+  } catch (e: any) { return apiFail('[interview id-doc] link to session', e, 'The file was uploaded but could not be attached to this interview. Try again.'); }
   return json({ ok: true, url });
 };

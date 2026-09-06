@@ -111,5 +111,8 @@ export async function sendGrade(token: string, score: number): Promise<{ ok: boo
     const resp = await fetch(l.outcome_url, { method: 'POST', headers: { 'Content-Type': 'application/xml', Authorization: auth }, body });
     if (!resp.ok) return { ok: false, error: 'LMS returned ' + resp.status };
     return { ok: true };
+  // Not a database catch: this wraps the outbound HTTP call to the LMS, so e.message is the
+  // network reason and there is no e.cause behind it.
+  // lint-mail-ignore: error-cause
   } catch (e: any) { return { ok: false, error: e?.message || 'network error' }; }
 }

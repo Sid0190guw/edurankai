@@ -74,6 +74,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
     if (action === 'addPrerequisite') {
       if (!b.unitId || !b.prerequisiteUnitId || b.unitId === b.prerequisiteUnitId) return j({ ok: false, error: 'distinct unitId + prerequisiteUnitId required' }, 400);
       try { await svc.addPrerequisite(String(b.unitId), String(b.prerequisiteUnitId)); }
+      // Matches the DOMAIN refusal thrown by the service ("…cycle…"), which is written to be read.
+      // Anything else is rethrown to the handler catch below, which logs reasonOf(e) - the real
+      // Postgres reason off e.cause - and returns a generic sentence. So e.cause is not lost here.
+      // lint-mail-ignore: error-cause
       catch (e: any) { if (/cycle/i.test(e?.message || '')) return j({ ok: false, error: 'would create a prerequisite cycle' }, 409); throw e; }
       return j({ ok: true });
     }
@@ -85,6 +89,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
     if (action === 'addConceptPrerequisite') {
       if (!b.conceptId || !b.prerequisiteConceptId || b.conceptId === b.prerequisiteConceptId) return j({ ok: false, error: 'distinct conceptId + prerequisiteConceptId required' }, 400);
       try { await svc.addConceptPrerequisite(String(b.conceptId), String(b.prerequisiteConceptId)); }
+      // Matches the DOMAIN refusal thrown by the service ("…cycle…"), which is written to be read.
+      // Anything else is rethrown to the handler catch below, which logs reasonOf(e) - the real
+      // Postgres reason off e.cause - and returns a generic sentence. So e.cause is not lost here.
+      // lint-mail-ignore: error-cause
       catch (e: any) { if (/cycle/i.test(e?.message || '')) return j({ ok: false, error: 'would create a prerequisite cycle' }, 409); throw e; }
       return j({ ok: true });
     }

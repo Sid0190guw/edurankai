@@ -1,6 +1,7 @@
 import type { APIRoute } from 'astro';
 import { listVersions, saveVersion, restoreVersion } from '@/lib/aquintutor-authoring';
 import { can } from '@/lib/auth/permissions';
+import { apiFail } from '@/lib/api-fail';
 
 function json(b: any, s = 200) { return new Response(JSON.stringify(b), { status: s, headers: { 'content-type': 'application/json' } }); }
 
@@ -16,7 +17,7 @@ export const GET: APIRoute = async ({ locals, params }) => {
   const id = params.id as string;
   if (!id) return json({ ok: false, error: 'id required' }, 400);
   try { return json({ ok: true, versions: await listVersions(id) }); }
-  catch (e: any) { return json({ ok: false, error: String(e?.message || e).slice(0, 240) }, 500); }
+  catch (e: any) { return apiFail('[lesson-versions] list', e, 'The saved versions could not be read just now. Try again in a moment.'); }
 };
 
 // POST { action: 'save' }                  -> snapshot current blocks as a new version
@@ -37,5 +38,5 @@ export const POST: APIRoute = async ({ locals, params, request }) => {
     }
     const saved = await saveVersion({ lessonId: id, byUserId: user.id, byName, notes: body.notes || 'Manual save' });
     return json({ ok: true, saved });
-  } catch (e: any) { return json({ ok: false, error: String(e?.message || e).slice(0, 240) }, 500); }
+  } catch (e: any) { return apiFail('[lesson-versions] save or restore', e, 'That version could not be saved or restored, so the lesson is unchanged.'); }
 };

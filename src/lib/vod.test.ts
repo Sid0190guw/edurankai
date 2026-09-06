@@ -80,6 +80,9 @@ ok('storageKey is filesystem-safe + kinded', /^vod\/abc-\d+\.webm$/.test(storage
   let refused = '';
   try {
     await svc.record(broadcastSession('bc-empty'), { title: 'Nothing', owner: null });
+  // Not a database catch: the assertion below is ABOUT the thrown message, which is a domain
+  // refusal written for a caller to read.
+  // lint-mail-ignore: error-cause
   } catch (e: any) { refused = e?.message || ''; }
   ok('a recording with no timeline AND no media is refused, not silently created', /nothing to record/i.test(refused), refused);
 

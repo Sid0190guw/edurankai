@@ -22,20 +22,7 @@
 // NOTE the `training_enrollments.payment_id` column is real and unrelated; only statements that
 // actually read FROM payments are examined.
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
-import path from 'node:path';
-
-function sources(): string[] {
-  const out: string[] = [];
-  (function walk(d: string) {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      const p = path.join(d, e.name);
-      if (e.isDirectory()) { walk(p); continue; }
-      if (/\.(ts|astro)$/.test(e.name) && !/\.test\.ts$/.test(e.name)) out.push(p);
-    }
-  })('src');
-  return out;
-}
+import { scanEntries, repoPath } from '@/lib/source-scan';
 
 /**
  * Every SQL-ish chunk that reads FROM the payments table.
@@ -51,19 +38,22 @@ function paymentsReads(src: string): string[] {
 }
 
 describe('reads of the payments table', () => {
-  const files = sources();
+  // READ ONCE. Both tests below need every source, and this file used to walk and read all 2,471 of
+  // them twice — once per test — which is most of why it timed out in a full run and passed alone.
+  // scanEntries memoises the read, and it also excludes the node_modules/ and dist/ directories that
+  // sit inside src/pages on a dev machine; the old walk here had no exclusions and scanned them.
+  const files = scanEntries({ ext: ['ts', 'astro'] });
 
   it('never select a bare payment_id, which does not exist on that table', () => {
     const offenders: string[] = [];
-    for (const f of files) {
-      const src = fs.readFileSync(f, 'utf8');
+    for (const [f, src] of files) {
       for (const chunk of paymentsReads(src)) {
         // The real column, and the alias form that renames it for a template, are both fine.
         const stripped = chunk
           .replace(/razorpay_payment_id/gi, '')
           .replace(/\bAS\s+payment_id\b/gi, '');
         if (/\bpayment_id\b/.test(stripped)) {
-          offenders.push(f.split(path.sep).join('/') + ': ' + chunk.replace(/\s+/g, ' ').slice(0, 120));
+          offenders.push(repoPath(f) + ': ' + chunk.replace(/\s+/g, ' ').slice(0, 120));
         }
       }
     }
@@ -74,7 +64,7 @@ describe('reads of the payments table', () => {
   it('finds the reads it claims to be checking, so a silent regex failure cannot pass this file', () => {
     // If the matcher ever stops matching, the assertion above becomes vacuously true. This is the
     // guard against a green test that checks nothing — the failure mode of every source scan.
-    const total = files.reduce((n, f) => n + paymentsReads(fs.readFileSync(f, 'utf8')).length, 0);
+    const total = files.reduce((n, [, src]) => n + paymentsReads(src).length, 0);
     expect(total).toBeGreaterThan(5);
   });
 });

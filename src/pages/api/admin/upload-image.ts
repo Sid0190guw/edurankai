@@ -7,6 +7,7 @@ import type { APIRoute } from 'astro';
 // (~17 minutes) and no request timeout. See src/lib/blob-upload.ts.
 import { putBounded as put } from '@/lib/blob-upload';
 import { denyAdminApi } from '@/lib/auth/api-guard';
+import { apiFail } from '@/lib/api-fail';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -40,5 +41,5 @@ export const POST: APIRoute = async ({ request, locals }) => {
   try {
     const blob = await put('event-media/' + Date.now() + '.' + (ext === 'jpeg' ? 'jpg' : ext), file, { access: 'public', contentType: spec.mime, addRandomSuffix: true });
     return json({ ok: true, url: blob.url });
-  } catch (e: any) { return json({ ok: false, error: e?.message || 'upload failed' }, 500); }
+  } catch (e: any) { return apiFail('[admin upload-image] upload', e, 'That image could not be uploaded, so nothing was saved.'); }
 };

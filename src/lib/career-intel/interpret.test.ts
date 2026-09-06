@@ -130,6 +130,9 @@ describe('it fails honestly', () => {
   });
 
   it('survives an empty string, whitespace and rubbish without throwing', () => {
+    // The house rule bans emoji from anything a person reads. This is a hostile-input fixture, not
+    // product copy: it asserts that an emoji-only input cannot throw.
+    // lint-mail-ignore: emoji
     for (const t of ['', '   ', '\n\n', '!!!', '😀', 'a']) {
       expect(() => interpretText(t)).not.toThrow();
     }

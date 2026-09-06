@@ -30,6 +30,7 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const args = process.argv.slice(2);
 const ALL = args.includes('--all');
 const CHANGED = args.includes('--changed');
+const PATHS = args.filter((a) => !a.startsWith('-'));
 
 const tty = process.stdout.isTTY;
 const paint = (c, s) => (tty ? `\x1b[${c}m${s}\x1b[0m` : s);
@@ -168,6 +169,19 @@ function targetFiles() {
       process.stderr.write(dim('  (--changed: could not diff against origin/main; falling back to the full mail subsystem)\n'));
     }
   }
+  // Explicit paths, so the rules can be exercised against a fixture directory by a test rather than
+  // only against src/. A rule whose precision is not tested is a rule that quietly loosens.
+  if (PATHS.length) {
+    const files = [];
+    for (const p of PATHS) {
+      const full = join(ROOT, p);
+      try {
+        if (statSync(full).isDirectory()) walk(full, files);
+        else if (EXTENSIONS.has(extname(full))) files.push(full);
+      } catch { /* a path that does not exist contributes nothing */ }
+    }
+    return [...new Set(files)];
+  }
   if (ALL) return walk(join(ROOT, 'src'));
   const files = [];
   for (const p of MAIL_PATHS) {
@@ -197,11 +211,46 @@ for (const file of files) {
   // analysis, but it is right in every shape that actually occurs in this codebase.
   const driverVars = new Set();
   const fileCtx = { path: rel, text, driverVars };
+
+  // THE OUTERMOST CALL DECIDES THE TYPE, not any call nested inside it.
+  //
+  // The previous test was `/\b(?:execute|query)\s*[(<`]/` against the whole right-hand side, which
+  // asked only "does db.execute appear anywhere here". Every read on this project's page-safety
+  // path is written as
+  //
+  //     const rosterCountRes = await safeRows('[attendance] roster', () => db.execute(sql`...`));
+  //
+  // and `safeRows` returns `{ ok, rows }` with `rows` ALREADY normalised through `toRows()`. The
+  // substring is there, the driver result is not. Run repo-wide that produced 38 errors, every one
+  // of them a correct read on a correctly-wrapped result, which is the exact failure this rule's own
+  // header warns about: a rule that cries wolf on correct code gets waved through, and it also means
+  // nobody can run `--all`, so the rest of src/ went unchecked for the real fault.
+  //
+  // So classify by the LEADING callee of the right-hand side:
+  //   normalising  — returns `{ ok, rows }` or a plain array; `.rows` on it is correct.
+  //   pass-through — returns whatever the driver returned, so the driver's rules still apply.
+  //   driver       — db.execute(...) / sql.query(...) / .unsafe(...) directly.
+  const NORMALISING = /^(?:safeRows|safeRow|toRows|runFanout|fanoutRows|listRows|readRows)\s*[(<]/;
+  const PASSTHROUGH = /^(?:withDbRetry|withDbTimeout|withTimeout)\s*[(<]/;
+  const DRIVER_CALL = /^(?:[A-Za-z_$][\w$]*\s*\.\s*)*(?:execute|query|unsafe)\s*[(<`]/;
+
   const trackAssignment = (line) => {
-    const m = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(.+)$/.exec(line);
+    // A declaration, or a bare RE-assignment of a name already in scope. The rolling map is only
+    // rolling if it follows the second kind too: `let r = await db.execute(...)` followed later by
+    // `r = await safeRows(...)` left `r` marked as a driver result for the rest of the file, so the
+    // correctly-wrapped read that followed was reported as the error.
+    const m =
+      /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(.+)$/.exec(line) ||
+      /^\s*([A-Za-z_$][\w$]*)\s*(?<![=!<>+\-*/%&|^])=(?!=)\s*(.+)$/.exec(line);
     if (!m) return;
-    const [, name, rhs] = m;
-    if (/\b(?:execute|query)\s*[(<`]/.test(rhs)) driverVars.add(name);
+    const [, name] = m;
+    // Peel the things that sit in front of the call without changing what it returns.
+    const rhs = m[2].replace(/^\s*(?:await\s+|\(\s*|!+|<[^>]*>\s*)+/, '').trimStart();
+    let driver;
+    if (NORMALISING.test(rhs)) driver = false;
+    else if (PASSTHROUGH.test(rhs)) driver = /\b(?:execute|query|unsafe)\s*[(<`]/.test(rhs);
+    else driver = DRIVER_CALL.test(rhs);
+    if (driver) driverVars.add(name);
     else driverVars.delete(name);
   };
 
