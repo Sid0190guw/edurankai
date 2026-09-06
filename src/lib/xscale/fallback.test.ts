@@ -134,7 +134,14 @@ describe('narrow means "certain to exist", not "as few as possible"', () => {
   it('searches the level column, so "junior" finds the roles whose level IS Junior', () => {
     // q=junior matched only postings whose PROSE carried the word; the sixteen Junior roles were
     // invisible to it. Both matchers read r.level now.
-    expect(MATCHER.includes('r.level')).toBe(true);
+    //
+    // AND IT MUST BE CAST. `r.level` is a Postgres ENUM — every other comparison in this file
+    // already writes `r.level::text` — so a bare `r.level ILIKE '%qa%'` is not a narrow result, it
+    // is a type error that fails the statement. Shipped without the cast, it took out BOTH the main
+    // query and the narrowed retry: every search on /careers returned readable:false and zero rows,
+    // including the single-word ones that had been working. Asserting the cast, not just the name.
+    expect(/r\.level::text ILIKE/.test(MATCHER)).toBe(true);
+    expect(/OR r\.level ILIKE/.test(MATCHER)).toBe(false);
   });
 });
 

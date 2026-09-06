@@ -445,7 +445,7 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
   const qMatch = (w: string) => {
     const lk = '%' + w + '%';
     return sql`(r.title ILIKE ${lk}
-             OR r.level ILIKE ${lk}
+             OR r.level::text ILIKE ${lk}
              OR r.function ILIKE ${lk}
              OR r.about ILIKE ${lk}
              OR COALESCE(d.name, '') ILIKE ${lk}
@@ -562,7 +562,7 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
    */
   const narrowMatch = (t: string) => {
     const lk = '%' + t + '%';
-    return sql`(r.title ILIKE ${lk} OR r.level ILIKE ${lk} OR r.function ILIKE ${lk} OR r.about ILIKE ${lk}
+    return sql`(r.title ILIKE ${lk} OR r.level::text ILIKE ${lk} OR r.function ILIKE ${lk} OR r.about ILIKE ${lk}
       OR COALESCE(d.name, '') ILIKE ${lk}
       OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(
            CASE WHEN jsonb_typeof(r.skills) = 'array' THEN r.skills ELSE '[]'::jsonb END
