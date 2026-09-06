@@ -154,6 +154,23 @@ describe('retention', () => {
     expect(flash(res).text).toContain('permission denied');
   });
 
+  it('catches the shape applyRetention now produces for a "review"/"report only" class whose due-count could not be read', async () => {
+    // Before this fix, a 'review' or 'report only' class's own count query failing returned a bare
+    // 0, and applyRetention() printed "Held for a person to decide... 0" or "X owns this table. 0
+    // rows are past the period" — never a note starting 'FAILED:', so this endpoint's own check
+    // (`note.startsWith('FAILED')`) could not catch it at all. retention.ts's fix gives that failure
+    // the same 'FAILED: ' prefix the owned-here delete/anonymise path already used. This exercises
+    // the real endpoint against exactly that new shape, so a future change to either file's prefix
+    // that breaks the other is caught here rather than in production.
+    mocks.governancePermissions.mockResolvedValue(held(['horizon.retention.manage']));
+    mocks.applyRetention.mockResolvedValue([
+      { recordClass: 'access_log', action: 'review', affected: 0, note: 'FAILED: could not count what is due — relation "hzn_access_log" does not exist' },
+    ]);
+    const res = await retentionPost(ctx(form({ action: 'sweep' }), SIGNED_IN));
+    expect(flash(res).kind).toBe('error');
+    expect(flash(res).text).toContain('could not count what is due');
+  });
+
   it('passes the policy fields through and refuses an end-of-period action it does not know', async () => {
     mocks.governancePermissions.mockResolvedValue(held(['horizon.retention.manage']));
     const bad = await retentionPost(ctx(form({ action: 'policy', recordClass: 'access_log', retainDays: '30', then: 'shred', basis: 'because' }), SIGNED_IN));

@@ -4,6 +4,7 @@ import {
   isTraineeEngagement, jobLocationType, locationLabel, PRIMARY_SITE, resolveWorkMode,
   violatesWorkModePolicy, workModeLabel, workModeSentence, workModeTitle, WORK_MODES,
   isOfferWorkMode, offerableWorkModes, offerWorkModeTitle, resolveOfferWorkMode,
+  offerWorkModeFromSavedContent,
 } from './work-mode';
 
 describe('the policy itself', () => {
@@ -261,5 +262,100 @@ describe('the offer path', () => {
     expect(isOfferWorkMode('telecommute')).toBe(false);
     expect(isOfferWorkMode('')).toBe(false);
     expect(isOfferWorkMode(null)).toBe(false);
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// /admin/offer/blank REOPENING AN EXISTING APPLICATION.
+//
+// Added 2026-09-06. The Custom Offer builder already asked resolveOfferWorkMode for its picker's
+// initial value, but always with `submitted: null` — so it re-derived a fresh policy-default mode
+// EVERY time the page was opened, discarding whatever an admin had actually chosen and saved on
+// that application's offer letter. An admin who deliberately picked Remote for one candidate saw
+// On-Site the next time they reopened that exact application, with nothing on screen saying their
+// choice had been overwritten.
+//
+// offer_letters.content is a jsonb column with no schema of its own, so `content.workMode` is
+// exactly the kind of value the task calls out: it can be missing (a row from before this field
+// existed), empty, not a string, or simply absent because there is no saved offer at all. Each case
+// below is one of those, named.
+describe('offerWorkModeFromSavedContent: reading a saved offer\'s mode out of an untyped jsonb blob', () => {
+  it('extracts each of the three real values, trimmed', () => {
+    expect(offerWorkModeFromSavedContent({ workMode: 'Remote' })).toBe('Remote');
+    expect(offerWorkModeFromSavedContent({ workMode: 'Hybrid' })).toBe('Hybrid');
+    expect(offerWorkModeFromSavedContent({ workMode: 'On-Site' })).toBe('On-Site');
+    expect(offerWorkModeFromSavedContent({ workMode: '  Remote  ' })).toBe('Remote');
+  });
+
+  it('is null when there is no saved offer at all', () => {
+    expect(offerWorkModeFromSavedContent(null)).toBeNull();
+    expect(offerWorkModeFromSavedContent(undefined)).toBeNull();
+  });
+
+  it('is null for a LEGACY row whose content predates this field — not an accidental empty string', () => {
+    expect(offerWorkModeFromSavedContent({})).toBeNull();
+    expect(offerWorkModeFromSavedContent({ candidateName: 'A Candidate', roleTitle: 'Something' })).toBeNull();
+  });
+
+  it('is null for an empty or whitespace-only saved value', () => {
+    expect(offerWorkModeFromSavedContent({ workMode: '' })).toBeNull();
+    expect(offerWorkModeFromSavedContent({ workMode: '   ' })).toBeNull();
+  });
+
+  it('is null for a value that is not a string, rather than coercing it into one', () => {
+    expect(offerWorkModeFromSavedContent({ workMode: 42 as any })).toBeNull();
+    expect(offerWorkModeFromSavedContent({ workMode: null as any })).toBeNull();
+    expect(offerWorkModeFromSavedContent({ workMode: {} as any })).toBeNull();
+  });
+
+  it('is null when content itself is not an object', () => {
+    expect(offerWorkModeFromSavedContent('not an object' as any)).toBeNull();
+    expect(offerWorkModeFromSavedContent(42 as any)).toBeNull();
+  });
+});
+
+describe('the full chain blank.astro runs to hydrate its picker: saved content -> resolveOfferWorkMode', () => {
+  // Exactly the expression in src/pages/admin/offer/blank.astro's `defaults.workMode`:
+  //   resolveOfferWorkMode(engagementType, level, offerWorkModeFromSavedContent(savedOffer?.content))
+  const hydrate = (engagementType: string, level: string | null, content: Record<string, unknown> | null) =>
+    resolveOfferWorkMode(engagementType, level, offerWorkModeFromSavedContent(content));
+
+  it('preserves an existing ON-SITE selection', () => {
+    expect(hydrate('Full-Time', 'Senior', { workMode: 'On-Site' })).toBe('on-site');
+  });
+
+  it('preserves an existing HYBRID selection', () => {
+    expect(hydrate('Internship', 'Intern', { workMode: 'Hybrid' })).toBe('hybrid');
+  });
+
+  it('preserves an existing REMOTE selection — the exact case that was being discarded', () => {
+    expect(hydrate('Full-Time', 'Senior', { workMode: 'Remote' })).toBe('remote');
+    // Even for an engagement that could never ADVERTISE hybrid: the offer path does not narrow by
+    // engagement, and a saved Remote choice must survive regardless of what the role is.
+    expect(hydrate('Contract', 'Mid', { workMode: 'Remote' })).toBe('remote');
+  });
+
+  it('a brand-new blank offer (no application at all) gets the policy default, never remote', () => {
+    // resolveWorkMode's own default is "the most restrictive mode the engagement is allowed" — for
+    // an internship that is on-site, even though hybrid is ALLOWED; hybrid has to be chosen, not
+    // assumed, exactly as src/lib/work-mode.test.ts already asserts for resolveWorkMode itself
+    // ("defaults to on-site when nothing is stored"). This is that same, unchanged policy, reached
+    // through the offer path with nothing saved to prefer.
+    expect(hydrate('Full-Time', 'Senior', null)).toBe('on-site');
+    expect(hydrate('Internship', 'Intern', null)).toBe('on-site');
+  });
+
+  it('a LEGACY application — a saved offer exists, but from before this field was recorded — falls to the policy default, never remote', () => {
+    expect(hydrate('Full-Time', 'Senior', {})).toBe('on-site');
+    expect(hydrate('Internship', 'Intern', { candidateName: 'Old Row' })).toBe('on-site');
+  });
+
+  it('missing engagement type on the application itself does not produce remote either', () => {
+    expect(hydrate('', null as any, {})).toBe('on-site');
+    expect(hydrate(null as any, null, { workMode: '' })).toBe('on-site');
+  });
+
+  it('a corrupted saved value is treated as absent, not trusted verbatim', () => {
+    expect(hydrate('Full-Time', 'Senior', { workMode: 'sitting on a beach' })).toBe('on-site');
   });
 });

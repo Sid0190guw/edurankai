@@ -134,6 +134,13 @@ export interface RetentionPolicy {
   basis: string;
   overriddenBy: string | null;
   updatedAt: string;
+  /**
+   * False when `hgov_retention_policy` could not be read and this row is the CODE default standing
+   * in for it — never rendered on its own, because a table missing entirely and a class nobody has
+   * customised yet produced the exact same object: `overriddenBy: null`. An admin's saved override
+   * could exist and be invisible right now, and the two states must not look identical on screen.
+   */
+  readable: boolean;
 }
 
 export type ErasureStatus =

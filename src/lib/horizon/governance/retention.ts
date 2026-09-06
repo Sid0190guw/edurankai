@@ -190,6 +190,7 @@ const mapPolicy = (r: any): RetentionPolicy => ({
   basis: String(r.basis),
   overriddenBy: r.overridden_by ? String(r.overridden_by) : null,
   updatedAt: String(r.updated_at),
+  readable: true,   // a row mapPolicy is called on came from an actual read of the table
 });
 
 /**
@@ -216,6 +217,37 @@ export async function ensureRetentionDefaults(): Promise<void> {
   }
 }
 
+/**
+ * The code default for one class, marked with whether it stands in for a real read.
+ *
+ * `readable: false` is the STATE A signal: `hgov_retention_policy` could not be read at all, so
+ * these numbers are what the code ships with, not what an administrator set. `readable: true` is
+ * used for the one call site below where the table WAS read successfully and simply had nothing in
+ * it yet for this class — genuine information, not a failure standing in for information.
+ */
+function defaultPolicyRow(t: RetentionTarget, readable: boolean): RetentionPolicy {
+  return {
+    recordClass: t.recordClass, ownerModule: t.ownerModule, dataClass: t.dataClass,
+    retainDays: t.defaultDays, action: t.defaultAction, basis: t.basis,
+    overriddenBy: null, updatedAt: '', readable,
+  };
+}
+
+/**
+ * The retention policy in force for every class — from the table when it can be read, from the
+ * code otherwise.
+ *
+ * STATE A (the table does not exist) and STATE B (the table exists and this class has no row yet)
+ * used to be INDISTINGUISHABLE: both produced `{ overriddenBy: null, updatedAt: '' }` and nothing
+ * else recorded which one had happened, so a page showing "the policy in force" could not tell "no
+ * administrator has ever touched this" from "we do not know whether one has, because we could not
+ * read the table" — an administrator's genuine override would be invisible in exactly the second
+ * case, with the screen giving no sign that anything was wrong. The catch below was also silent:
+ * unlike every other failure in this file, it did not even log.
+ *
+ * `readable` on each returned row is that distinction, made explicit rather than left for a caller
+ * to reconstruct.
+ */
 export async function listRetentionPolicies(): Promise<RetentionPolicy[]> {
   try {
     await ensureRetentionDefaults();
@@ -223,14 +255,20 @@ export async function listRetentionPolicies(): Promise<RetentionPolicy[]> {
     const sql = await sqlTag();
     const r = rows(await db.execute(sql`SELECT * FROM hgov_retention_policy ORDER BY owner_module ASC, record_class ASC`));
     if (r.length > 0) return r.map(mapPolicy);
-  } catch { /* fall through to the code defaults */ }
-  // The code defaults, so the screen shows the policy in force even when the table does not exist
-  // yet. Marked as not overridden, which is exactly what they are.
-  return RETENTION_TARGETS.map((t) => ({
-    recordClass: t.recordClass, ownerModule: t.ownerModule, dataClass: t.dataClass,
-    retainDays: t.defaultDays, action: t.defaultAction, basis: t.basis,
-    overriddenBy: null, updatedAt: '',
-  }));
+    // A successful read that found nothing. ensureRetentionDefaults() above seeds every class in
+    // RETENTION_TARGETS via ON CONFLICT DO NOTHING before this SELECT runs, so once it succeeds
+    // without throwing the table is guaranteed to hold a row for each of them — this branch is
+    // therefore not expected to run in practice. Kept as a defined fallback rather than an
+    // assertion failure, and marked readable because the read itself did not fail.
+    return RETENTION_TARGETS.map((t) => defaultPolicyRow(t, true));
+  } catch (e: any) {
+    // Every other read failure in this module is logged (ensureRetentionDefaults two lines up does
+    // exactly this on its own failure); this one previously was not, which meant a state that
+    // changes what an administrator can trust on screen left no trace anywhere to find it by.
+    const { logEvent } = await import('@/lib/logger');
+    logEvent('warn', 'horizon.governance.retention_policy_unreadable', { message: reason(e) });
+    return RETENTION_TARGETS.map((t) => defaultPolicyRow(t, false));
+  }
 }
 
 export async function setRetentionPolicy(input: {
@@ -292,6 +330,31 @@ export interface RetentionDue {
   sweepable: boolean;
 }
 
+/**
+ * How many rows of `target` are past `cutoff`, and whether that count could actually be read.
+ *
+ * SHARED BY retentionDue() AND applyRetention(), which is the point. They ran the identical query
+ * against identical tables and disagreed on what a failure meant: this function used to exist once
+ * here, honestly, and a second time below as `countDue()`, which caught the same exception and
+ * returned a bare `0` — a number indistinguishable from "nothing is due". One caller (this page's
+ * due-count column) told the truth; the other (the dry run and the sweep itself) did not. One
+ * function, used both places, is what stops that drift from being possible again.
+ */
+async function countDueReadable(
+  target: RetentionTarget, cutoff: string,
+): Promise<{ count: number; readable: boolean; error: string | null }> {
+  try {
+    const db = await database();
+    const sql = await sqlTag();
+    // Table and column names come from RETENTION_TARGETS above, never from a parameter.
+    const r = rows(await db.execute(sql.raw(
+      `SELECT COUNT(*)::int AS n FROM ${target.table} WHERE ${target.dateColumn} < ${lit(cutoff)}::timestamptz`)));
+    return { count: Number(r[0]?.n || 0), readable: true, error: null };
+  } catch (e: any) {
+    return { count: 0, readable: false, error: reason(e) };
+  }
+}
+
 /** What is past its period right now. A read, never a write — safe to call from a page. */
 export async function retentionDue(): Promise<RetentionDue[]> {
   const policies = await listRetentionPolicies();
@@ -299,17 +362,8 @@ export async function retentionDue(): Promise<RetentionDue[]> {
   for (const p of policies) {
     const target = TARGET_BY_CLASS.get(p.recordClass);
     if (!target) continue;
-    let dueCount = 0;
-    let readable = true;
-    try {
-      const db = await database();
-      const sql = await sqlTag();
-      const cutoff = new Date(Date.now() - p.retainDays * 86400000).toISOString();
-      // Table and column names come from RETENTION_TARGETS above, never from a parameter.
-      const r = rows(await db.execute(sql.raw(
-        `SELECT COUNT(*)::int AS n FROM ${target.table} WHERE ${target.dateColumn} < ${lit(cutoff)}::timestamptz`)));
-      dueCount = Number(r[0]?.n || 0);
-    } catch { readable = false; }
+    const cutoff = new Date(Date.now() - p.retainDays * 86400000).toISOString();
+    const { count: dueCount, readable } = await countDueReadable(target, cutoff);
     out.push({
       recordClass: p.recordClass, ownerModule: p.ownerModule, action: p.action,
       retainDays: p.retainDays, dueCount, readable,
@@ -332,23 +386,43 @@ export interface SweepReport {
  * `review` classes are NEVER touched — they are reported for a human, which is what the action means.
  * `dryRun` is the DEFAULT: a function that deletes by default is one somebody calls to see what it
  * would do.
+ *
+ * A COUNT THAT COULD NOT BE READ IS REPORTED AS A FAILURE, NOT AS A ZERO. Every branch below that
+ * would otherwise print `countDueReadable`'s count — review, report-only, and either owned-elsewhere
+ * or owned-here's OWN dry-run preview — checks `readable` first and reports the real reason instead
+ * when it is false. The note is prefixed 'FAILED: ', the exact prefix the two API endpoints that
+ * call this function (src/pages/api/admin/governance/retention.ts) already scan for, so this needed
+ * no change there: a sweep in which every class fails this way now surfaces as an error banner
+ * instead of "Sweep complete. access_log (review) 0" — a sentence that read as a successful sweep
+ * of nothing, when nothing had actually been read.
+ *
+ * The two branches that are NOT gated on `readable` — a registered sweeper's real (non-dry-run) run,
+ * and this layer's own real DELETE/UPDATE — do not need it: neither reads its affected count from
+ * `countDueReadable`. Each runs its own statement and already carries its own honest catch.
  */
 export async function applyRetention(actor: GovernanceActor, opts: { dryRun?: boolean } = {}): Promise<SweepReport[]> {
   const dryRun = opts.dryRun !== false;
   const policies = await listRetentionPolicies();
   const report: SweepReport[] = [];
 
+  /** The one shape every gated branch below reports on an unreadable count. */
+  const unreadable = (recordClass: string, action: string, error: string | null): SweepReport => ({
+    recordClass, action,
+    affected: 0,
+    note: 'FAILED: could not count what is due — ' + (error || 'unknown reason'),
+  });
+
   for (const p of policies) {
     const target = TARGET_BY_CLASS.get(p.recordClass);
     if (!target) continue;
     const cutoff = new Date(Date.now() - p.retainDays * 86400000).toISOString();
-    const due = await countDue(target, cutoff);
 
     if (p.action === 'review') {
-      report.push({
+      const { count: due, readable, error } = await countDueReadable(target, cutoff);
+      report.push(readable ? {
         recordClass: p.recordClass, action: 'review', affected: due,
         note: 'Held for a person to decide. Nothing is removed automatically from this class.',
-      });
+      } : unreadable(p.recordClass, 'review', error));
       continue;
     }
 
@@ -356,14 +430,18 @@ export async function applyRetention(actor: GovernanceActor, opts: { dryRun?: bo
     if (p.ownerModule !== 'horizon.governance') {
       const sweeper = SWEEPERS.get(p.recordClass);
       if (!sweeper) {
-        report.push({
+        const { count: due, readable, error } = await countDueReadable(target, cutoff);
+        report.push(readable ? {
           recordClass: p.recordClass, action: 'report only', affected: due,
           note: p.ownerModule + ' owns this table. ' + due + ' rows are past the period; removing them is that patch\'s to do.',
-        });
+        } : unreadable(p.recordClass, 'report only', error));
         continue;
       }
       if (dryRun) {
-        report.push({ recordClass: p.recordClass, action: p.action + ' (dry run, via ' + sweeper.recordClass + ')', affected: due, note: 'Nothing was changed.' });
+        const { count: due, readable, error } = await countDueReadable(target, cutoff);
+        report.push(readable ? {
+          recordClass: p.recordClass, action: p.action + ' (dry run, via ' + sweeper.recordClass + ')', affected: due, note: 'Nothing was changed.',
+        } : unreadable(p.recordClass, p.action + ' (dry run, via ' + sweeper.recordClass + ')', error));
         continue;
       }
       try {
@@ -376,7 +454,10 @@ export async function applyRetention(actor: GovernanceActor, opts: { dryRun?: bo
     }
 
     if (dryRun) {
-      report.push({ recordClass: p.recordClass, action: p.action + ' (dry run)', affected: due, note: 'Nothing was changed.' });
+      const { count: due, readable, error } = await countDueReadable(target, cutoff);
+      report.push(readable ? {
+        recordClass: p.recordClass, action: p.action + ' (dry run)', affected: due, note: 'Nothing was changed.',
+      } : unreadable(p.recordClass, p.action + ' (dry run)', error));
       continue;
     }
 
@@ -408,16 +489,6 @@ export async function applyRetention(actor: GovernanceActor, opts: { dryRun?: bo
     });
   }
   return report;
-}
-
-async function countDue(target: RetentionTarget, cutoff: string): Promise<number> {
-  try {
-    const db = await database();
-    const sql = await sqlTag();
-    const r = rows(await db.execute(sql.raw(
-      `SELECT COUNT(*)::int AS n FROM ${target.table} WHERE ${target.dateColumn} < ${lit(cutoff)}::timestamptz`)));
-    return Number(r[0]?.n || 0);
-  } catch { return 0; }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -708,7 +779,20 @@ export async function executeErasure(id: string, actor: GovernanceActor): Promis
   } catch (e: any) { return fail(reason(e)); }
 }
 
-export async function listErasureRequests(status?: ErasureStatus, limit = 100): Promise<ErasureRequest[]> {
+/**
+ * The open (or filtered) erasure requests, and whether the table could actually be read.
+ *
+ * The array alone used to be the whole return value, and its catch was `return []` — the identical
+ * shape as `listRetentionPolicies`'s original defect, against the SAME missing-table cause
+ * (`hgov_erasure_request`, one of this layer's four tables). "No erasure request has been opened"
+ * and "the request table could not be read" produced the exact same array, and retention.astro
+ * renders "No erasure request has been opened." for both. `readable` is that distinction, carried
+ * as a sibling value rather than folded into the array — the same shape `retentionDue()` already
+ * uses for the identical reason.
+ */
+export async function listErasureRequests(
+  status?: ErasureStatus, limit = 100,
+): Promise<{ requests: ErasureRequest[]; readable: boolean }> {
   try {
     await ensureGovernanceSchema();
     const db = await database();
@@ -717,6 +801,10 @@ export async function listErasureRequests(status?: ErasureStatus, limit = 100): 
     const r = status
       ? rows(await db.execute(sql`SELECT * FROM hgov_erasure_request WHERE status = ${status} ORDER BY created_at DESC LIMIT ${n}`))
       : rows(await db.execute(sql`SELECT * FROM hgov_erasure_request ORDER BY created_at DESC LIMIT ${n}`));
-    return r.map(mapErasure);
-  } catch { return []; }
+    return { requests: r.map(mapErasure), readable: true };
+  } catch (e: any) {
+    const { logEvent } = await import('@/lib/logger');
+    logEvent('warn', 'horizon.governance.erasure_requests_unreadable', { message: reason(e) });
+    return { requests: [], readable: false };
+  }
 }

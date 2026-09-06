@@ -92,6 +92,32 @@ export function resolveOfferWorkMode(
   return resolveWorkMode(engagementType, level, null);
 }
 
+/**
+ * The work mode a PREVIOUSLY SAVED offer letter recorded, read out of its `content` jsonb — or
+ * `null` when there is nothing usable to read.
+ *
+ * WHY THIS EXISTS AS ITS OWN FUNCTION, rather than inline where it is used. `offer_letters.content`
+ * is a jsonb column with no schema of its own — "so we can change template fields without
+ * migrations", per its own table comment — which means every value coming out of it is untyped and
+ * every one of these is a real, seen shape: `content` can be `null` on a row from before this field
+ * existed, `content.workMode` can be `undefined` on a row saved before an earlier version of the
+ * builder wrote it, or it can hold whatever a hand-edited or malformed row happens to contain. None
+ * of those are errors — they are exactly what "an application created before the current work-mode
+ * architecture" looks like on disk — and the one honest answer to all of them is `null`: "nothing
+ * saved to prefer", which resolveOfferWorkMode already turns into the safe, non-remote,
+ * engagement-derived default rather than into remote by accident.
+ *
+ * This does not decide anything — it only answers "was there a usable value here at all". The
+ * decision belongs to resolveOfferWorkMode, called with this as its `submitted` argument.
+ */
+export function offerWorkModeFromSavedContent(content: Record<string, unknown> | null | undefined): string | null {
+  if (!content || typeof content !== 'object') return null;
+  const v = content.workMode;
+  if (typeof v !== 'string') return null;
+  const trimmed = v.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 /** Engagement names as they are stored on `roles.engagement_type` and on applications. */
 export type EngagementName =
   | 'Internship' | 'Apprenticeship' | 'Full-Time' | 'Part-Time' | 'Contract';
