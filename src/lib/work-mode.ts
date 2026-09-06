@@ -23,10 +23,74 @@
 
 /* ------------------------------------------------------------------------------------- modes */
 
-/** The only work modes this company advertises. 'remote' is deliberately absent from the union. */
+/** The only work modes this company ADVERTISES. 'remote' is deliberately absent from the union. */
 export type WorkMode = 'on-site' | 'hybrid';
 
 export const WORK_MODES: readonly WorkMode[] = ['on-site', 'hybrid'] as const;
+
+/* ------------------------------------------------------------------ what an OFFER may agree to */
+
+/**
+ * WHAT IS ADVERTISED AND WHAT IS AGREED ARE NOT THE SAME QUESTION, and this is where they part.
+ *
+ * Everything above is about a PUBLIC POSTING: what /careers shows, what the jobs feed publishes,
+ * what Google is told. That stays exactly as it was — permanent work is on site, trainees may be
+ * hybrid, and nothing is advertised as remote. The reasons in this file's header have not changed:
+ * candidates applied for remote work because the adverts said so, and were then offered it in
+ * writing.
+ *
+ * An OFFER LETTER is a different act. It is written for one named person, by a human who has
+ * already spoken to them, and it records the arrangement those two agreed. Remote belongs there and
+ * not on a job board, so it lives in a separate union that the advertising path cannot reach.
+ *
+ * The practical guarantee: adding 'remote' here CANNOT put remote work back on a public page.
+ * `allowedWorkModes`, `resolveWorkMode`, `displayLocation` and `jobLocationType` all still speak in
+ * `WorkMode`, which has no remote member, so a stale database row still resolves to on-site or
+ * hybrid on every candidate-facing surface.
+ */
+export type OfferWorkMode = WorkMode | 'remote';
+
+/** Every mode an individually negotiated offer letter may record. */
+export const OFFER_WORK_MODES: readonly OfferWorkMode[] = ['on-site', 'hybrid', 'remote'] as const;
+
+/**
+ * The modes an offer letter may choose from. Unlike `allowedWorkModes` this does not narrow by
+ * engagement: the engagement decides what may be ADVERTISED, and a signed arrangement with one
+ * person is not an advert.
+ */
+export function offerableWorkModes(): readonly OfferWorkMode[] {
+  return OFFER_WORK_MODES;
+}
+
+export function isOfferWorkMode(v: unknown): v is OfferWorkMode {
+  return typeof v === 'string' && (OFFER_WORK_MODES as readonly string[]).includes(v);
+}
+
+/** "On-Site" / "Hybrid" / "Remote" — the single word an offer letter prints. */
+export function offerWorkModeTitle(mode: OfferWorkMode): string {
+  if (mode === 'remote') return 'Remote';
+  return workModeTitle(mode);
+}
+
+/**
+ * What an offer letter should record, given what the admin submitted.
+ *
+ * A submitted value is honoured when it is one of the three real modes — that is the whole point of
+ * the control. Anything unrecognised (an empty form field, a tampered POST, a stale value from an
+ * older letter) falls back to what the ENGAGEMENT would advertise, which is the conservative answer
+ * and never remote.
+ */
+export function resolveOfferWorkMode(
+  engagementType?: string | null,
+  level?: string | null,
+  submitted?: string | null,
+): OfferWorkMode {
+  const raw = String(submitted || '').trim().toLowerCase().replace(/\s+/g, '-');
+  if (raw === 'remote') return 'remote';
+  if (raw === 'hybrid') return 'hybrid';
+  if (raw === 'on-site' || raw === 'onsite') return 'on-site';
+  return resolveWorkMode(engagementType, level, null);
+}
 
 /** Engagement names as they are stored on `roles.engagement_type` and on applications. */
 export type EngagementName =

@@ -341,12 +341,46 @@ function mapOpportunity(r: any): OpportunityRow {
  * window function is evaluated over every matching row before the limit is applied, which is a full
  * scan dressed up as a paginated read, and it is called out by name in this project's notes.
  */
+/**
+ * The words of a search box, deduplicated and bounded. Exported so the behaviour can be asserted
+ * without a database — the phrase-matching fault it replaces was only ever visible by calling the
+ * live endpoint, which is a slow way to learn that a search returns nothing.
+ *
+ * Case is preserved: ILIKE does the case-insensitive comparison, and lowercasing here would only
+ * make the deduplication claim something the SQL does not.
+ */
+export function searchWords(term: string): string[] {
+  return Array.from(new Set(String(term || '').trim().split(/\s+/).map((w) => w.trim()).filter(Boolean)))
+    // Bounded, so a pasted paragraph cannot build an unbounded WHERE clause. Six is well past any
+    // real query and still far below the parameter limit each word contributes to.
+    .slice(0, 6);
+}
+
 export async function listOpportunities(f: OpportunityFilters = {}): Promise<OpportunityPage> {
   const limit = Math.max(1, Math.min(MAX_LIMIT, Math.floor(f.limit ?? 24)));
   const offset = Math.max(0, Math.floor(f.offset ?? 0));
 
   const term = String(f.q || '').trim();
-  const like = '%' + term + '%';
+
+  /**
+   * THE SEARCH BOX HOLDS WORDS, NOT ONE LITERAL PHRASE.
+   *
+   * `q` was matched as a single string: `'%' + term + '%'` ILIKE'd against each column. So a query
+   * had to appear, contiguously and in that order, inside ONE field. Measured on the live endpoint:
+   *
+   *     q=QA            ->  9 roles
+   *     q=junior        -> 16 roles
+   *     q=QA junior     ->  0 roles
+   *
+   * "Data QA Analyst" is a Junior role. It matches both words and was returned by neither query
+   * that named both, because no single column contains the string "QA junior". A person searching
+   * the two things they know about the job they want got nothing, while browsing showed it — which
+   * reads as "we have no QA roles", not as "your phrasing was wrong".
+   *
+   * Every word must match SOMEWHERE (AND across words, OR across columns). That is what narrowing a
+   * search means, and it keeps single-word queries answering exactly as they do today.
+   */
+  const qWords = searchWords(term);
 
   const band = scaleBand(f.band);
   const bandLo = band ? band.minExp : null;
@@ -398,6 +432,42 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
   const termsFragment = () => (hasTerms
     ? sql`(${sql.join(anyTerms.map(wideMatch), sql` OR `)})`
     : sql`TRUE`);
+
+  /**
+   * ONE WORD OF THE SEARCH BOX, against every column a person could reasonably expect it to hit.
+   *
+   * `r.level` is in here and was not in the phrase version, which is why `q=junior` matched only
+   * postings whose PROSE happens to contain the word rather than the sixteen whose level IS Junior.
+   * The jsonb_typeof guard is kept verbatim: jsonb_array_elements_text throws a hard Postgres error
+   * on any row whose skills column is not an array, and because it runs per row across the whole
+   * table, ONE bad row once returned "0 results" for every search on /careers.
+   */
+  const qMatch = (w: string) => {
+    const lk = '%' + w + '%';
+    return sql`(r.title ILIKE ${lk}
+             OR r.level ILIKE ${lk}
+             OR r.function ILIKE ${lk}
+             OR r.about ILIKE ${lk}
+             OR COALESCE(d.name, '') ILIKE ${lk}
+             OR COALESCE(v.name, '') ILIKE ${lk}
+             OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(
+                  CASE WHEN jsonb_typeof(r.skills) = 'array' THEN r.skills ELSE '[]'::jsonb END
+                ) AS s WHERE s ILIKE ${lk})
+             OR EXISTS (SELECT 1 FROM unnest(COALESCE(r.tools, ARRAY[]::text[])) AS t WHERE t ILIKE ${lk}))`;
+  };
+
+  /**
+   * A FACTORY, like whereClause() and termsFragment() above, and for the same reason: one shared
+   * `sql` fragment reused by both the rows statement and the count statement is what produced
+   * "bind message supplies 36 parameters, but prepared statement requires 34". Each call builds new
+   * fragments, so each statement carries its own parameter list.
+   *
+   * An empty box is `TRUE`, never a predicate nothing satisfies — the standard way an optional
+   * filter turns into a search that silently returns zero.
+   */
+  const qFragment = () => (qWords.length === 0
+    ? sql`TRUE`
+    : sql`(${sql.join(qWords.map(qMatch), sql` AND `)})`);
 
   // `&&` is array overlap. Guarded by hasCatsAny so an empty list is a no-op rather than a
   // predicate over an empty array, which overlaps with nothing and would return no rows at all.
@@ -568,25 +638,7 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
           CASE WHEN jsonb_typeof(r.skills) = 'array' THEN r.skills ELSE '[]'::jsonb END
         ) AS s WHERE s ILIKE '%' || ${f.skill || null} || '%'
       ))
-      AND (${term === '' } OR (
-           r.title ILIKE ${like}
-        OR r.function ILIKE ${like}
-        OR r.about ILIKE ${like}
-        OR COALESCE(d.name, '') ILIKE ${like}
-        OR COALESCE(v.name, '') ILIKE ${like}
-        OR EXISTS (
-             SELECT 1 FROM jsonb_array_elements_text(
-               -- GUARDED WITH jsonb_typeof. jsonb_array_elements_text throws a hard Postgres error
-               -- on any row whose skills column is not actually a JSON array, and because this runs
-               -- per row across the whole table, ONE bad row silently killed EVERY search on
-               -- /careers — surfacing as "0 results" for terms that obviously matched.
-               CASE WHEN jsonb_typeof(r.skills) = 'array' THEN r.skills ELSE '[]'::jsonb END
-             ) AS s WHERE s ILIKE ${like}
-           )
-        OR EXISTS (
-             SELECT 1 FROM unnest(COALESCE(r.tools, ARRAY[]::text[])) AS t WHERE t ILIKE ${like}
-           )
-      ))`;
+      AND ${qFragment()}`;
 
   try {
     await ensureXscaleSchema();

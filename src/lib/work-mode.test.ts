@@ -3,6 +3,7 @@ import {
   allowedWorkModes, claimsHybrid, claimsRemote, correctedLocation, displayLocation,
   isTraineeEngagement, jobLocationType, locationLabel, PRIMARY_SITE, resolveWorkMode,
   violatesWorkModePolicy, workModeLabel, workModeSentence, workModeTitle, WORK_MODES,
+  isOfferWorkMode, offerableWorkModes, offerWorkModeTitle, resolveOfferWorkMode,
 } from './work-mode';
 
 describe('the policy itself', () => {
@@ -200,5 +201,65 @@ describe('the catalogue no longer advertises remote work', () => {
     return import('@/data/role-catalog').then(({ ROLE_CATALOG }) => {
       expect((ROLE_CATALOG as any[]).length).toBeGreaterThan(100);
     });
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// WHAT AN OFFER MAY AGREE TO, which is not what a posting may advertise.
+//
+// Added 2026-09-06. The Custom Offer builder (/admin/offer/blank) had never been moved onto this
+// module: it carried its own <select> with Remote pre-selected, so every letter generated there
+// defaulted to the exact value this file was written to remove — while the applications-side letter
+// asked this module and offered On-Site alone. Two offer screens, two different answers.
+//
+// The resolution keeps the two questions apart. A public posting still cannot say remote; an offer
+// letter, which is written for one named person by somebody who has spoken to them, can.
+describe('the offer path', () => {
+  it('offers all three modes, because an offer is an agreement and not an advert', () => {
+    expect(offerableWorkModes()).toEqual(['on-site', 'hybrid', 'remote']);
+  });
+
+  it('does NOT let remote leak into the advertising path', () => {
+    // The guarantee that makes the split safe: everything candidate-facing still speaks in
+    // WorkMode, which has no remote member.
+    expect(WORK_MODES).toEqual(['on-site', 'hybrid']);
+    expect(allowedWorkModes('Full-Time', 'Senior')).not.toContain('remote');
+    expect(allowedWorkModes('Internship', 'Intern')).not.toContain('remote');
+    expect(resolveWorkMode('Internship', 'Intern', 'Remote / Anywhere')).not.toBe('remote');
+  });
+
+  it('honours each of the three modes an admin can actually select', () => {
+    expect(resolveOfferWorkMode('Full-Time', 'Senior', 'Remote')).toBe('remote');
+    expect(resolveOfferWorkMode('Full-Time', 'Senior', 'Hybrid')).toBe('hybrid');
+    expect(resolveOfferWorkMode('Full-Time', 'Senior', 'On-Site')).toBe('on-site');
+  });
+
+  it('accepts the spellings a form or an older letter might carry', () => {
+    expect(resolveOfferWorkMode('Full-Time', null, 'remote')).toBe('remote');
+    expect(resolveOfferWorkMode('Full-Time', null, '  REMOTE  ')).toBe('remote');
+    expect(resolveOfferWorkMode('Full-Time', null, 'onsite')).toBe('on-site');
+    expect(resolveOfferWorkMode('Full-Time', null, 'On Site')).toBe('on-site');
+  });
+
+  it('falls back to what the engagement would ADVERTISE when nothing usable was submitted', () => {
+    // A tampered POST, an empty field or a value from a form that no longer exists must never
+    // become remote by accident. The conservative answer is the advertised one.
+    expect(resolveOfferWorkMode('Full-Time', 'Senior', '')).toBe('on-site');
+    expect(resolveOfferWorkMode('Full-Time', 'Senior', null)).toBe('on-site');
+    expect(resolveOfferWorkMode('Full-Time', 'Senior', 'work from the moon')).toBe('on-site');
+    expect(resolveOfferWorkMode('Internship', 'Intern', 'nonsense')).toBe('on-site');
+  });
+
+  it('prints the single word an offer letter shows', () => {
+    expect(offerWorkModeTitle('remote')).toBe('Remote');
+    expect(offerWorkModeTitle('hybrid')).toBe('Hybrid');
+    expect(offerWorkModeTitle('on-site')).toBe('On-Site');
+  });
+
+  it('recognises exactly the three, and nothing else', () => {
+    expect(isOfferWorkMode('remote')).toBe(true);
+    expect(isOfferWorkMode('telecommute')).toBe(false);
+    expect(isOfferWorkMode('')).toBe(false);
+    expect(isOfferWorkMode(null)).toBe(false);
   });
 });
