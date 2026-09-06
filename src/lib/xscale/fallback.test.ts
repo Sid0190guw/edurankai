@@ -115,7 +115,26 @@ describe('narrow means "certain to exist", not "as few as possible"', () => {
 
   it('uses the same matcher for free text and for the any-of terms, so the two cannot drift', () => {
     expect(/anyTerms\.map\(narrowMatch\)/.test(SRC)).toBe(true);
-    expect(/OR \$\{narrowMatch\(term\)\}/.test(SRC)).toBe(true);
+    // The free-text box is now matched WORD BY WORD rather than as one literal phrase — `q=QA
+    // junior` returned nothing while `q=QA` returned nine, because no column holds the two words
+    // contiguously. It still goes through narrowMatch, which is what this case is really about.
+    expect(/qWords\.map\(narrowMatch\)/.test(SRC)).toBe(true);
+  });
+
+  it('splits the free-text box on BOTH paths, not just the healthy one', () => {
+    // This is the half that mattered in production. The main statement joins `divisions`, a table
+    // db/xscale-schema.sql has not created on the live database, so every real query fails and is
+    // answered by the retry. Teaching only the main whereClause to split words changed nothing a
+    // visitor could see: q=QA junior stayed 0 while q=junior QA became 1, an answer that depended on
+    // the order of the words because one path had been fixed and the other had not.
+    expect(/qWords\.map\(qMatch\)/.test(SRC)).toBe(true);
+    expect(/qWords\.map\(narrowMatch\)/.test(SRC)).toBe(true);
+  });
+
+  it('searches the level column, so "junior" finds the roles whose level IS Junior', () => {
+    // q=junior matched only postings whose PROSE carried the word; the sixteen Junior roles were
+    // invisible to it. Both matchers read r.level now.
+    expect(MATCHER.includes('r.level')).toBe(true);
   });
 });
 

@@ -506,7 +506,11 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
   const relevanceOrder = (matcher: (t: string) => any, includeCats: boolean) => {
     const parts: any[] = [];
     if (includeCats && hasCatsAny) parts.push(sql`CASE WHEN ${catsFragment()} THEN 3 ELSE 0 END`);
-    const scored = hasTerms ? anyTerms : (term === '' ? [] : [term]);
+    // SCORED PER WORD, for the same reason the WHERE clause matches per word. Scoring the whole
+    // phrase gave every row 0 for a two-word query — nothing contains "QA junior" contiguously — so
+    // even once such a query returned rows, they came back in no particular order. A posting that
+    // matches both words in its title now outranks one that matches one of them in its prose.
+    const scored = hasTerms ? anyTerms : qWords;
     for (const t of scored) {
       const lk = '%' + t + '%';
       parts.push(sql`CASE WHEN r.title ILIKE ${lk} THEN 2 WHEN ${matcher(t)} THEN 1 ELSE 0 END`);
@@ -558,7 +562,7 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
    */
   const narrowMatch = (t: string) => {
     const lk = '%' + t + '%';
-    return sql`(r.title ILIKE ${lk} OR r.function ILIKE ${lk} OR r.about ILIKE ${lk}
+    return sql`(r.title ILIKE ${lk} OR r.level ILIKE ${lk} OR r.function ILIKE ${lk} OR r.about ILIKE ${lk}
       OR COALESCE(d.name, '') ILIKE ${lk}
       OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(
            CASE WHEN jsonb_typeof(r.skills) = 'array' THEN r.skills ELSE '[]'::jsonb END
@@ -569,6 +573,28 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
   const narrowTerms = () => (hasTerms
     ? sql`(${sql.join(anyTerms.map(narrowMatch), sql` OR `)})`
     : sql`TRUE`);
+
+  /**
+   * THE SEARCH BOX, ON THE RETRY PATH — AND THIS IS THE PATH PRODUCTION ACTUALLY TAKES.
+   *
+   * The main statement joins `divisions`, a table created only by db/xscale-schema.sql, which has
+   * not been applied. So every live query fails, lands in the catch below, and is answered here:
+   * /api/careers/search returns `degraded: true` for EVERY search, which is this function saying so.
+   *
+   * That is why fixing the word-splitting in the main whereClause alone changed nothing a visitor
+   * could see. Measured after that deploy:
+   *
+   *     q=QA          -> 9   degraded:true
+   *     q=QA junior   -> 0   degraded:true
+   *     q=junior QA   -> 1   degraded:true
+   *
+   * — a search whose answer depended on the ORDER of the two words, because one path had been taught
+   * to split them and the other was still matching the phrase. A fix that only reaches the healthy
+   * path is not a fix on a database that never takes it.
+   */
+  const narrowQFragment = () => (qWords.length === 0
+    ? sql`TRUE`
+    : sql`(${sql.join(qWords.map(narrowMatch), sql` AND `)})`);
 
   // The public rule, or the admin one. `includeUnpublished` is set only by an authenticated admin
   // surface; it is never derived from a query parameter on a public page.
@@ -712,7 +738,7 @@ export async function listOpportunities(f: OpportunityFilters = {}): Promise<Opp
            AND (r.application_deadline IS NULL OR r.application_deadline > NOW())
            AND (${f.departmentId || null}::text IS NULL OR r.department_id = ${f.departmentId || null})
            AND (${f.level || null}::text IS NULL OR r.level::text = ${f.level || null})
-           AND (${term === ''} OR ${narrowMatch(term)})
+           AND ${narrowQFragment()}
            -- The any-of terms survive the narrowing, over every column the base schema guarantees.
            -- The discipline overlap does NOT, which is precisely why degraded stays true below:
            -- this result was produced without it and must not be presented as though it had it.
