@@ -14,13 +14,22 @@
 //
 //   1. BROKEN TARGET   a link, form action or fetch that resolves to no route at all.
 //   2. WRONG METHOD    a form or fetch whose target route does not export the method it uses.
+//   3. ORPHAN PAGE     a static page that no source file links to.
+//
+// Check 3 is the mirror of src/lib/admin-nav-reachable.test.ts, which asserts that every sidebar
+// link resolves to a page. Nothing asserted the other direction, and that is the more expensive
+// half: a dangling sidebar link is a 404 somebody reports, while a page nothing links to is silent
+// and the work in it is simply never used. /admin/recruitment/dashboard was 342 lines answering
+// "what is the state of hiring", reachable only by typing the URL, and /admin/horizon/interpretation
+// carried a header saying it "exists so the layer is reachable rather than a set of files nobody can
+// open" — while being unreachable.
 //
 // WHAT IT DELIBERATELY DOES NOT REPORT. A URL built by concatenation (`'/a/b/' + id`) or by template
-// interpolation is a dynamic route and is not checked as a literal — the first version of this did
-// check them and reported ten findings, every one of them correct code, which is the fastest way to
-// make a check unrunnable. Orphan detection ("no page links here") is not here either: this codebase
-// links from nav registries and template literals, so the honest answer needs a resolver this file
-// does not have, and a wall of false orphans would bury the two faults above.
+// interpolation is a dynamic route and is not checked as a broken literal — the first version of
+// this did check them and reported ten findings, every one of them correct code, which is the
+// fastest way to make a check unrunnable. For the same reason check 3 asks only about STATIC pages:
+// a [param] route is reached by building a string, the ways to build one are unbounded, and asked
+// about them this check named twenty-one pages that were all reachable.
 //
 //   node scripts/audit-wiring.mjs          report; exit non-zero if anything is broken
 //   node scripts/audit-wiring.mjs --list   also print the route table size and the checks run
@@ -118,6 +127,51 @@ const srcFiles = walk(SRC).filter((f) => /\.(astro|ts|tsx|js|jsx)$/.test(f) && !
 const broken = [];      // target does not exist
 const wrongMethod = [];
 
+// For the orphan check: every route-shaped string this codebase mentions, however it builds it.
+// A nav registry stores `{ href: '/admin/x' }`, so an href= scan alone misses it; a link is just as
+// often `` `/a/${id}/edit` `` or `'/a/' + id + '/edit'`, so the interpolated forms are collected
+// separately with each ${...} collapsed to a wildcard.
+// The placeholder a collapsed ${...} leaves behind when an interpolated path is normalised.
+//
+// DECLARED HERE, ABOVE ITS FIRST USE, because `const` is not hoisted — the house trap that has taken
+// this site down before. It was first written below the loop that reads it and the gate died on its
+// own first line with "Cannot access 'WILDCARD' before initialization".
+//
+// Printable, rather than the raw NUL byte it started as: a NUL in a source file makes git treat the
+// whole file as binary, and `git diff` on this gate reported "Bin 9736 -> 15326 bytes" instead of
+// showing the change.
+const WILDCARD = '*';
+
+const literalTargets = new Set();
+const interpolated = new Set();
+
+for (const file of srcFiles) {
+  const text = readFileSync(file, 'utf8');
+  const self = '/' + rel(file);
+  for (const m of text.matchAll(/["'`](\/[A-Za-z0-9][^"'`\s>){}]*)["'`]/g)) {
+    literalTargets.add(m[1].split('?')[0].split('#')[0].replace(/\/$/, '') || '/');
+  }
+  for (const m of text.matchAll(/`(\/[A-Za-z0-9][^`]*)`/g)) {
+    if (!m[1].includes('${')) continue;
+    interpolated.add(m[1].replace(/\$\{[^}]*\}/g, WILDCARD).split('?')[0].split('#')[0].replace(/\/$/, ''));
+  }
+  for (const m of text.matchAll(/["'](\/[A-Za-z0-9][^"']*)["']\s*\+\s*[^+;)\n]+?(?:\s*\+\s*["']([^"']*)["'])?/g)) {
+    const head = m[1].replace(/\/$/, '');
+    const tailPart = m[2] ? (m[2].startsWith('/') ? m[2] : '/' + m[2]) : '';
+    interpolated.add((head + '/' + WILDCARD + tailPart).split('?')[0].split('#')[0].replace(/\/+/g, '/').replace(/\/$/, ''));
+  }
+  // A file naming its own path is not a link to itself.
+  literalTargets.delete(self);
+}
+
+const interpolatedSegs = [...interpolated].map((b) => b.split('/').filter(Boolean));
+/** A route matches a built path when the segments line up, [param] and * both being wildcards. */
+function matchesInterpolated(routePath) {
+  const rs = routePath.split('/').filter(Boolean);
+  return interpolatedSegs.some((bs) =>
+    bs.length === rs.length && rs.every((seg, i) => /^\[.+\]$/.test(seg) || bs[i] === seg || bs[i] === WILDCARD));
+}
+
 /** True when the literal is being concatenated onto — a dynamic URL, not a static one. */
 const isConcatenated = (line, endIndex) => line.slice(endIndex).trimStart().startsWith('+');
 
@@ -195,10 +249,66 @@ for (const w of wrongMethod) {
   console.log(dim(`          ${w.r}:${w.line}  — ${w.file} exports [${w.has}]`));
 }
 
-const total = broken.length + wrongMethod.length;
+// ------------------------------------------------------------------------------------------------
+// 3. ORPHAN PAGES — built, and reachable by nobody.
+//
+// src/lib/admin-nav-reachable.test.ts already asserts the other direction: every sidebar link
+// resolves to a page. Nothing asserted THIS one, and that is the more expensive gap. A dangling
+// sidebar link is a 404 somebody reports; a page with no inbound link is silent, and the work in it
+// is simply never used. /admin/recruitment/dashboard was 342 lines answering "what is the state of
+// hiring", reachable only by typing the URL. /admin/horizon/interpretation had a header saying it
+// "exists so the layer is reachable rather than a set of files nobody can open" — and was not.
+//
+// A page counts as reachable if ANY source file names it: an href, a nav registry entry, a redirect,
+// or a template/concatenation that builds it. That is generous on purpose. This gate is for pages
+// nothing mentions at all, which is unambiguous.
+//
+// THE EXEMPTIONS ARE NAMED, WITH A REASON EACH. An unexplained allowlist is how this defect comes
+// back; a reason is the difference between a decision and an oversight.
+const NEVER_LINKED = new Map([
+  ['/', 'The homepage. It is the entry point, not something linked from one.'],
+  ['/404', 'Astro renders it on a miss; nothing links to a 404 on purpose.'],
+  ['/i/[slug]', 'Short link opened from outside the product — an invitation email, a QR code.'],
+  ['/r/[slug]', 'Short link opened from outside the product, same as /i.'],
+  ['/portal/activate', 'A deliberately deprecated legacy page. Its whole body is a redirect to /portal, and its header says account creation is free and this prompt must not gate anyone. Linking it would undo that.'],
+  ['/admin/test-payment', 'Fires a REAL Razorpay charge from the browser. It has no PATH_SECTION entry either, so its frontmatter guard is the only thing in front of it. A menu entry is exactly what this must not have.'],
+  ['/admin/diag', 'A mobile diagnostic opened by hand while debugging a specific device.'],
+  ['/admin/era-editor-demo', 'A component demo, not a product surface.'],
+  ['/founder/admin/wellness', 'The founder console is deliberately outside the main admin nav and gated to one account. Not being in a menu is the design.'],
+]);
+
+// STATIC PAGES ONLY, and that boundary is the difference between a gate people run and one they
+// switch off. A [param] route is reached by BUILDING a URL out of data, and the number of ways to
+// build a string is unbounded: `/a/${id}/edit`, `'/a/' + id + '/edit'`, a helper that returns a
+// path, a value read from the database. Asked about dynamic routes this check reported twenty-one,
+// and the ones spot-checked were all reachable — /aquintutor/interview/[slug]/preflight is opened by
+// `'/aquintutor/interview/' + templateSlug + '/preflight?session=' + …`, which is a link by any
+// honest reading. Chasing those would mean approximating a resolver, and every approximation shows
+// up as a false finding on correct code.
+//
+// A static page has no such ambiguity: some file names it or no file does. That is the question this
+// answers, and it answers it with certainty.
+const pageRoutes = routes.filter((r) =>
+  !r.path.startsWith('/api/') && !r.file.includes('/api/') && !r.path.includes('['));
+const orphans = [];
+for (const r of pageRoutes) {
+  if (NEVER_LINKED.has(r.path)) continue;
+  const p = r.path.replace(/\/$/, '') || '/';
+  if (literalTargets.has(p)) continue;
+  if (matchesInterpolated(p)) continue;
+  orphans.push(r);
+}
+
+for (const o of orphans) {
+  console.log(`${red('orphan')}  ${o.path}`);
+  console.log(dim(`          ${o.file}  — built, and no source file links to it`));
+}
+
+const total = broken.length + wrongMethod.length + orphans.length;
 console.log('');
 if (total === 0) {
-  console.log(green('  Every link, form action and fetch resolves to a route that answers it.'));
+  console.log(green('  Every link, form action and fetch resolves to a route that answers it,'));
+  console.log(green('  and every page is reachable from somewhere.'));
 } else {
   console.log(red(`  ${broken.length} broken target(s), ${wrongMethod.length} wrong method(s).`));
   console.log(dim('  A control that posts to nothing is a screen that looks finished and does nothing.'));

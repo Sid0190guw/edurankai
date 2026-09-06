@@ -149,6 +149,13 @@ export const ADMIN_NAV: AdminNavEntry[] = [
     icon: 'users',
     children: [
       { id: 'recruitment', label: 'Overview', href: '/admin/recruitment', icon: 'grid', section: 'applications' },
+      // THE NUMBERS, AND NOTHING COULD REACH THEM. /admin/recruitment/dashboard is 342 lines that
+      // answer "what is the state of hiring" — postings by status, applications by status, by
+      // department, by division, by career level, each one saying whether it could be read. No
+      // sidebar entry and no link from any reachable page, so the only way in was to type the URL.
+      // Same section as its siblings: the page asks can(applications.view) in its own frontmatter,
+      // so the menu and the lock agree.
+      { id: 'recruitment-dashboard', label: 'Hiring dashboard', href: '/admin/recruitment/dashboard', icon: 'bar-chart-2', section: 'applications' },
       { id: 'recruitment-referrals', label: 'Referral programme', href: '/admin/recruitment/referrals', icon: 'users', section: 'applications' },
       { id: 'recruitment-talent-pool', label: 'Talent pool', href: '/admin/recruitment/talent-pool', icon: 'inbox', section: 'applications' },
       { id: 'recruitment-feedback', label: 'Interview feedback', href: '/admin/recruitment/feedback', icon: 'message-circle', section: 'applications' },
@@ -353,6 +360,13 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // and gates every tab on its own capability. It does not replace the employee record screen —
       // that one is where a value is edited, this one is where a value is explained.
       { id: 'horizon-records', label: 'Intelligence records', href: '/admin/horizon',            icon: 'grid',     section: 'employees' },
+      // ITS OWN HEADER SAYS WHY THIS ENTRY HAD TO EXIST: "It exists so the layer is reachable rather
+      // than a set of files nobody can open." It was not reachable. PATCH 03's read surface — the
+      // twelve neutral professional dimensions — had no sidebar entry and no inbound link, so the
+      // one page written to make the layer openable could only be opened by typing the URL.
+      // `employees`, because middleware maps /admin/horizon to that section by longest prefix and
+      // the page additionally asks can(horizon.interpretation.view) for itself.
+      { id: 'horizon-interpretation', label: 'Professional interpretation', href: '/admin/horizon/interpretation', icon: 'grid', section: 'employees' },
       // HORIZON INTEGRATION (PATCH-20) — the build's own state: which patches are reachable, which
       // concepts have two owners, and which Definition-of-Done items are actually proven rather than
       // asserted. Filed under `settings` and NOT `employees`, because it is the one HORIZON screen
@@ -647,6 +661,23 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       { id: 'courses', label: 'Courses', href: '/admin/courses', icon: 'book', section: 'lms' },
       { id: 'paths', label: 'Learning Paths', href: '/admin/paths', icon: 'grid', section: 'lms' },
       { id: 'instructors', label: 'Faculty', href: '/admin/instructors', icon: 'users', section: 'lms' },
+      // THE ACCREDITED-PARTNER REGISTRY, which is not the partner console. AquinAdminLayout's nav
+      // already carries /aquintutor/admin/partner — a partner's OWN view, gated on the AquinTutor
+      // principal. This is the plural page: who the accredited partners are, their accreditation,
+      // MoU status and capacity. It is the register behind "partners award the credentials, we do
+      // not", and nothing linked to it.
+      //
+      // It goes HERE rather than in AquinAdminLayout's nav because it does not use that gate: it is
+      // on AquintutorLayout and checks Astro.locals.user's EduRankAI role for itself. That shell's
+      // header is explicit that it exists so there is exactly ONE gate, and putting a page with a
+      // different one into its menu is the disagreement it warns about.
+      //
+      // 'lms' UNDER-OFFERS ON PURPOSE, by the same rule as the Command Center below: the page admits
+      // super_admin, hr, editor and admin, and no section key matches that set. 'lms' is held by
+      // editor and super_admin, both of which the page's own guard admits — so every person shown
+      // this link can open it. hr and admin keep the URL and lose the link, which is the safe way to
+      // be wrong here; a link that bounces on click is not.
+      { id: 'aquintutor-partners', label: 'Accredited partners', href: '/aquintutor/admin/partners', icon: 'users', section: 'lms' },
       // NEWLY MAPPED, and NOT on 'lms' with the rest of this group, which is where it was first put.
       // This is the only entry in the catalogue whose href leaves /admin, so middleware's
       // PATH_SECTION never sees it and the page guards itself: src/pages/aquintutor/admin/index.astro

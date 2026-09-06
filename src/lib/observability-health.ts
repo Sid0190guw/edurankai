@@ -509,6 +509,31 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   // a hand-run file, and `reference: a repo .sql is not an applied .sql`. Registering it turns a
   // flag buried in an API response into something the health endpoint states.
   { module: 'Extreme-Scale divisions', table: 'divisions', owner: 'db/xscale-schema.sql' },
+
+  // HORIZON GOVERNANCE, REGISTERED THE DAY ITS CONTROLS BECAME REACHABLE.
+  //
+  // The four hgov_* tables were created only by ensureGovernanceSchema(), and SCHEMA_BOOTSTRAP is
+  // OFF in production — so on the live database they exist only once somebody has run
+  // db/horizon-governance-schema.sql by hand. Absent from this list, /api/health answered "all
+  // expected tables present" while none of the four was there, which is the failure this list is
+  // for: a table nothing says anything about is one whose absence reads as health.
+  //
+  // It mattered less while the console was read-only. It matters now: /admin/governance and
+  // /admin/governance/retention gained working POST endpoints, so a person can press "run the sweep
+  // for real" and "carry out this erasure" against tables that may not exist. The endpoints report
+  // that honestly, but only after the fact and only to whoever pressed the button. This says it
+  // before anybody presses anything.
+  //
+  // OWNER IS THE .sql, NOT schema.ts, for the reason recorded against the career-intel and
+  // invitation entries above: /admin/setup splits missing tables on `owner.startsWith('db/')`, so
+  // naming the module puts these in the bucket labelled "still missing after this run" — reported
+  // to an operator as a failure of the Create-module-tables button, for tables that button was never
+  // wired to create. The file below is the one to run, and it carries all four CREATEs.
+  { module: 'Governance decision log', table: 'hgov_decision_log', owner: 'db/horizon-governance-schema.sql' },
+  { module: 'Governance engine versions', table: 'hgov_engine_version', owner: 'db/horizon-governance-schema.sql' },
+  { module: 'Retention policy', table: 'hgov_retention_policy', owner: 'db/horizon-governance-schema.sql' },
+  { module: 'Erasure requests', table: 'hgov_erasure_request', owner: 'db/horizon-governance-schema.sql' },
+
 ];
 
 /**
