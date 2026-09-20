@@ -12,17 +12,15 @@
 // building and external mail never arrived.
 //
 // This module asks the mailbox question instead, so ONE mail system can serve both surfaces.
-// It does not create a second RBAC: it composes three answers that already exist.
+// It does not create a second RBAC: it composes the shared-mail capability and employee status.
 //
-// IT FAILS CLOSED. Every arm it consults fails closed — canOpenAdmin() denies when the employee
-// lookup throws, requireEmployee() returns 'lookup-failed' rather than a guess, and
+// IT FAILS CLOSED. requireEmployee() returns 'lookup-failed' rather than a guess, and
 // holdsCapability() needs no database at all. A database hiccup refuses to send a message; it
 // never sends one on behalf of somebody who should not have.
 //
 // IT AUTHORISES BEFORE THE HANDLER RUNS. Call denyMailApi() on the first line, before reading the
 // body and before any SELECT — a query that ran for an unauthorised principal has already
 // happened whatever the response says.
-import { canOpenAdmin } from '@/lib/auth/admin-access';
 import { holdsCapability } from '@/lib/auth/capability';
 import { requireEmployee, type WorkspaceUser } from '@/lib/auth/workspace-access';
 import { logEvent } from '@/lib/logger';
@@ -70,7 +68,7 @@ export interface MailAccess {
   allowed: boolean;
   reason: MailAccessReason;
   /** Which arm admitted them, for the log line and for a diagnostics screen. Null on a denial. */
-  via: 'capability' | 'admin' | 'employee' | null;
+  via: 'capability' | 'employee' | null;
   /** A heading and a sentence a person can act on. Null when allowed. Render it — a blank mailbox
    *  with no explanation reads as "you have no mail". */
   denial: { title: string; reason: string } | null;
@@ -81,31 +79,21 @@ const ALLOW = (via: NonNullable<MailAccess['via']>): MailAccess => ({ allowed: t
 /**
  * MAY THIS ACCOUNT OPEN AND USE THE COMPANY MAILBOX?
  *
- * Three arms, cheapest first, and each one is an answer that already exists elsewhere:
+ * Two arms, cheapest first, and each one is an answer that already exists elsewhere:
  *
- *   1. `mail.manage` through can() — the compiled matrix only, NO database. Granted in
- *      PERMS_BY_ROLE to exactly the ten non-applicant built-in roles, which is the population
- *      /api/mail/{test,verify,imap-poll,imap-test} already admit to the company mailbox today. So
- *      this arm adds nobody who cannot already send from it, and it costs no query for the roles
- *      that make up most of the traffic.
+ *   1. `mail.manage` through can() — the compiled matrix only, NO database. Granted only to
+ *      super_admin, which is the role allowed to operate the shared company mailbox. Employees
+ *      reach the separate employee arm below for their own mailbox.
  *
- *   2. canOpenAdmin() — kept even though the ten roles above are a superset of the seven
- *      admin-capable ones, because it is the ONLY arm that sees a CUSTOM role granted admin.access
- *      through src/lib/auth/registry.ts. Dropping it would silently REMOVE the mailbox from a
- *      custom role that has it today, which is a narrowing dressed up as a simplification.
- *
- *   3. An ACTIVE employee record — requireEmployee(). This is the arm this module was written for:
+ *   2. An ACTIVE employee record — requireEmployee(). This is the arm this module was written for:
  *      the person works here, has a work address, and receives mail whether or not anyone gave
  *      them a console. It is the same fact the workforce navigation calls `worksHere` and the same
  *      lookup composeWorkspace() already ran, so the two surfaces cannot disagree about who works
  *      here.
  *
- * WHAT THIS WIDENS, stated plainly rather than left to be discovered. Before: /api/mail/send and
- * /api/mail/draft admitted canOpenAdmin() only — seven built-in roles plus registry grants, never
- * an internship. After: those seven, plus partner / teacher / technical_moderator (who already
- * send company mail through /api/mail/test), plus anyone with an active hr_employees record
- * including interns (see MAILBOX_REFUSES_INTERNS). It does NOT admit an applicant with no employee
- * record, which is the account type the original `if (!user) return 401` let through.
+ * Employee mailbox access remains separate from shared-mail administration: an active employee can
+ * use their own mailbox, while the shared company-mail controls and admin composer are reserved for
+ * super_admin. Applicants without an employee record remain denied.
  */
 export async function canUseMailbox(user: WorkspaceUser | null | undefined): Promise<MailAccess> {
   if (!user?.id) {
@@ -120,14 +108,10 @@ export async function canUseMailbox(user: WorkspaceUser | null | undefined): Pro
     };
   }
 
-  // 1. No database. The ten internal roles.
+  // 1. No database. The super_admin shared-mail capability.
   if (holdsCapability(user, 'mail.manage')) return ALLOW('capability');
 
-  // 2. One indexed query, and the only arm that sees a registry grant of admin.access.
-  const admin = await canOpenAdmin(user);
-  if (admin.allowed) return ALLOW('admin');
-
-  // 3. Do they work here? requireEmployee fails closed on its own errors and distinguishes "no
+  // 2. Do they work here? requireEmployee fails closed on its own errors and distinguishes "no
   //    record" from "the lookup did not run" — two different screens, never collapsed into one.
   let gate: Awaited<ReturnType<typeof requireEmployee>>;
   try {

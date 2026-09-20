@@ -70,10 +70,10 @@ export type Permission =
   | 'audit.view'
 
   // =============================================================================================
-  // THE `role !== 'applicant'` FAMILY. Every key in this group replaces the exact test
-  // canAccessSection()'s docblock warns against, and every one of them is granted to EXACTLY the ten
-  // non-applicant built-in roles — including partner, teacher and technical_moderator, which hold no
-  // admin.access and which src/middleware.ts bounces off /admin entirely.
+  // THE `role !== 'applicant'` FAMILY. Most keys in this group replace the exact test
+  // canAccessSection()'s docblock warns against and are granted to the ten non-applicant built-in
+  // roles. `mail.manage` is intentionally narrower: it is the shared company-mail capability and
+  // is granted only to super_admin below.
   //
   // THAT WIDTH IS NOT AN ENDORSEMENT. It is what the code enforces today, and this sprint changes
   // HOW authorization is asked, never WHO may do what. Recording the population as a capability is
@@ -1128,8 +1128,8 @@ export type Permission =
 //     community.moderate       src/lib/moderation.ts:78 checks NOBODY. No rule to preserve.
 // ---------------------------------------------------------------------------------------------
 /**
- * The six keys that replace a `role !== 'applicant'` test, written ONCE and spread into all ten
- * non-applicant roles below.
+ * The five keys that replace a `role !== 'applicant'` test, written ONCE and spread into all ten
+ * non-applicant roles below. Shared company-mail administration is deliberately not in this bundle.
  *
  * Declared here rather than typed out ten times because ten hand-maintained copies of one population
  * is ten chances for them to disagree, and "these six keys are held by exactly the same people" is
@@ -1139,7 +1139,6 @@ export type Permission =
  * Deliberately NOT granted to `applicant`, which is the entire content of the test being replaced.
  */
 const INTERNAL_ROLE_KEYS: Permission[] = [
-  'mail.manage',
   'lessons.author', 'lessons.publish',
   'interviews.author',
   'jobs.run',
@@ -1158,6 +1157,7 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     'settings.view', 'settings.edit',
     'offers.view', 'offers.edit',
     'payments.view', 'payments.refund',
+    'mail.manage',
     // Already holds every one of these: approverRole() answers 'super_admin' first, and
     // getViewableSectionKeys()/canAccessSection() return "unrestricted" for this role. Not
     // 'department.lead' — requireTeamLead() refuses super_admin today and that must not move.
