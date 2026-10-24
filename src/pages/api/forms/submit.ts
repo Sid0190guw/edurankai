@@ -38,7 +38,27 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   for (const f of fields) {
     const v = data[f.key];
     const empty = v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0);
-    if (f.required && empty) return json({ ok: false, error: 'Please fill: ' + f.label }, 400);
+    const sensitiveOptional = ['selfie', 'location', 'signature'].includes(f.type);
+    if (f.required && !sensitiveOptional && empty) return json({ ok: false, error: 'Please fill: ' + f.label }, 400);
+    if (f.type === 'acknowledgment' && f.required && v !== true) {
+      return json({ ok: false, error: 'Please acknowledge: ' + f.label }, 400);
+    }
+    if (f.type === 'selfie' && !empty && (typeof v !== 'string' || v.length > 50000 || !/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(v))) {
+      return json({ ok: false, error: 'The selfie capture is invalid. Please retake it or leave it blank.' }, 400);
+    }
+    if (f.type === 'signature' && !empty && (typeof v !== 'string' || v.length > 40000 || !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(v))) {
+      return json({ ok: false, error: 'The signature is invalid. Please sign again or leave it blank.' }, 400);
+    }
+    if (f.type === 'location' && !empty) {
+      const latitude = Number(v?.latitude);
+      const longitude = Number(v?.longitude);
+      const accuracy = Number(v?.accuracy);
+      if (!v || typeof v !== 'object' || !Number.isFinite(latitude) || latitude < -90 || latitude > 90 ||
+          !Number.isFinite(longitude) || longitude < -180 || longitude > 180 ||
+          (v.accuracy !== undefined && (!Number.isFinite(accuracy) || accuracy < 0))) {
+        return json({ ok: false, error: 'The location is invalid. Please try again or leave it blank.' }, 400);
+      }
+    }
     if (f.type === 'email' && !email && v) email = String(v).trim();
     if (f.type === 'phone' && !phone && v) phone = String(v).trim();
     if (f.type === 'text' && !name && v) name = String(v).trim();
@@ -57,11 +77,32 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   // POST could carry megabytes of undeclared keys into form_responses. Keep the declared keys, drop
   // the rest, and refuse anything still oversized rather than truncating it: a real answer that is
   // too long should be reported to the person who wrote it, not silently cut in half.
-  const declared = new Set(fields.map((f: any) => String(f.key)));
+  const declared = new Map(fields.map((f: any) => [String(f.key), f]));
   const clean: Record<string, any> = {};
-  for (const k of Object.keys(data)) if (declared.has(k)) clean[k] = (data as any)[k];
+  for (const k of Object.keys(data)) {
+    const field: any = declared.get(k);
+    if (!field) continue;
+    const value = (data as any)[k];
+    if (field.type === 'location' && value && typeof value === 'object') {
+      clean[k] = {
+        latitude: Number(value.latitude),
+        longitude: Number(value.longitude),
+        ...(Number.isFinite(Number(value.accuracy)) ? { accuracy: Number(value.accuracy) } : {}),
+        ...(typeof value.capturedAt === 'string' ? { capturedAt: value.capturedAt.slice(0, 40) } : {}),
+      };
+    } else if (field.type === 'acknowledgment') {
+      if (typeof value !== 'boolean') return json({ ok: false, error: 'The acknowledgment response is invalid.' }, 400);
+      clean[k] = {
+        acknowledged: value,
+        statement: String(field.label || '').slice(0, 200),
+        acknowledgedAt: new Date().toISOString(),
+      };
+    } else {
+      clean[k] = value;
+    }
+  }
   const rawJson = JSON.stringify(clean);
-  if (rawJson.length > 64_000) return json({ ok: false, error: 'That submission is too large.' }, 413);
+  if (rawJson.length > 128_000) return json({ ok: false, error: 'That submission is too large.' }, 413);
 
   const ip = (clientAddress || '').toString().slice(0, 64);
   const dataJson = sql.raw("'" + rawJson.replace(/'/g, "''") + "'::jsonb");

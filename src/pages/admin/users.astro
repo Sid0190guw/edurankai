@@ -8,7 +8,7 @@ import { hashPassword } from '@/lib/auth/password';
 import { sendEmail, brandedEmail } from '@/lib/email';
 import { logAudit } from '@/lib/audit';
 import { uuidIn } from '@/lib/pg-array';
-import { asc, eq, desc, inArray } from 'drizzle-orm';
+import { asc, eq, desc, inArray, and, ilike } from 'drizzle-orm';
 import { sql } from 'drizzle-orm';
 
 const currentUser = Astro.locals.user!;
@@ -249,7 +249,9 @@ if (Astro.request.method === 'POST' && canEdit) {
 
 // Filter
 const url = new URL(Astro.request.url);
-const filter = url.searchParams.get('filter') || 'admins';
+const filterParam = url.searchParams.get('filter') || 'admins';
+const filter = ['admins', 'applicants', 'pending', 'inactive', 'all'].includes(filterParam) ? filterParam : 'admins';
+const search = String(url.searchParams.get('q') || '').trim().slice(0, 120);
 
 // Belt-and-braces: auto-promote every pending APPLICANT before rendering the
 // list. Account creation is free and the application fee is the only paid
@@ -284,6 +286,8 @@ try {
 // Now: the counters are ONE aggregate that transfers five integers, the list is filtered and capped
 // IN SQL, and the raw access columns are read only for the rows actually on screen.
 const PAGE_CAP = 250;
+const requestedPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
+const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
 
 // The counters. COUNT(*) FILTER does all five in one pass, and access_status is read here rather
 // than reconstructed from a row array. The whole thing is guarded because access_status is a raw
@@ -304,17 +308,39 @@ try {
   console.error('[admin/users] counts', e?.cause?.message || e?.message);
 }
 
-// The list. One filter clause, applied in SQL, capped. 'all' keeps its previous meaning (no filter).
+// Apply filters and search in SQL, then page through the entire matching result set.
 const filterCond =
   filter === 'admins' ? sql`role <> 'applicant'` :
   filter === 'applicants' ? sql`role = 'applicant'` :
   filter === 'inactive' ? sql`is_active = false` :
   filter === 'pending' ? sql`COALESCE(access_status, 'approved') = 'pending'` :
   sql`true`;
+const searchPattern = '%' + search.replace(/[\\%_]/g, '\\$&') + '%';
+const listCond = search
+  ? and(filterCond, sql`(${ilike(users.name, searchPattern)} OR ${ilike(users.email, searchPattern)} OR ${ilike(users.internalHandle, searchPattern)})`)
+  : filterCond;
+const matchingCount = await db.select({ total: sql<number>`COUNT(*)::int` }).from(users).where(listCond);
+const matchingTotal = matchingCount[0]?.total || 0;
+const pageCount = Math.max(1, Math.ceil(matchingTotal / PAGE_CAP));
+const currentPage = Math.min(page, pageCount);
 const filteredUsers = await db.select().from(users)
-  .where(filterCond)
-  .orderBy(desc(users.createdAt))
-  .limit(PAGE_CAP);
+  .where(listCond)
+  .orderBy(desc(users.createdAt), desc(users.id))
+  .limit(PAGE_CAP)
+  .offset((currentPage - 1) * PAGE_CAP);
+
+function usersHref(nextPage: number): string {
+  const params = new URLSearchParams({ filter, page: String(nextPage) });
+  if (search) params.set('q', search);
+  return '/admin/users?' + params.toString();
+}
+function usersFilterHref(nextFilter: string): string {
+  const params = new URLSearchParams({ filter: nextFilter });
+  if (search) params.set('q', search);
+  return '/admin/users?' + params.toString();
+}
+const firstShown = matchingTotal === 0 ? 0 : (currentPage - 1) * PAGE_CAP + 1;
+const lastShown = Math.min(currentPage * PAGE_CAP, matchingTotal);
 
 // Access status + waiver fields live on raw columns (not in the Drizzle model) — read for the rows
 // on screen only. `pageIds` is also what narrows the custom-role assignment read further down.
@@ -395,15 +421,18 @@ try {
     <div class="users-split" style="display:grid;gap:18px;align-items:flex-start;">
 
       <div class="admin-card" style="padding:0;min-width:0;">
-        <div style="padding:12px 16px;border-bottom:1px solid #1f1f26;">
-          <input type="text" id="userSearch" placeholder="Search by name, personal email, or @edurankai.in handle..." style="width:100%;padding:8px 12px;background:#08080a;border:1px solid #1f1f26;border-radius:7px;color:#fff;font-size:12.5px;outline:none;" />
-        </div>
+        <form method="GET" style="padding:12px 16px;border-bottom:1px solid #1f1f26;display:flex;gap:8px;">
+          <input type="hidden" name="filter" value={filter} />
+          <input type="search" name="q" value={search} placeholder="Search all users by name, personal email, or @edurankai.in handle..." style="flex:1;min-width:0;padding:8px 12px;background:#08080a;border:1px solid #424956;border-radius:7px;color:#fff;font-size:12.5px;outline:none;" />
+          <button type="submit" class="admin-btn">Search</button>
+          {search && <a href={'/admin/users?filter=' + encodeURIComponent(filter)} class="admin-btn" style="display:inline-flex;align-items:center;text-decoration:none;">Clear</a>}
+        </form>
         <div style="padding:14px 16px;border-bottom:1px solid #1f1f26;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-          <a href="?filter=admins" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'admins' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Admins ({counts.admins})</a>
-          <a href="?filter=applicants" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'applicants' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Applicants ({counts.applicants})</a>
-          <a href="?filter=pending" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'pending' ? '#FF4F00;background:#FF4F00;color:#fff' : (counts.pending > 0 ? '#fbbf24;color:#fbbf24' : '#1f1f26;color:#a0a0ab'))}>Pending approval ({counts.pending})</a>
-          <a href="?filter=inactive" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'inactive' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Deactivated ({counts.inactive})</a>
-          <a href="?filter=all" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'all' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>All ({counts.total})</a>
+          <a href={usersFilterHref('admins')} style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'admins' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Admins ({counts.admins})</a>
+          <a href={usersFilterHref('applicants')} style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'applicants' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Applicants ({counts.applicants})</a>
+          <a href={usersFilterHref('pending')} style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'pending' ? '#FF4F00;background:#FF4F00;color:#fff' : (counts.pending > 0 ? '#fbbf24;color:#fbbf24' : '#1f1f26;color:#a0a0ab'))}>Pending approval ({counts.pending})</a>
+          <a href={usersFilterHref('inactive')} style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'inactive' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Deactivated ({counts.inactive})</a>
+          <a href={usersFilterHref('all')} style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'all' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>All ({counts.total})</a>
         </div>
 
         {filter === 'pending' && counts.pending > 0 && (
@@ -568,11 +597,20 @@ try {
             {filteredUsers.length === 0 && (
               <tr><td colspan="5" style="text-align:center;padding:30px;color:#8a8a94;font-size:13px;">No users in this view.</td></tr>
             )}
-            {filteredUsers.length >= PAGE_CAP && (
-              <tr><td colspan="5" style="padding:14px 12px;color:#a0a0ab;font-size:11.5px;line-height:1.6;">Showing the {PAGE_CAP} most recently created accounts in this view. The counts above are over every account; use the tabs to narrow the view.</td></tr>
-            )}
           </tbody>
         </table>
+        </div>
+        <div style="padding:12px 16px;border-top:1px solid #1f1f26;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+          <span style="font-size:11.5px;color:#c3cbd6;">Showing {firstShown}-{lastShown} of {matchingTotal}{search ? ' matching users' : ' users'}.</span>
+          <div style="display:flex;align-items:center;gap:8px;">
+            {currentPage > 1
+              ? <a class="admin-btn" href={usersHref(currentPage - 1)} style="text-decoration:none;">Previous</a>
+              : <span class="admin-btn" style="opacity:.45;">Previous</span>}
+            <span style="font-size:11.5px;color:#c3cbd6;">Page {currentPage} of {pageCount}</span>
+            {currentPage < pageCount
+              ? <a class="admin-btn" href={usersHref(currentPage + 1)} style="text-decoration:none;">Next</a>
+              : <span class="admin-btn" style="opacity:.45;">Next</span>}
+          </div>
         </div>
       </div>
 
@@ -659,17 +697,6 @@ try {
   </style>
   <script is:inline>
     (function () {
-      var box = document.getElementById('userSearch');
-      if (box) {
-        box.addEventListener('input', function () {
-          var q = box.value.trim().toLowerCase();
-          document.querySelectorAll('.user-row').forEach(function (row) {
-            var hay = row.getAttribute('data-search') || '';
-            row.style.display = (!q || hay.indexOf(q) !== -1) ? '' : 'none';
-          });
-        });
-      }
-
       // ---- Bulk approve on the pending tab ----
       var bulkForm = document.getElementById('bulkApproveForm');
       var bulkBtn = document.getElementById('bulkApproveSelectedBtn');
