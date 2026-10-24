@@ -86,6 +86,15 @@ silent fallback is expensive and cheap to miss.
 | **DKIM private key** | a **file**, mounted read-only at mode 0600. Never in a variable, never in git. |
 | **Prometheus bearer token** | `docker/prometheus/metrics_token`, written by `start-mail.sh`, gitignored |
 
+SMTP, IMAP, Resend, and inbound webhook secrets entered in Mail Administration are envelope-encrypted
+before new values are written to `mail_config`, using the existing AES-256-GCM field encryption.
+Configure `ACTIVE_DATA_KEY_ID` and the matching `DATA_ENCRYPTION_KEY_<keyId>` in the deployment's
+secret manager before saving or rotating these values. Never paste credentials into source code or
+logs. Existing plaintext values remain readable for backward compatibility until an authorized
+operator replaces them; changing environment keys without preserving every key used by stored
+ciphertext makes those secrets unreadable. The inbound webhook secret is shown only immediately
+after it is generated, so copy it into the forwarding service's secret manager at that time.
+
 `.gitignore` ignores `.env.*` and then re-includes exactly one name:
 
 ```gitignore

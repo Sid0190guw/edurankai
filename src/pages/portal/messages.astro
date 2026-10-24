@@ -1,5 +1,9 @@
 ---
-import { withDbTimeout } from '@/lib/db-timeout';
+import { withDbTimeout, DB_TIMEOUT_MS } from '@/lib/db-timeout';
+// The member lookups below are a wave of independent reads, not a sequence. runFanout() takes
+// THUNKS, so the ones that have not been sent yet can still be declined when the breaker opens
+// mid-wave — see the loop it replaces for what that was costing.
+import { runFanout, type FanoutMember } from '@/lib/db-fanout';
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
@@ -610,10 +614,57 @@ if (!myThreads.length) {
   myThreads = await threadRowsFor();
 }
 
-// Member lookup per thread (limited)
+// MEMBER LOOKUP PER THREAD — A WAVE, NOT A QUEUE.
+//
+// This was `for (const t of myThreads.slice(0, 25)) { threadMembers[t.id] = await membersOf(t.id); }`
+// — up to twenty-five round trips taken strictly one after another, each holding a pool slot for its
+// turn, on the render path of a page people leave open all day. At the round trip this deployment
+// measures (~135ms) that is roughly three and a half seconds of serialised database time before the
+// first byte, and src/lib/db/index.ts caps the instance at five connections while the same warm
+// process is serving other requests — one of which is somebody's session gate.
+//
+// Two things were wrong with it beyond the wall clock, and they are the reason this uses the
+// scheduler rather than Promise.all:
+//
+//   1. NOTHING COULD CALL IT OFF. `await` in a loop consults no breaker. When the process-global
+//      circuit opened partway through — when three consecutive timeouts had already concluded the
+//      database was gone and every other read in the instance was being refused without waiting —
+//      this loop carried on sending the remaining lookups into it, holding connections that
+//      src/lib/db-timeout.ts's wedge diagnosis shows may never be given back. Promise.all would fix
+//      the serialisation and none of this: it starts every member immediately, so there is nothing
+//      left to decline. runFanout takes thunks and asks the breaker before each one is sent.
+//
+//   2. membersOf() HAS NO CATCH. One thread whose lookup rejected took the whole page down with it,
+//      turning a missing member list into a 500 on a messenger.
+//
+// WHY A DECLINED MEMBER IS SAFE HERE, which is the part that had to be checked before touching an
+// end-to-end encrypted surface rather than assumed: the seed's member list is a first-paint hint and
+// nothing else. The client re-reads members from the `fetch_messages` response every time a thread
+// is opened, and says so at the assignment — "Members come from THIS response, not from the page
+// seed." It says that because an empty seed list once sent key derivation down the encrypt-to-
+// yourself path, and the fix was to stop trusting the seed. The seed is ALREADY empty for every
+// thread past the first twenty-five, so a declined lookup produces exactly the state thread
+// twenty-six is in on every load today. No key material is derived from this object.
+//
+// The bound, the concurrency and the breaker check all come from the scheduler; the shape of
+// `threadMembers` is unchanged, and every reader of it already guards with `|| []`.
 const threadMembers: { [k: string]: any[] } = {};
-for (const t of myThreads.slice(0, 25)) {
-  threadMembers[t.id] = await membersOf(t.id);
+{
+  const memberBatch: FanoutMember[] = myThreads.slice(0, 25).map((t: any) => ({
+    label: 'members:' + String(t.id),
+    run: async () => {
+      try {
+        threadMembers[t.id] = await membersOf(t.id);
+      } catch (e: any) {
+        // Left absent rather than set to []: the readers below already treat a missing key as "no
+        // members known", and writing an empty array here would be indistinguishable from a thread
+        // that genuinely has none.
+        console.error('[messages] members could not be read for thread', String(t.id), '-', reason(e));
+      }
+    },
+  }));
+  const wave = await runFanout(memberBatch, { label: 'messages.threadMembers', ms: DB_TIMEOUT_MS });
+  if (wave.error) console.error('[messages] member wave barrier -', reason(wave.error));
 }
 
 // The unread total for the whole mailbox, rendered into the document title so a background tab

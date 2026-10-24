@@ -2,6 +2,8 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
+import { decodeMailSecret, encodeMailSecret } from '@/lib/mail-secrets';
+import { resolveConfiguredMailboxRecipients, type ConfiguredMailboxRecipientRow } from '@/lib/mail-inbound-routing';
 // THE BINDING THAT NEVER RAN. Five statements in this file matched a column against a JS array with
 // `= ANY(${jsArray}::uuid[])` / `::text[]`. postgres-js serialises a JS array as a RECORD literal, so
 // Postgres answers "cannot cast type record to uuid[]" and the statement never executes — the exact
@@ -163,14 +165,20 @@ export function makeSnippet(text: string | null | undefined, html?: string | nul
 export async function resolveAddress(email: string): Promise<ResolvedUser> {
   await ensureMailSchema();
   const e = normalizeEmail(email);
+  if (e.slice(e.lastIndexOf('@') + 1) !== MAIL_DOMAIN.toLowerCase()) {
+    return { userId: null, email: e, name: null };
+  }
   const local = e.split('@')[0];
   const r = await db.execute(sql`
     SELECT id, name, email, mailbox_address, internal_handle FROM users
-    WHERE lower(mailbox_address) = ${e}
-       OR lower(email) = ${e}
-       OR lower(internal_handle) = ${e}
-       OR lower(internal_handle) = ${local}
-       OR lower(internal_handle || '@' || ${MAIL_DOMAIN}) = ${e}
+    WHERE is_active = true
+      AND (
+           lower(mailbox_address) = ${e}
+        OR lower(email) = ${e}
+        OR lower(internal_handle) = ${e}
+        OR lower(internal_handle) = ${local}
+        OR lower(internal_handle || '@' || ${MAIL_DOMAIN}) = ${e}
+      )
     LIMIT 1
   `);
   const u = rows(r)[0];
@@ -181,6 +189,160 @@ export async function resolveAddress(email: string): Promise<ResolvedUser> {
     return { userId: u.id, email: canonical, name: u.name };
   }
   return { userId: null, email: e, name: null };
+}
+
+/**
+ * Resolve an inbound address through configured mailbox ownership and membership first.
+ * A configured mailbox with no active authorized users must not fall through to the
+ * legacy login-email mapping.
+ */
+export async function resolveInboundRecipients(email: string): Promise<ResolvedUser[]> {
+  await ensureMailSchema();
+  const address = normalizeEmail(email);
+  try {
+    const result = rows<ConfiguredMailboxRecipientRow>(await db.execute(sql`
+      WITH targets AS (
+        SELECT mailbox_id
+        FROM mp_email_addresses a
+        JOIN mp_domains d ON d.id = a.domain_id AND d.org_id = a.org_id
+        WHERE lower(a.address) = ${address}
+          AND a.deleted_at IS NULL
+          AND a.mailbox_id IS NOT NULL
+          AND a.purpose IN ('mailbox', 'alias')
+          AND d.deleted_at IS NULL
+          AND d.status = 'verified'
+          AND d.purpose IN ('receiving', 'both')
+        UNION
+        SELECT id AS mailbox_id
+        FROM mp_mailboxes m
+        JOIN mp_organizations o ON o.id = m.org_id
+        JOIN mp_domains d ON d.org_id = m.org_id
+          AND lower(d.domain) = lower(split_part(m.primary_address, '@', 2))
+        WHERE lower(m.primary_address) = ${address}
+          AND m.deleted_at IS NULL
+          AND d.deleted_at IS NULL
+          AND d.status = 'verified'
+          AND d.purpose IN ('receiving', 'both')
+          AND o.status = 'active'
+        UNION
+        SELECT a.mailbox_id
+        FROM mp_aliases a
+        JOIN mp_domains d ON d.org_id = a.org_id
+          AND lower(d.domain) = lower(split_part(a.source_address, '@', 2))
+        WHERE lower(a.source_address) = ${address}
+          AND a.is_active = true
+          AND a.deleted_at IS NULL
+          AND a.mailbox_id IS NOT NULL
+          AND d.deleted_at IS NULL
+          AND d.status = 'verified'
+          AND d.purpose IN ('receiving', 'both')
+        UNION
+        SELECT m.id AS mailbox_id
+        FROM mp_aliases a
+        JOIN mp_mailboxes m ON lower(m.primary_address) = lower(a.destination_address)
+        JOIN mp_organizations o ON o.id = a.org_id AND o.id = m.org_id
+        JOIN mp_domains d ON d.org_id = a.org_id
+          AND lower(d.domain) = lower(split_part(a.source_address, '@', 2))
+        WHERE lower(a.source_address) = ${address}
+          AND a.is_active = true
+          AND a.deleted_at IS NULL
+          AND m.deleted_at IS NULL
+          AND d.deleted_at IS NULL
+          AND d.status = 'verified'
+          AND d.purpose IN ('receiving', 'both')
+          AND o.status = 'active'
+        UNION
+        SELECT m.id AS mailbox_id
+        FROM mp_aliases a
+        JOIN mp_alias_targets target ON target.alias_id = a.id AND target.org_id = a.org_id
+        JOIN mp_mailboxes m ON lower(m.primary_address) = lower(target.destination_address)
+        JOIN mp_organizations o ON o.id = a.org_id AND o.id = m.org_id
+        JOIN mp_domains d ON d.org_id = a.org_id
+          AND lower(d.domain) = lower(split_part(a.source_address, '@', 2))
+        WHERE lower(a.source_address) = ${address}
+          AND a.is_active = true
+          AND a.deleted_at IS NULL
+          AND m.deleted_at IS NULL
+          AND d.deleted_at IS NULL
+          AND d.status = 'verified'
+          AND d.purpose IN ('receiving', 'both')
+          AND o.status = 'active'
+        UNION
+        SELECT ea.mailbox_id
+        FROM mp_aliases a
+        JOIN mp_alias_targets target ON target.alias_id = a.id AND target.org_id = a.org_id
+        JOIN mp_email_addresses ea ON lower(ea.address) = lower(target.destination_address)
+          AND ea.org_id = a.org_id
+        JOIN mp_domains destination_domain ON destination_domain.id = ea.domain_id
+          AND destination_domain.org_id = ea.org_id
+        JOIN mp_organizations o ON o.id = a.org_id
+        JOIN mp_domains d ON d.org_id = a.org_id
+          AND lower(d.domain) = lower(split_part(a.source_address, '@', 2))
+        WHERE lower(a.source_address) = ${address}
+          AND a.is_active = true
+          AND a.deleted_at IS NULL
+          AND ea.deleted_at IS NULL
+          AND ea.mailbox_id IS NOT NULL
+          AND destination_domain.deleted_at IS NULL
+          AND destination_domain.status = 'verified'
+          AND destination_domain.purpose IN ('receiving', 'both')
+          AND d.deleted_at IS NULL
+          AND d.status = 'verified'
+          AND d.purpose IN ('receiving', 'both')
+          AND o.status = 'active'
+      )
+      SELECT t.mailbox_id, m.is_active, m.deleted_at AS mailbox_deleted_at,
+             o.status AS organization_status,
+             u.id AS user_id, u.name AS user_name, u.email AS user_email
+      FROM targets t
+      LEFT JOIN mp_mailboxes m ON m.id = t.mailbox_id
+      LEFT JOIN mp_organizations o ON o.id = m.org_id
+      LEFT JOIN users u ON u.is_active = true
+        AND EXISTS (
+          SELECT 1 FROM mp_organization_members om
+          WHERE om.org_id = m.org_id
+            AND om.user_id = u.id
+            AND om.deleted_at IS NULL
+        )
+        AND (
+          u.id = m.owner_user_id
+          OR EXISTS (
+            SELECT 1 FROM mp_mailbox_members mm
+            WHERE mm.mailbox_id = m.id
+              AND mm.org_id = m.org_id
+              AND mm.user_id = u.id
+              AND mm.deleted_at IS NULL
+          )
+        )
+      ORDER BY m.primary_address, u.name
+    `));
+    const configured = resolveConfiguredMailboxRecipients(result, address);
+    if (configured.matched) return configured.recipients;
+  } catch (error: any) {
+    const code = error?.cause?.code || error?.code;
+    if (code !== '42P01') {
+      console.error('[mail] configured inbound identity lookup failed:', error?.cause?.message || error?.message);
+      throw error;
+    }
+    const schema = rows(await db.execute(sql`
+      SELECT
+        to_regclass('public.mp_mailboxes') IS NOT NULL AS mailboxes,
+        to_regclass('public.mp_email_addresses') IS NOT NULL AS addresses,
+        to_regclass('public.mp_aliases') IS NOT NULL AS aliases,
+        to_regclass('public.mp_alias_targets') IS NOT NULL AS alias_targets,
+        to_regclass('public.mp_mailbox_members') IS NOT NULL AS members,
+        to_regclass('public.mp_organization_members') IS NOT NULL AS organization_members,
+        to_regclass('public.mp_organizations') IS NOT NULL AS organizations
+    `))[0] || {};
+    if (Object.values(schema).some(Boolean)) {
+      console.error('[mail] configured inbound identity schema is only partially installed.');
+      throw new Error('Configured mail identity schema is incomplete; refusing legacy inbound fallback.');
+    }
+    console.warn('[mail] configured mailbox identity tables are unavailable; using the legacy company-address mapping.');
+  }
+
+  const legacy = await resolveAddress(address);
+  return legacy.userId ? [legacy] : [];
 }
 
 export async function getMailboxAddress(userId: string): Promise<string> {
@@ -329,6 +491,7 @@ export interface MailConfig {
   smtpHost: string; smtpPort: number; smtpUser: string; smtpPass: string; smtpSecure: boolean; smtpInsecure: boolean;
   fromName: string; fromAddress: string; resendApiKey: string; inboundSecret: string;
   outboundEnabled: boolean; source: 'db' | 'env' | 'none';
+  secretErrors: Record<string, string>;
   /**
    * NOT-CONFIGURED AND COULD-NOT-BE-READ ARE DIFFERENT ANSWERS, AND THEY USED TO BE THE SAME ONE.
    *
@@ -372,9 +535,23 @@ export async function getMailConfig(): Promise<MailConfig> {
   const dbResendKey = nonEmpty(row.resend_api_key);
   const envSmtpHost = nonEmpty(process.env.SMTP_HOST);
   const envResendKey = nonEmpty(process.env.RESEND_API_KEY);
+  const secretErrors: Record<string, string> = {};
+  const readSecret = (column: string, value: unknown): string => {
+    if (!nonEmpty(value)) return '';
+    try {
+      return decodeMailSecret(value, column);
+    } catch (error) {
+      secretErrors[column] = 'The stored secret could not be decrypted. Verify the deployment encryption key and retry.';
+      console.error('[mail] stored mail secret unavailable:', column, error instanceof Error ? error.message : 'decryption failed');
+      return '';
+    }
+  };
 
   const smtpHost = dbSmtpHost || envSmtpHost;
-  const resendApiKey = dbResendKey || envResendKey;
+  const dbResendSecret = readSecret('resend_api_key', row.resend_api_key);
+  const dbSmtpSecret = readSecret('smtp_pass', row.smtp_pass);
+  const dbInboundSecret = readSecret('inbound_secret', row.inbound_secret);
+  const resendApiKey = dbResendKey ? dbResendSecret : envResendKey;
   const hasDb = !!(dbSmtpHost || dbResendKey);
   const hasEnv = !!(envSmtpHost || envResendKey);
 
@@ -382,16 +559,17 @@ export async function getMailConfig(): Promise<MailConfig> {
     smtpHost,
     smtpPort: Number(nonEmpty(row.smtp_port) || nonEmpty(process.env.SMTP_PORT) || '587'),
     smtpUser: nonEmpty(row.smtp_user) || nonEmpty(process.env.SMTP_USER),
-    smtpPass: nonEmpty(row.smtp_pass) || nonEmpty(process.env.SMTP_PASS),
+    smtpPass: nonEmpty(row.smtp_pass) ? dbSmtpSecret : nonEmpty(process.env.SMTP_PASS),
     smtpSecure: row.smtp_secure != null ? !!row.smtp_secure : (process.env.SMTP_SECURE === 'true'),
     smtpInsecure: row.smtp_insecure != null ? !!row.smtp_insecure : (process.env.SMTP_INSECURE === 'true'),
     fromName: nonEmpty(row.from_name) || 'EduRankAI',
     fromAddress: nonEmpty(row.from_address) || nonEmpty(process.env.EMAIL_FROM),
     resendApiKey,
-    inboundSecret: nonEmpty(row.inbound_secret) || nonEmpty(process.env.MAIL_INBOUND_SECRET),
+    inboundSecret: nonEmpty(row.inbound_secret) ? dbInboundSecret : nonEmpty(process.env.MAIL_INBOUND_SECRET),
     outboundEnabled: !!(smtpHost || resendApiKey),
     source: hasDb ? 'db' : (hasEnv ? 'env' : 'none'),
     readError,
+    secretErrors,
   };
 }
 
@@ -407,13 +585,13 @@ export async function saveMailConfig(p: Partial<{ smtpHost: string; smtpPort: nu
   const smtpHost     = s(p.smtpHost);
   const smtpPort     = p.smtpPort == null || isNaN(Number(p.smtpPort)) ? null : Number(p.smtpPort);
   const smtpUser     = s(p.smtpUser);
-  const smtpPass     = s(p.smtpPass);                   // null = keep existing
+  const smtpPass     = encodeMailSecret(p.smtpPass, 'smtp_pass'); // null = keep existing
   const smtpSecure   = p.smtpSecure == null ? null : !!p.smtpSecure;
   const smtpInsecure = p.smtpInsecure == null ? null : !!p.smtpInsecure;
   const fromName     = s(p.fromName);
   const fromAddress  = s(p.fromAddress);
-  const resendApiKey = s(p.resendApiKey);                // null = keep existing
-  const inboundSecret = s(p.inboundSecret);              // null = keep existing
+  const resendApiKey = encodeMailSecret(p.resendApiKey, 'resend_api_key'); // null = keep existing
+  const inboundSecret = encodeMailSecret(p.inboundSecret, 'inbound_secret'); // null = keep existing
   await db.execute(sql`
     INSERT INTO mail_config (id, smtp_host, smtp_port, smtp_user, smtp_pass, smtp_secure, smtp_insecure, from_name, from_address, resend_api_key, inbound_secret, updated_at)
     VALUES (1, ${smtpHost}, ${smtpPort}, ${smtpUser}, ${smtpPass}, ${smtpSecure ?? false}, ${smtpInsecure ?? false}, ${fromName}, ${fromAddress}, ${resendApiKey}, ${inboundSecret}, NOW())
@@ -1060,8 +1238,9 @@ export function normalizeSubject(s: string): string {
 // filing or the notification fails, but "the rules did not run" is a fact worth having in the log
 // rather than a silence.
 //
-// DE-DUPLICATION IS THE CALLER'S JOB and stays there — the IMAP puller has its own UID watermark
-// plus an rfc-id check, and the webhook is fired once per message by its sender.
+// DE-DUPLICATION IS PER RECIPIENT AND RFC MESSAGE-ID. A transaction-scoped advisory lock makes the
+// check-and-insert atomic across a webhook retry, a forced IMAP re-poll, or two recipients delivered
+// concurrently. The same RFC message may still have one independent mailbox copy per recipient.
 export interface InboundDelivery {
   /** The recipient in THIS product, already resolved from the envelope address. */
   userId: string;
@@ -1087,6 +1266,7 @@ export interface InboundResult {
 
 /** Deliver one arriving message to one recipient: thread it, store it, file it, announce it. */
 export async function deliverInbound(d: InboundDelivery): Promise<InboundResult> {
+  const rfcMessageId = String(d.rfcMessageId || '').slice(0, 255);
   // THE ENGINE, NOT A SECOND COPY OF ITS FIRST LINE. In-Reply-To is still tried first inside
   // findThreadForInbound(); what is new here is that a reply which lost the header now rejoins its
   // conversation instead of starting a fresh one.
@@ -1097,19 +1277,40 @@ export async function deliverInbound(d: InboundDelivery): Promise<InboundResult>
     fromEmail: d.fromEmail,
   })) || randomUUID();
 
-  const ins = rows(await db.execute(sql`
-    INSERT INTO mail_messages (thread_id, subject, from_user_id, from_email, from_name, body_html, body_text, snippet, direction, rfc_message_id, in_reply_to)
-    VALUES (${threadId}, ${d.subject}, NULL, ${d.fromEmail}, ${d.fromName}, ${d.bodyHtml || null}, ${d.bodyText || null}, ${makeSnippet(d.bodyText, d.bodyHtml)}, 'inbound', ${d.rfcMessageId}, ${d.inReplyTo})
-    RETURNING id`));
-  const messageId = String(ins[0].id);
+  const stored = await db.transaction(async (tx) => {
+    await tx.execute(sql`
+      SELECT pg_advisory_xact_lock(hashtextextended(${rfcMessageId + ':' + d.userId}, 0))
+    `);
+    const existing = rows(await tx.execute(sql`
+      SELECT m.id, m.thread_id
+      FROM mail_messages m
+      JOIN mail_recipients r ON r.message_id = m.id
+      WHERE m.rfc_message_id = ${rfcMessageId}
+        AND r.user_id = ${d.userId}
+      ORDER BY m.created_at ASC
+      LIMIT 1
+    `))[0];
+    if (existing) {
+      return { messageId: String(existing.id), threadId: String(existing.thread_id), duplicate: true };
+    }
 
-  await db.execute(sql`
-    INSERT INTO mail_recipients (message_id, kind, user_id, email, name)
-    VALUES (${messageId}, 'to', ${d.userId}, ${d.email}, ${d.name})`);
-  await db.execute(sql`
-    INSERT INTO mail_box (user_id, message_id, thread_id, folder, is_read)
-    VALUES (${d.userId}, ${messageId}, ${threadId}, 'inbox', false)
-    ON CONFLICT (user_id, message_id) DO NOTHING`);
+    const ins = rows(await tx.execute(sql`
+      INSERT INTO mail_messages (thread_id, subject, from_user_id, from_email, from_name, body_html, body_text, snippet, direction, rfc_message_id, in_reply_to)
+      VALUES (${threadId}, ${d.subject}, NULL, ${d.fromEmail}, ${d.fromName}, ${d.bodyHtml || null}, ${d.bodyText || null}, ${makeSnippet(d.bodyText, d.bodyHtml)}, 'inbound', ${rfcMessageId}, ${d.inReplyTo})
+      RETURNING id`));
+    const messageId = String(ins[0].id);
+
+    await tx.execute(sql`
+      INSERT INTO mail_recipients (message_id, kind, user_id, email, name)
+      VALUES (${messageId}, 'to', ${d.userId}, ${d.email}, ${d.name})`);
+    await tx.execute(sql`
+      INSERT INTO mail_box (user_id, message_id, thread_id, folder, is_read)
+      VALUES (${d.userId}, ${messageId}, ${threadId}, 'inbox', false)
+      ON CONFLICT (user_id, message_id) DO NOTHING`);
+    return { messageId, threadId, duplicate: false };
+  });
+  const messageId = stored.messageId;
+  if (stored.duplicate) return { messageId, threadId: stored.threadId, ruleActions: [] };
 
   // ---- THE FILTERS RUN, AT LAST, ON THE MESSAGE THAT JUST LANDED ---------------------------------
   //

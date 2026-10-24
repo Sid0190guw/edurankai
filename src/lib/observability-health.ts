@@ -394,8 +394,16 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   // personalisation lives in their own browser; these two carry an explicit save and explicit
   // recommendation feedback. Absent, the Save control reports honestly that saving is unavailable
   // and the governance page reports that it cannot read, rather than showing an empty chart.
-  { module: 'Career profiles', table: 'career_profiles', owner: 'src/lib/career-intel/store.ts' },
-  { module: 'Career recommendation feedback', table: 'career_feedback_events', owner: 'src/lib/career-intel/store.ts' },
+  // OWNER IS THE THING THAT CREATES THE TABLE IN PRODUCTION, NOT THE MODULE THAT SHAPES IT.
+  // These two named src/lib/career-intel/store.ts, whose own docblock says the opposite in as many
+  // words: "In production this returns immediately without running anything - ddlPermitted() is
+  // false there by design - which is exactly why db/career-intel-schema.sql exists". /admin/setup
+  // splits missing tables on `owner.startsWith('db/')`, so naming the module put both of these in
+  // the bucket labelled "still missing after this run" - reported to an operator as a failure of
+  // the Create module tables button, for two tables that button was never wired to create. The
+  // file below is the one to run, it exists, and it carries both CREATEs.
+  { module: 'Career profiles', table: 'career_profiles', owner: 'db/career-intel-schema.sql' },
+  { module: 'Career recommendation feedback', table: 'career_feedback_events', owner: 'db/career-intel-schema.sql' },
 
   // INVITATIONS TO APPLY, REGISTERED WITH THE FEATURE FOR THE SAME REASON AS THE TWO ABOVE.
   //
@@ -407,7 +415,12 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   // instead of rendering an empty list, and an invitation link resolves to the same "not usable"
   // page every dead link gets. What absence would NOT do is break an ordinary application — the
   // fee-waiver lookup falls through to the paid path it would have taken anyway.
-  { module: 'Invitations to apply', table: 'application_invitations', owner: 'src/lib/hiring/invitations.ts' },
+  // Same correction, and this file already used the right convention one entry down: the code_hash
+  // COLUMN on this very table is owned by 'db/application-invitations-code.sql'. The TABLE was
+  // attributed to the module, whose header states the production path plainly - "the table is
+  // created by db/application-invitations-schema.sql, run by hand ... ensureInvitationSchema()
+  // below is the local-development path only".
+  { module: 'Invitations to apply', table: 'application_invitations', owner: 'db/application-invitations-schema.sql' },
 
   // ============================================================================================
   // THE PAGES A PERSON CAN ACTUALLY OPEN, ADDED 2026-08-24 AFTER A REPO-WIDE SWEEP
@@ -533,7 +546,6 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   { module: 'Governance engine versions', table: 'hgov_engine_version', owner: 'db/horizon-governance-schema.sql' },
   { module: 'Retention policy', table: 'hgov_retention_policy', owner: 'db/horizon-governance-schema.sql' },
   { module: 'Erasure requests', table: 'hgov_erasure_request', owner: 'db/horizon-governance-schema.sql' },
-
 ];
 
 /**
@@ -928,6 +940,9 @@ export async function recordRelease(): Promise<void> {
 /** Does the database answer, and how fast. One statement, no DDL, no transaction. */
 export async function dbPing(): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
   const started = Date.now();
+  if (!process.env.DATABASE_URL) {
+    return { ok: false, latencyMs: Date.now() - started, error: 'DATABASE_URL is not set' };
+  }
   try {
     const { db, sql } = await ctx();
     await db.execute(sql`SELECT 1 AS ok`);

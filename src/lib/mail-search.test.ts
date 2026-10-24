@@ -9,12 +9,14 @@
 // and asserting the clauses is what turns it into something checkable — if a new operator is added
 // to the parser and not to the compiler, this suite fails rather than the migration.
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   parseSearchQuery, parseSize, parseWhen, formatSize, describeQuery, emptyQuery,
   isBroadQuery, toSearchDsl, encodeCursor, decodeCursor, SEARCH_HELP, COUNT_CAP,
 } from './mail-search';
 
 const NOW = new Date('2026-08-16T12:00:00+05:30');
+const MAIL_SEARCH_SOURCE = readFileSync(new URL('./mail-search.ts', import.meta.url), 'utf8');
 
 describe('operators', () => {
   it('reads the example from the brief', () => {
@@ -78,6 +80,17 @@ describe('operators', () => {
 
   it('an address domain strips a leading @', () => {
     expect(parseSearchQuery('domain:@university.edu').domain[0].value).toBe('university.edu');
+  });
+});
+
+describe('mailbox size query schema compatibility', () => {
+  it('calculates body size from canonical message fields instead of assuming mail_messages.body_bytes exists', () => {
+    expect(MAIL_SEARCH_SOURCE).not.toMatch(/\bm\.body_bytes\b/);
+    expect(MAIL_SEARCH_SOURCE).not.toMatch(/ALTER TABLE mail_messages ADD COLUMN IF NOT EXISTS body_bytes/);
+    expect(MAIL_SEARCH_SOURCE).toContain("octet_length(coalesce(m.subject, ''))");
+    expect(MAIL_SEARCH_SOURCE).toContain("octet_length(coalesce(m.body_text, ''))");
+    expect(MAIL_SEARCH_SOURCE).toContain("octet_length(coalesce(m.body_html, ''))");
+    expect(MAIL_SEARCH_SOURCE).toContain('${messageBodyBytesExpr()} AS body_bytes');
   });
 });
 

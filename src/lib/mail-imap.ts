@@ -12,8 +12,9 @@ import { sql } from 'drizzle-orm';
 // was told NOTHING — while the same message arriving through the webhook at /api/mail/inbound did
 // get a push. Whether you heard about your own mail depended on which transport the company was
 // using that week. See the block above deliverInbound() in src/lib/mail.ts.
-import { ensureMailSchema, resolveAddress, getMailConfig, deliverInbound } from '@/lib/mail';
-import { randomUUID } from 'node:crypto';
+import { ensureMailSchema, resolveInboundRecipients, getMailConfig, deliverInbound } from '@/lib/mail';
+import { normalizeInboundMessageId } from '@/lib/mail-inbound-routing';
+import { decodeMailSecret, encodeMailSecret } from '@/lib/mail-secrets';
 
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
@@ -87,9 +88,10 @@ export async function saveImapConfig(p: { host?: string; port?: number; user?: s
   await ensureMailSchema();
   await ensureImapSchema();
   const s = (v: any) => { const t = (v ?? '').toString().trim(); return t === '' ? null : t; };
+  const encryptedPass = encodeMailSecret(p.pass, 'imap_pass');
   await db.execute(sql`
     INSERT INTO mail_config (id, imap_host, imap_port, imap_user, imap_pass, imap_secure, updated_at)
-    VALUES (1, ${s(p.host)}, ${p.port == null ? null : Number(p.port)}, ${s(p.user)}, ${s(p.pass)},
+    VALUES (1, ${s(p.host)}, ${p.port == null ? null : Number(p.port)}, ${s(p.user)}, ${encryptedPass},
             ${p.secure == null ? null : !!p.secure}, NOW())
     ON CONFLICT (id) DO UPDATE SET
       imap_host = COALESCE(EXCLUDED.imap_host, mail_config.imap_host),
@@ -112,17 +114,21 @@ export async function getImapConfig() {
   // goes and re-enters credentials that were never lost. `configRead` travels with the config so a
   // caller can tell the two apart.
   let configRead = true;
-  try { row = rows(await db.execute(sql`SELECT imap_host, imap_port, imap_user, imap_pass, imap_secure, imap_last_uid, imap_last_run FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {}; }
+  let pass = '';
+  try {
+    row = rows(await db.execute(sql`SELECT imap_host, imap_port, imap_user, imap_pass, imap_secure, imap_last_uid, imap_last_run FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {};
+    pass = decodeMailSecret(row.imap_pass, 'imap_pass');
+  }
   catch (e: any) {
     configRead = false;
-    console.error('[mail-imap] IMAP config could not be read:', e?.cause?.message || e?.message);
+    console.error('[mail-imap] IMAP config or saved secret could not be read:', e?.cause?.message || e?.message);
   }
   return {
     configRead,
     host: row.imap_host || '',
     port: Number(row.imap_port || 993),
     user: row.imap_user || '',
-    pass: row.imap_pass || '',
+    pass,
     secure: row.imap_secure == null ? true : !!row.imap_secure,
     lastUid: Number(row.imap_last_uid || 0),
     lastRun: row.imap_last_run || null,
@@ -165,54 +171,57 @@ export async function pollImapInbox(opts: { force?: boolean; limit?: number } = 
         // was not processed.
         if (fetched >= limit) break;
         fetched++;
-        if (msg.uid > maxUid) maxUid = msg.uid;
+        let parsed: any;
         try {
-          const parsed = await simpleParser(msg.source as Buffer);
+          parsed = await simpleParser(msg.source as Buffer);
+        } catch (e: any) {
+          console.error('[mail-imap] MIME parse failed for UID', msg.uid, '-', e?.cause?.message || e?.message);
+          if (msg.uid > maxUid) maxUid = msg.uid;
+          continue;
+        }
+
+        try {
           const fromAddr = (parsed.from?.value?.[0]?.address || '').toString().toLowerCase();
           const fromName = (parsed.from?.value?.[0]?.name || '').toString().slice(0, 200);
-          const toList = (parsed.to as any)?.value || [];
+          const toList = [
+            ...((parsed.to as any)?.value || []),
+            ...((parsed.cc as any)?.value || []),
+          ];
           const toAddrs = toList.map((a: any) => a.address).filter(Boolean).map((a: string) => a.toLowerCase());
           const subject = (parsed.subject || '(no subject)').toString().slice(0, 500);
           const bodyText = (parsed.text || '').toString();
           const bodyHtml = (parsed.html || '').toString();
-          const rfcId = (parsed.messageId || `<${randomUUID()}@inbound>`).toString();
+          const rfcId = normalizeInboundMessageId(parsed.messageId, msg.source as Buffer);
           const inReplyTo = (parsed.inReplyTo || '').toString() || null;
 
           const seen = new Set<string>();
           for (const addr of toAddrs) {
-            const resolved = await resolveAddress(addr);
-            if (!resolved.userId || seen.has(resolved.userId)) continue;
-            seen.add(resolved.userId);
+            const recipients = await resolveInboundRecipients(addr);
+            for (const resolved of recipients) {
+              if (!resolved.userId || seen.has(resolved.userId)) continue;
+              seen.add(resolved.userId);
 
-            // DE-DUPLICATION STAYS HERE. It is the puller's own problem: a re-poll with `force`, or
-            // a watermark that went backwards, re-reads UIDs already delivered. deliverInbound() is
-            // deliberately not idempotent — the webhook is fired once per message by its sender — so
-            // this check must come BEFORE the call, not inside it.
-            const dupe = rows(await db.execute(sql`
-              SELECT 1 FROM mail_box b JOIN mail_messages m ON m.id = b.message_id
-              WHERE b.user_id = ${resolved.userId} AND m.rfc_message_id = ${rfcId} LIMIT 1
-            `));
-            if (dupe[0]) continue;
-
-            await deliverInbound({
-              userId: resolved.userId,
-              email: resolved.email,
-              name: resolved.name,
-              fromEmail: fromAddr, fromName, subject, bodyText, bodyHtml,
-              rfcMessageId: rfcId,
-              inReplyTo,
-            });
-            delivered++;
+              // deliverInbound() serializes and de-duplicates by RFC message id and user, so a
+              // forced poll or a retry after an interrupted delivery cannot create another copy.
+              await deliverInbound({
+                userId: resolved.userId,
+                email: resolved.email,
+                name: resolved.name,
+                fromEmail: fromAddr, fromName, subject, bodyText, bodyHtml,
+                rfcMessageId: rfcId,
+                inReplyTo,
+              });
+              delivered++;
+            }
           }
         } catch (e: any) {
-          // NOT A BARE catch (_) ANY MORE. This swallowed everything — a malformed MIME part, yes,
-          // but equally a failed INSERT or a database that had gone away — and the loop then recorded
-          // the UID as processed, so the message was never fetched again. Mail could be dropped
-          // permanently and the only outward sign was `fetched` exceeding `delivered` by a number
-          // nobody was looking at. The UID watermark still advances (a message that cannot be parsed
-          // must not wedge the poll for every message behind it), but the reason is now on the record.
-          console.error('[mail-imap] message UID', msg.uid, 'was NOT delivered -', e?.cause?.message || e?.message);
+          // Do not move the persisted UID watermark past a failed database write or identity lookup.
+          // The next poll retries this message; the shared delivery transaction makes earlier
+          // recipient copies idempotent if a multi-recipient delivery was only partly completed.
+          console.error('[mail-imap] delivery failed for UID', msg.uid, '-', e?.cause?.message || e?.message);
+          break;
         }
+        if (msg.uid > maxUid) maxUid = msg.uid;
       }
     } finally {
       lock.release();

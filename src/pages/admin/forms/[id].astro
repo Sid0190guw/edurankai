@@ -4,14 +4,59 @@ import { db } from '@/lib/db';
 import { canAccessSection } from '@/lib/auth/permissions';
 import { publicUrl } from '@/lib/public-origin';
 import { normalizeFormFields, validateFormForPublishing } from '@/lib/forms/form-schema';
+import { saveFormRoleLink } from '@/lib/forms/form-role-link';
+import { qrDataUri } from '@/lib/qr';
 import { sql } from 'drizzle-orm';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 if (user.role === 'applicant') return Astro.redirect('/portal');
+const canWrite = await canAccessSection(user as any, 'content', 'edit');
 
 const { id } = Astro.params;
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+let roles: any[] = [];
+let reviewers: any[] = [];
+let roleLink: any = null;
+let roleLinkSettingsAvailable = true;
+try {
+  roleLink = rows(await db.execute(sql`SELECT * FROM form_role_links WHERE form_id = ${id} LIMIT 1`))[0] || null;
+} catch (e: any) {
+  roleLinkSettingsAvailable = false;
+  console.error(
+    '[admin/forms] recruitment-link settings unavailable:',
+    e?.cause?.code || 'unknown database error',
+    e?.cause?.message || e?.message || 'Unknown error',
+  );
+}
+try {
+  roles = rows(await db.execute(sql`
+    SELECT r.id, r.title, r.slug, r.level, r.engagement_type, r.is_open, r.application_deadline
+    FROM roles r
+    WHERE (r.is_open = true AND (r.application_deadline IS NULL OR r.application_deadline > NOW()))
+       OR r.id = ${roleLink?.role_id || null}
+    ORDER BY r.title
+  `));
+} catch (e: any) {
+  roleLinkSettingsAvailable = false;
+  console.error(
+    '[admin/forms] Careers roles unavailable:',
+    e?.cause?.code || 'unknown database error',
+    e?.cause?.message || e?.message || 'Unknown error',
+  );
+}
+if (canWrite) {
+  try {
+    reviewers = rows(await db.execute(sql`
+      SELECT id, name
+      FROM users
+      WHERE is_active = true AND role IN ('hr', 'recruiter', 'reviewer', 'department_head')
+      ORDER BY name
+    `));
+  } catch (e: any) {
+    console.error('[admin/forms] reviewer list unavailable:', e?.cause?.message || e?.message);
+  }
+}
 // EVERY WRITE ON THIS PAGE WAS FRONTED BY user.role === 'applicant' AND NOTHING ELSE.
 //
 // src/middleware.ts maps this path to the content section and getViewableSectionKeys() enforces
@@ -24,8 +69,6 @@ function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 // section view/edit/export and reserves delete for super_admin, so asking for 'delete' here would
 // take an action away from a role that holds this section today. Narrowing it further is a policy
 // decision for a human; refusing a custom VIEW-ONLY role is the mechanism fix, and that is this.
-const canWrite = await canAccessSection(user as any, 'content', 'edit');
-
 let okMsg = '', errMsg = '';
 
 if (Astro.request.method === 'POST') {
@@ -42,17 +85,73 @@ if (Astro.request.method === 'POST') {
       const isPublished = fd.get('is_published') === 'on';
       const submittedFields = JSON.parse(fd.get('fields_json') as string || '[]');
       const fields = normalizeFormFields(submittedFields);
+      const linkedRoleId = String(fd.get('application_role_id') || '').trim();
+      const nameFieldKey = String(fd.get('application_name_key') || '').trim();
+      const emailFieldKey = String(fd.get('application_email_key') || '').trim();
+      const phoneFieldKey = String(fd.get('application_phone_key') || '').trim() || null;
+      const reviewerUserId = String(fd.get('application_reviewer_id') || '').trim() || null;
+      if (linkedRoleId) {
+        const role = roles.find((candidate) => String(candidate.id) === linkedRoleId);
+        const existingRoleId = roleLink?.role_id ? String(roleLink.role_id) : null;
+        if (!role || (!role.is_open && linkedRoleId !== existingRoleId) ||
+          (role.application_deadline && new Date(role.application_deadline).getTime() <= Date.now() && linkedRoleId !== existingRoleId)) {
+          throw new Error('Choose an open Careers role with a future deadline.');
+        }
+        if (feeChf > 0) throw new Error('Recruitment applications use the existing fee-free application policy.');
+        if (!fields.some((field) => field.key === nameFieldKey && field.type === 'text' && field.required)) {
+          throw new Error('Map the applicant name to a text question before linking this form.');
+        }
+        if (!fields.some((field) => field.key === emailFieldKey && field.type === 'email' && field.required)) {
+          throw new Error('Map the account email to an email question before linking this form.');
+        }
+        if (phoneFieldKey && !fields.some((field) => field.key === phoneFieldKey && field.type === 'phone')) {
+          throw new Error('The mapped phone question must use the phone type.');
+        }
+        if (reviewerUserId && !reviewers.some((candidate) => String(candidate.id) === reviewerUserId)) {
+          throw new Error('Choose an active HR, recruiter, reviewer, or department-head account for the assignment.');
+        }
+      }
       const publicationError = isPublished ? validateFormForPublishing(fields) : null;
       if (publicationError) throw new Error(publicationError);
-      await db.execute(sql`UPDATE forms SET title = ${title}, description = ${description}, fee_chf = ${feeChf}, success_message = ${successMessage}, is_published = ${isPublished}, fields = ${sql.raw("'" + JSON.stringify(fields).replace(/'/g, "''") + "'::jsonb")}, updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Saved.';
+      await db.transaction(async (tx) => {
+        await tx.execute(sql`UPDATE forms SET title = ${title}, description = ${description}, fee_chf = ${feeChf}, success_message = ${successMessage}, is_published = ${isPublished}, fields = ${JSON.stringify(fields)}::jsonb, updated_at = NOW() WHERE id = ${id}`);
+        await saveFormRoleLink(tx, {
+          available: roleLinkSettingsAvailable,
+          formId: String(id || ''),
+          existingRoleId: roleLink?.role_id ? String(roleLink.role_id) : null,
+          existingNameFieldKey: roleLink?.name_field_key ? String(roleLink.name_field_key) : null,
+          existingEmailFieldKey: roleLink?.email_field_key ? String(roleLink.email_field_key) : null,
+          existingPhoneFieldKey: roleLink?.phone_field_key ? String(roleLink.phone_field_key) : null,
+          existingReviewerUserId: roleLink?.reviewer_user_id ? String(roleLink.reviewer_user_id) : null,
+          roleId: linkedRoleId,
+          nameFieldKey,
+          emailFieldKey,
+          phoneFieldKey,
+          reviewerUserId,
+          createdBy: String(user.id),
+        });
+      });
+      okMsg = roleLinkSettingsAvailable
+        ? 'Saved.'
+        : 'Form settings saved. Recruitment-link settings were unavailable and left unchanged.';
     }
-  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'error'); }
+  } catch (e: any) {
+    console.error(
+      '[admin/forms] save failed:',
+      e?.cause?.code || 'unknown database error',
+      e?.cause?.message || e?.message || 'Unknown error',
+    );
+    errMsg = 'The form could not be saved. No changes were saved. Please try again or contact an administrator.';
+  }
 }
 
 const form: any = rows(await db.execute(sql`SELECT * FROM forms WHERE id = ${id} LIMIT 1`))[0];
 if (!form) return Astro.redirect('/admin/forms');
 const fields = normalizeFormFields(form.fields);
+const publicFormUrl = publicUrl('/f/' + form.slug);
+const publicFormQr = await qrDataUri(publicFormUrl, { size: 180 });
+const emailShareUrl = 'mailto:?subject=' + encodeURIComponent('Please complete this form: ' + form.title) +
+  '&body=' + encodeURIComponent(publicFormUrl);
 const responseUrl = new URL(Astro.request.url);
 const responseSearch = String(responseUrl.searchParams.get('q') || '').trim().slice(0, 120);
 const responsePageParam = Number.parseInt(responseUrl.searchParams.get('responsePage') || '1', 10);
@@ -162,7 +261,33 @@ const urlParts = (raw: string) => {
   <div class="admin-page" style="max-width:1000px;">
     <a href="/admin/forms" style="font-size:11px;color:#FF7040;text-decoration:none;font-weight:600;">&lt; All forms</a>
     <h1 class="admin-page-title" style="margin-top:8px;">{form.title}</h1>
-    <p class="admin-page-sub">Public link: <span style="font-family:monospace;color:#c8c3b8;">{publicUrl('/f/' + form.slug)}</span> <a href={'/f/' + form.slug + '?preview=1'} target="_blank" rel="noopener noreferrer" class="response-link">Preview form</a></p>
+    <section class="form-sharing" aria-labelledby="formSharingTitle">
+      <div class="form-sharing-heading">
+        <div>
+          <h2 id="formSharingTitle">Share and publish</h2>
+          <p>{form.is_published ? 'This form is publicly available.' : 'Publish this form before sharing it with respondents.'}</p>
+        </div>
+        <a href={'/f/' + form.slug + '?preview=1'} target="_blank" rel="noopener noreferrer" class="response-link">Preview form</a>
+      </div>
+      <label class="fl" for="publicFormUrl">Public respondent link</label>
+      <div class="form-share-row">
+        <input id="publicFormUrl" class="fi" value={publicFormUrl} readonly />
+        <button type="button" class="form-share-button" data-copy-target="publicFormUrl">Copy link</button>
+        <button type="button" class="form-share-button" data-share-form>Share</button>
+        <a class="form-share-button" href={emailShareUrl}>Share by email</a>
+        <a class="form-share-button" href={publicFormUrl} target="_blank" rel="noopener noreferrer">Open form</a>
+      </div>
+      <label class="fl" for="formEmbedCode">Responsive embed code</label>
+      <div class="form-share-row form-embed-row">
+        <textarea id="formEmbedCode" class="fi" rows="3" readonly>{`<iframe src="${publicFormUrl}" title="EduRankAI form" width="100%" height="800" loading="lazy"></iframe>`}</textarea>
+        <button type="button" class="form-share-button" data-copy-target="formEmbedCode">Copy embed</button>
+      </div>
+      {publicFormQr && <div class="form-qr">
+        <img src={publicFormQr} alt="QR code for the public form link" width="144" height="144" />
+        <span>Scan to open the respondent form</span>
+      </div>}
+      <p id="formShareStatus" role="status" aria-live="polite" class="form-share-status"></p>
+    </section>
     {errMsg && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 13px;margin:12px 0;font-size:12.5px;">{errMsg}</div>}
     {okMsg && <div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 13px;margin:12px 0;font-size:12.5px;">{okMsg}</div>}
 
@@ -177,6 +302,42 @@ const urlParts = (raw: string) => {
       <div style="margin-top:10px;"><label class="fl">Success message (after submit)</label><input name="success_message" value={form.success_message || ''} placeholder="Thanks! Your response is recorded." class="fi" /></div>
       <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#c8c3b8;margin-top:10px;cursor:pointer;"><input type="checkbox" name="is_published" checked={form.is_published} /> Published (publicly fillable)</label>
 
+      <section style="margin-top:16px;padding:14px;border:1px solid #39414d;border-radius:9px;">
+        <h2 style="font-size:13px;color:#fff;margin:0 0 5px;">Careers application link</h2>
+        <p class="field-note">Optionally link this form to one existing open role. The respondent must sign in with a verified applicant account; submissions create an application through the existing Careers workflow.</p>
+        {!roleLinkSettingsAvailable && <p role="alert" class="field-note">Recruitment-link settings could not be loaded. They are disabled and will be left unchanged when saving this form.</p>}
+        <label class="fl">Careers role</label>
+        <select name="application_role_id" class="fi" disabled={!roleLinkSettingsAvailable}>
+          <option value="">Not a recruitment form</option>
+          {roles.map((role: any) => <option value={role.id} selected={String(roleLink?.role_id || '') === String(role.id)}>{role.title} · {role.slug}{role.is_open && (!role.application_deadline || new Date(role.application_deadline).getTime() > Date.now()) ? '' : ' · currently linked, closed'}</option>)}
+        </select>
+        <label class="fl" style="margin-top:10px;">Assign new applications to (optional)
+          <select name="application_reviewer_id" class="fi" disabled={!roleLinkSettingsAvailable}>
+            <option value="">Leave unassigned</option>
+            {reviewers.map((reviewer: any) => <option value={reviewer.id} selected={String(roleLink?.reviewer_user_id || '') === String(reviewer.id)}>{reviewer.name}</option>)}
+          </select>
+        </label>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:10px;">
+            <label class="fl">Applicant name question
+              <select name="application_name_key" class="fi" disabled={!roleLinkSettingsAvailable}>
+                <option value="">Choose text question</option>
+                {fields.filter((field) => field.type === 'text').map((field) => <option value={field.key} selected={roleLink?.name_field_key === field.key}>{field.label}</option>)}
+              </select>
+            </label>
+            <label class="fl">Verified account email question
+              <select name="application_email_key" class="fi" disabled={!roleLinkSettingsAvailable}>
+                <option value="">Choose email question</option>
+                {fields.filter((field) => field.type === 'email').map((field) => <option value={field.key} selected={roleLink?.email_field_key === field.key}>{field.label}</option>)}
+              </select>
+            </label>
+            <label class="fl">Phone question (optional)
+              <select name="application_phone_key" class="fi" disabled={!roleLinkSettingsAvailable}>
+                <option value="">No phone question</option>
+                {fields.filter((field) => field.type === 'phone').map((field) => <option value={field.key} selected={roleLink?.phone_field_key === field.key}>{field.label}</option>)}
+              </select>
+            </label>
+        </div>
+      </section>
       <p style="font-size:12px;font-weight:700;color:#fff;margin:16px 0 8px;">Questions</p>
       <p class="field-note">This starts as a blank form. Selfie, location, and signature questions are always optional; respondents choose whether to provide them.</p>
       <div id="fieldList" style="display:flex;flex-direction:column;gap:8px;"></div>
@@ -359,10 +520,65 @@ const urlParts = (raw: string) => {
     .distribution-row{display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-top:1px solid #303640;color:#e3e7ed;font-size:11px}
     .distribution-row span{overflow-wrap:anywhere}
     .distribution-row strong{color:#8bc5ff}
+    .form-sharing{margin:14px 0;padding:15px;border:1px solid #39414d;border-radius:10px;background:#10141b}
+    .form-sharing-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+    .form-sharing-heading h2{margin:0;color:#fff;font-size:14px}
+    .form-sharing-heading p,.form-share-status{margin:4px 0 0;color:#aeb7c4;font-size:11px}
+    .form-share-row{display:flex;align-items:stretch;gap:8px;margin:5px 0 12px}
+    .form-share-row .fi{min-width:0;flex:1}
+    .form-share-button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;padding:8px 12px;border:1px solid #45505e;border-radius:7px;background:#202833;color:#f4f6f9;font-size:11px;font-weight:700;text-decoration:none;white-space:nowrap;cursor:pointer}
+    .form-share-button:hover{background:#2a3542}
+    .form-embed-row{align-items:flex-start}
+    .form-share-status:empty{display:none}
+    .form-qr{display:flex;align-items:center;gap:12px;color:#c8d0da;font-size:11px}
+    .form-qr img{width:112px;height:112px;border:5px solid #fff;border-radius:5px;background:#fff}
+    @media(max-width:640px){.form-share-row{flex-wrap:wrap}.form-share-row .fi{flex-basis:100%}.form-sharing-heading{align-items:flex-start;flex-direction:column}}
     @media(max-width:640px){.form-top-grid{grid-template-columns:1fr}.profile-value{grid-template-columns:1fr;gap:4px}.response-profile{min-width:270px}}
   </style>
   <script is:inline define:vars={{ initial: fields }}>
     (function () {
+      var shareStatus = document.getElementById('formShareStatus');
+      document.querySelectorAll('[data-copy-target]').forEach(function (button) {
+        button.addEventListener('click', function () {
+          var target = document.getElementById(button.getAttribute('data-copy-target'));
+          var value = target && ('value' in target ? target.value : target.textContent);
+          if (!value || !navigator.clipboard || !navigator.clipboard.writeText) {
+            shareStatus.textContent = 'Clipboard access is unavailable. Select and copy the text directly.';
+            if (target) { target.focus(); target.select(); }
+            return;
+          }
+          navigator.clipboard.writeText(value).then(function () {
+            shareStatus.textContent = button.getAttribute('data-copy-target') === 'publicFormUrl'
+              ? 'Public link copied.'
+              : 'Embed code copied.';
+          }).catch(function () {
+            shareStatus.textContent = 'Could not copy automatically. Select and copy the text directly.';
+            target.focus();
+            target.select();
+          });
+        });
+      });
+      var shareButton = document.querySelector('[data-share-form]');
+      if (shareButton) {
+        shareButton.addEventListener('click', function () {
+          var link = document.getElementById('publicFormUrl').value;
+          if (navigator.share) {
+            navigator.share({ title: document.querySelector('.admin-page-title').textContent, url: link })
+              .then(function () { shareStatus.textContent = 'Form shared.'; })
+              .catch(function (error) {
+                if (error && error.name !== 'AbortError') shareStatus.textContent = 'Sharing was unavailable. Copy the public link instead.';
+              });
+          } else if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(link).then(function () {
+              shareStatus.textContent = 'Public link copied. You can paste it into a message.';
+            }).catch(function () {
+              shareStatus.textContent = 'Could not share automatically. Copy the public link instead.';
+            });
+          } else {
+            shareStatus.textContent = 'Use Copy link to share this form.';
+          }
+        });
+      }
       var TYPES = ['text','textarea','email','phone','url','number','currency','percentage','duration','rating','linear_scale','date','time','datetime','select','radio','checkbox','yes_no','acknowledgment','selfie','location','signature'];
       var OPTIONAL_TYPES = ['selfie','location','signature'];
       var list = document.getElementById('fieldList');

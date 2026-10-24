@@ -46,6 +46,10 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
+// `live_classes.id` is a UUID PRIMARY KEY (see the CREATE below). `id::text = $1` casts every row
+// in the table before comparing, so a single-row primary-key lookup was reading the whole relation.
+// idEq() puts the cast on the PARAMETER instead, which is the same answer on an index.
+import { idEq } from '@/lib/workforce/scale';
 import { resolveVideoLink, safeResourceUrl, type VideoLinkKind } from '@/lib/video-embed';
 import { pricingFromRow, priceForUser } from '@/lib/course-pricing';
 
@@ -731,7 +735,7 @@ export async function resolveJoinTarget(
     row = rowsOf(await db.execute(sql`
       SELECT id, course_id, title, scheduled_at, duration_minutes, status, mode, time_zone,
              meet_url, board_session_id, recording_url, host_user_id
-        FROM live_classes WHERE id::text = ${sessionId} LIMIT 1`))[0];
+        FROM live_classes WHERE ${idEq(sql`id`, sessionId)} LIMIT 1`))[0];
   } catch (e: any) {
     logFail('resolveJoinTarget read ' + sessionId, e);
     return { ok: false, url: '', kind: null, status: 503, reason: 'That session could not be read just now. Try again in a moment.' };
@@ -934,7 +938,7 @@ export async function setSessionRecording(sessionId: string, recordingUrl: strin
     // re-entering a link.
     const done = rowsOf(await db.execute(sql`
       UPDATE live_classes SET recording_url = ${v.originalUrl}, is_recorded = true
-       WHERE id::text = ${sessionId} AND course_id IS NOT NULL
+       WHERE ${idEq(sql`id`, sessionId)} AND course_id IS NOT NULL
       RETURNING id`));
     if (done.length === 0) return { ok: false, id: null, error: 'No course session matched, so no recording was saved.' };
     return { ok: true, id: String(done[0].id), error: '' };
@@ -951,7 +955,7 @@ export async function updateSessionLink(sessionId: string, meetUrl: string): Pro
   try {
     const done = rowsOf(await db.execute(sql`
       UPDATE live_classes SET meet_url = ${v.url}
-       WHERE id::text = ${sessionId} AND course_id IS NOT NULL AND mode = 'external'
+       WHERE ${idEq(sql`id`, sessionId)} AND course_id IS NOT NULL AND mode = 'external'
       RETURNING id`));
     if (done.length === 0) {
       return { ok: false, id: null, error: 'No external course session matched, so the ' + MEETING_LINK_LABEL + ' was not changed.' };
@@ -968,7 +972,7 @@ export async function cancelCourseSession(sessionId: string): Promise<WriteResul
   try {
     const done = rowsOf(await db.execute(sql`
       UPDATE live_classes SET status = 'cancelled'
-       WHERE id::text = ${sessionId} AND course_id IS NOT NULL
+       WHERE ${idEq(sql`id`, sessionId)} AND course_id IS NOT NULL
       RETURNING id`));
     if (done.length === 0) return { ok: false, id: null, error: 'No course session matched, so nothing was cancelled.' };
     return { ok: true, id: String(done[0].id), error: '' };
@@ -983,7 +987,7 @@ export async function organiserBoardUrl(sessionId: string): Promise<string | nul
   if (!isUuid(sessionId)) return null;
   try {
     const row = rowsOf(await db.execute(sql`
-      SELECT board_session_id FROM live_classes WHERE id::text = ${sessionId} LIMIT 1`))[0];
+      SELECT board_session_id FROM live_classes WHERE ${idEq(sql`id`, sessionId)} LIMIT 1`))[0];
     const bs = row?.board_session_id ? String(row.board_session_id) : '';
     return bs ? '/aquintutor/board?session=' + encodeURIComponent(bs) : null;
   } catch (e: any) {

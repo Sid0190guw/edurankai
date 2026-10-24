@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeFormFields, validateFormAnswers, validateFormForPublishing } from '@/lib/forms/form-schema';
+import { FORM_FIELD_TYPES, normalizeFormFields, validateFormAnswers, validateFormForPublishing } from '@/lib/forms/form-schema';
 
 describe('normalizeFormFields', () => {
   it('normalizes configured questions and preserves stable question keys', () => {
@@ -12,6 +12,31 @@ describe('normalizeFormFields', () => {
     expect(fields.map((field) => field.key)).toEqual(['full_name', 'preferredName', 'optional_photo']);
     expect(fields[0].required).toBe(true);
     expect(fields[2].required).toBe(false);
+  });
+
+  it('renders saved JSON-serialized field definitions through the same schema', () => {
+    const saved = JSON.stringify([
+      { key: 'name', type: 'text', label: 'Full Name', required: true },
+      { key: 'email', type: 'email', label: 'Email', required: true },
+      { key: 'portfolio', type: 'url', label: 'Portfolio', required: false },
+    ]);
+
+    expect(normalizeFormFields(saved).map(({ key, type }) => ({ key, type }))).toEqual([
+      { key: 'name', type: 'text' },
+      { key: 'email', type: 'email' },
+      { key: 'portfolio', type: 'url' },
+    ]);
+    expect(() => normalizeFormFields('not-json')).toThrow('invalid saved JSON');
+  });
+
+  it('retains every supported question type in the authoritative definition', () => {
+    const fields = normalizeFormFields(FORM_FIELD_TYPES.map((type) => ({
+      type,
+      label: type,
+      options: ['select', 'radio', 'checkbox'].includes(type) ? ['Option A', 'Option B'] : [],
+    })));
+
+    expect(fields.map((field) => field.type)).toEqual(FORM_FIELD_TYPES);
   });
 
   it('does not rewrite duplicate legacy keys while reading an existing form', () => {

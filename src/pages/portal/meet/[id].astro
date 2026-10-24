@@ -3,6 +3,10 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 import SceneGL from '@/components/SceneGL.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+// The four room-state reads below are independent of one another. runFanout() bounds them as one
+// wave and can decline the ones not yet sent when the breaker opens partway through.
+import { runFanout, type FanoutMember } from '@/lib/db-fanout';
+import { DB_TIMEOUT_MS } from '@/lib/db-timeout';
 import { SCENE_EXAMPLE_IDS } from '@/lib/scene-examples';
 import {
   ensureMeetSchema, meetBlockReason, roomLookupSql, normaliseRoomCode,
@@ -253,30 +257,63 @@ let chat: any[] = [];
 let polls: any[] = [];
 let breakouts: any[] = [];
 
+// FOUR READS OF ONE ROOM, TAKEN AS A WAVE INSTEAD OF A QUEUE.
+//
+// Participants, chat, polls and breakouts are four different tables keyed on the same room id and
+// assigned to four different variables. None of them reads anything another one writes, so taking
+// them in turn bought nothing and cost four serial round trips on the render path of a live huddle,
+// each holding one of the instance's five pool slots while the next one waited.
+//
+// ERROR SEMANTICS ARE DELIBERATELY UNCHANGED. There is no error state in this page's markup: before
+// this, a read that rejected took the render down, and after it one still does — the wave is
+// inspected below and a degraded wave is re-thrown. Swallowing here would be worse than the bug it
+// replaced, because an empty participant list rendered as fact on a huddle screen is a claim that
+// nobody is in the room. What the wave adds is not tolerance, it is restraint: one bound over the
+// four, the breaker consulted BEFORE each statement is sent, and the members not yet dispatched
+// declined outright when it is open, instead of four more reads pushed into a pool that has already
+// been diagnosed as wedged.
 if (room) {
-  participants = rowsOf(await db.execute(sql`
-    SELECT user_id, display_name, role, joined_at, left_at, in_lobby
-    FROM meet_participants WHERE room_id = ${room.id}::uuid AND left_at IS NULL
-    ORDER BY joined_at ASC LIMIT 250
-  `));
-  chat = rowsOf(await db.execute(sql`
-    SELECT c.id, c.user_id, c.body, c.is_private_to, c.created_at, p.display_name
-    FROM meet_chat c
-    LEFT JOIN meet_participants p ON p.user_id = c.user_id AND p.room_id = c.room_id
-    WHERE c.room_id = ${room.id}::uuid AND (c.is_private_to IS NULL OR c.is_private_to = ${user.id}::uuid OR c.user_id = ${user.id}::uuid)
-    ORDER BY c.created_at DESC LIMIT 100
-  `));
-  chat = chat.reverse();
-  polls = rowsOf(await db.execute(sql`
-    SELECT id, question, options, votes, status, created_at
-    FROM meet_polls WHERE room_id = ${room.id}::uuid
-    ORDER BY created_at DESC LIMIT 20
-  `));
-  breakouts = rowsOf(await db.execute(sql`
-    SELECT id, label, participants, ends_at, created_at
-    FROM meet_breakouts WHERE room_id = ${room.id}::uuid
-    AND ends_at > NOW() ORDER BY created_at DESC LIMIT 20
-  `));
+  const roomBatch: FanoutMember[] = [
+    { label: 'participants', run: async () => {
+      participants = rowsOf(await db.execute(sql`
+        SELECT user_id, display_name, role, joined_at, left_at, in_lobby
+        FROM meet_participants WHERE room_id = ${room.id}::uuid AND left_at IS NULL
+        ORDER BY joined_at ASC LIMIT 250
+      `));
+    } },
+    { label: 'chat', run: async () => {
+      chat = rowsOf(await db.execute(sql`
+        SELECT c.id, c.user_id, c.body, c.is_private_to, c.created_at, p.display_name
+        FROM meet_chat c
+        LEFT JOIN meet_participants p ON p.user_id = c.user_id AND p.room_id = c.room_id
+        WHERE c.room_id = ${room.id}::uuid AND (c.is_private_to IS NULL OR c.is_private_to = ${user.id}::uuid OR c.user_id = ${user.id}::uuid)
+        ORDER BY c.created_at DESC LIMIT 100
+      `));
+      // Stays with its own read: the query orders newest-first for the LIMIT, and the screen wants
+      // oldest-first. Reversing anywhere else would depend on this member having already run.
+      chat = chat.reverse();
+    } },
+    { label: 'polls', run: async () => {
+      polls = rowsOf(await db.execute(sql`
+        SELECT id, question, options, votes, status, created_at
+        FROM meet_polls WHERE room_id = ${room.id}::uuid
+        ORDER BY created_at DESC LIMIT 20
+      `));
+    } },
+    { label: 'breakouts', run: async () => {
+      breakouts = rowsOf(await db.execute(sql`
+        SELECT id, label, participants, ends_at, created_at
+        FROM meet_breakouts WHERE room_id = ${room.id}::uuid
+        AND ends_at > NOW() ORDER BY created_at DESC LIMIT 20
+      `));
+    } },
+  ];
+  const wave = await runFanout(roomBatch, { label: 'portalMeet.room', ms: DB_TIMEOUT_MS });
+  if (wave.degraded) {
+    // Same outcome the sequential version produced for the same failure, and it names which reads
+    // never answered — which the sequential version could not, because it stopped at the first.
+    throw new Error('[portal/meet] room state could not be read: ' + wave.unread.join(', '));
+  }
 }
 
 const roomTitle = room?.title || 'Untitled huddle';

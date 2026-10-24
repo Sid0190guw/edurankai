@@ -79,6 +79,13 @@ function fieldKey(raw: unknown, label: string, index: number): string {
 
 /** Validate and normalize stored JSONB form fields without mutating existing submissions. */
 export function normalizeFormFields(input: unknown): FormField[] {
+  if (typeof input === 'string') {
+    try {
+      input = JSON.parse(input);
+    } catch {
+      throw new Error('Questions contain invalid saved JSON.');
+    }
+  }
   if (!Array.isArray(input)) throw new Error('Questions must be a list.');
   if (input.length > 120) throw new Error('A form can have at most 120 questions.');
 

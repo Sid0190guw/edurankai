@@ -5,17 +5,13 @@
 // is absent, falls back to the saved mail_config row.
 import type { APIRoute } from 'astro';
 import nodemailer from 'nodemailer';
-import { db } from '@/lib/db';
-import { sql } from 'drizzle-orm';
-import { getMailboxAddress, getMailConfig, ensureMailSchema } from '@/lib/mail';
+import { getMailboxAddress, getMailConfig } from '@/lib/mail';
 import { sendExternal } from '@/lib/mail-transport';
 import { can } from '@/lib/auth/permissions';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
-function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
-
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any).user;
   // THIS ROUTE SENDS REAL MAIL FROM THE COMPANY MAILBOX, and its gate was `role !== 'applicant'` —
@@ -43,18 +39,13 @@ export const POST: APIRoute = async ({ request, locals }) => {
   // the inline pass is blank (so admins don't have to re-type it).
   if (inlineHost) {
     try {
-      await ensureMailSchema();
       let inlinePass = (body.pass || '').toString();
       if (!inlinePass) {
-        try {
-          const r = rows(await db.execute(sql`SELECT smtp_pass FROM mail_config WHERE id = 1 LIMIT 1`))[0] as any;
-          inlinePass = (r?.smtp_pass || '').toString();
-        } catch (e: any) {
-          // Swallowed, an unreadable saved password produced an EMPTY password, the server answered
-          // "authentication failed", and this endpoint's own hint tells the operator their username
-          // or app password is wrong. It is neither.
-          console.error('[api/mail/test] saved SMTP password could not be read:', String(e?.cause?.message || e?.message || 'unknown error'));
+        const savedConfig = await getMailConfig();
+        if (savedConfig.readError || savedConfig.secretErrors.smtp_pass) {
+          return json({ ok: false, error: 'The saved SMTP password could not be read. Nothing was sent; retry after checking the encryption key configuration.' }, 503);
         }
+        inlinePass = savedConfig.smtpPass;
       }
       const inlineUser = (body.user || '').toString().trim();
       const inlinePort = Number(body.port || 587);
@@ -105,6 +96,9 @@ export const POST: APIRoute = async ({ request, locals }) => {
   // operator to type their SMTP credentials in again — over a configuration that was intact.
   if (cfg.readError) {
     return json({ ok: false, error: 'The saved mail configuration could not be read, so nothing was sent and nothing is known about your settings: ' + cfg.readError + ' Do not re-enter credentials on the strength of this — retry in a moment.' }, 503);
+  }
+  if (cfg.secretErrors.smtp_pass) {
+    return json({ ok: false, error: cfg.secretErrors.smtp_pass + ' Nothing was sent.' }, 503);
   }
   if (cfg.source === 'none') {
     return json({ ok: false, error: 'No transport configured. Fill the SMTP host, username and password in the form above, then either click "Verify connection" or paste the values into Send test (it will use whatever is in the form, even before Save).' }, 400);

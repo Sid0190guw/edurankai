@@ -4,8 +4,13 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { denyAdminApi } from '@/lib/auth/api-guard';
 import { csvCell } from '@/lib/csv';
+import { normalizeFormFields, type FormField } from '@/lib/forms/form-schema';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+function dbErrorMessage(error: unknown): string {
+  const cause = (error as any)?.cause;
+  return String(cause?.message || (error as any)?.message || 'unknown error');
+}
 
 export const GET: APIRoute = async ({ params, locals }) => {
   // Bulk CSV of every respondent's name, email and phone for one form. It sits outside /admin, so
@@ -19,17 +24,28 @@ export const GET: APIRoute = async ({ params, locals }) => {
   const id = params.id;
   const form: any = rows(await db.execute(sql`SELECT slug, fields FROM forms WHERE id = ${id} LIMIT 1`))[0];
   if (!form) return new Response('Not found', { status: 404 });
-  const fields = Array.isArray(form.fields) ? form.fields : [];
+  let fields: FormField[];
+  try {
+    fields = normalizeFormFields(form.fields);
+  } catch (error) {
+    console.error('[forms/export] invalid saved form definition:', dbErrorMessage(error));
+    return new Response('This form has an invalid question definition and cannot be exported.', { status: 500 });
+  }
   const resp = rows(await db.execute(sql`SELECT * FROM form_responses WHERE form_id = ${id} ORDER BY created_at ASC`));
 
-  const headers = ['submitted_at', 'name', 'email', 'phone', 'payment_status', ...fields.map((f: any) => f.label)];
+  const headers = ['submitted_at', 'name', 'email', 'phone', 'payment_status', ...fields.map((f) => f.label)];
   const lines = [headers.map(csvCell).join(',')];
   for (const r of resp as any[]) {
     const d = r.data || {};
-    const line = [r.created_at, r.respondent_name, r.respondent_email, r.respondent_phone, r.payment_status, ...fields.map((f: any) => d[f.key])];
+    const line = [r.created_at, r.respondent_name, r.respondent_email, r.respondent_phone, r.payment_status, ...fields.map((f) => d[f.key])];
     lines.push(line.map(csvCell).join(','));
   }
+  const filename = String(form.slug || 'form').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80) || 'form';
   return new Response(lines.join('\n'), {
-    headers: { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="' + (form.slug || 'form') + '-responses.csv"' },
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${filename}-responses.csv"`,
+      'Cache-Control': 'private, no-store',
+    },
   });
 };

@@ -3,6 +3,9 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { canAccessSection } from '@/lib/auth/permissions';
 import { sql } from 'drizzle-orm';
+// The five event-detail reads below are independent of one another once `ev` has gated the page.
+import { runFanout, type FanoutMember } from '@/lib/db-fanout';
+import { DB_TIMEOUT_MS } from '@/lib/db-timeout';
 import { issueArtifact } from '@/lib/issue-artifact';
 import { ARTIFACT_TYPES, ARTIFACT_LABELS, ARTIFACT_TITLES, isArtifactType } from '@/lib/event-cert';
 
@@ -134,11 +137,39 @@ if (Astro.request.method === 'POST') {
 const ev: any = rows(await db.execute(sql`SELECT * FROM events WHERE id = ${id} LIMIT 1`))[0];
 if (!ev) return Astro.redirect('/admin/events');
 
-const levels = rows(await db.execute(sql`SELECT * FROM event_levels WHERE event_id = ${id} ORDER BY sort_order ASC, created_at ASC`));
-const regs = rows(await db.execute(sql`SELECT * FROM event_registrations WHERE event_id = ${id} ORDER BY created_at DESC`));
-const progress = rows(await db.execute(sql`SELECT * FROM event_level_progress WHERE event_id = ${id}`));
-const certs = rows(await db.execute(sql`SELECT * FROM event_certificates WHERE event_id = ${id} ORDER BY issued_at DESC`));
-const tests = rows(await db.execute(sql`SELECT slug, title FROM tests ORDER BY created_at DESC LIMIT 200`));
+// FIVE INDEPENDENT READS, AND THE ONE THEY ARE NOT INDEPENDENT OF STAYS ABOVE THEM.
+//
+// `ev` is read on its own and still gates the page — `if (!ev) return Astro.redirect(...)` runs
+// before any of this, so a request for an event that does not exist sends nothing further to the
+// database. That ordering is a real dependency and is preserved exactly.
+//
+// The five below are not: four are keyed on the same route parameter and the fifth (the test list
+// for the level picker) is keyed on nothing at all. They were five serial round trips holding one
+// pool slot each in turn, on an admin page reached from a list where several tabs get opened at
+// once. They are now one bounded wave at the scheduler's concurrency.
+//
+// `let` rather than `const`, because a thunk assigns them — and declared before the wave, because
+// `const` is not hoisted and reading one of these above its declaration is a defect this project has
+// shipped before. Error semantics are unchanged: this page has no partial-failure state, a rejected
+// read used to take the render down, and a degraded wave still does.
+let levels: any[] = [];
+let regs: any[] = [];
+let progress: any[] = [];
+let certs: any[] = [];
+let tests: any[] = [];
+{
+  const eventBatch: FanoutMember[] = [
+    { label: 'levels', run: async () => { levels = rows(await db.execute(sql`SELECT * FROM event_levels WHERE event_id = ${id} ORDER BY sort_order ASC, created_at ASC`)); } },
+    { label: 'registrations', run: async () => { regs = rows(await db.execute(sql`SELECT * FROM event_registrations WHERE event_id = ${id} ORDER BY created_at DESC`)); } },
+    { label: 'progress', run: async () => { progress = rows(await db.execute(sql`SELECT * FROM event_level_progress WHERE event_id = ${id}`)); } },
+    { label: 'certificates', run: async () => { certs = rows(await db.execute(sql`SELECT * FROM event_certificates WHERE event_id = ${id} ORDER BY issued_at DESC`)); } },
+    { label: 'tests', run: async () => { tests = rows(await db.execute(sql`SELECT slug, title FROM tests ORDER BY created_at DESC LIMIT 200`)); } },
+  ];
+  const wave = await runFanout(eventBatch, { label: 'adminEvent.detail', ms: DB_TIMEOUT_MS });
+  if (wave.degraded) {
+    throw new Error('[admin/events] event detail could not be read: ' + wave.unread.join(', '));
+  }
+}
 
 // index progress by reg|level
 const progIdx: Record<string, any> = {};

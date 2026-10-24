@@ -131,6 +131,32 @@ ok('an empty schedule falls back to daily', cronIntervalHours('') === 24);
 ok('every bootstrap module names a distinct table', new Set(BOOTSTRAP_MODULES.map((m) => m.table)).size === BOOTSTRAP_MODULES.length);
 ok('the error log itself is monitored', BOOTSTRAP_MODULES.some((m) => m.table === 'edu_error_log'));
 
+// ---- the owner string is load-bearing, not documentation ----
+//
+// /admin/setup sorts every MISSING table into one of three buckets by reading `owner`, and each
+// bucket is a different sentence to an operator: `db/…` is a file to apply by hand, `src/pages/…`
+// is built by the screen that uses it on first visit, and anything else is something the "Create
+// module tables" button is expected to have made — which, when it is still missing, is reported as
+// a failure. An owner in none of those three shapes silently lands in the failure bucket, so a
+// typo'd or new prefix would accuse the button of breaking. This asserts the shape rather than the
+// spelling of any one entry.
+const OWNER_SHAPES = ['db/', 'src/pages/', 'src/lib/'];
+const strayOwners = BOOTSTRAP_MODULES.filter((m) => !OWNER_SHAPES.some((p) => m.owner.startsWith(p)));
+ok('every monitored table names its creator in a shape /admin/setup can classify',
+  strayOwners.length === 0, strayOwners.map((m) => m.table + ' -> ' + m.owner));
+
+// The three that were attributed to the module which SHAPES them rather than the file that CREATES
+// them in production. Both modules say so in their own headers — career-intel/store.ts ("in
+// production this returns immediately … which is exactly why db/career-intel-schema.sql exists")
+// and hiring/invitations.ts ("the table is created by db/application-invitations-schema.sql, run by
+// hand"). While they named the module, /admin/setup put all three under "still missing after this
+// run", telling an operator the button had failed at something it was never wired to do.
+for (const t of ['career_profiles', 'career_feedback_events', 'application_invitations']) {
+  const row = BOOTSTRAP_MODULES.find((m) => m.table === t);
+  ok('"' + t + '" is owned by the SQL file that creates it in production, not by a module',
+    !!row && row.owner.startsWith('db/'), row?.owner);
+}
+
 // ---- column catalogue: the blind spot the table list cannot see ----
 ok('every monitored column names a distinct table.column',
   new Set(BOOTSTRAP_COLUMNS.map((c) => c.table + '.' + c.column)).size === BOOTSTRAP_COLUMNS.length);

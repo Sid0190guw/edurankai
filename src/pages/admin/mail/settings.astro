@@ -21,7 +21,7 @@ function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 // later declaration throws on its first line. The real Postgres reason is on e.cause; e.message is
 // only the SQL that failed.
 const dbReason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
-let okMsg = '', errMsg = '';
+let okMsg = '', errMsg = '', generatedInboundSecret = '';
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
@@ -48,17 +48,20 @@ if (Astro.request.method === 'POST') {
       try {
         const cur = rows(await db.execute(sql`SELECT inbound_secret FROM mail_config WHERE id = 1 LIMIT 1`))[0] as any;
         if (!cur?.inbound_secret) {
-          await saveMailConfig({ inboundSecret: randomBytes(24).toString('hex') });
+          generatedInboundSecret = randomBytes(24).toString('hex');
+          await saveMailConfig({ inboundSecret: generatedInboundSecret });
         }
       } catch (e: any) {
+        generatedInboundSecret = '';
         console.error('[admin/mail/settings] inbound secret auto-mint failed:', dbReason(e));
         errMsg = 'SMTP was saved, but the inbound secret could not be minted (' + dbReason(e) + '). Generate one below before pointing an MTA at /api/mail/inbound.';
       }
-      okMsg = 'SMTP settings saved. Use "Verify connection" above the form to confirm the server accepts auth.';
+      okMsg = 'SMTP settings saved. Use "Verify connection" above the form to confirm the server accepts auth.'
+        + (generatedInboundSecret ? ' The new inbound secret is shown once below; copy it into the forwarding service secret now.' : '');
     } else if (action === 'gen_inbound') {
-      const secret = randomBytes(24).toString('hex');
-      await saveMailConfig({ inboundSecret: secret });
-      okMsg = 'New inbound secret generated.';
+      generatedInboundSecret = randomBytes(24).toString('hex');
+      await saveMailConfig({ inboundSecret: generatedInboundSecret });
+      okMsg = 'New inbound secret generated. Copy it now and update the forwarding service secret; it will not be shown again.';
     } else if (action === 'clear_smtp') {
       try {
         await clearMailField('smtp_host');
@@ -113,6 +116,7 @@ if (Astro.request.method === 'POST') {
       okMsg = 'IMAP settings saved. Click "Verify IMAP" to confirm, then "Check now" to fetch.';
     }
   } catch (e: any) {
+    generatedInboundSecret = '';
     // e.message on a drizzle/postgres-js error is the failed SQL STATEMENT, table and column names
     // included, handed to the operator; the database's actual complaint sits unread on e.cause. And
     // nothing was logged at all, so a save that never happened left no trace for anyone asked later.
@@ -130,7 +134,7 @@ const cfg = await getMailConfig();
 let raw: any = {};
 let rawError = cfg.readError;
 try {
-  raw = rows(await db.execute(sql`SELECT smtp_host, smtp_port, smtp_user, smtp_secure, COALESCE(smtp_insecure, false) AS smtp_insecure, from_name, from_address, inbound_secret, (smtp_pass IS NOT NULL AND smtp_pass <> '') AS has_pass, (resend_api_key IS NOT NULL AND resend_api_key <> '') AS has_resend FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {};
+  raw = rows(await db.execute(sql`SELECT smtp_host, smtp_port, smtp_user, smtp_secure, COALESCE(smtp_insecure, false) AS smtp_insecure, from_name, from_address, (inbound_secret IS NOT NULL AND inbound_secret <> '') AS has_inbound_secret, (smtp_pass IS NOT NULL AND smtp_pass <> '') AS has_pass, (resend_api_key IS NOT NULL AND resend_api_key <> '') AS has_resend FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {};
 } catch (e: any) {
   rawError = dbReason(e);
   console.error('[admin/mail/settings] mail_config read failed:', rawError);
@@ -194,6 +198,12 @@ const imapHasPass = !!imap.pass;
         <strong>The saved mail configuration could not be read, so nothing below describes it.</strong>
         <span style="display:block;margin-top:5px;color:#e6d08a;">{rawError}</span>
         <span style="display:block;margin-top:5px;">The fields are showing defaults, not your settings. Do not retype credentials and do not regenerate the inbound secret until this reads clean — the live values are almost certainly still there.</span>
+      </div>
+    )}
+    {(cfg.secretErrors.smtp_pass || cfg.secretErrors.imap_pass || cfg.secretErrors.resend_api_key || cfg.secretErrors.inbound_secret) && (
+      <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.30);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:8px;margin-bottom:16px;">
+        <strong>A saved mail secret could not be decrypted.</strong>
+        <span style="display:block;margin-top:5px;">Check that the active and historical DATA_ENCRYPTION_KEY values are present in deployment secrets. Do not clear or overwrite the saved credential until its encryption key is restored.</span>
       </div>
     )}
 
@@ -337,7 +347,7 @@ const imapHasPass = !!imap.pass;
       </div>
       <div>
         <label class="rolefield-label">x-mail-secret</label>
-        <input class="rolefield-input" readonly value={raw.inbound_secret || '(not generated yet)'} onclick="this.select()" style="font-family:'Geist Mono',monospace;" />
+        <input class="rolefield-input" readonly value={generatedInboundSecret || (raw.has_inbound_secret ? 'Configured; secret value hidden. Regenerate to issue a replacement.' : '(not generated yet)')} onclick="this.select()" style="font-family:'Geist Mono',monospace;" />
       </div>
       <div style="background:var(--o-panel,#08080a);border:1px solid var(--o-stroke,#1f1f26);border-radius:8px;padding:10px;font-family:'Geist Mono',monospace;font-size:11px;color:#6ee7b7;line-height:1.7;overflow-x:auto;">
         <div>POST {inboundUrl}</div>
@@ -345,7 +355,7 @@ const imapHasPass = !!imap.pass;
         <div>{'{ "to":"you@edurankai.in", "from":"alice@gmail.com", "fromName":"Alice",'}</div>
         <div>{'  "subject":"Hi", "text":"...", "html":"...", "messageId":"<..>", "inReplyTo":"<..>" }'}</div>
       </div>
-      <div><button type="submit" class="admin-btn" style="padding:8px 16px;font-size:12px;">{raw.inbound_secret ? 'Regenerate secret' : 'Generate secret'}</button></div>
+      <div><button type="submit" class="admin-btn" style="padding:8px 16px;font-size:12px;">{raw.has_inbound_secret ? 'Regenerate secret' : 'Generate secret'}</button></div>
     </form>
   </div>
 

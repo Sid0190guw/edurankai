@@ -448,29 +448,26 @@ export function decodeCursor(c: string | null | undefined): { t: string; id: str
 }
 
 // =================================================================================================
-// SCHEMA — additive, idempotent, and generated rather than triggered
+// SCHEMA — additive and idempotent
 // =================================================================================================
 //
-// `search_tsv` and `body_bytes` are GENERATED ... STORED. Both expressions are immutable
-// (to_tsvector with an explicit regconfig, regexp_replace, octet_length, coalesce), which is what
-// Postgres requires and what makes the columns impossible to leave stale. A trigger would have been
-// one more thing for an inbound path to forget.
+// `search_tsv` is GENERATED ... STORED. Its expression is immutable (to_tsvector with an explicit
+// regconfig), which is what Postgres requires and what makes the column impossible to leave stale.
+// Message size is calculated from the base body columns in the listing query: it must not depend on
+// a generated column that is absent from the canonical mail schema.
 //
-// Attachment bytes are deliberately NOT in body_bytes: attachments arrive as their own rows after
-// the message is inserted, so a generated column cannot see them. `larger:`/`smaller:` therefore
-// add the attachment sum with a LATERAL only when one of those operators is present — see
-// buildFrom(). Attachments stored as links have no recorded size and count as zero; the search
-// help text says so rather than pretending the number is complete.
-let searchSchemaReady: Promise<{ fts: boolean; bytes: boolean }> | null = null;
+// Attachment bytes are added separately with a LATERAL only when a size operator is present.
+// Attachments stored as links have no recorded size and count as zero; the search help text says so
+// rather than pretending the number is complete.
+let searchSchemaReady: Promise<{ fts: boolean }> | null = null;
 
-export function ensureSearchSchema(): Promise<{ fts: boolean; bytes: boolean }> {
+export function ensureSearchSchema(): Promise<{ fts: boolean }> {
   if (!searchSchemaReady) searchSchemaReady = bootstrapSearchSchema();
   return searchSchemaReady;
 }
 
-async function bootstrapSearchSchema(): Promise<{ fts: boolean; bytes: boolean }> {
+async function bootstrapSearchSchema(): Promise<{ fts: boolean }> {
   let fts = false;
-  let bytes = false;
   try {
     await db.execute(sql`
       ALTER TABLE mail_messages ADD COLUMN IF NOT EXISTS search_tsv tsvector
@@ -486,16 +483,6 @@ async function bootstrapSearchSchema(): Promise<{ fts: boolean; bytes: boolean }
     // and reported on every page through `degraded` so nobody concludes the index is working.
     console.error('[mail-search] full-text column unavailable, falling back to ILIKE:', reasonOf(e));
   }
-  try {
-    await db.execute(sql`
-      ALTER TABLE mail_messages ADD COLUMN IF NOT EXISTS body_bytes BIGINT
-      GENERATED ALWAYS AS (
-        octet_length(coalesce(subject, '')) + octet_length(coalesce(body_text, '')) + octet_length(coalesce(body_html, ''))
-      ) STORED`);
-    bytes = true;
-  } catch (e: any) {
-    console.error('[mail-search] size column unavailable, larger:/smaller: will be ignored:', reasonOf(e));
-  }
   // Paging walks (user_id, folder, created_at DESC) — already indexed by mail.ts. These two cover
   // the label rail and the starred rail, which had no index of their own and were sequential scans.
   try {
@@ -510,12 +497,16 @@ async function bootstrapSearchSchema(): Promise<{ fts: boolean; bytes: boolean }
   try {
     await db.execute(sql`CREATE INDEX IF NOT EXISTS mail_attach_name_idx ON mail_attachments(lower(filename))`);
   } catch (e: any) { console.error('[mail-search] filename index:', reasonOf(e)); }
-  return { fts, bytes };
+  return { fts };
 }
 
 // =================================================================================================
 // POSTGRES PROVIDER
 // =================================================================================================
+
+function messageBodyBytesExpr() {
+  return sql`(octet_length(coalesce(m.subject, ''))::bigint + octet_length(coalesce(m.body_text, ''))::bigint + octet_length(coalesce(m.body_html, ''))::bigint)`;
+}
 
 /** A term is turned into a websearch tsquery. Postgres parses the quoting; we do not hand-build it. */
 function ftsExpression(terms: Matcher[]): string {
@@ -544,7 +535,7 @@ class PostgresSearchProvider implements MailSearchProvider {
     const degraded: string[] = [];
 
     const { where, scopeLabel, wide } = buildWhere(q, ctx.userId, scope, caps, degraded);
-    const sizeJoin = (q.largerThan != null || q.smallerThan != null) && caps.bytes
+    const sizeJoin = (q.largerThan != null || q.smallerThan != null)
       ? sql`LEFT JOIN LATERAL (SELECT COALESCE(SUM(a.size_bytes), 0)::bigint AS att_bytes FROM mail_attachments a WHERE a.message_id = m.id) sz ON true`
       : sql``;
 
@@ -572,7 +563,7 @@ class PostgresSearchProvider implements MailSearchProvider {
                b.created_at AS box_created,
                m.subject, m.snippet, m.from_name, m.from_email, m.from_user_id,
                m.has_attachments, m.direction, m.is_draft, m.created_at AS msg_created,
-               ${caps.bytes ? sql`m.body_bytes` : sql`NULL::bigint AS body_bytes`},
+               ${messageBodyBytesExpr()} AS body_bytes,
                ${rankExpr} AS rank
         FROM mail_box b
         JOIN mail_messages m ON m.id = b.message_id
@@ -736,7 +727,7 @@ export function buildWhere(
   q: SearchQuery,
   userId: string,
   scope: SearchScope,
-  caps: { fts: boolean; bytes: boolean },
+  caps: { fts: boolean },
   degraded: string[],
 ): { where: any; scopeLabel: string; wide: boolean } {
   let where = sql`b.user_id = ${userId}`;
@@ -787,12 +778,8 @@ export function buildWhere(
   if (q.before) where = sql`${where} AND m.created_at < ${q.before.toISOString()}::timestamptz`;
 
   if (q.largerThan != null || q.smallerThan != null) {
-    if (!caps.bytes) {
-      degraded.push('Message size is not recorded on this database yet, so larger:/smaller: were ignored.');
-    } else {
-      if (q.largerThan != null) where = sql`${where} AND (COALESCE(m.body_bytes,0) + sz.att_bytes) > ${q.largerThan}`;
-      if (q.smallerThan != null) where = sql`${where} AND (COALESCE(m.body_bytes,0) + sz.att_bytes) < ${q.smallerThan}`;
-    }
+    if (q.largerThan != null) where = sql`${where} AND (${messageBodyBytesExpr()} + sz.att_bytes) > ${q.largerThan}`;
+    if (q.smallerThan != null) where = sql`${where} AND (${messageBodyBytesExpr()} + sz.att_bytes) < ${q.smallerThan}`;
   }
 
   for (const t of q.from) {

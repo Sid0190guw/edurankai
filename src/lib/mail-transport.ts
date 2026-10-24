@@ -161,6 +161,16 @@ export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
     }
   };
 
+  if (c.readError) {
+    await logLine('failed', 'Saved mail configuration could not be read; send refused.');
+    return { ok: false, provider: 'none', error: 'Saved mail configuration could not be read. Nothing was sent; retry after the mail settings are available.' };
+  }
+
+  if (c.secretErrors.smtp_pass) {
+    await logLine('failed', c.secretErrors.smtp_pass);
+    return { ok: false, provider: 'smtp', error: c.secretErrors.smtp_pass };
+  }
+
   if (!c.smtpHost) {
     await logLine('no_transport', 'No SMTP configured');
     return { ok: false, provider: 'none', error: 'No SMTP transport configured (add your mail server in Mail Settings)' };

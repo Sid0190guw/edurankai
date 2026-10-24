@@ -4,17 +4,13 @@
 // auth without committing values. Falls back to the saved password (DB) when
 // the body omits one.
 import type { APIRoute } from 'astro';
-import { db } from '@/lib/db';
-import { sql } from 'drizzle-orm';
-import { ensureMailSchema } from '@/lib/mail';
+import { getMailConfig } from '@/lib/mail';
 import { verifySmtp } from '@/lib/mail-transport';
 import { can } from '@/lib/auth/permissions';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
-function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
-
 export const POST: APIRoute = async ({ request, locals }) => {
   // `!user || user.role === 'applicant'` -> the ability, asked for by name. MECHANISM, NOT POLICY:
   // `mail.manage` is granted in PERMS_BY_ROLE to exactly the ten non-applicant built-in roles, which
@@ -41,19 +37,15 @@ export const POST: APIRoute = async ({ request, locals }) => {
   // password - breaks mail for real. A read that failed is now said out loud instead of tested.
   let pass = (body.pass || '').toString();
   if (!pass) {
-    try {
-      await ensureMailSchema();
-      const r = rows(await db.execute(sql`SELECT smtp_pass FROM mail_config WHERE id = 1 LIMIT 1`))[0] as any;
-      pass = (r?.smtp_pass || '').toString();
-    } catch (e: any) {
-      const reason = String(e?.cause?.message || e?.message || 'unknown error');
-      console.error('[api/mail/verify] saved password read failed:', reason);
+    const config = await getMailConfig();
+    if (config.readError || config.secretErrors.smtp_pass) {
       return json({
         ok: false,
-        error: 'The saved SMTP password could not be read (' + reason + '), so nothing was tested. '
+        error: 'The saved SMTP password could not be read, so nothing was tested. '
           + 'This is NOT an authentication failure - do not change the password on the strength of it.',
       }, 503);
     }
+    pass = config.smtpPass;
   }
 
   const res = await verifySmtp({

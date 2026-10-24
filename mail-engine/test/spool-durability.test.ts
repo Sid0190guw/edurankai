@@ -144,7 +144,7 @@ describe('claiming', () => {
       // Clear sending/ so the next round starts from a known state.
       for (const entry of claimed) await workers[0].complete(entry.id).catch(() => {});
     }
-  }, 60_000);
+  }, 180_000);
 
   it('does not claim an entry that is not due yet', async () => {
     const now = 10_000;

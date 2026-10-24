@@ -48,14 +48,6 @@ export const UPCOMING: readonly UpcomingFeature[] = Object.freeze([
     insteadHref: '/portal/employee',
     insteadLabel: 'Back to your workspace',
   },
-  {
-    key: 'mail',
-    label: 'Mail',
-    note: 'Mail is not open yet. It is built and being finished rather than abandoned. Until it is, '
-      + 'use your own email for anything that needs to reach somebody today.',
-    insteadHref: '/portal/employee',
-    insteadLabel: 'Back to your workspace',
-  },
 ]);
 
 const BY_KEY: Readonly<Record<string, UpcomingFeature>> = Object.freeze(
@@ -80,8 +72,6 @@ export function upcomingFeature(key: string): UpcomingFeature | null {
  */
 const PREFIXES: readonly { prefix: string; key: string }[] = Object.freeze([
   { prefix: '/portal/messages', key: 'messaging' },
-  { prefix: '/portal/mail', key: 'mail' },
-  { prefix: '/admin/mail', key: 'mail' },
   { prefix: '/admin/threads', key: 'messaging' },
   { prefix: '/portal/dms', key: 'messaging' },
   { prefix: '/admin/dms', key: 'messaging' },

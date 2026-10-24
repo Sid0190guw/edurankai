@@ -3,7 +3,7 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { isConfigured } from '@/lib/razorpay';
-import { normalizeFormFields, type FormField } from '@/lib/forms/form-schema';
+import { normalizeFormFields, validateFormForPublishing, type FormField } from '@/lib/forms/form-schema';
 import { canAccessSection } from '@/lib/auth/permissions';
 
 const { slug } = Astro.params;
@@ -22,6 +22,8 @@ let fields: FormField[] = [];
 if (form) {
   try {
     fields = normalizeFormFields(form.fields);
+    const publicationError = validateFormForPublishing(fields);
+    if (publicationError) throw new Error(publicationError);
   } catch (error) {
     console.error('[public-form] invalid saved form definition:', error instanceof Error ? error.message : error);
     return new Response('This form is temporarily unavailable. Please contact the form owner.', { status: 500 });
@@ -29,30 +31,62 @@ if (form) {
 }
 const feeChf = form ? (parseInt(form.fee_chf || 0) || 0) : 0;
 const paymentsReady = isConfigured();
+let recruitmentLink: any = null;
+if (form) {
+  try {
+    recruitmentLink = rows(await db.execute(sql`
+      SELECT r.title, r.slug, r.is_open, r.application_deadline
+      FROM form_role_links l
+      JOIN roles r ON r.id = l.role_id
+      WHERE l.form_id = ${form.id}
+      LIMIT 1
+    `))[0] || null;
+  } catch (error) {
+    console.error('[public-form] recruitment-link lookup failed:', error instanceof Error ? error.message : error);
+  }
+}
+const loginRequired = !!recruitmentLink && (!Astro.locals.user || Astro.locals.user.role !== 'applicant');
 ---
-<BaseLayout title={form ? form.title : 'Form'} description={form?.description || 'EduRankAI form'}>
-  <section class="px-[5vw] py-10 md:py-16 max-w-xl mx-auto">
+<BaseLayout title={form ? form.title : 'Form'} description={form?.description || 'EduRankAI form'} showNav={false} showFooter={false} noindex={preview}>
+  <section class="public-form-page px-4 py-6 md:px-6 md:py-10">
+    <div class="public-form-shell">
+      <header class="respondent-brand">
+        <a href="/" aria-label="EduRankAI home"><img src="/favicon.svg" alt="" width="32" height="32" /><span>EduRankAI</span></a>
+        {form && <div class="appearance-picker" role="group" aria-label="Form appearance">
+          <button type="button" data-appearance-choice="system" aria-pressed="true">System</button>
+          <button type="button" data-appearance-choice="light" aria-pressed="false">Light</button>
+          <button type="button" data-appearance-choice="dark" aria-pressed="false">Dark</button>
+          <button type="button" data-appearance-choice="reading" aria-pressed="false">Reading</button>
+        </div>}
+      </header>
     {!form ? (
-      <div class="bg-white border border-ink/10 rounded-2xl p-8 text-center">
+      <div class="form-sheet form-unavailable">
         <h1 class="font-display text-[1.5rem] font-semibold text-ink mb-2">Form not found</h1>
         <p class="text-[0.9rem] text-ink-soft">This form is unavailable or not published.</p>
       </div>
     ) : (
       <>
-        <h1 class="font-display text-[clamp(1.7rem,4.5vw,2.4rem)] font-semibold text-ink leading-tight mb-2">{form.title}</h1>
-        {form.description && <p class="text-[0.95rem] text-ink-soft leading-relaxed mb-2 whitespace-pre-wrap">{form.description}</p>}
+        <div class="form-sheet">
+        <h1 id="formTitle" class="font-display text-[clamp(1.7rem,4.5vw,2.4rem)] font-semibold text-ink leading-tight mb-2">{form.title}</h1>
+        {form.description && <p id="formDescription" class="text-[0.95rem] text-ink-soft leading-relaxed mb-2 whitespace-pre-wrap">{form.description}</p>}
         {preview && <p class="preview-notice" role="status">Private preview — this form is not accepting responses.</p>}
+        {recruitmentLink && <p class="recruitment-notice">Application for <strong>{recruitmentLink.title}</strong>. Sign in with a verified applicant account before submitting. Submission creates an application in My Applications.</p>}
+        {recruitmentLink && <p class="recruitment-login" style={loginRequired ? undefined : 'display:none'}><a id="recruitmentSignIn" href={'/portal/login?next=' + encodeURIComponent('/f/' + form.slug)}>Sign in to continue</a></p>}
         {feeChf > 0 && <p class="text-[0.85rem] text-ink-2 mb-5 inline-block bg-burn-pale border border-burn-dim rounded-lg px-3 py-1.5">Fee on submit: <strong>{feeChf} CHF</strong> (charged in INR via Razorpay)</p>}
 
-        <form id="pubForm" class="flex flex-col gap-4 bg-white border border-ink/10 rounded-2xl p-5 md:p-6 mt-3">
+        <form id="pubForm" aria-labelledby="formTitle" aria-describedby={form.description ? 'formDescription' : undefined} class="respondent-form flex flex-col gap-4 border rounded-2xl p-5 md:p-7 mt-3">
+          <div class="section-progress" aria-live="polite">
+            <div class="section-progress-label"><span id="sectionProgressText"></span><span id="sectionProgressPercent"></span></div>
+            <progress id="sectionProgress" max="100" value="0" aria-label="Form progress"></progress>
+          </div>
           <fieldset class="preview-controls">
             {fields.map((f: FormField, index: number) => (
               <>
-              {(index === 0 || fields[index - 1].section !== f.section) && <div class="form-section-heading"><h2>{f.section}</h2></div>}
-              <div data-field data-key={f.key} data-type={f.type} data-required={f.required ? 'true' : 'false'} data-condition={f.condition ? JSON.stringify(f.condition) : ''}>
+              {(index === 0 || fields[index - 1].section !== f.section) && <div class="form-section-heading" data-section-heading={f.section}><h2>{f.section}</h2></div>}
+              <div class="form-question" data-field data-section={f.section} data-key={f.key} data-type={f.type} data-required={f.required ? 'true' : 'false'} data-condition={f.condition ? JSON.stringify(f.condition) : ''}>
               {f.type === 'acknowledgment' ? (
                 <div>
-                  <label class="flex items-start gap-3 text-[0.9rem] text-ink-2 leading-relaxed"><input data-input type="checkbox" required={f.required} class="accent-burn mt-1" /><span>{f.label}{f.required && <span class="text-burn"> *</span>}</span></label>
+                  <label class="flex items-start gap-3 text-[0.9rem] text-ink-2 leading-relaxed"><input data-input type="checkbox" aria-label={f.label} required={f.required} class="accent-burn mt-1" /><span>{f.label}{f.required && <span class="text-burn"> *</span>}</span></label>
                   {f.description && <p class="field-description">{f.description}</p>}
                 </div>
               ) : (
@@ -60,15 +94,15 @@ const paymentsReady = isConfigured();
                   <label class="block text-[0.9rem] font-semibold text-ink mb-1.5">{f.label}{f.required && <span class="text-burn"> *</span>}{['selfie','location','signature'].includes(f.type) && <span class="ml-2 text-[0.78rem] font-normal text-ink-soft">(optional)</span>}</label>
                   {f.description && <p class="field-description">{f.description}</p>}
                   {f.type === 'textarea' ? (
-                    <textarea data-input required={f.required} minlength={f.minLength || undefined} maxlength={f.maxLength || undefined} rows="3" placeholder={f.placeholder || ''} class="pfi"></textarea>
+                    <textarea data-input aria-label={f.label} required={f.required} minlength={f.minLength ?? undefined} maxlength={f.maxLength ?? undefined} rows="3" placeholder={f.placeholder || ''} class="pfi"></textarea>
                   ) : f.type === 'select' ? (
-                    <select data-input required={f.required} class="pfi"><option value="">Choose...</option>{(f.options || []).map((o: string) => <option value={o}>{o}</option>)}</select>
+                    <select data-input aria-label={f.label} required={f.required} class="pfi"><option value="">Choose...</option>{(f.options || []).map((o: string) => <option value={o}>{o}</option>)}</select>
                   ) : f.type === 'radio' ? (
-                    <div class="flex flex-col gap-1.5">{(f.options || []).map((o: string, i: number) => <label class="flex items-center gap-2 text-[0.9rem] text-ink-2"><input type="radio" name={'r_' + f.key} value={o} required={f.required && i === 0} class="accent-burn" /> {o}</label>)}</div>
+                    <div role="group" aria-label={f.label} class="flex flex-col gap-1.5">{(f.options || []).map((o: string, i: number) => <label class="flex items-center gap-2 text-[0.9rem] text-ink-2"><input type="radio" name={'r_' + f.key} value={o} required={f.required && i === 0} class="accent-burn" /> {o}</label>)}</div>
                   ) : f.type === 'checkbox' ? (
-                    <div class="flex flex-col gap-1.5">{(f.options || []).map((o: string) => <label class="flex items-center gap-2 text-[0.9rem] text-ink-2"><input type="checkbox" data-cb value={o} class="accent-burn" /> {o}</label>)}</div>
+                    <div role="group" aria-label={f.label} class="flex flex-col gap-1.5">{(f.options || []).map((o: string) => <label class="flex items-center gap-2 text-[0.9rem] text-ink-2"><input type="checkbox" data-cb value={o} class="accent-burn" /> {o}</label>)}</div>
                   ) : f.type === 'yes_no' ? (
-                    <div class="flex gap-5">{['yes','no'].map((answer) => <label class="flex items-center gap-2 text-[0.9rem] text-ink-2"><input type="radio" name={'r_' + f.key} value={answer} required={f.required && answer === 'yes'} class="accent-burn" /> {answer === 'yes' ? 'Yes' : 'No'}</label>)}</div>
+                    <div role="group" aria-label={f.label} class="flex gap-5">{['yes','no'].map((answer) => <label class="flex items-center gap-2 text-[0.9rem] text-ink-2"><input type="radio" name={'r_' + f.key} value={answer} required={f.required && answer === 'yes'} class="accent-burn" /> {answer === 'yes' ? 'Yes' : 'No'}</label>)}</div>
                   ) : f.type === 'rating' || f.type === 'linear_scale' ? (
                     <select data-input required={f.required} class="pfi" aria-label={f.type === 'rating' ? 'Choose a rating' : 'Choose a scale value'}>
                       <option value="">Choose...</option>
@@ -103,7 +137,7 @@ const paymentsReady = isConfigured();
                     </div>
                   ) : (
                     <div>
-                      <input data-input type={['number','currency','percentage','duration'].includes(f.type) ? 'number' : f.type === 'email' ? 'email' : f.type === 'url' ? 'url' : f.type === 'date' ? 'date' : f.type === 'time' ? 'time' : f.type === 'datetime' ? 'datetime-local' : f.type === 'phone' ? 'tel' : 'text'} step={['currency','percentage'].includes(f.type) ? 'any' : undefined} required={f.required} min={f.min ?? undefined} max={f.max ?? undefined} minlength={f.minLength ?? undefined} maxlength={f.maxLength ?? undefined} autocomplete={f.type === 'phone' ? 'tel' : f.type === 'email' ? 'email' : undefined} placeholder={f.placeholder || ''} class="pfi" />
+                      <input data-input aria-label={f.label} type={['number','currency','percentage','duration'].includes(f.type) ? 'number' : f.type === 'email' ? 'email' : f.type === 'url' ? 'url' : f.type === 'date' ? 'date' : f.type === 'time' ? 'time' : f.type === 'datetime' ? 'datetime-local' : f.type === 'phone' ? 'tel' : 'text'} step={['currency','percentage'].includes(f.type) ? 'any' : undefined} required={f.required} min={f.min ?? undefined} max={f.max ?? undefined} minlength={f.minLength ?? undefined} maxlength={f.maxLength ?? undefined} autocomplete={f.type === 'phone' ? 'tel' : f.type === 'email' ? 'email' : undefined} placeholder={f.placeholder || ''} class="pfi" />
                       {f.example && <p class="field-example">{f.example}</p>}
                     </div>
                   )}
@@ -113,6 +147,10 @@ const paymentsReady = isConfigured();
               </div>
               </>
             ))}
+            <div class="section-actions">
+              <button type="button" id="sectionBack" class="section-button" style="display:none;">Back</button>
+              <button type="button" id="sectionContinue" class="section-button section-button-primary" style="display:none;">Continue</button>
+            </div>
             <button type="submit" id="pubSubmit" disabled={preview} class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 rounded-lg text-[0.92rem] mt-1">{preview ? 'Preview only' : feeChf > 0 ? 'Pay ' + feeChf + ' CHF & submit' : 'Submit'}</button>
             <p id="pubErr" class="text-[0.82rem] text-red-700 text-center" style="display:none;"></p>
           </fieldset>
@@ -121,19 +159,68 @@ const paymentsReady = isConfigured();
           <p class="font-semibold text-leaf mb-1">Submitted</p>
           <p id="pubDoneMsg" class="text-[0.9rem] text-ink-2"></p>
         </div>
+        </div>
       </>
     )}
+    </div>
   </section>
 
   {form && (
     <>
       {feeChf > 0 && paymentsReady && !preview && <script is:inline src="https://checkout.razorpay.com/v1/checkout.js"></script>}
-      <script is:inline define:vars={{ slug, fee: feeChf, preview }}>
+      <script is:inline define:vars={{ slug, fee: feeChf, preview, sectionNames: Array.from(new Set(fields.map((field) => field.section))) }}>
         (function () {
           var form = document.getElementById('pubForm'); if (!form) return;
           var err = document.getElementById('pubErr'), btn = document.getElementById('pubSubmit');
+          var sections = Array.isArray(sectionNames) && sectionNames.length ? sectionNames : ['General'];
+          var activeSection = 0;
+          var sectionBack = document.getElementById('sectionBack');
+          var sectionContinue = document.getElementById('sectionContinue');
           function showErr(m) { err.textContent = m; err.style.display = 'block'; }
           function done(msg) { form.style.display = 'none'; document.getElementById('pubDone').style.display = 'block'; document.getElementById('pubDoneMsg').textContent = msg || 'Your response has been recorded.'; }
+          function setSection(index) {
+            activeSection = Math.max(0, Math.min(index, sections.length - 1));
+            var name = sections[activeSection];
+            document.querySelectorAll('[data-section-heading]').forEach(function (heading) {
+              heading.style.display = heading.getAttribute('data-section-heading') === name ? '' : 'none';
+            });
+            document.querySelectorAll('[data-field]').forEach(function (wrap) {
+              var isCurrent = wrap.getAttribute('data-section') === name;
+              wrap.classList.toggle('form-question-inactive', !isCurrent);
+              if (!isCurrent && typeof wrap.__stopCamera === 'function') wrap.__stopCamera();
+              wrap.querySelectorAll('input,select,textarea,button').forEach(function (control) {
+                control.disabled = !isCurrent || wrap.hidden;
+              });
+            });
+            var progress = document.getElementById('sectionProgress');
+            var progressText = document.getElementById('sectionProgressText');
+            var progressPercent = document.getElementById('sectionProgressPercent');
+            progress.value = Math.round(((activeSection + 1) / sections.length) * 100);
+            progressText.textContent = sections.length > 1
+              ? 'Section ' + (activeSection + 1) + ' of ' + sections.length + ' · ' + name
+              : name;
+            progressPercent.textContent = progress.value + '%';
+            sectionBack.style.display = activeSection > 0 ? '' : 'none';
+            sectionContinue.style.display = activeSection < sections.length - 1 ? '' : 'none';
+            btn.style.display = activeSection === sections.length - 1 ? '' : 'none';
+          }
+          function applyAppearance(appearance) {
+            var supported = ['system', 'light', 'dark', 'reading'];
+            if (supported.indexOf(appearance) < 0) appearance = 'system';
+            document.querySelector('.public-form-page').setAttribute('data-appearance', appearance);
+            document.querySelectorAll('[data-appearance-choice]').forEach(function (choice) {
+              choice.setAttribute('aria-pressed', choice.getAttribute('data-appearance-choice') === appearance ? 'true' : 'false');
+            });
+            try { localStorage.setItem('edurankai-form-appearance', appearance); } catch (_) {}
+          }
+          var savedAppearance = 'system';
+          try { savedAppearance = localStorage.getItem('edurankai-form-appearance') || 'system'; } catch (_) {}
+          applyAppearance(savedAppearance);
+          document.querySelectorAll('[data-appearance-choice]').forEach(function (choice) {
+            choice.addEventListener('click', function () {
+              applyAppearance(choice.getAttribute('data-appearance-choice'));
+            });
+          });
           function collect() {
             var data = Object.create(null);
             document.querySelectorAll('[data-field]').forEach(function (wrap) {
@@ -194,16 +281,44 @@ const paymentsReady = isConfigured();
                 control.required = visible && control.getAttribute('data-rule-required') === 'true';
               });
             });
+            setSection(activeSection);
           }
           form.addEventListener('input', updateConditionalFields);
           form.addEventListener('change', updateConditionalFields);
           updateConditionalFields();
+          function validateCurrentSection() {
+            if (!form.reportValidity()) return false;
+            var valid = true;
+            document.querySelectorAll('[data-field][data-type="checkbox"]').forEach(function (wrap) {
+              var input = wrap.querySelector('[data-cb]');
+              if (wrap.getAttribute('data-section') === sections[activeSection] &&
+                  !wrap.hidden && wrap.getAttribute('data-required') === 'true' &&
+                  input && !wrap.querySelector('[data-cb]:checked')) {
+                showErr('Please choose at least one option.');
+                input.focus();
+                valid = false;
+              }
+            });
+            return valid;
+          }
+          sectionBack.addEventListener('click', function () {
+            err.style.display = 'none';
+            setSection(activeSection - 1);
+            document.getElementById('formTitle').scrollIntoView({ behavior: 'smooth', block: 'start' });
+          });
+          sectionContinue.addEventListener('click', function () {
+            err.style.display = 'none';
+            if (!validateCurrentSection()) return;
+            setSection(activeSection + 1);
+            document.getElementById('formTitle').scrollIntoView({ behavior: 'smooth', block: 'start' });
+          });
           if (preview) return;
           function validateChoiceGroups() {
             var ok = true;
             document.querySelectorAll('[data-field][data-type="checkbox"]').forEach(function (wrap) {
               var input = wrap.querySelector('[data-cb]');
-              if (!wrap.hidden && wrap.getAttribute('data-required') === 'true' && input && !wrap.querySelector('[data-cb]:checked')) {
+              if (wrap.getAttribute('data-section') === sections[activeSection] &&
+                  !wrap.hidden && wrap.getAttribute('data-required') === 'true' && input && !wrap.querySelector('[data-cb]:checked')) {
                 showErr('Please choose at least one option.');
                 input.focus();
                 ok = false;
@@ -352,6 +467,12 @@ const paymentsReady = isConfigured();
           });
           form.addEventListener('submit', function (e) {
             e.preventDefault(); err.style.display = 'none';
+            if (activeSection < sections.length - 1) {
+              if (!validateCurrentSection()) return;
+              setSection(activeSection + 1);
+              document.getElementById('formTitle').scrollIntoView({ behavior: 'smooth', block: 'start' });
+              return;
+            }
             if (!form.reportValidity() || !validateChoiceGroups()) return;
             document.querySelectorAll('[data-field]').forEach(function (wrap) {
               if (typeof wrap.__stopCamera === 'function') wrap.__stopCamera();
@@ -359,7 +480,12 @@ const paymentsReady = isConfigured();
             var prev = btn.textContent; btn.disabled = true; btn.textContent = 'Submitting...';
             fetch('/api/forms/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ slug: slug, data: collect() }) })
               .then(function (r) { return r.json(); }).then(function (d) {
-                if (!d.ok) { btn.disabled = false; btn.textContent = prev; showErr(d.error || 'Could not submit.'); return; }
+                if (!d.ok) {
+                  btn.disabled = false; btn.textContent = prev; showErr(d.error || 'Could not submit.');
+                  if (d.signInUrl) { var login = document.getElementById('recruitmentSignIn'); if (login) login.href = d.signInUrl; }
+                  return;
+                }
+                if (d.redirect) { window.location.assign(d.redirect); return; }
                 if (d.done) { done(d.message); return; }
                 if (typeof Razorpay === 'undefined') { btn.disabled = false; btn.textContent = prev; showErr('Razorpay failed to load.'); return; }
                 var rzp = new Razorpay({ key: d.keyId, amount: d.amountPaise, currency: d.currency, name: 'EduRankAI', description: d.formTitle || 'Form fee', order_id: d.orderId, prefill: d.prefill || {}, theme: { color: '#FF4F00' },
@@ -377,6 +503,54 @@ const paymentsReady = isConfigured();
     </>
   )}
   <style>
+    .public-form-page{--form-bg:#f4f5f7;--form-card:#fff;--form-text:#17202b;--form-muted:#4c5868;--form-border:#d7dce2;min-height:calc(100vh - 1px);background:var(--form-bg);color:var(--form-text);font-family:Inter,ui-sans-serif,system-ui,sans-serif}
+    .public-form-shell{width:min(100%,48rem);margin:0 auto}
+    .respondent-brand{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:0 auto 22px;padding:4px 2px}
+    .respondent-brand>a{display:inline-flex;align-items:center;gap:9px;color:var(--form-text);font-weight:750;text-decoration:none;font-size:1rem;letter-spacing:-.02em}
+    .respondent-brand>a img{width:32px;height:32px;object-fit:contain}
+    .appearance-picker{display:flex;gap:3px;padding:3px;border:1px solid var(--form-border);border-radius:10px;background:var(--form-card)}
+    .appearance-picker button{border:0;border-radius:7px;padding:6px 9px;background:transparent;color:var(--form-muted);font:600 .72rem/1.1 Inter,ui-sans-serif,system-ui,sans-serif;cursor:pointer}
+    .appearance-picker button[aria-pressed="true"]{background:#e9edf2;color:var(--form-text)}
+    .form-sheet{padding:clamp(20px,5vw,36px);border:1px solid var(--form-border);border-top:5px solid #ff4f00;border-radius:16px;background:var(--form-card);box-shadow:0 14px 44px rgba(23,32,43,.07)}
+    .respondent-form{border-color:var(--form-border);background:var(--form-card);box-shadow:none}
+    .form-question{padding:3px 0}
+    .form-question-inactive{display:none!important}
+    .section-progress{display:grid;gap:7px;margin:0 0 3px;color:var(--form-muted);font-size:.78rem;font-weight:650}
+    .section-progress-label{display:flex;justify-content:space-between;gap:12px}
+    .section-progress progress{width:100%;height:7px;overflow:hidden;border:0;border-radius:99px;background:#e8ebef;accent-color:#e4480b}
+    .section-progress progress::-webkit-progress-bar{border-radius:99px;background:#e8ebef}
+    .section-progress progress::-webkit-progress-value{border-radius:99px;background:#e4480b}
+    .section-progress progress::-moz-progress-bar{border-radius:99px;background:#e4480b}
+    .section-actions{display:flex;justify-content:space-between;gap:12px;margin-top:4px}
+    .section-button{min-height:44px;padding:9px 16px;border:1px solid var(--form-border);border-radius:8px;background:var(--form-card);color:var(--form-text);font:650 .9rem Inter,ui-sans-serif,system-ui,sans-serif;cursor:pointer}
+    .section-button-primary{margin-left:auto;border-color:#c83d0b;background:#c83d0b;color:#fff}
+    .section-button:hover{filter:brightness(.96)}
+    .section-button:focus-visible,.appearance-picker button:focus-visible{outline:3px solid #f97316;outline-offset:2px}
+    .public-form-page .text-ink,.public-form-page .text-ink-2{color:var(--form-text)}
+    .public-form-page .text-ink-soft{color:var(--form-muted)}
+    .public-form-page .form-section-heading{border-color:var(--form-border)}
+    .public-form-page .form-section-heading h2{color:var(--form-text)}
+    .public-form-page .field-description,.public-form-page .field-example{color:var(--form-muted)}
+    .public-form-page .pfi{min-height:46px;border-color:#8993a0;background:var(--form-card);color:var(--form-text)}
+    .public-form-page .pfi:focus{border-color:#c93e0a}
+    .public-form-page .capture-box{border-color:var(--form-border);background:var(--form-bg)}
+    .public-form-page .capture-help,.public-form-page .capture-status{color:var(--form-muted)}
+    .public-form-page .capture-button{min-height:42px;border-color:#6b7583;background:var(--form-card);color:var(--form-text)}
+    .public-form-page .preview-notice,.public-form-page .recruitment-notice{color:#71330c}
+    .public-form-page[data-appearance="dark"]{--form-bg:#11151b;--form-card:#1b222b;--form-text:#f5f7fa;--form-muted:#c1cad5;--form-border:#394553;color:var(--form-text)}
+    .public-form-page[data-appearance="dark"] .appearance-picker button[aria-pressed="true"]{background:#303b48;color:#fff}
+    .public-form-page[data-appearance="dark"] .section-progress progress,
+    .public-form-page[data-appearance="dark"] .section-progress progress::-webkit-progress-bar{background:#384352}
+    .public-form-page[data-appearance="dark"] .text-ink{color:var(--form-text)}
+    .public-form-page[data-appearance="dark"] .preview-notice,.public-form-page[data-appearance="dark"] .recruitment-notice{border-color:#a56a38;background:#3a2a1c;color:#ffe0bd}
+    .public-form-page[data-appearance="reading"]{--form-bg:#f3eedf;--form-card:#fffaf0;--form-text:#2b281f;--form-muted:#4c463b;--form-border:#d4cbb8;font-size:1.08rem}
+    .public-form-page[data-appearance="reading"] .form-sheet{line-height:1.8;box-shadow:none}
+    .public-form-page[data-appearance="reading"] .pfi{font-size:1.05rem;line-height:1.6}
+    .public-form-page[data-appearance="system"]{color-scheme:light}
+    @media(prefers-color-scheme:dark){.public-form-page[data-appearance="system"]{--form-bg:#11151b;--form-card:#1b222b;--form-text:#f5f7fa;--form-muted:#c1cad5;--form-border:#394553;color:var(--form-text);color-scheme:dark}.public-form-page[data-appearance="system"] .appearance-picker button[aria-pressed="true"]{background:#303b48;color:#fff}}
+    @media(max-width:520px){.public-form-page{padding:12px}.respondent-brand{align-items:flex-start;flex-direction:column;margin-bottom:14px}.appearance-picker{width:100%;justify-content:space-between}.appearance-picker button{flex:1;padding:8px 5px}.form-sheet{padding:19px 15px;border-radius:13px}}
+    @media(prefers-reduced-motion:reduce){.public-form-page *{scroll-behavior:auto!important;transition:none!important}}
+    .public-form-page~.era-fab,.era-has-fab .era-fab{display:none!important}
     .preview-notice{margin:12px 0;padding:10px 12px;border:1px solid #b45309;border-radius:8px;background:#fff7ed;color:#7c2d12;font-size:.86rem;font-weight:600}
     .preview-controls{display:flex;flex-direction:column;gap:1rem;width:100%;min-width:0;margin:0;padding:0;border:0}
     .pfi{width:100%;padding:10px 12px;background:#fff;border:1px solid rgba(0,0,0,.24);border-radius:8px;color:#17191d;font-size:.95rem;outline:none}

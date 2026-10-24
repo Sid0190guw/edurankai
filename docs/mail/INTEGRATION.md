@@ -79,9 +79,27 @@ valid request can replay it forever.
 
 `src/lib/mailops/webhook.ts` adds HMAC over `timestamp . body` with a freshness window and
 delivery-id replay detection — and **accepts either scheme**, reporting which one authenticated.
-The route itself was not modified. An MTA already configured with the shared secret keeps working;
-`/api/health/mail` reports when a sender is still on the weaker scheme, so it can be retired on
-evidence.
+An MTA already configured with the shared secret keeps working; `/api/health/mail` reports when a
+sender is still on the weaker scheme, so it can be retired on evidence.
+
+### 2.5 Inbound identity resolution and duplicate delivery
+
+The inbound webhook and IMAP poller use the same resolver. When the configured mail-platform
+schema is available, the destination address is matched against active mailbox addresses, primary
+mailbox addresses, and active aliases. Delivery copies go only to the active mailbox owner and
+active members of an active organization. A mapped-but-disabled mailbox does not fall back to a
+login-email match. If the platform identity tables are not installed, legacy routing is limited to
+active users and addresses on the configured EduRankAI mail domain; arbitrary external login
+addresses are not treated as internal mailboxes. If only part of the identity schema is present,
+inbound delivery fails explicitly rather than weakening authorization through fallback.
+
+Inbound writes are serialized by RFC Message-ID and recipient account. Replays from the webhook or
+an IMAP re-poll reuse the existing message copy instead of adding another inbox row. This does not
+create a central archive copy or unassigned-message queue: both require retention policy and
+authorized access controls that are not yet implemented. Provider-level routing, quarantine, and
+delivery still require an authorized production configuration and end-to-end test. The IMAP UID
+watermark advances only after delivery succeeds (or after a parse failure is logged), so a database
+or identity-resolution failure is retried on the next poll instead of being skipped permanently.
 
 ---
 

@@ -3,17 +3,12 @@
 // Verifies an IMAP connection without saving. Used by the Verify button under
 // the IMAP / inbound section of the admin settings page.
 import type { APIRoute } from 'astro';
-import { db } from '@/lib/db';
-import { sql } from 'drizzle-orm';
-import { ensureMailSchema } from '@/lib/mail';
-import { verifyImap } from '@/lib/mail-imap';
+import { getImapConfig, verifyImap } from '@/lib/mail-imap';
 import { can } from '@/lib/auth/permissions';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
-function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
-
 export const POST: APIRoute = async ({ request, locals }) => {
   // Same swap as its four siblings, and deliberately made in the same commit so the six mail routes
   // cannot end up disagreeing about who administers mail. `mail.manage` is held by exactly the ten
@@ -29,12 +24,11 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
   let pass = (body.pass || '').toString();
   if (!pass) {
-    try {
-      await ensureMailSchema();
-      try { await db.execute(sql`ALTER TABLE mail_config ADD COLUMN IF NOT EXISTS imap_pass TEXT`); } catch (_) {}
-      const r = rows(await db.execute(sql`SELECT imap_pass FROM mail_config WHERE id = 1 LIMIT 1`))[0] as any;
-      pass = (r?.imap_pass || '').toString();
-    } catch (_) {}
+    const config = await getImapConfig();
+    if (!config.configRead) {
+      return json({ ok: false, error: 'Saved IMAP settings or secret could not be read. Nothing was tested; check the encryption key and retry.' }, 503);
+    }
+    pass = config.pass;
   }
 
   const res = await verifyImap({

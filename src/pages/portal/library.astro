@@ -7,6 +7,11 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
+// The catalogue, the loans and the reservations are three independent reads that were taken one
+// after another. runFanout() sends them as one bounded wave and can decline the ones not yet sent
+// if the breaker opens partway through.
+import { runFanout, type FanoutMember } from '@/lib/db-fanout';
+import { DB_TIMEOUT_MS } from '@/lib/db-timeout';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/library'));
@@ -272,6 +277,26 @@ let resourcesError: string | null = null;
 let loansError: string | null = null;
 let reservationsError: string | null = null;
 let resources: any[] = [];
+// ONE WAVE, THREE READS, TAKEN TOGETHER RATHER THAN IN TURN.
+//
+// These three were sequential `await`s: the catalogue, then the loans, then the reservations, each
+// waiting for the one before it to give its pool slot back. Nothing here depends on anything else
+// here — three different tables, three different result variables, three separate try/catch blocks
+// already written to swallow into their own *Error string — so the ordering was cost without
+// meaning. The three members below are the SAME code, moved inside thunks and nothing more; every
+// query, every catch, every error message and every variable it assigns is unchanged.
+//
+// The reason this is runFanout() and not Promise.all(): Promise.all starts all three immediately,
+// which fixes the serialisation and leaves the page unable to decline anything once the circuit
+// opens. A thunk that has not been dispatched can still be skipped, and on a page whose reads are
+// each allowed to be missing that is the difference between a degraded screen and one more caller
+// feeding a wedged pool.
+//
+// The `resources` member keeps its four-way branch intact. Only one of those branches runs per
+// request — they are alternatives selected by the query string, not a sequence — so this is one read
+// in the wave, not four.
+const shelfBatch: FanoutMember[] = [];
+shelfBatch.push({ label: 'catalogue', run: async () => {
 try {
   if (q && subject) {
     const like = '%' + q + '%';
@@ -301,9 +326,11 @@ try {
   resourcesError = String(e?.cause?.message || e?.message || 'unknown database error');
   console.error('[portal/library] catalogue read failed -', resourcesError);
 }
+} });
 
 // -- My loans --------------------------------------------------------------
 let loans: any[] = [];
+shelfBatch.push({ label: 'loans', run: async () => {
 try {
   loans = rowsOf(await db.execute(sql`
     SELECT l.id, l.loaned_at, l.due_at, l.returned_at, l.status, l.fine_amount_paise,
@@ -317,9 +344,11 @@ try {
   loansError = String(e?.cause?.message || e?.message || 'unknown database error');
   console.error('[portal/library] loan read failed -', loansError);
 }
+} });
 
 // -- My reservations -------------------------------------------------------
 let reservations: any[] = [];
+shelfBatch.push({ label: 'reservations', run: async () => {
 try {
   reservations = rowsOf(await db.execute(sql`
     SELECT res.id, res.reserved_at, res.status,
@@ -332,6 +361,23 @@ try {
 } catch (e: any) {
   reservationsError = String(e?.cause?.message || e?.message || 'unknown database error');
   console.error('[portal/library] reservation read failed -', reservationsError);
+}
+} });
+
+// A member that never ran leaves its *Error null and its list empty, which the markup would render
+// as "No matching items" — the exact confident-empty-state defect the comment above these reads was
+// written about. So a skipped member gets the same sentence a failed one gets: the screen says the
+// shelf could not be read, rather than that it is empty.
+{
+  const wave = await runFanout(shelfBatch, { label: 'portalLibrary.shelf', ms: DB_TIMEOUT_MS });
+  if (wave.error) console.error('[portal/library] shelf wave barrier -', String((wave.error as any)?.cause?.message || (wave.error as any)?.message || wave.error));
+  if (wave.degraded) {
+    const missed = new Set(wave.unread);
+    const NOT_READ = 'the database did not answer in time';
+    if (missed.has('catalogue') && !resourcesError) resourcesError = NOT_READ;
+    if (missed.has('loans') && !loansError) loansError = NOT_READ;
+    if (missed.has('reservations') && !reservationsError) reservationsError = NOT_READ;
+  }
 }
 
 function fmtDate(d: any): string {

@@ -16,9 +16,10 @@
 // import makes the config itself fail to load — which takes down every suite, including the ones
 // that were passing. A plain exported object is the shape Vitest reads either way.
 //
-// NOTHING ELSE IS CONFIGURED, on purpose. No environment, no setup file, no globals: the tests here
-// import { describe, it, expect } from 'vitest' explicitly and exercise pure functions. A default
-// that changed how they run would be a change nobody asked for.
+// NO ENVIRONMENT, NO SETUP FILE, NO GLOBALS, on purpose. The tests here import
+// { describe, it, expect } from 'vitest' explicitly and exercise pure functions. A default that
+// changed how they run would be a change nobody asked for. The one exception is testTimeout, and
+// the paragraph below is why it had to stop being a default.
 import { fileURLToPath } from 'node:url';
 
 // TWO TEST STYLES LIVE HERE, AND VITEST MUST NOT TRY TO RUN BOTH.
@@ -69,6 +70,35 @@ try {
   // the shim ones fail loudly, which is exactly the previous behaviour and no worse.
 }
 
+// THE DEFAULT TIMEOUT WAS 80% SPENT BEFORE ANY LOAD, WHICH IS WHY THE GATE FLAPPED.
+//
+// Vitest's default testTimeout is 5000ms and there was no config line changing it. Measured on this
+// suite with --slowTestThreshold=300, the slowest test that the timeout ACTUALLY GOVERNS is
+// src/lib/horizon/record.test.ts "bounds a hanging provider instead of holding the whole record" at
+// 4014ms, with mail-engine/test/spool-durability.test.ts "gives every entry to exactly one of three
+// racing workers" behind it at 3752ms. Both are async, so both are on the clock. That is 80% of the
+// budget spent by a passing test on an idle machine.
+//
+// GOVERNS is the load-bearing word. src/lib/orphan-detect.test.ts runs for 11708ms — more than twice
+// the old ceiling — and has never failed, because it is SYNCHRONOUS: it blocks the event loop, the
+// timer never gets a turn, and Vitest cannot interrupt it. So the 5000ms figure was never a real
+// bound on the suite's slowest work; it was a bound on its slowest AWAITING work only, and that is
+// the half where a busy machine costs time.
+//
+// What that cost: this suite's own wall clock was observed at 16.49s and at 33.46s on the same
+// checkout, a 2.03x spread driven purely by what else the machine was doing. Apply that spread to a
+// 4014ms test and it lands at ~8.1s, past the fuse. The two failures seen were exactly that shape —
+// src/lib/work-mode.test.ts timing out on a cold `await import('@/data/role-catalog')` as the first
+// statement of the test, and neither failure reproducible in isolation (both files alone: 44 passed
+// in 1.63s). A gate that is red for reasons unrelated to the code is a gate people re-run until it
+// is green, which is how a real failure gets waved through.
+//
+// 20000ms is 4.98x the measured slowest governed test. That absorbs the observed 2.03x load spread
+// with 2.4x still in hand, and it is deliberately NOT a disabled timeout: a genuinely hung await
+// still fails this suite inside twenty seconds, and the whole run completes in 16-33s regardless.
+// Raise this only against a new measurement, not a new flake.
+const TEST_TIMEOUT_MS = 20000;
+
 export default {
   resolve: {
     alias: {
@@ -77,5 +107,6 @@ export default {
   },
   test: {
     exclude: ['**/node_modules/**', '**/dist/**', ...nonVitest],
+    testTimeout: TEST_TIMEOUT_MS,
   },
 };

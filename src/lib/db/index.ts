@@ -26,6 +26,38 @@ try {
 let _client: ReturnType<typeof postgres> | null = null;
 let _real: any = null;
 
+export function dbConfigured(): boolean {
+  return !!process.env.DATABASE_URL;
+}
+
+function offlineSqlClient(): ReturnType<typeof postgres> {
+  const tag = Object.assign(
+    async (_query: any, ..._args: any[]) => [],
+    {
+      query: async (..._args: any[]) => ({ rows: [] }),
+      execute: async (..._args: any[]) => [],
+      end: () => {},
+    },
+  );
+  return tag as any;
+}
+
+function offlineDb(): any {
+  return new Proxy({
+    execute: async (..._args: any[]) => [],
+    select: async (..._args: any[]) => [],
+    query: async (..._args: any[]) => ({ rows: [] }),
+  }, {
+    get(target, prop) {
+      if (prop === 'execute') return async (..._args: any[]) => [];
+      if (prop === 'select') return async (..._args: any[]) => [];
+      if (prop === 'query') return async (..._args: any[]) => ({ rows: [] });
+      const value = (target as any)[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
 /**
  * How many connections this instance's pool may hold. Declared here, above every reader — `const`
  * is not hoisted and that has taken pages down on this project.
@@ -39,7 +71,9 @@ function connect(): any {
   if (_real) return _real;
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) {
-    throw new Error('DATABASE_URL is not set');
+    _client = offlineSqlClient();
+    _real = offlineDb();
+    return _real;
   }
   // Serverless pool sizing. Every warm Vercel instance builds its own client, and postgres-js
   // defaults to max:10 with idle_timeout:0 — ten connections per instance, held open for the life

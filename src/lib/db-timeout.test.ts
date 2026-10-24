@@ -294,8 +294,24 @@ describe('pool reset', () => {
     // Two waits stranded, then a third that reaches capacity and requests the reset. The first two
     // belong to the old pool; when they finally answer they must not make the new pool look emptier
     // than it is, or the next genuine wedge would need extra losses to be seen.
-    const a = settle(40).then(() => 'a');
-    const b = settle(40).then(() => 'b');
+    //
+    // THE STRAGGLERS LAND WHEN THIS TEST SAYS SO, NOT WHEN A TIMER SAYS SO.
+    //
+    // These were `settle(40).then(...)`, which quietly made the test's meaning depend on 40ms of
+    // wall clock outlasting the three withDbTimeout calls below. On a loaded machine it does not.
+    // The timers fire before the third call; their late-answer handlers reach the
+    // noteAbandonReleased() branch in withDbTimeout and credit BOTH slots back; the tally never
+    // reaches the capacity of 3 registered in beforeEach; no reset is requested; and `reasons` is
+    // still empty at the assertion below.
+    //
+    // That is the failure that was actually observed — "AssertionError: expected +0 to be 1" on the
+    // reasons line, which is NOT a timeout and which no testTimeout setting has any effect on. A
+    // deferred cannot land early, so the ordering this test exists to describe is now a property of
+    // the test instead of a property of the machine it runs on. Every assertion is unchanged.
+    let landA!: (value: string) => void;
+    let landB!: (value: string) => void;
+    const a = new Promise<string>((resolve) => { landA = resolve; });
+    const b = new Promise<string>((resolve) => { landB = resolve; });
     await withDbTimeout(a, 'test.old-a', 5, { cosmetic: true }).catch(() => {});
     await withDbTimeout(b, 'test.old-b', 5, { cosmetic: true }).catch(() => {});
     expect(dbPoolResetState().abandoned).toBe(2);
@@ -303,6 +319,8 @@ describe('pool reset', () => {
     expect(reasons.length).toBe(1);
     expect(dbPoolResetState().abandoned).toBe(0);
     // Now the two stragglers land, against a pool that no longer exists.
+    landA('a');
+    landB('b');
     await Promise.all([a, b]);
     await settle(5);
     expect(dbPoolResetState().abandoned).toBe(0);

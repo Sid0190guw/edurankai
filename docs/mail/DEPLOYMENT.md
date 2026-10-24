@@ -97,12 +97,17 @@ The deployed app needs, at minimum:
 DATABASE_URL  SESSION_SECRET  SESSION_COOKIE_NAME  CRON_SECRET
 MAIL_DOMAIN  EMAIL_FROM
 MAIL_INBOUND_SECRET  and/or  MAIL_WEBHOOK_SECRET
+ACTIVE_DATA_KEY_ID  DATA_ENCRYPTION_KEY_<keyId>
 METRICS_TOKEN                 (>= 32 characters, see section 7)
 MAIL_ALLOWED_ORIGINS          https://www.edurankai.in,https://edurankai.in
 ```
 
 SMTP credentials normally come from the `mail_config` row edited at `/admin/mail/settings`, which
-**overrides** the environment. If mail is not sending, check that screen before checking Vercel.
+**overrides** the environment. New SMTP, IMAP, Resend, and inbound webhook credentials saved there
+are envelope-encrypted. Configure the active data-encryption key pair in Vercel's secret manager
+before saving or rotating Mail credentials. Existing plaintext values remain compatible until an
+authorized operator replaces them. Never commit or display provider credentials. If mail is not
+sending, check the settings and health screens before checking provider authentication.
 
 **Deploy budget: 100 per day on the free tier.** If "Resource is limited" appears, stop and tell the
 user rather than retrying — retrying spends the rest of the budget.

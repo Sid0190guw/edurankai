@@ -20,8 +20,8 @@
 // inbound rule an administrator built on /admin/mail/rules had ever filed a message on arrival.
 // Both doors now go through deliverInbound(). See the block above it in src/lib/mail.ts.
 import type { APIRoute } from 'astro';
-import { parseAddressList, resolveAddress, ensureMailSchema, getMailConfig, deliverInbound } from '@/lib/mail';
-import { randomUUID } from 'node:crypto';
+import { parseAddressList, resolveInboundRecipients, ensureMailSchema, getMailConfig, deliverInbound } from '@/lib/mail';
+import { normalizeInboundMessageId } from '@/lib/mail-inbound-routing';
 // The HMAC verifier this route was always meant to use. It already existed, fully written and
 // tested, in src/lib/mailops/webhook.ts — and nothing called it. Meanwhile docker/mailops/ingest.mjs
 // has been SIGNING every forwarded message with MAIL_WEBHOOK_SECRET, and /api/health/mail reports
@@ -110,6 +110,10 @@ export const POST: APIRoute = async ({ request }) => {
     console.error('[api/mail/inbound] refusing delivery: mail_config unreadable -', cfg.readError);
     return json({ ok: false, error: 'mail configuration could not be read; retry shortly' }, 503);
   }
+  if (cfg.secretErrors.inbound_secret) {
+    console.error('[api/mail/inbound] refusing delivery because the stored webhook secret cannot be decrypted.');
+    return json({ ok: false, error: 'mail authentication configuration is temporarily unavailable; retry shortly' }, 503);
+  }
   // ═══ AUTHENTICATION ═══
   //
   // WHAT THIS REPLACES, AND WHY EACH PART OF IT MATTERED:
@@ -167,36 +171,38 @@ export const POST: APIRoute = async ({ request }) => {
   const bodyText = (body.text || '').toString();
   const bodyHtml = (body.html || '').toString();
   const inReplyTo = (body.inReplyTo || body.in_reply_to || '').toString() || null;
-  const rfcId = (body.messageId || body.message_id || `<${randomUUID()}@inbound>`).toString();
+  const rfcId = normalizeInboundMessageId(body.messageId || body.message_id, raw);
 
   try {
     let delivered = 0;
     const unresolved: string[] = [];
     const seen = new Set<string>();
     for (const addr of toList) {
-      const resolved = await resolveAddress(addr);
+      const recipients = await resolveInboundRecipients(addr);
       // MAIL TO AN ADDRESS WITH NO MAILBOX WAS ACCEPTED AND THROWN AWAY. The loop skipped it, the
       // response was `{ ok: true, delivered: 0 }`, and the sending MTA read that 200 as delivery -
       // so no bounce ever reached the person who wrote to us and no line anywhere recorded that a
       // message had arrived for nobody. The status stays 200 on purpose (a non-2xx makes a
       // forwarding worker retry the same undeliverable message for hours), but the addresses are
       // named in the log and in the answer so this is discoverable instead of silent.
-      if (!resolved.userId) { if (!unresolved.includes(addr)) unresolved.push(addr); continue; }
-      if (seen.has(resolved.userId)) continue;
-      seen.add(resolved.userId);
+      if (!recipients.length) { if (!unresolved.includes(addr)) unresolved.push(addr); continue; }
+      for (const resolved of recipients) {
+        if (!resolved.userId || seen.has(resolved.userId)) continue;
+        seen.add(resolved.userId);
 
-      // Threading, storage, arrival filtering and the recipient's notification, in the one place
-      // that does all four. A throw here still aborts the request and answers 500 — this is a write
-      // path and it must not report a delivery that did not happen.
-      await deliverInbound({
-        userId: resolved.userId,
-        email: resolved.email,
-        name: resolved.name,
-        fromEmail, fromName, subject, bodyText, bodyHtml,
-        rfcMessageId: rfcId,
-        inReplyTo,
-      });
-      delivered += 1;
+        // Threading, storage, arrival filtering and the recipient's notification, in the one place
+        // that does all four. A throw here still aborts the request and answers 500 — this is a write
+        // path and it must not report a delivery that did not happen.
+        await deliverInbound({
+          userId: resolved.userId,
+          email: resolved.email,
+          name: resolved.name,
+          fromEmail, fromName, subject, bodyText, bodyHtml,
+          rfcMessageId: rfcId,
+          inReplyTo,
+        });
+        delivered += 1;
+      }
     }
     if (unresolved.length) {
       console.error('[api/mail/inbound] no mailbox for', unresolved.join(', '), '- from', fromEmail, '- subject', subject.slice(0, 120));
