@@ -3,13 +3,30 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { isConfigured } from '@/lib/razorpay';
+import { normalizeFormFields, type FormField } from '@/lib/forms/form-schema';
+import { canAccessSection } from '@/lib/auth/permissions';
 
 const { slug } = Astro.params;
 if (!slug) return new Response('Not found', { status: 404 });
+const preview = new URL(Astro.request.url).searchParams.get('preview') === '1';
+if (preview && !(await canAccessSection(Astro.locals.user as any, 'content', 'view'))) {
+  return new Response('Not found', { status: 404 });
+}
+if (preview) Astro.response.headers.set('Cache-Control', 'private, no-store');
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
-const form: any = rows(await db.execute(sql`SELECT * FROM forms WHERE slug = ${slug} AND is_published = true LIMIT 1`))[0];
+const form: any = rows(await db.execute(preview
+  ? sql`SELECT * FROM forms WHERE slug = ${slug} LIMIT 1`
+  : sql`SELECT * FROM forms WHERE slug = ${slug} AND is_published = true LIMIT 1`))[0];
 
-const fields = form && Array.isArray(form.fields) ? form.fields : [];
+let fields: FormField[] = [];
+if (form) {
+  try {
+    fields = normalizeFormFields(form.fields);
+  } catch (error) {
+    console.error('[public-form] invalid saved form definition:', error instanceof Error ? error.message : error);
+    return new Response('This form is temporarily unavailable. Please contact the form owner.', { status: 500 });
+  }
+}
 const feeChf = form ? (parseInt(form.fee_chf || 0) || 0) : 0;
 const paymentsReady = isConfigured();
 ---
@@ -24,24 +41,41 @@ const paymentsReady = isConfigured();
       <>
         <h1 class="font-display text-[clamp(1.7rem,4.5vw,2.4rem)] font-semibold text-ink leading-tight mb-2">{form.title}</h1>
         {form.description && <p class="text-[0.95rem] text-ink-soft leading-relaxed mb-2 whitespace-pre-wrap">{form.description}</p>}
+        {preview && <p class="preview-notice" role="status">Private preview — this form is not accepting responses.</p>}
         {feeChf > 0 && <p class="text-[0.85rem] text-ink-2 mb-5 inline-block bg-burn-pale border border-burn-dim rounded-lg px-3 py-1.5">Fee on submit: <strong>{feeChf} CHF</strong> (charged in INR via Razorpay)</p>}
 
         <form id="pubForm" class="flex flex-col gap-4 bg-white border border-ink/10 rounded-2xl p-5 md:p-6 mt-3">
-          {fields.map((f: any) => (
-            <div data-field data-key={f.key} data-type={f.type}>
+          <fieldset class="preview-controls">
+            {fields.map((f: FormField, index: number) => (
+              <>
+              {(index === 0 || fields[index - 1].section !== f.section) && <div class="form-section-heading"><h2>{f.section}</h2></div>}
+              <div data-field data-key={f.key} data-type={f.type} data-required={f.required ? 'true' : 'false'} data-condition={f.condition ? JSON.stringify(f.condition) : ''}>
               {f.type === 'acknowledgment' ? (
-                <label class="flex items-start gap-3 text-[0.9rem] text-ink-2 leading-relaxed"><input data-input type="checkbox" required={f.required} class="accent-burn mt-1" /><span>{f.label}{f.required && <span class="text-burn"> *</span>}</span></label>
+                <div>
+                  <label class="flex items-start gap-3 text-[0.9rem] text-ink-2 leading-relaxed"><input data-input type="checkbox" required={f.required} class="accent-burn mt-1" /><span>{f.label}{f.required && <span class="text-burn"> *</span>}</span></label>
+                  {f.description && <p class="field-description">{f.description}</p>}
+                </div>
               ) : (
                 <>
-                  <label class="block text-[0.85rem] font-semibold text-ink mb-1.5">{f.label}{f.required && <span class="text-burn"> *</span>}{['selfie','location','signature'].includes(f.type) && <span class="ml-2 text-[0.75rem] font-normal text-ink-soft">(optional)</span>}</label>
+                  <label class="block text-[0.9rem] font-semibold text-ink mb-1.5">{f.label}{f.required && <span class="text-burn"> *</span>}{['selfie','location','signature'].includes(f.type) && <span class="ml-2 text-[0.78rem] font-normal text-ink-soft">(optional)</span>}</label>
+                  {f.description && <p class="field-description">{f.description}</p>}
                   {f.type === 'textarea' ? (
-                    <textarea data-input required={f.required} rows="3" placeholder={f.placeholder || ''} class="pfi"></textarea>
+                    <textarea data-input required={f.required} minlength={f.minLength || undefined} maxlength={f.maxLength || undefined} rows="3" placeholder={f.placeholder || ''} class="pfi"></textarea>
                   ) : f.type === 'select' ? (
                     <select data-input required={f.required} class="pfi"><option value="">Choose...</option>{(f.options || []).map((o: string) => <option value={o}>{o}</option>)}</select>
                   ) : f.type === 'radio' ? (
-                    <div class="flex flex-col gap-1.5">{(f.options || []).map((o: string) => <label class="flex items-center gap-2 text-[0.9rem] text-ink-2"><input type="radio" name={'r_' + f.key} value={o} class="accent-burn" /> {o}</label>)}</div>
+                    <div class="flex flex-col gap-1.5">{(f.options || []).map((o: string, i: number) => <label class="flex items-center gap-2 text-[0.9rem] text-ink-2"><input type="radio" name={'r_' + f.key} value={o} required={f.required && i === 0} class="accent-burn" /> {o}</label>)}</div>
                   ) : f.type === 'checkbox' ? (
                     <div class="flex flex-col gap-1.5">{(f.options || []).map((o: string) => <label class="flex items-center gap-2 text-[0.9rem] text-ink-2"><input type="checkbox" data-cb value={o} class="accent-burn" /> {o}</label>)}</div>
+                  ) : f.type === 'yes_no' ? (
+                    <div class="flex gap-5">{['yes','no'].map((answer) => <label class="flex items-center gap-2 text-[0.9rem] text-ink-2"><input type="radio" name={'r_' + f.key} value={answer} required={f.required && answer === 'yes'} class="accent-burn" /> {answer === 'yes' ? 'Yes' : 'No'}</label>)}</div>
+                  ) : f.type === 'rating' || f.type === 'linear_scale' ? (
+                    <select data-input required={f.required} class="pfi" aria-label={f.type === 'rating' ? 'Choose a rating' : 'Choose a scale value'}>
+                      <option value="">Choose...</option>
+                      {Array.from({ length: (f.max !== null ? f.max : 5) - (f.min !== null ? f.min : 0) + 1 }, (_, index) => (f.min !== null ? f.min : 0) + index).map((value) => (
+                        <option value={value}>{f.type === 'rating' ? value + ' stars' : value}</option>
+                      ))}
+                    </select>
                   ) : f.type === 'selfie' ? (
                     <div class="capture-box">
                       <p class="capture-help">Optional live selfie. Camera access starts only after you choose to turn it on.</p>
@@ -68,14 +102,20 @@ const paymentsReady = isConfigured();
                       <button type="button" data-signature-clear class="capture-button" style="margin-top:8px;">Clear signature</button>
                     </div>
                   ) : (
-                    <input data-input type={f.type === 'number' ? 'number' : f.type === 'email' ? 'email' : f.type === 'url' ? 'url' : f.type === 'date' ? 'date' : f.type === 'phone' ? 'tel' : 'text'} required={f.required} placeholder={f.placeholder || ''} class="pfi" />
+                    <div>
+                      <input data-input type={['number','currency','percentage','duration'].includes(f.type) ? 'number' : f.type === 'email' ? 'email' : f.type === 'url' ? 'url' : f.type === 'date' ? 'date' : f.type === 'time' ? 'time' : f.type === 'datetime' ? 'datetime-local' : f.type === 'phone' ? 'tel' : 'text'} step={['currency','percentage'].includes(f.type) ? 'any' : undefined} required={f.required} min={f.min ?? undefined} max={f.max ?? undefined} minlength={f.minLength ?? undefined} maxlength={f.maxLength ?? undefined} autocomplete={f.type === 'phone' ? 'tel' : f.type === 'email' ? 'email' : undefined} placeholder={f.placeholder || ''} class="pfi" />
+                      {f.example && <p class="field-example">{f.example}</p>}
+                    </div>
                   )}
+                  {f.example && ['textarea','select','radio','checkbox','yes_no','rating','linear_scale'].includes(f.type) && <p class="field-example">{f.example}</p>}
                 </>
               )}
-            </div>
-          ))}
-          <button type="submit" id="pubSubmit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 rounded-lg text-[0.92rem] mt-1">{feeChf > 0 ? 'Pay ' + feeChf + ' CHF & submit' : 'Submit'}</button>
-          <p id="pubErr" class="text-[0.82rem] text-red-700 text-center" style="display:none;"></p>
+              </div>
+              </>
+            ))}
+            <button type="submit" id="pubSubmit" disabled={preview} class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 rounded-lg text-[0.92rem] mt-1">{preview ? 'Preview only' : feeChf > 0 ? 'Pay ' + feeChf + ' CHF & submit' : 'Submit'}</button>
+            <p id="pubErr" class="text-[0.82rem] text-red-700 text-center" style="display:none;"></p>
+          </fieldset>
         </form>
         <div id="pubDone" style="display:none;" class="bg-leaf-bg/40 border border-leaf-border rounded-2xl p-6 text-center mt-3">
           <p class="font-semibold text-leaf mb-1">Submitted</p>
@@ -87,15 +127,15 @@ const paymentsReady = isConfigured();
 
   {form && (
     <>
-      {feeChf > 0 && paymentsReady && <script is:inline src="https://checkout.razorpay.com/v1/checkout.js"></script>}
-      <script is:inline define:vars={{ slug, fee: feeChf }}>
+      {feeChf > 0 && paymentsReady && !preview && <script is:inline src="https://checkout.razorpay.com/v1/checkout.js"></script>}
+      <script is:inline define:vars={{ slug, fee: feeChf, preview }}>
         (function () {
           var form = document.getElementById('pubForm'); if (!form) return;
           var err = document.getElementById('pubErr'), btn = document.getElementById('pubSubmit');
           function showErr(m) { err.textContent = m; err.style.display = 'block'; }
           function done(msg) { form.style.display = 'none'; document.getElementById('pubDone').style.display = 'block'; document.getElementById('pubDoneMsg').textContent = msg || 'Your response has been recorded.'; }
           function collect() {
-            var data = {};
+            var data = Object.create(null);
             document.querySelectorAll('[data-field]').forEach(function (wrap) {
               var key = wrap.getAttribute('data-key'), type = wrap.getAttribute('data-type');
               if (type === 'acknowledgment') { var ack = wrap.querySelector('[data-input]'); data[key] = !!(ack && ack.checked); }
@@ -108,11 +148,68 @@ const paymentsReady = isConfigured();
                 var canvas = wrap.querySelector('[data-signature]');
                 data[key] = canvas && canvas.getAttribute('data-signed') === 'true' ? canvas.toDataURL('image/png') : '';
               }
-              else if (type === 'radio') { var c = wrap.querySelector('input[type=radio]:checked'); data[key] = c ? c.value : ''; }
+              else if (type === 'radio' || type === 'yes_no') { var c = wrap.querySelector('input[type=radio]:checked'); data[key] = c ? c.value : ''; }
               else if (type === 'checkbox') { var arr = []; wrap.querySelectorAll('[data-cb]:checked').forEach(function (x) { arr.push(x.value); }); data[key] = arr; }
               else { var el = wrap.querySelector('[data-input]'); data[key] = el ? el.value.trim() : ''; }
             });
             return data;
+          }
+          function readValue(wrap) {
+            var type = wrap.getAttribute('data-type');
+            if (type === 'radio' || type === 'yes_no') {
+              var checked = wrap.querySelector('input[type=radio]:checked');
+              return checked ? checked.value : '';
+            }
+            if (type === 'checkbox') {
+              var checkedOptions = [];
+              wrap.querySelectorAll('[data-cb]:checked').forEach(function (input) { checkedOptions.push(input.value); });
+              return checkedOptions;
+            }
+            var input = wrap.querySelector('[data-input]');
+            return input ? input.value.trim() : '';
+          }
+          function updateConditionalFields() {
+            var wrappers = Array.prototype.slice.call(document.querySelectorAll('[data-field]'));
+            wrappers.forEach(function (wrap) {
+              var raw = wrap.getAttribute('data-condition');
+              if (!raw) return;
+              var condition;
+              try { condition = JSON.parse(raw); } catch (_) { wrap.hidden = true; return; }
+              var source = wrappers.find(function (candidate) { return candidate.getAttribute('data-key') === condition.fieldKey; });
+              var value = source && !source.hidden ? readValue(source) : '';
+              var answered = Array.isArray(value) ? value.length > 0 : value !== '';
+              var visible = true;
+              if (condition.operator === 'answered') visible = answered;
+              else if (condition.operator === 'not_answered') visible = !answered;
+              else {
+                var equal = Array.isArray(value) ? value.indexOf(condition.value) >= 0 : String(value) === condition.value;
+                visible = condition.operator === 'equals' ? equal : !equal;
+              }
+              wrap.hidden = !visible;
+              if (!visible && typeof wrap.__stopCamera === 'function') wrap.__stopCamera();
+              wrap.querySelectorAll('input,select,textarea').forEach(function (control) {
+                if (!control.hasAttribute('data-rule-required')) {
+                  control.setAttribute('data-rule-required', control.required ? 'true' : 'false');
+                }
+                control.required = visible && control.getAttribute('data-rule-required') === 'true';
+              });
+            });
+          }
+          form.addEventListener('input', updateConditionalFields);
+          form.addEventListener('change', updateConditionalFields);
+          updateConditionalFields();
+          if (preview) return;
+          function validateChoiceGroups() {
+            var ok = true;
+            document.querySelectorAll('[data-field][data-type="checkbox"]').forEach(function (wrap) {
+              var input = wrap.querySelector('[data-cb]');
+              if (!wrap.hidden && wrap.getAttribute('data-required') === 'true' && input && !wrap.querySelector('[data-cb]:checked')) {
+                showErr('Please choose at least one option.');
+                input.focus();
+                ok = false;
+              }
+            });
+            return ok;
           }
           document.querySelectorAll('[data-field][data-type="selfie"]').forEach(function (wrap) {
             var start = wrap.querySelector('[data-camera-start]');
@@ -255,6 +352,7 @@ const paymentsReady = isConfigured();
           });
           form.addEventListener('submit', function (e) {
             e.preventDefault(); err.style.display = 'none';
+            if (!form.reportValidity() || !validateChoiceGroups()) return;
             document.querySelectorAll('[data-field]').forEach(function (wrap) {
               if (typeof wrap.__stopCamera === 'function') wrap.__stopCamera();
             });
@@ -279,7 +377,11 @@ const paymentsReady = isConfigured();
     </>
   )}
   <style>
+    .preview-notice{margin:12px 0;padding:10px 12px;border:1px solid #b45309;border-radius:8px;background:#fff7ed;color:#7c2d12;font-size:.86rem;font-weight:600}
+    .preview-controls{display:flex;flex-direction:column;gap:1rem;width:100%;min-width:0;margin:0;padding:0;border:0}
     .pfi{width:100%;padding:10px 12px;background:#fff;border:1px solid rgba(0,0,0,.24);border-radius:8px;color:#17191d;font-size:.95rem;outline:none}
+    .form-section-heading{padding-top:10px;border-top:1px solid rgba(23,32,43,.12)}
+    .form-section-heading h2{margin:0;color:#17202b;font-size:1.1rem;font-weight:700}
     .pfi::placeholder{color:#626a75;opacity:1}
     .pfi:focus{border-color:#c93e0a;box-shadow:0 0 0 3px rgba(255,79,0,.16)}
     .capture-box{padding:12px;border:1px solid rgba(0,0,0,.16);border-radius:10px;background:#fbfaf7}

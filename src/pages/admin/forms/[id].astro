@@ -3,6 +3,7 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { canAccessSection } from '@/lib/auth/permissions';
 import { publicUrl } from '@/lib/public-origin';
+import { normalizeFormFields, validateFormForPublishing } from '@/lib/forms/form-schema';
 import { sql } from 'drizzle-orm';
 
 const user = Astro.locals.user;
@@ -39,21 +40,10 @@ if (Astro.request.method === 'POST') {
       const feeChf = parseInt(fd.get('fee_chf') as string || '0') || 0;
       const successMessage = (fd.get('success_message') as string || '').trim() || null;
       const isPublished = fd.get('is_published') === 'on';
-      let fields: any = [];
-      try { fields = JSON.parse(fd.get('fields_json') as string || '[]'); } catch { fields = []; }
-      if (!Array.isArray(fields)) fields = [];
-      // sanitise
-      fields = fields.filter((f: any) => f && f.label).map((f: any, i: number) => {
-        const type = ['text','email','phone','url','number','textarea','select','radio','checkbox','date','acknowledgment','selfie','location','signature'].includes(f.type) ? f.type : 'text';
-        return {
-          key: (f.key || ('f' + i)).toString().slice(0, 40),
-          type,
-          label: String(f.label).slice(0, 200),
-          required: !['selfie','location','signature'].includes(type) && !!f.required,
-          options: Array.isArray(f.options) ? f.options.map((o: any) => String(o).slice(0, 120)).filter(Boolean) : [],
-          placeholder: f.placeholder ? String(f.placeholder).slice(0, 120) : '',
-        };
-      });
+      const submittedFields = JSON.parse(fd.get('fields_json') as string || '[]');
+      const fields = normalizeFormFields(submittedFields);
+      const publicationError = isPublished ? validateFormForPublishing(fields) : null;
+      if (publicationError) throw new Error(publicationError);
       await db.execute(sql`UPDATE forms SET title = ${title}, description = ${description}, fee_chf = ${feeChf}, success_message = ${successMessage}, is_published = ${isPublished}, fields = ${sql.raw("'" + JSON.stringify(fields).replace(/'/g, "''") + "'::jsonb")}, updated_at = NOW() WHERE id = ${id}`);
       okMsg = 'Saved.';
     }
@@ -62,8 +52,86 @@ if (Astro.request.method === 'POST') {
 
 const form: any = rows(await db.execute(sql`SELECT * FROM forms WHERE id = ${id} LIMIT 1`))[0];
 if (!form) return Astro.redirect('/admin/forms');
-const responses = rows(await db.execute(sql`SELECT * FROM form_responses WHERE form_id = ${id} ORDER BY created_at DESC LIMIT 300`));
-const fields = Array.isArray(form.fields) ? form.fields : [];
+const fields = normalizeFormFields(form.fields);
+const responseUrl = new URL(Astro.request.url);
+const responseSearch = String(responseUrl.searchParams.get('q') || '').trim().slice(0, 120);
+const responsePageParam = Number.parseInt(responseUrl.searchParams.get('responsePage') || '1', 10);
+const responsePage = Number.isSafeInteger(responsePageParam) && responsePageParam > 0 ? responsePageParam : 1;
+const responsePattern = '%' + responseSearch.replace(/[\\%_]/g, '\\$&') + '%';
+function validDateParam(value: string | null): string {
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return '';
+  const parsed = new Date(value + 'T00:00:00.000Z');
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value ? value : '';
+}
+const responseStartDate = validDateParam(responseUrl.searchParams.get('startDate'));
+const responseEndDate = validDateParam(responseUrl.searchParams.get('endDate'));
+let responseFilter = sql`form_id = ${id}`;
+if (responseSearch) {
+  responseFilter = sql`${responseFilter} AND (respondent_name ILIKE ${responsePattern} OR respondent_email ILIKE ${responsePattern} OR respondent_phone ILIKE ${responsePattern} OR data::text ILIKE ${responsePattern})`;
+}
+if (responseStartDate) responseFilter = sql`${responseFilter} AND created_at >= ${responseStartDate}::date`;
+if (responseEndDate) responseFilter = sql`${responseFilter} AND created_at < (${responseEndDate}::date + INTERVAL '1 day')`;
+const responseCount = rows(await db.execute(sql`SELECT COUNT(*)::int AS total FROM form_responses WHERE ${responseFilter}`));
+const responseTotal = Number(responseCount[0]?.total || 0);
+const responsePageSize = 50;
+const responsePageCount = Math.max(1, Math.ceil(responseTotal / responsePageSize));
+const responseCurrentPage = Math.min(responsePage, responsePageCount);
+const responses = rows(await db.execute(sql`SELECT * FROM form_responses WHERE ${responseFilter} ORDER BY created_at DESC LIMIT ${responsePageSize} OFFSET ${(responseCurrentPage - 1) * responsePageSize}`));
+const responseMetrics: any = rows(await db.execute(sql`
+  SELECT
+    COUNT(*)::int AS total,
+    COUNT(*) FILTER (WHERE payment_status = 'none')::int AS no_payment_required,
+    COUNT(*) FILTER (WHERE payment_status = 'paid')::int AS paid,
+    COUNT(*) FILTER (WHERE payment_status = 'pending')::int AS payment_pending,
+    COUNT(*) FILTER (WHERE payment_status NOT IN ('none', 'paid', 'pending'))::int AS other_status
+  FROM form_responses WHERE form_id = ${id}
+`))[0] || {};
+const dailyMetrics = rows(await db.execute(sql`
+  SELECT to_char(created_at, 'YYYY-MM-DD') AS day, COUNT(*)::int AS total
+  FROM form_responses
+  WHERE form_id = ${id} AND created_at >= NOW() - INTERVAL '14 days'
+  GROUP BY to_char(created_at, 'YYYY-MM-DD')
+  ORDER BY day ASC
+`));
+const distributableFields = fields.filter((field) =>
+  ['select', 'radio', 'checkbox', 'yes_no', 'rating', 'linear_scale'].includes(field.type),
+);
+const answerDistribution = distributableFields.length
+  ? rows(await db.execute(sql`
+      WITH answer_counts AS (
+        SELECT answer_pair.key, answer_value.value AS answer, COUNT(*)::int AS total
+        FROM form_responses AS response
+        CROSS JOIN LATERAL jsonb_each(
+          CASE WHEN jsonb_typeof(response.data) = 'object' THEN response.data ELSE '{}'::jsonb END
+        ) AS answer_pair(key, value)
+        CROSS JOIN LATERAL jsonb_array_elements_text(
+          CASE
+            WHEN jsonb_typeof(answer_pair.value) = 'array' THEN answer_pair.value
+            ELSE jsonb_build_array(answer_pair.value)
+          END
+        ) AS answer_value(value)
+        WHERE response.form_id = ${id}
+          AND answer_pair.key IN (${sql.join(distributableFields.map((field) => sql`${field.key}`), sql`, `)})
+          AND answer_value.value <> ''
+        GROUP BY answer_pair.key, answer_value.value
+      ), ranked AS (
+        SELECT key, answer, total,
+          ROW_NUMBER() OVER (PARTITION BY key ORDER BY total DESC, answer ASC) AS position
+        FROM answer_counts
+      )
+      SELECT key, answer, total FROM ranked WHERE position <= 10 ORDER BY key, position
+    `))
+  : [];
+function responseHref(nextPage: number): string {
+  const params = new URLSearchParams();
+  params.set('responsePage', String(nextPage));
+  if (responseSearch) params.set('q', responseSearch);
+  if (responseStartDate) params.set('startDate', responseStartDate);
+  if (responseEndDate) params.set('endDate', responseEndDate);
+  return '/admin/forms/' + id + '?' + params.toString();
+}
+const responseFirst = responseTotal === 0 ? 0 : (responseCurrentPage - 1) * responsePageSize + 1;
+const responseLast = Math.min(responseCurrentPage * responsePageSize, responseTotal);
 const fmt = (d: any) => d ? new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }) : '';
 const externalUrl = (raw: string) => {
   try {
@@ -94,7 +162,7 @@ const urlParts = (raw: string) => {
   <div class="admin-page" style="max-width:1000px;">
     <a href="/admin/forms" style="font-size:11px;color:#FF7040;text-decoration:none;font-weight:600;">&lt; All forms</a>
     <h1 class="admin-page-title" style="margin-top:8px;">{form.title}</h1>
-    <p class="admin-page-sub">Public link: <span style="font-family:monospace;color:#c8c3b8;">{publicUrl('/f/' + form.slug)}</span></p>
+    <p class="admin-page-sub">Public link: <span style="font-family:monospace;color:#c8c3b8;">{publicUrl('/f/' + form.slug)}</span> <a href={'/f/' + form.slug + '?preview=1'} target="_blank" rel="noopener noreferrer" class="response-link">Preview form</a></p>
     {errMsg && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 13px;margin:12px 0;font-size:12.5px;">{errMsg}</div>}
     {okMsg && <div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 13px;margin:12px 0;font-size:12.5px;">{okMsg}</div>}
 
@@ -109,16 +177,26 @@ const urlParts = (raw: string) => {
       <div style="margin-top:10px;"><label class="fl">Success message (after submit)</label><input name="success_message" value={form.success_message || ''} placeholder="Thanks! Your response is recorded." class="fi" /></div>
       <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#c8c3b8;margin-top:10px;cursor:pointer;"><input type="checkbox" name="is_published" checked={form.is_published} /> Published (publicly fillable)</label>
 
-      <p style="font-size:12px;font-weight:700;color:#fff;margin:16px 0 8px;">Fields</p>
-      <p class="field-note">Selfie, location, and signature fields are always optional. People are asked for camera or location access only when they choose that field.</p>
+      <p style="font-size:12px;font-weight:700;color:#fff;margin:16px 0 8px;">Questions</p>
+      <p class="field-note">This starts as a blank form. Selfie, location, and signature questions are always optional; respondents choose whether to provide them.</p>
       <div id="fieldList" style="display:flex;flex-direction:column;gap:8px;"></div>
-      <button type="button" id="addField" style="margin-top:10px;font-size:12px;background:#222831;border:1px solid #2a3038;color:#fff;padding:7px 14px;border-radius:7px;cursor:pointer;">+ Add field</button>
+      <button type="button" id="addField" style="margin-top:10px;font-size:12px;background:#222831;border:1px solid #2a3038;color:#fff;padding:7px 14px;border-radius:7px;cursor:pointer;">+ Add your first question</button>
 
       <div style="margin-top:16px;"><button type="submit" class="admin-btn admin-btn-primary">Save form</button></div>
     </form>
 
     <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:18px;margin-top:16px;">
-      <p style="font-size:13px;font-weight:700;color:#fff;margin:0 0 10px;">Responses ({responses.length})</p>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
+        <p style="font-size:13px;font-weight:700;color:#fff;margin:0;">Responses ({responseTotal})</p>
+        <form method="GET" action={'/admin/forms/' + id} style="display:flex;gap:7px;flex-wrap:wrap;align-items:center;">
+          <input type="search" name="q" value={responseSearch} placeholder="Search responses" aria-label="Search responses" class="fi" style="width:min(260px,65vw);" />
+          <label class="filter-label">From <input type="date" name="startDate" value={responseStartDate} class="fi date-filter" /></label>
+          <label class="filter-label">To <input type="date" name="endDate" value={responseEndDate} class="fi date-filter" /></label>
+          <button type="submit" class="admin-btn">Search</button>
+          {(responseSearch || responseStartDate || responseEndDate) && <a href={'/admin/forms/' + id} class="admin-btn" style="display:inline-flex;align-items:center;text-decoration:none;">Clear</a>}
+        </form>
+      </div>
+      <p class="field-note">Showing {responseFirst}-{responseLast} of {responseTotal} matching responses.</p>
       <div style="overflow-x:auto;">
         <table class="response-table" style="width:100%;border-collapse:collapse;font-size:12px;">
           <thead><tr style="text-align:left;border-bottom:1px solid #3a414c;"><th style="padding:8px;">When</th><th style="padding:8px;">Name</th><th style="padding:8px;">Email</th><th style="padding:8px;">Phone</th><th style="padding:8px;">Fee</th><th style="padding:8px;">Response</th></tr></thead>
@@ -169,12 +247,70 @@ const urlParts = (raw: string) => {
                 </tr>
               );
             })}
-            {responses.length === 0 && <tr><td colspan="6" style="padding:14px 8px;color:#8a8a94;">No responses yet.</td></tr>}
+            {responses.length === 0 && <tr><td colspan="6" style="padding:14px 8px;color:#c3cbd6;">{responseSearch ? 'No responses match your search.' : 'No responses yet.'}</td></tr>}
           </tbody>
         </table>
       </div>
+      <div style="display:flex;justify-content:flex-end;align-items:center;gap:8px;margin-top:12px;">
+        {responseCurrentPage > 1
+          ? <a class="admin-btn" href={responseHref(responseCurrentPage - 1)} style="text-decoration:none;">Previous</a>
+          : <span class="admin-btn" style="opacity:.45;">Previous</span>}
+        <span style="font-size:11.5px;color:#c3cbd6;">Page {responseCurrentPage} of {responsePageCount}</span>
+        {responseCurrentPage < responsePageCount
+          ? <a class="admin-btn" href={responseHref(responseCurrentPage + 1)} style="text-decoration:none;">Next</a>
+          : <span class="admin-btn" style="opacity:.45;">Next</span>}
+      </div>
       <a href={'/api/forms/export/' + form.id} style="font-size:11px;color:#60a5fa;text-decoration:none;display:inline-block;margin-top:8px;">Export CSV</a>
+      <span style="color:#6b7280;margin:0 8px;">|</span>
+      <a href={'/api/forms/export-json/' + form.id} style="font-size:11px;color:#60a5fa;text-decoration:none;display:inline-block;margin-top:8px;">Export JSON</a>
     </div>
+
+    <section class="analytics-panel" aria-labelledby="analyticsHeading">
+      <div class="analytics-heading">
+        <div>
+          <h2 id="analyticsHeading">Submission analytics</h2>
+          <p>Measured records only. Drafts, incomplete attempts, and time-to-completion are not tracked.</p>
+        </div>
+        <span>{Number(responseMetrics.total || 0)} total records</span>
+      </div>
+      <div class="analytics-cards">
+        <div><span>Free submissions</span><strong>{Number(responseMetrics.no_payment_required || 0)}</strong></div>
+        <div><span>Paid submissions</span><strong>{Number(responseMetrics.paid || 0)}</strong></div>
+        <div><span>Payment pending</span><strong>{Number(responseMetrics.payment_pending || 0)}</strong></div>
+        {Number(responseMetrics.other_status || 0) > 0 && <div><span>Other payment states</span><strong>{Number(responseMetrics.other_status)}</strong></div>}
+      </div>
+      <h3>Daily submissions · past 14 days</h3>
+      {dailyMetrics.length > 0 ? (
+        <div class="analytics-trend" role="list">
+          {dailyMetrics.map((day: any) => (
+            <div class="analytics-day" role="listitem">
+              <span>{day.day}</span>
+              <strong>{Number(day.total || 0)}</strong>
+              <span>submissions</span>
+            </div>
+          ))}
+        </div>
+      ) : <p class="analytics-empty">No submissions were recorded in the past 14 days.</p>}
+      {distributableFields.length > 0 && (
+        <>
+          <h3>Answer distributions</h3>
+          <p class="analytics-empty">Top recorded answers for configured choice and scale questions. Counts include submissions that answered that question.</p>
+          <div class="distribution-grid">
+            {distributableFields.map((field) => {
+              const answers = answerDistribution.filter((answer: any) => answer.key === field.key);
+              return (
+                <div class="distribution-card">
+                  <h4>{field.label}</h4>
+                  {answers.length > 0 ? answers.map((answer: any) => (
+                    <div class="distribution-row"><span>{answer.answer}</span><strong>{Number(answer.total)}</strong></div>
+                  )) : <p class="analytics-empty">No answers recorded.</p>}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </section>
   </div>
 
   <style>
@@ -182,6 +318,8 @@ const urlParts = (raw: string) => {
     .fi{width:100%;padding:8px 10px;background:#08080a;border:1px solid #424956;border-radius:6px;color:#f4f6f8;font-size:12.5px;font-family:inherit;outline:none}
     .fi::placeholder{color:#a5adba;opacity:1}
     .fi:focus{border-color:#FF7040;box-shadow:0 0 0 2px rgba(255,112,64,.18)}
+    .filter-label{display:flex;align-items:center;gap:5px;color:#c3cbd6;font-size:11px}
+    .date-filter{width:145px}
     .fld{background:#151a22;border:1px solid #39414d;border-radius:8px;padding:10px}
     .field-note{margin:0 0 10px;color:#c3cbd6;font-size:12px;line-height:1.5}
     .form-top-grid{display:grid;grid-template-columns:minmax(0,2fr) 110px;gap:10px}
@@ -202,11 +340,30 @@ const urlParts = (raw: string) => {
     .ack-time{display:block;color:#adb7c4;margin-top:3px}
     .response-image{display:block;max-width:240px;max-height:240px;border-radius:8px;border:1px solid #495261}
     .response-signature{display:block;max-width:360px;max-height:140px;background:#fff;border-radius:6px;padding:4px}
+    .analytics-panel{margin-top:16px;padding:18px;background:#0f0f14;border:1px solid #303640;border-radius:12px}
+    .analytics-heading{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
+    .analytics-heading h2{margin:0;color:#fff;font-size:15px}
+    .analytics-heading p,.analytics-empty{margin:5px 0 0;color:#c3cbd6;font-size:12px;line-height:1.5}
+    .analytics-heading>span{color:#e3e7ed;font-size:12px;font-weight:600}
+    .analytics-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:9px;margin:14px 0}
+    .analytics-cards>div{display:flex;flex-direction:column;gap:5px;padding:11px;background:#151a22;border:1px solid #39414d;border-radius:8px}
+    .analytics-cards span,.analytics-day span{color:#c3cbd6;font-size:11px}
+    .analytics-cards strong{color:#fff;font-size:20px}
+    .analytics-panel h3{margin:14px 0 8px;color:#e3e7ed;font-size:12px}
+    .analytics-trend{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px}
+    .analytics-day{min-width:90px;display:flex;flex-direction:column;gap:4px;padding:9px;background:#151a22;border:1px solid #303640;border-radius:7px}
+    .analytics-day strong{color:#8bc5ff;font-size:16px}
+    .distribution-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:9px}
+    .distribution-card{padding:11px;background:#151a22;border:1px solid #303640;border-radius:8px}
+    .distribution-card h4{margin:0 0 8px;color:#fff;font-size:12px}
+    .distribution-row{display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-top:1px solid #303640;color:#e3e7ed;font-size:11px}
+    .distribution-row span{overflow-wrap:anywhere}
+    .distribution-row strong{color:#8bc5ff}
     @media(max-width:640px){.form-top-grid{grid-template-columns:1fr}.profile-value{grid-template-columns:1fr;gap:4px}.response-profile{min-width:270px}}
   </style>
   <script is:inline define:vars={{ initial: fields }}>
     (function () {
-      var TYPES = ['text','email','phone','url','number','textarea','select','radio','checkbox','date','acknowledgment','selfie','location','signature'];
+      var TYPES = ['text','textarea','email','phone','url','number','currency','percentage','duration','rating','linear_scale','date','time','datetime','select','radio','checkbox','yes_no','acknowledgment','selfie','location','signature'];
       var OPTIONAL_TYPES = ['selfie','location','signature'];
       var list = document.getElementById('fieldList');
       function escapeAttr(value) {
@@ -215,22 +372,97 @@ const urlParts = (raw: string) => {
       function row(f) {
         f = f || { type: 'text', label: '', required: false, options: [] };
         if (TYPES.indexOf(f.type) < 0) f.type = 'text';
+        var previousFields = Array.prototype.slice.call(list.querySelectorAll('.fld'));
+        var sourceOptions = '<option value="">Always show</option>' + previousFields.map(function (previous, index) {
+          var savedKey = previous.getAttribute('data-key') || '';
+          var label = previous.querySelector('.f-label').value.trim();
+          var key = savedKey || label.toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'').slice(0,40) || ('field_'+index);
+          return label ? '<option value="'+escapeAttr(key)+'"'+(f.condition && f.condition.fieldKey===key?' selected':'')+'>'+escapeAttr(label)+'</option>' : '';
+        }).join('');
         var d = document.createElement('div'); d.className = 'fld';
+        d.setAttribute('data-key', f.key || '');
         d.innerHTML =
           '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">' +
-            '<select class="fi f-type" style="max-width:160px;">' + TYPES.map(function(t){return '<option value="'+t+'"'+(f.type===t?' selected':'')+'>'+t+'</option>';}).join('') + '</select>' +
-            '<input class="fi f-label" placeholder="Question / label" value="'+escapeAttr(f.label)+'" style="flex:1;min-width:160px;" />' +
+            '<select class="fi f-type" aria-label="Question type" style="max-width:160px;">' + TYPES.map(function(t){return '<option value="'+t+'"'+(f.type===t?' selected':'')+'>'+t+'</option>';}).join('') + '</select>' +
+            '<input class="fi f-label" aria-label="Question label" placeholder="Question / label" value="'+escapeAttr(f.label)+'" style="flex:1;min-width:160px;" />' +
             '<label class="f-required-wrap" style="font-size:11px;color:#e0e5ec;display:flex;gap:5px;align-items:center;"><input type="checkbox" class="f-req"'+(f.required?' checked':'')+(OPTIONAL_TYPES.indexOf(f.type)>=0?' disabled':'')+'/> required</label>' +
+            '<button type="button" class="f-up" aria-label="Move question up" style="background:none;border:none;color:#c3cbd6;cursor:pointer;font-size:12px;">up</button>' +
+            '<button type="button" class="f-down" aria-label="Move question down" style="background:none;border:none;color:#c3cbd6;cursor:pointer;font-size:12px;">down</button>' +
+            '<button type="button" class="f-duplicate" style="background:none;border:none;color:#8bc5ff;cursor:pointer;font-size:12px;">duplicate</button>' +
             '<button type="button" class="f-del" style="background:none;border:none;color:#fca5a5;cursor:pointer;font-size:12px;">remove</button>' +
           '</div>' +
           '<input class="fi f-opts" placeholder="Options (comma-separated) - for select/radio/checkbox" value="'+escapeAttr((f.options||[]).join(', '))+'" style="margin-top:6px;display:'+(['select','radio','checkbox'].indexOf(f.type)>=0?'block':'none')+';" />' +
+          '<textarea class="fi f-description" aria-label="Question description" placeholder="Description or instructions (optional)" rows="2" style="margin-top:6px;">'+escapeAttr(f.description)+'</textarea>' +
+          '<div class="f-logic" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;">' +
+            '<input class="fi f-section" aria-label="Section name" placeholder="Section (default: General)" value="'+escapeAttr(f.section || 'General')+'" style="flex:1;min-width:150px;" />' +
+            '<select class="fi f-condition-source" aria-label="Show question based on" style="flex:1;min-width:150px;">'+sourceOptions+'</select>' +
+            '<select class="fi f-condition-op" aria-label="Visibility condition" style="width:145px;">' +
+              '<option value="equals"'+(f.condition && f.condition.operator==='equals'?' selected':'')+'>is</option>' +
+              '<option value="not_equals"'+(f.condition && f.condition.operator==='not_equals'?' selected':'')+'>is not</option>' +
+              '<option value="answered"'+(f.condition && f.condition.operator==='answered'?' selected':'')+'>has an answer</option>' +
+              '<option value="not_answered"'+(f.condition && f.condition.operator==='not_answered'?' selected':'')+'>has no answer</option>' +
+            '</select>' +
+            '<input class="fi f-condition-value" aria-label="Matching answer" placeholder="Matching answer" value="'+escapeAttr(f.condition && f.condition.value)+'" style="flex:1;min-width:140px;" />' +
+          '</div>' +
+          '<div class="f-advanced" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;">' +
+            '<input class="fi f-placeholder" aria-label="Placeholder" placeholder="Placeholder (optional)" value="'+escapeAttr(f.placeholder)+'" style="flex:1;min-width:140px;" />' +
+            '<input class="fi f-example" aria-label="Example" placeholder="Example or help text (optional)" value="'+escapeAttr(f.example)+'" style="flex:1;min-width:140px;" />' +
+            '<input class="fi f-min" aria-label="Minimum value or length" type="number" placeholder="Minimum" value="'+(f.min == null ? '' : escapeAttr(f.min))+'" style="width:100px;" />' +
+            '<input class="fi f-max" aria-label="Maximum value or length" type="number" placeholder="Maximum" value="'+(f.max == null ? '' : escapeAttr(f.max))+'" style="width:100px;" />' +
+            '<input class="fi f-minlength" aria-label="Minimum characters" type="number" min="0" placeholder="Min chars" value="'+(f.minLength == null ? '' : escapeAttr(f.minLength))+'" style="width:100px;" />' +
+            '<input class="fi f-maxlength" aria-label="Maximum characters" type="number" min="1" placeholder="Max chars" value="'+(f.maxLength == null ? '' : escapeAttr(f.maxLength))+'" style="width:100px;" />' +
+          '</div>' +
           '<p class="f-help" style="margin:7px 0 0;color:#c3cbd6;font-size:11px;line-height:1.45;"></p>';
         d.querySelector('.f-del').addEventListener('click', function(){ d.remove(); });
+        d.querySelector('.f-up').addEventListener('click', function(){
+          if (d.previousElementSibling) list.insertBefore(d, d.previousElementSibling);
+        });
+        d.querySelector('.f-down').addEventListener('click', function(){
+          if (d.nextElementSibling) list.insertBefore(d.nextElementSibling, d);
+        });
+        d.querySelector('.f-duplicate').addEventListener('click', function(){
+          row({
+            type: typeSel.value,
+            label: d.querySelector('.f-label').value + ' copy',
+            required: required.checked,
+            options: opts.value.split(',').map(function(s){return s.trim();}).filter(Boolean),
+            description: d.querySelector('.f-description').value,
+            placeholder: d.querySelector('.f-placeholder').value,
+            example: d.querySelector('.f-example').value,
+            min: d.querySelector('.f-min').value,
+            max: d.querySelector('.f-max').value,
+            minLength: d.querySelector('.f-minlength').value,
+            maxLength: d.querySelector('.f-maxlength').value,
+            section: d.querySelector('.f-section').value,
+            condition: d.querySelector('.f-condition-source').value ? {
+              fieldKey: d.querySelector('.f-condition-source').value,
+              operator: d.querySelector('.f-condition-op').value,
+              value: d.querySelector('.f-condition-value').value
+            } : null
+          });
+        });
         var typeSel = d.querySelector('.f-type'); var opts = d.querySelector('.f-opts'); var required = d.querySelector('.f-req'); var help = d.querySelector('.f-help');
+        var conditionSource = d.querySelector('.f-condition-source');
+        var conditionOperator = d.querySelector('.f-condition-op');
+        var conditionValue = d.querySelector('.f-condition-value');
+        function updateConditionControls() {
+          var hasSource = !!conditionSource.value;
+          conditionOperator.style.display = hasSource ? 'block' : 'none';
+          conditionValue.style.display = hasSource && ['equals','not_equals'].indexOf(conditionOperator.value)>=0 ? 'block' : 'none';
+        }
         function updateType() {
-          opts.style.display = ['select','radio','checkbox'].indexOf(typeSel.value)>=0 ? 'block':'none';
+          var choiceType = ['select','radio','checkbox'].indexOf(typeSel.value)>=0;
+          var textType = ['text','textarea','email','phone','url'].indexOf(typeSel.value)>=0;
+          opts.style.display = choiceType ? 'block':'none';
+          var numericType = ['number','currency','percentage','duration','rating','linear_scale'].indexOf(typeSel.value)>=0;
+          d.querySelector('.f-placeholder').style.display = textType || numericType ? 'block':'none';
+          d.querySelector('.f-min').style.display = numericType ? 'block':'none';
+          d.querySelector('.f-max').style.display = numericType ? 'block':'none';
+          d.querySelector('.f-minlength').style.display = textType ? 'block':'none';
+          d.querySelector('.f-maxlength').style.display = textType ? 'block':'none';
           required.disabled = OPTIONAL_TYPES.indexOf(typeSel.value)>=0;
           if (required.disabled) required.checked = false;
+          updateConditionControls();
           help.textContent = typeSel.value === 'acknowledgment'
             ? 'Write the exact acknowledgment or consent statement in the label. You may mark it required.'
             : typeSel.value === 'selfie'
@@ -242,22 +474,52 @@ const urlParts = (raw: string) => {
                   : '';
         }
         typeSel.addEventListener('change', updateType);
+        conditionSource.addEventListener('change', updateConditionControls);
+        conditionOperator.addEventListener('change', updateConditionControls);
         updateType();
         list.appendChild(d);
       }
-      (initial && initial.length ? initial : []).forEach(row);
-      if (!initial || !initial.length) row();
+      (initial || []).forEach(row);
       document.getElementById('addField').addEventListener('click', function(){ row(); });
       document.getElementById('formEditor').addEventListener('submit', function(){
         var out = [];
+        var usedKeys = Object.create(null);
         list.querySelectorAll('.fld').forEach(function(d, i){
           var label = d.querySelector('.f-label').value.trim(); if (!label) return;
           var type = d.querySelector('.f-type').value;
           var required = d.querySelector('.f-req').checked;
           var optsRaw = d.querySelector('.f-opts').value;
           var options = (['select','radio','checkbox'].indexOf(type)>=0 && optsRaw) ? optsRaw.split(',').map(function(s){return s.trim();}).filter(Boolean) : [];
-          var key = label.toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'').slice(0,40) || ('f'+i);
-          out.push({ key: key, type: type, label: label, required: required, options: options });
+          var storedKey = d.getAttribute('data-key') || '';
+          var baseKey = storedKey || label.toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'').slice(0,40) || ('field_'+i);
+          var key = baseKey;
+          var suffix = 2;
+          while (!storedKey && usedKeys[key]) {
+            var ending = '_'+suffix++;
+            key = baseKey.slice(0,40-ending.length)+ending;
+          }
+          usedKeys[key] = true;
+          d.setAttribute('data-key', key);
+          out.push({
+            key: key,
+            type: type,
+            label: label,
+            required: required,
+            options: options,
+            description: d.querySelector('.f-description').value.trim(),
+            placeholder: d.querySelector('.f-placeholder').value.trim(),
+            example: d.querySelector('.f-example').value.trim(),
+            min: d.querySelector('.f-min').value || null,
+            max: d.querySelector('.f-max').value || null,
+            minLength: d.querySelector('.f-minlength').value || null,
+            maxLength: d.querySelector('.f-maxlength').value || null,
+            section: d.querySelector('.f-section').value.trim() || 'General',
+            condition: d.querySelector('.f-condition-source').value ? {
+              fieldKey: d.querySelector('.f-condition-source').value,
+              operator: d.querySelector('.f-condition-op').value,
+              value: d.querySelector('.f-condition-value').value.trim()
+            } : null
+          });
         });
         document.getElementById('fields_json').value = JSON.stringify(out);
       });
