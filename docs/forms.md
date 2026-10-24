@@ -12,10 +12,11 @@ kept stable so editing a label does not detach answers from existing submissions
 submission endpoint stores only declared answers and records an acknowledgment statement and
 timestamp when a respondent accepts a required acknowledgment.
 
-Supported question types are short text, paragraph, email, phone, URL, number, date, time, date/time,
-dropdown, radio, checkbox, yes/no, acknowledgment, optional selfie, optional location, and optional
-drawn signature. Choice options, text lengths, and numeric bounds are validated before publication
-or submission.
+Supported question types are short text, paragraph, email, phone, URL, number, currency, percentage,
+duration, date, time, date/time, dropdown, radio, checkbox, yes/no, numeric rating, linear scale,
+acknowledgment, optional selfie, optional location, and optional drawn signature. Choice options,
+text lengths, numeric bounds, dates, and conditional rules are validated before publication or
+submission.
 
 ## Draft preview
 
