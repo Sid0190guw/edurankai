@@ -14,11 +14,12 @@ import { sql } from 'drizzle-orm';
 // using that week. See the block above deliverInbound() in src/lib/mail.ts.
 import { ensureMailSchema, resolveInboundRecipients, getMailConfig, deliverInbound } from '@/lib/mail';
 import { normalizeInboundMessageId } from '@/lib/mail-inbound-routing';
-import { decodeMailSecret, encodeMailSecret } from '@/lib/mail-secrets';
+import { assertMailSecretReadableBeforeReplace, decodeMailSecret, encodeMailSecret } from '@/lib/mail-secrets';
+import { cryptoFailureCode, cryptoFailureMessage } from '@/lib/crypto';
 
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
-async function ensureImapSchema() {
+export async function ensureImapSchema() {
   try { await db.execute(sql`ALTER TABLE mail_config ADD COLUMN IF NOT EXISTS imap_host TEXT`); } catch (_) {}
   try { await db.execute(sql`ALTER TABLE mail_config ADD COLUMN IF NOT EXISTS imap_port INT`); } catch (_) {}
   try { await db.execute(sql`ALTER TABLE mail_config ADD COLUMN IF NOT EXISTS imap_user TEXT`); } catch (_) {}
@@ -88,8 +89,14 @@ export async function saveImapConfig(p: { host?: string; port?: number; user?: s
   await ensureMailSchema();
   await ensureImapSchema();
   const s = (v: any) => { const t = (v ?? '').toString().trim(); return t === '' ? null : t; };
+  let expectedPass: unknown = null;
+  if (s(p.pass)) {
+    const current = rows(await db.execute(sql`SELECT imap_pass FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {};
+    expectedPass = current.imap_pass ?? null;
+    assertMailSecretReadableBeforeReplace(current.imap_pass, 'imap_pass');
+  }
   const encryptedPass = encodeMailSecret(p.pass, 'imap_pass');
-  await db.execute(sql`
+  const result = await db.execute(sql`
     INSERT INTO mail_config (id, imap_host, imap_port, imap_user, imap_pass, imap_secure, updated_at)
     VALUES (1, ${s(p.host)}, ${p.port == null ? null : Number(p.port)}, ${s(p.user)}, ${encryptedPass},
             ${p.secure == null ? null : !!p.secure}, NOW())
@@ -100,7 +107,12 @@ export async function saveImapConfig(p: { host?: string; port?: number; user?: s
       imap_pass = COALESCE(EXCLUDED.imap_pass, mail_config.imap_pass),
       imap_secure = COALESCE(${p.secure == null ? null : !!p.secure}::boolean, mail_config.imap_secure),
       updated_at = NOW()
+    ${s(p.pass) ? sql`WHERE mail_config.imap_pass IS NOT DISTINCT FROM ${expectedPass}` : sql``}
+    RETURNING id
   `);
+  if (s(p.pass) && rows(result).length !== 1) {
+    throw new Error('The saved IMAP password changed during this save. Reload settings and retry.');
+  }
 }
 
 export async function getImapConfig() {
@@ -114,17 +126,33 @@ export async function getImapConfig() {
   // goes and re-enters credentials that were never lost. `configRead` travels with the config so a
   // caller can tell the two apart.
   let configRead = true;
+  let readError = '';
+  let secretError = '';
+  let secretErrorCode = '';
   let pass = '';
   try {
     row = rows(await db.execute(sql`SELECT imap_host, imap_port, imap_user, imap_pass, imap_secure, imap_last_uid, imap_last_run FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {};
-    pass = decodeMailSecret(row.imap_pass, 'imap_pass');
   }
   catch (e: any) {
     configRead = false;
-    console.error('[mail-imap] IMAP config or saved secret could not be read:', e?.cause?.message || e?.message);
+    readError = String(e?.cause?.message || e?.message || 'Database read failed.');
+    console.error('[mail-imap] IMAP config could not be read:', 'database_error');
+  }
+  if (configRead) {
+    try {
+      pass = decodeMailSecret(row.imap_pass, 'imap_pass');
+    } catch (error) {
+      configRead = false;
+      secretError = cryptoFailureMessage(error);
+      secretErrorCode = cryptoFailureCode(error);
+      console.error('[mail-imap] stored mail secret unavailable:', 'imap_pass', secretErrorCode);
+    }
   }
   return {
     configRead,
+    readError,
+    secretError,
+    secretErrorCode,
     host: row.imap_host || '',
     port: Number(row.imap_port || 993),
     user: row.imap_user || '',

@@ -108,6 +108,10 @@ are envelope-encrypted. Configure the active data-encryption key pair in Vercel'
 before saving or rotating Mail credentials. Existing plaintext values remain compatible until an
 authorized operator replaces them. Never commit or display provider credentials. If mail is not
 sending, check the settings and health screens before checking provider authentication.
+The key suffix is case-sensitive: the existing `k1` value is `DATA_ENCRYPTION_KEY_k1`, encoded from
+exactly 32 random bytes as Base64. See [`ENCRYPTION-RECOVERY.md`](ENCRYPTION-RECOVERY.md) for the
+Production restore and lost-key procedures. Restoring a key or changing Production variables
+requires an approved deployment; a new key ID cannot read older ciphertext.
 
 **Deploy budget: 100 per day on the free tier.** If "Resource is limited" appears, stop and tell the
 user rather than retrying — retrying spends the rest of the budget.

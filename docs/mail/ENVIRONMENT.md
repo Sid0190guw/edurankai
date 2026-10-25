@@ -95,6 +95,11 @@ operator replaces them; changing environment keys without preserving every key u
 ciphertext makes those secrets unreadable. The inbound webhook secret is shown only immediately
 after it is generated, so copy it into the forwarding service's secret manager at that time.
 
+The key value must decode from Base64 to exactly 32 bytes. For existing key ID `k1`, the variable
+name is case-sensitive: `DATA_ENCRYPTION_KEY_k1`. See
+[`ENCRYPTION-RECOVERY.md`](ENCRYPTION-RECOVERY.md) for escrow, routine rotation, and recovery after
+key loss; a new key cannot decrypt ciphertext written with a missing key.
+
 `.gitignore` ignores `.env.*` and then re-includes exactly one name:
 
 ```gitignore

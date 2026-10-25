@@ -5,6 +5,54 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { activeKeyId, getKeyMaterial } from './keys';
 import { EnvelopeCiphertextSchema, type EnvelopeCiphertext } from './schema';
+import { CiphertextAuthenticationError, MalformedCiphertextError } from './errors';
+
+function parseEnvelope(value: unknown): EnvelopeCiphertext {
+  try {
+    return EnvelopeCiphertextSchema.parse(value);
+  } catch {
+    throw new MalformedCiphertextError('Encrypted data envelope has an invalid structure.');
+  }
+}
+
+function decodeCiphertextPart(value: string, part: 'iv' | 'ct' | 'tag', expectedLength?: number): Buffer {
+  const compact = value.replace(/[\t\n\r ]/g, '');
+  if (part === 'ct' && compact === '') return Buffer.alloc(0);
+  const isUrlSafe = /[-_]/.test(compact);
+  const alphabet = isUrlSafe ? /^[A-Za-z0-9_-]+={0,2}$/ : /^[A-Za-z0-9+/]+={0,2}$/;
+  if (!compact || !alphabet.test(compact)) {
+    throw new MalformedCiphertextError(`Encrypted data ${part} is not valid Base64.`);
+  }
+  const unpadded = compact.replace(/=+$/, '');
+  if (unpadded.length % 4 === 1) throw new MalformedCiphertextError(`Encrypted data ${part} is not valid Base64.`);
+  const bytes = Buffer.from(unpadded, isUrlSafe ? 'base64url' : 'base64');
+  const canonical = bytes.toString(isUrlSafe ? 'base64url' : 'base64').replace(/=+$/, '');
+  const expectedPadded = isUrlSafe
+    ? bytes.toString('base64').replace(/\+/g, '-').replace(/\//g, '_')
+    : bytes.toString('base64');
+  if (canonical !== unpadded || (compact.includes('=') && compact !== expectedPadded)) {
+    throw new MalformedCiphertextError(`Encrypted data ${part} is not valid Base64.`);
+  }
+  if (expectedLength != null && bytes.length !== expectedLength) {
+    throw new MalformedCiphertextError(`Encrypted data ${part} has an invalid length.`);
+  }
+  return bytes;
+}
+
+function decipherField(env: EnvelopeCiphertext, ciphertext: Uint8Array): Buffer {
+  const iv = decodeCiphertextPart(env.iv, 'iv', 12);
+  const tag = decodeCiphertextPart(env.tag, 'tag', 16);
+  const key = getKeyMaterial(env.keyId);
+  const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  if (env.aad) decipher.setAAD(Buffer.from(env.aad, 'utf8'));
+  try {
+    return Buffer.concat([decipher.update(Buffer.from(ciphertext)), decipher.final()]);
+  } catch {
+    // AES-GCM deliberately does not distinguish a wrong key from altered ciphertext/tag.
+    throw new CiphertextAuthenticationError(env.keyId);
+  }
+}
 
 export function encryptField(plaintext: string, aad?: string): EnvelopeCiphertext {
   const keyId = activeKeyId();
@@ -18,12 +66,9 @@ export function encryptField(plaintext: string, aad?: string): EnvelopeCiphertex
 }
 
 export function decryptField(env: EnvelopeCiphertext): string {
-  EnvelopeCiphertextSchema.parse(env);   // reject malformed structure
-  const key = getKeyMaterial(env.keyId); // selected by keyId — resolvable during/after rotation
-  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(env.iv, 'base64'));
-  decipher.setAuthTag(Buffer.from(env.tag, 'base64'));
-  if (env.aad) decipher.setAAD(Buffer.from(env.aad, 'utf8'));
-  return Buffer.concat([decipher.update(Buffer.from(env.ct, 'base64')), decipher.final()]).toString('utf8');
+  const parsed = parseEnvelope(env);
+  const ciphertext = decodeCiphertextPart(parsed.ct, 'ct');
+  return decipherField(parsed, ciphertext).toString('utf8');
 }
 
 /** Encrypt a blob: the ciphertext travels in `body` (store as a sidecar); the header (iv/tag/keyId)
@@ -40,10 +85,6 @@ export function encryptBlob(data: Uint8Array, aad?: string): { header: EnvelopeC
 }
 
 export function decryptBlob(header: EnvelopeCiphertext, body: Uint8Array): Uint8Array {
-  EnvelopeCiphertextSchema.parse(header);
-  const key = getKeyMaterial(header.keyId);
-  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(header.iv, 'base64'));
-  decipher.setAuthTag(Buffer.from(header.tag, 'base64'));
-  if (header.aad) decipher.setAAD(Buffer.from(header.aad, 'utf8'));
-  return new Uint8Array(Buffer.concat([decipher.update(Buffer.from(body)), decipher.final()]));
+  const parsed = parseEnvelope(header);
+  return new Uint8Array(decipherField(parsed, body));
 }

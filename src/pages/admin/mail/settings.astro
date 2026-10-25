@@ -3,8 +3,10 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { randomBytes } from 'node:crypto';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { getMailConfig, saveMailConfig, ensureMailSchema, clearMailField } from '@/lib/mail';
-import { getImapConfig, saveImapConfig } from '@/lib/mail-imap';
+import { getMailConfig, saveMailConfig, ensureMailSchema, clearSmtpSettings } from '@/lib/mail';
+import { getImapConfig, saveImapConfig, ensureImapSchema } from '@/lib/mail-imap';
+import { replaceUnreadableMailSecret } from '@/lib/mail-secret-recovery';
+import type { MailSecretColumn } from '@/lib/mail-secrets';
 import { verifySmtp } from '@/lib/mail-transport';
 import { can } from '@/lib/auth/permissions';
 
@@ -23,12 +25,35 @@ function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 const dbReason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 let okMsg = '', errMsg = '', generatedInboundSecret = '';
 
+function sameOriginRequest(request: Request): boolean {
+  const expected = new URL(request.url).origin;
+  const origin = request.headers.get('origin');
+  const referer = request.headers.get('referer');
+  try {
+    if (origin) return new URL(origin).origin === expected;
+    if (referer) return new URL(referer).origin === expected;
+  } catch { return false; }
+  return false;
+}
+
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('_action') as string;
   try {
     await ensureMailSchema();
-    if (action === 'save_smtp') {
+    if (action === 'recover_unreadable_secret') {
+      if (!sameOriginRequest(Astro.request)) throw new Error('Recovery must be submitted from this authenticated settings page.');
+      const column = String(fd.get('secret_column') || '') as MailSecretColumn;
+      const supported: MailSecretColumn[] = ['smtp_pass', 'imap_pass', 'resend_api_key', 'inbound_secret'];
+      if (!supported.includes(column)) throw new Error('Select one supported saved mail credential.');
+      if (fd.get('confirm_unrecoverable') !== 'yes') {
+        throw new Error('Confirm that the original encryption key cannot be recovered before replacing this credential.');
+      }
+      if (column === 'imap_pass') await ensureImapSchema();
+      await replaceUnreadableMailSecret(column, fd.get('replacement_secret'), true);
+      console.info('[admin/mail/settings] unreadable mail secret replaced:', column);
+      okMsg = column + ' replaced. Only this saved credential changed; verify the connection and update any provider that shares this secret.';
+    } else if (action === 'save_smtp') {
       const pass = (fd.get('smtp_pass') as string || '').trim();
       await saveMailConfig({
         smtpHost: (fd.get('smtp_host') as string || '').trim(),
@@ -64,11 +89,7 @@ if (Astro.request.method === 'POST') {
       okMsg = 'New inbound secret generated. Copy it now and update the forwarding service secret; it will not be shown again.';
     } else if (action === 'clear_smtp') {
       try {
-        await clearMailField('smtp_host');
-        await clearMailField('smtp_user');
-        await clearMailField('smtp_pass');
-        await clearMailField('from_name');
-        await clearMailField('from_address');
+        await clearSmtpSettings();
         okMsg = 'SMTP settings cleared. The mail system is now offline until you re-save.';
       } catch (e: any) {
         console.error('[admin/mail/settings] clear_smtp failed:', dbReason(e));
@@ -141,6 +162,14 @@ try {
 }
 
 const imap = await getImapConfig();
+const secretCandidates: Array<{ column: MailSecretColumn; label: string; detail: string; code: string }> = [
+  { column: 'smtp_pass', label: 'SMTP password', detail: cfg.secretErrors.smtp_pass || '', code: cfg.secretErrorCodes.smtp_pass || '' },
+  { column: 'imap_pass', label: 'IMAP password', detail: imap.secretError || '', code: imap.secretErrorCode || '' },
+  { column: 'resend_api_key', label: 'Resend API key', detail: cfg.secretErrors.resend_api_key || '', code: cfg.secretErrorCodes.resend_api_key || '' },
+  { column: 'inbound_secret', label: 'Inbound webhook secret', detail: cfg.secretErrors.inbound_secret || '', code: cfg.secretErrorCodes.inbound_secret || '' },
+];
+const unreadableSecrets = secretCandidates.filter((item) => !!item.detail);
+const recoverableSecrets = unreadableSecrets.filter((item) => item.code === 'missing_key_material');
 const origin = new URL(Astro.request.url).origin;
 const inboundUrl = origin + '/api/mail/inbound';
 const imapHasPass = !!imap.pass;
@@ -200,10 +229,40 @@ const imapHasPass = !!imap.pass;
         <span style="display:block;margin-top:5px;">The fields are showing defaults, not your settings. Do not retype credentials and do not regenerate the inbound secret until this reads clean — the live values are almost certainly still there.</span>
       </div>
     )}
-    {(cfg.secretErrors.smtp_pass || cfg.secretErrors.imap_pass || cfg.secretErrors.resend_api_key || cfg.secretErrors.inbound_secret) && (
+    {unreadableSecrets.length > 0 && (
       <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.30);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:8px;margin-bottom:16px;">
-        <strong>A saved mail secret could not be decrypted.</strong>
-        <span style="display:block;margin-top:5px;">Check that the active and historical DATA_ENCRYPTION_KEY values are present in deployment secrets. Do not clear or overwrite the saved credential until its encryption key is restored.</span>
+        <strong>One or more saved mail credentials cannot be read.</strong>
+        <ul style="margin:6px 0 0;padding-left:20px;">{unreadableSecrets.map((secret) => <li>{secret.label}: {secret.detail}</li>)}</ul>
+        <span style="display:block;margin-top:5px;">The saved value is not empty. Restore the original key before replacing any field.</span>
+      </div>
+    )}
+
+    {recoverableSecrets.length > 0 && (
+      <div class="admin-card" style="margin-bottom:16px;border-color:rgba(251,191,36,0.45);">
+        <div class="admin-card-title" style="margin-bottom:6px;">Replace a confirmed unrecoverable credential</div>
+        <p style="font-size:12px;color:var(--o-mid,#8a8a94);margin:0 0 12px;line-height:1.6;">Use this only after checking the original key backup and confirming it cannot be recovered. Each form replaces one field only, encrypts it with the active data key, and leaves all other mail settings unchanged.</p>
+        <div style="display:flex;flex-direction:column;gap:12px;">
+          {recoverableSecrets.map((secret) => (
+            <form method="POST" style="border:1px solid var(--o-stroke,#1f1f26);border-radius:9px;padding:12px;display:flex;flex-direction:column;gap:8px;">
+              <input type="hidden" name="_action" value="recover_unreadable_secret" />
+              <input type="hidden" name="secret_column" value={secret.column} />
+              <strong style="font-size:12px;color:#fbbf24;">{secret.label}: {secret.detail}</strong>
+              <label style="font-size:11.5px;color:var(--o-mid,#8a8a94);">Replacement value
+                <input name="replacement_secret" type="password" required autocomplete="new-password" class="rolefield-input" style="display:block;width:100%;margin-top:5px;" />
+              </label>
+              <label style="display:flex;align-items:flex-start;gap:8px;font-size:11.5px;color:var(--o-mid,#8a8a94);line-height:1.5;">
+                <input type="checkbox" name="confirm_unrecoverable" value="yes" required />
+                I confirmed the original encryption key cannot be recovered and approve replacing only this saved credential.
+              </label>
+              <button type="submit" class="admin-btn" style="align-self:flex-start;padding:7px 12px;border-color:rgba(251,191,36,0.45);color:#fbbf24;">Replace {secret.label}</button>
+            </form>
+          ))}
+        </div>
+      </div>
+    )}
+    {unreadableSecrets.some((secret) => secret.code !== 'missing_key_material') && (
+      <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);color:#fbbf24;font-size:12px;padding:10px 13px;border-radius:8px;margin-bottom:16px;">
+        Replacement is disabled for invalid key settings, malformed ciphertext, and authentication failures. Correct the key configuration or investigate the stored value first; an authentication failure can mean either a wrong key or changed ciphertext.
       </div>
     )}
 

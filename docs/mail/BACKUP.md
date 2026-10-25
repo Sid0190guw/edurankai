@@ -10,7 +10,7 @@ to it.** This document covers the mail infrastructure specifically.
 
 | # | Asset | If lost | Where |
 | --- | --- | --- | --- |
-| 1 | **`DATA_ENCRYPTION_KEY_<keyId>`** | Every column encrypted under it becomes permanently unreadable. A perfect database dump does not help. | Vercel env vars |
+| 1 | **`DATA_ENCRYPTION_KEY_<keyId>`** | Every column encrypted under it becomes unreadable if the key is lost. A perfect database dump does not help. | Vercel env vars plus separate encrypted escrow |
 | 2 | **DKIM private key** | Recoverable by generating a new one — but every message signed with the old key fails until DNS propagates, and anyone holding a copy can sign mail as this domain forever. | `docker/data/mta/config/rspamd/dkim/` |
 | 3 | **The Postgres database** | Everything else. No file in this repository reconstructs the live schema; only a dump does. | Supabase |
 | 4 | **Mailboxes** | Messages held on this host. | `docker/data/mta/mail/` |
@@ -18,6 +18,8 @@ to it.** This document covers the mail infrastructure specifically.
 | 6 | **Mail server config** | Accounts and aliases. Rebuildable by hand, tediously. | `docker/data/mta/config/` |
 
 The git repository is not on this list — GitHub holds it and every clone is a copy.
+Keep an encrypted escrow copy of every key ID outside Vercel; follow
+[`ENCRYPTION-RECOVERY.md`](ENCRYPTION-RECOVERY.md) for rotation and key-loss procedures.
 
 ---
 

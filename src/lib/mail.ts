@@ -2,7 +2,8 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
-import { decodeMailSecret, encodeMailSecret } from '@/lib/mail-secrets';
+import { assertMailSecretReadableBeforeReplace, decodeMailSecret, encodeMailSecret } from '@/lib/mail-secrets';
+import { cryptoFailureCode, cryptoFailureMessage } from '@/lib/crypto';
 import { resolveConfiguredMailboxRecipients, type ConfiguredMailboxRecipientRow } from '@/lib/mail-inbound-routing';
 // THE BINDING THAT NEVER RAN. Five statements in this file matched a column against a JS array with
 // `= ANY(${jsArray}::uuid[])` / `::text[]`. postgres-js serialises a JS array as a RECORD literal, so
@@ -492,6 +493,7 @@ export interface MailConfig {
   fromName: string; fromAddress: string; resendApiKey: string; inboundSecret: string;
   outboundEnabled: boolean; source: 'db' | 'env' | 'none';
   secretErrors: Record<string, string>;
+  secretErrorCodes: Record<string, string>;
   /**
    * NOT-CONFIGURED AND COULD-NOT-BE-READ ARE DIFFERENT ANSWERS, AND THEY USED TO BE THE SAME ONE.
    *
@@ -536,13 +538,15 @@ export async function getMailConfig(): Promise<MailConfig> {
   const envSmtpHost = nonEmpty(process.env.SMTP_HOST);
   const envResendKey = nonEmpty(process.env.RESEND_API_KEY);
   const secretErrors: Record<string, string> = {};
+  const secretErrorCodes: Record<string, string> = {};
   const readSecret = (column: string, value: unknown): string => {
     if (!nonEmpty(value)) return '';
     try {
       return decodeMailSecret(value, column);
     } catch (error) {
-      secretErrors[column] = 'The stored secret could not be decrypted. Verify the deployment encryption key and retry.';
-      console.error('[mail] stored mail secret unavailable:', column, error instanceof Error ? error.message : 'decryption failed');
+      secretErrors[column] = cryptoFailureMessage(error);
+      secretErrorCodes[column] = cryptoFailureCode(error);
+      console.error('[mail] stored mail secret unavailable:', column, cryptoFailureCode(error));
       return '';
     }
   };
@@ -570,6 +574,7 @@ export async function getMailConfig(): Promise<MailConfig> {
     source: hasDb ? 'db' : (hasEnv ? 'env' : 'none'),
     readError,
     secretErrors,
+    secretErrorCodes,
   };
 }
 
@@ -582,6 +587,25 @@ export async function saveMailConfig(p: Partial<{ smtpHost: string; smtpPort: nu
   // than wiping it — the old behaviour silently nuked smtp_host when users
   // re-saved without re-typing it.
   const s = (v: any) => { const t = (v ?? '').toString().trim(); return t === '' ? null : t; };
+  const hasSecretReplacement = [p.smtpPass, p.resendApiKey, p.inboundSecret].some((v) => !!s(v));
+  let expectedSecrets: Record<'smtp_pass' | 'resend_api_key' | 'inbound_secret', unknown> = {
+    smtp_pass: null,
+    resend_api_key: null,
+    inbound_secret: null,
+  };
+  if (hasSecretReplacement) {
+    // A routine save may update unrelated fields while blank secrets preserve their rows. A newly
+    // entered secret cannot silently replace a saved value that this deployment cannot read.
+    const current = rows(await db.execute(sql`SELECT smtp_pass, resend_api_key, inbound_secret FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {};
+    expectedSecrets = {
+      smtp_pass: current.smtp_pass ?? null,
+      resend_api_key: current.resend_api_key ?? null,
+      inbound_secret: current.inbound_secret ?? null,
+    };
+    if (s(p.smtpPass)) assertMailSecretReadableBeforeReplace(current.smtp_pass, 'smtp_pass');
+    if (s(p.resendApiKey)) assertMailSecretReadableBeforeReplace(current.resend_api_key, 'resend_api_key');
+    if (s(p.inboundSecret)) assertMailSecretReadableBeforeReplace(current.inbound_secret, 'inbound_secret');
+  }
   const smtpHost     = s(p.smtpHost);
   const smtpPort     = p.smtpPort == null || isNaN(Number(p.smtpPort)) ? null : Number(p.smtpPort);
   const smtpUser     = s(p.smtpUser);
@@ -592,7 +616,14 @@ export async function saveMailConfig(p: Partial<{ smtpHost: string; smtpPort: nu
   const fromAddress  = s(p.fromAddress);
   const resendApiKey = encodeMailSecret(p.resendApiKey, 'resend_api_key'); // null = keep existing
   const inboundSecret = encodeMailSecret(p.inboundSecret, 'inbound_secret'); // null = keep existing
-  await db.execute(sql`
+  const conflictGuards = [];
+  if (s(p.smtpPass)) conflictGuards.push(sql`mail_config.smtp_pass IS NOT DISTINCT FROM ${expectedSecrets.smtp_pass}`);
+  if (s(p.resendApiKey)) conflictGuards.push(sql`mail_config.resend_api_key IS NOT DISTINCT FROM ${expectedSecrets.resend_api_key}`);
+  if (s(p.inboundSecret)) conflictGuards.push(sql`mail_config.inbound_secret IS NOT DISTINCT FROM ${expectedSecrets.inbound_secret}`);
+  const conflictGuard = conflictGuards.length
+    ? sql`WHERE ${sql.join(conflictGuards, sql` AND `)}`
+    : sql``;
+  const result = await db.execute(sql`
     INSERT INTO mail_config (id, smtp_host, smtp_port, smtp_user, smtp_pass, smtp_secure, smtp_insecure, from_name, from_address, resend_api_key, inbound_secret, updated_at)
     VALUES (1, ${smtpHost}, ${smtpPort}, ${smtpUser}, ${smtpPass}, ${smtpSecure ?? false}, ${smtpInsecure ?? false}, ${fromName}, ${fromAddress}, ${resendApiKey}, ${inboundSecret}, NOW())
     ON CONFLICT (id) DO UPDATE SET
@@ -607,7 +638,12 @@ export async function saveMailConfig(p: Partial<{ smtpHost: string; smtpPort: nu
       resend_api_key = COALESCE(EXCLUDED.resend_api_key, mail_config.resend_api_key),
       inbound_secret = COALESCE(EXCLUDED.inbound_secret, mail_config.inbound_secret),
       updated_at = NOW()
+    ${conflictGuard}
+    RETURNING id
   `);
+  if (hasSecretReplacement && rows(result).length !== 1) {
+    throw new Error('A saved mail credential changed during this save. Reload settings and retry.');
+  }
 }
 
 // Hard-clear a single field. Used by the "Clear" button in the admin so a user
@@ -616,7 +652,23 @@ export async function clearMailField(field: 'smtp_host' | 'smtp_user' | 'smtp_pa
   await ensureMailSchema();
   const allowed = new Set(['smtp_host','smtp_user','smtp_pass','from_name','from_address','resend_api_key','inbound_secret']);
   if (!allowed.has(field)) return;
+  if (field === 'smtp_pass' || field === 'resend_api_key' || field === 'inbound_secret') {
+    const current = rows(await db.execute(sql`SELECT ${sql.raw(field)} AS stored FROM mail_config WHERE id = 1 LIMIT 1`))[0];
+    assertMailSecretReadableBeforeReplace(current?.stored, field);
+    const result = await db.execute(sql`UPDATE mail_config SET ${sql.raw(field)} = NULL, updated_at = NOW() WHERE id = 1 AND ${sql.raw(field)} IS NOT DISTINCT FROM ${current?.stored ?? null} RETURNING id`);
+    if (rows(result).length !== 1) throw new Error(`Saved ${field} changed while it was being cleared. Reload settings and retry.`);
+    return;
+  }
   await db.execute(sql.raw(`UPDATE mail_config SET ${field} = NULL, updated_at = NOW() WHERE id = 1`));
+}
+
+/** Clear the SMTP form's settings in one statement after confirming its saved password is readable. */
+export async function clearSmtpSettings(): Promise<void> {
+  await ensureMailSchema();
+  const current = rows(await db.execute(sql`SELECT smtp_pass FROM mail_config WHERE id = 1 LIMIT 1`))[0];
+  assertMailSecretReadableBeforeReplace(current?.smtp_pass, 'smtp_pass');
+  const result = await db.execute(sql`UPDATE mail_config SET smtp_host = NULL, smtp_user = NULL, smtp_pass = NULL, from_name = NULL, from_address = NULL, updated_at = NOW() WHERE id = 1 AND smtp_pass IS NOT DISTINCT FROM ${current?.smtp_pass ?? null} RETURNING id`);
+  if (rows(result).length !== 1) throw new Error('The saved SMTP password changed while settings were being cleared. Reload settings and retry.');
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
