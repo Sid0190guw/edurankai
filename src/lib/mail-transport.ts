@@ -4,6 +4,7 @@
 import nodemailer from 'nodemailer';
 // Refuses a destination that is not a public mail host. See the note in verifySmtp().
 import { assertSafeMailTarget } from '@/lib/mailsec/net';
+import { diagnoseSmtpFailure } from '@/lib/mail-connection-diagnostics';
 import { getMailConfig, logOutbound } from '@/lib/mail';
 
 export interface SendExternalParams {
@@ -77,7 +78,7 @@ export interface VerifySmtpParams {
   insecure?: boolean;
 }
 
-export async function verifySmtp(p: VerifySmtpParams): Promise<{ ok: boolean; detail: string; hint?: string }> {
+export async function verifySmtp(p: VerifySmtpParams): Promise<{ ok: boolean; detail: string; hint?: string; diagnostic?: { code: string; stage: 'verification'; detail: string } }> {
   if (!p.host) return { ok: false, detail: 'SMTP host is empty', hint: 'Type your mail server hostname (e.g. mail.yourdomain.com or smtp.office365.com)' };
   if (!p.user || !p.pass) return { ok: false, detail: 'Username or password missing', hint: 'Most SMTP servers require auth. Use the full email for username and an app password if 2FA is on.' };
   // Auto-correct: 587 → STARTTLS (secure:false), 465 → implicit TLS (secure:true).
@@ -129,17 +130,15 @@ export async function verifySmtp(p: VerifySmtpParams): Promise<{ ok: boolean; de
       socketTimeout: 20000,
     });
     await transport.verify();
-    return { ok: true, detail: `Authenticated as ${p.user} against ${p.host}:${port} (${secure ? 'implicit TLS' : 'STARTTLS'})` };
+    return { ok: true, detail: 'SMTP connection and authentication succeeded.' };
   } catch (e: any) {
-    const msg = (e?.message || 'connect failed').toString();
+    const diagnostic = diagnoseSmtpFailure(e);
     let hint: string | undefined;
-    const low = msg.toLowerCase();
-    if (low.includes('wrong version number') || low.includes('tlsv1') || low.includes('ssl routines')) hint = 'TLS mode mismatch. Port 587 uses STARTTLS — UNTICK "Use TLS/SSL" for port 587. Only tick it for port 465.';
-    else if (low.includes('etimedout') || low.includes('econnrefused')) hint = 'The server did not respond on that port. Try 587 (STARTTLS) or 465 (TLS). Check that the firewall allows outbound to your mail host.';
-    else if (low.includes('self-signed') || low.includes('self signed') || low.includes('certificate')) hint = 'TLS certificate problem. Tick "Allow self-signed certs" below if you trust this server.';
-    else if (low.includes('authentication') || low.includes('535') || low.includes('invalid login')) hint = 'Auth failed. For Office365 / GoDaddy use the FULL email address as username and an app password if 2FA is on.';
-    else if (low.includes('enotfound') || low.includes('getaddrinfo')) hint = 'Could not resolve that hostname — check the SMTP host spelling.';
-    return { ok: false, detail: msg, hint };
+    if (diagnostic.code === 'SMTP_TLS_FAILURE') hint = 'Check the SMTP TLS mode and certificate. Port 587 normally uses STARTTLS; port 465 normally uses implicit TLS.';
+    else if (diagnostic.code === 'SMTP_CONNECTION_TIMEOUT' || diagnostic.code === 'SMTP_CONNECTION_FAILURE') hint = 'Check the SMTP host, port, and outbound network access.';
+    else if (diagnostic.code === 'SMTP_AUTH_REJECTED') hint = 'Check the saved SMTP account authorization with the mail provider. Do not paste credentials into support chat.';
+    else if (diagnostic.code === 'SMTP_DNS_FAILURE') hint = 'Check the SMTP host name in mail settings.';
+    return { ok: false, detail: diagnostic.detail, hint, diagnostic };
   }
 }
 

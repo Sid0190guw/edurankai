@@ -16,6 +16,7 @@ import { ensureMailSchema, resolveInboundRecipients, getMailConfig, deliverInbou
 import { normalizeInboundMessageId } from '@/lib/mail-inbound-routing';
 import { assertMailSecretReadableBeforeReplace, decodeMailSecret, encodeMailSecret } from '@/lib/mail-secrets';
 import { cryptoFailureCode, cryptoFailureMessage } from '@/lib/crypto';
+import { diagnoseImapFailure, type MailConnectionDiagnostic, type MailConnectionStage } from '@/lib/mail-connection-diagnostics';
 
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
@@ -37,7 +38,7 @@ export interface ImapTestParams {
   secure?: boolean;
 }
 
-export async function verifyImap(p: ImapTestParams): Promise<{ ok: boolean; detail: string; hint?: string; mailboxes?: string[] }> {
+export async function verifyImap(p: ImapTestParams): Promise<{ ok: boolean; detail: string; hint?: string; diagnostic?: MailConnectionDiagnostic }> {
   if (!p.host) return { ok: false, detail: 'IMAP host is empty', hint: 'GoDaddy: imap.secureserver.net · Office365: outlook.office365.com · Gmail: imap.gmail.com' };
   if (!p.user || !p.pass) return { ok: false, detail: 'Username or password missing' };
   const port = p.port || 993;
@@ -66,22 +67,24 @@ export async function verifyImap(p: ImapTestParams): Promise<{ ok: boolean; deta
     auth: { user: p.user, pass: p.pass },
     logger: false,
   });
+  let stage: MailConnectionStage = 'connection';
   try {
     await client.connect();
+    stage = 'mailbox_listing';
     const list: string[] = [];
     for (const m of await client.list()) list.push(m.path);
     await client.logout();
-    return { ok: true, detail: `Connected to ${p.host}:${port}. Found ${list.length} folders.`, mailboxes: list.slice(0, 10) };
-  } catch (e: any) {
-    const msg = (e?.message || 'IMAP connect failed').toString();
-    const low = msg.toLowerCase();
+    return { ok: true, detail: 'IMAP connection, authentication, and mailbox listing succeeded.' };
+  } catch (error: any) {
+    const diagnostic = diagnoseImapFailure(error, stage);
     let hint: string | undefined;
-    if (low.includes('auth') || low.includes('login') || low.includes('bad credentials')) hint = 'IMAP auth failed. Use FULL email as username. GoDaddy Workspace + M365: same password as webmail. If 2FA is on, generate an app password.';
-    else if (low.includes('etimedout') || low.includes('econnrefused')) hint = 'Server did not respond. Try port 993 (SSL) — most IMAP providers require it.';
-    else if (low.includes('certificate')) hint = 'Cert problem — usually a host typo. GoDaddy = imap.secureserver.net.';
-    else if (low.includes('enotfound') || low.includes('getaddrinfo')) hint = 'Could not resolve host — check the spelling.';
+    if (diagnostic.code === 'IMAP_AUTH_REJECTED') hint = 'The server rejected the login/authentication command. Verify the account authorization with the mail provider; do not paste credentials into chat.';
+    else if (diagnostic.code === 'IMAP_CONNECTION_TIMEOUT' || diagnostic.code === 'IMAP_CONNECTION_FAILURE') hint = 'Check the IMAP host, port, TLS setting, and outbound network access.';
+    else if (diagnostic.code === 'IMAP_TLS_FAILURE') hint = 'Check the IMAP TLS mode and certificate for the configured host and port.';
+    else if (diagnostic.code === 'IMAP_DNS_FAILURE') hint = 'Check the IMAP host name in mail settings.';
     try { await client.logout(); } catch (_) {}
-    return { ok: false, detail: msg, hint };
+    console.error('[mail-imap] verification failed:', diagnostic.code, diagnostic.stage, diagnostic.command || '', diagnostic.protocolStatus || '', diagnostic.protocolCode || '');
+    return { ok: false, detail: diagnostic.detail, hint, diagnostic };
   }
 }
 
@@ -165,12 +168,17 @@ export async function getImapConfig() {
 
 // Fetch new messages since the last seen UID, parse, and insert. Idempotent —
 // re-running will not produce duplicates because we record last_uid.
-export async function pollImapInbox(opts: { force?: boolean; limit?: number } = {}): Promise<{ ok: boolean; fetched: number; delivered: number; error?: string; detail?: string }> {
+export async function pollImapInbox(opts: { force?: boolean; limit?: number } = {}): Promise<{ ok: boolean; fetched: number; delivered: number; error?: string; detail?: string; diagnostic?: MailConnectionDiagnostic }> {
   const cfg = await getImapConfig();
   if (!cfg.configRead) {
-    return { ok: false, fetched: 0, delivered: 0, error: 'The IMAP settings could not be read, so no poll was attempted. This is not the same as IMAP being unconfigured - nothing has been changed or lost.' };
+    const diagnostic: MailConnectionDiagnostic = { code: 'IMAP_CONFIG_READ_FAILED', stage: 'configuration', detail: 'Saved IMAP configuration could not be read; no connection was attempted.' };
+    console.error('[mail-imap] poll not attempted:', diagnostic.code, cfg.secretErrorCode || 'database_error');
+    return { ok: false, fetched: 0, delivered: 0, error: diagnostic.detail, diagnostic };
   }
-  if (!cfg.host || !cfg.user || !cfg.pass) return { ok: false, fetched: 0, delivered: 0, error: 'IMAP not configured' };
+  if (!cfg.host || !cfg.user || !cfg.pass) {
+    const diagnostic: MailConnectionDiagnostic = { code: 'IMAP_NOT_CONFIGURED', stage: 'configuration', detail: 'IMAP settings are incomplete.' };
+    return { ok: false, fetched: 0, delivered: 0, error: diagnostic.detail, diagnostic };
+  }
   const since = cfg.lastUid;
   const limit = opts.limit || 50;
 
@@ -182,11 +190,15 @@ export async function pollImapInbox(opts: { force?: boolean; limit?: number } = 
 
   let fetched = 0, delivered = 0;
   let maxUid = since;
+  let stage: MailConnectionStage = 'connection';
+  let runFailure: MailConnectionDiagnostic | null = null;
   try {
     await client.connect();
+    stage = 'mailbox_selection';
     const lock = await client.getMailboxLock('INBOX');
     try {
       const range = since > 0 ? `${since + 1}:*` : '1:*';
+      stage = 'message_fetch';
       for await (const msg of client.fetch(range, { uid: true, source: true, envelope: true, internalDate: true })) {
         if (!opts.force && msg.uid <= since) continue;
         // THE LIMIT USED TO EAT ONE MESSAGE, PERMANENTLY. The order was `fetched++; maxUid =
@@ -202,12 +214,13 @@ export async function pollImapInbox(opts: { force?: boolean; limit?: number } = 
         let parsed: any;
         try {
           parsed = await simpleParser(msg.source as Buffer);
-        } catch (e: any) {
-          console.error('[mail-imap] MIME parse failed for UID', msg.uid, '-', e?.cause?.message || e?.message);
-          if (msg.uid > maxUid) maxUid = msg.uid;
-          continue;
+        } catch (error: any) {
+          runFailure = diagnoseImapFailure(error, 'message_parse');
+          console.error('[mail-imap] message processing failed:', runFailure.code, runFailure.stage);
+          break;
         }
 
+        stage = 'message_delivery';
         try {
           const fromAddr = (parsed.from?.value?.[0]?.address || '').toString().toLowerCase();
           const fromName = (parsed.from?.value?.[0]?.name || '').toString().slice(0, 200);
@@ -242,18 +255,21 @@ export async function pollImapInbox(opts: { force?: boolean; limit?: number } = 
               delivered++;
             }
           }
-        } catch (e: any) {
+        } catch (error: any) {
           // Do not move the persisted UID watermark past a failed database write or identity lookup.
           // The next poll retries this message; the shared delivery transaction makes earlier
           // recipient copies idempotent if a multi-recipient delivery was only partly completed.
-          console.error('[mail-imap] delivery failed for UID', msg.uid, '-', e?.cause?.message || e?.message);
+          runFailure = diagnoseImapFailure(error, 'message_delivery');
+          console.error('[mail-imap] message delivery failed:', runFailure.code, runFailure.stage);
           break;
         }
         if (msg.uid > maxUid) maxUid = msg.uid;
+        stage = 'message_fetch';
       }
     } finally {
       lock.release();
     }
+    stage = 'logout';
     await client.logout();
 
     // Persist watermark + run time. NOT swallowed: a watermark that did not save means the next
@@ -261,23 +277,25 @@ export async function pollImapInbox(opts: { force?: boolean; limit?: number } = 
     // from producing duplicates, so it is a cost problem rather than a correctness one - but a poll
     // that silently cannot record its own progress is exactly the thing an operator needs told.
     let watermarkSaved = true;
+    stage = 'watermark_persistence';
     try {
       await db.execute(sql`UPDATE mail_config SET imap_last_uid = ${maxUid}, imap_last_run = NOW() WHERE id = 1`);
-    } catch (e: any) {
+    } catch (error: any) {
       watermarkSaved = false;
-      console.error('[mail-imap] the IMAP watermark could not be saved:', e?.cause?.message || e?.message);
+      runFailure = diagnoseImapFailure(error, 'watermark_persistence');
+      console.error('[mail-imap] poll progress could not be saved:', runFailure.code, runFailure.stage);
     }
 
+    if (runFailure) return { ok: false, fetched, delivered, error: runFailure.detail, diagnostic: runFailure };
     return {
       ok: true, fetched, delivered,
       detail: `Fetched ${fetched} new message(s) since UID ${since}; ${delivered} delivered to a known mailbox; max UID is now ${maxUid}.`
         + (watermarkSaved ? '' : ' The position marker could NOT be saved, so the next poll will re-read from UID ' + since + '.'),
     };
-  } catch (e: any) {
+  } catch (error: any) {
     try { await client.logout(); } catch (_) {}
-    // e.message on a wrapped driver error is only the failed statement; the reason is on e.cause.
-    const reason = e?.cause?.message || e?.message || 'IMAP poll failed';
-    console.error('[mail-imap] poll failed:', reason);
-    return { ok: false, fetched, delivered, error: reason };
+    const diagnostic = diagnoseImapFailure(error, stage);
+    console.error('[mail-imap] poll failed:', diagnostic.code, diagnostic.stage, diagnostic.command || '', diagnostic.protocolStatus || '', diagnostic.protocolCode || '');
+    return { ok: false, fetched, delivered, error: diagnostic.detail, diagnostic };
   }
 }
