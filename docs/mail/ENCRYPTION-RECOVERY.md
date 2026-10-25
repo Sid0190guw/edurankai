@@ -1,7 +1,8 @@
 # Mail credential encryption and recovery
 
-This runbook covers the app's AES-256-GCM envelope keys and the four encrypted fields in
-`mail_config`: `smtp_pass`, `imap_pass`, `resend_api_key`, and `inbound_secret`.
+This runbook covers the app's AES-256-GCM envelope keys and the four secret fields in
+`mail_config`: `smtp_pass`, `imap_pass`, `resend_api_key`, and `inbound_secret`. A field can hold an
+encrypted envelope, legacy plaintext, or no value.
 
 ## Encryption contract
 
@@ -15,13 +16,95 @@ This runbook covers the app's AES-256-GCM envelope keys and the four encrypted f
   are accepted. Whitespace is ignored for compatibility.
 - `ACTIVE_DATA_KEY_ID` chooses the ID used for new writes and defaults to `k1`. Every key ID still
   present in ciphertext must remain configured for reads. A new key cannot decrypt an older ID.
-- Mail fields are stored as `era-mail-secret:v1:` followed by a JSON envelope. Legacy plaintext
-  values remain readable until an authorized save encrypts them.
+- Encrypted mail fields are stored as `era-mail-secret:v1:` followed by a JSON envelope. Legacy
+  plaintext values remain readable; only a supplied replacement or an approved migration encrypts
+  them.
 
 The loader distinguishes missing key material, invalid Base64, and an incorrect decoded length.
 Envelope parsing distinguishes malformed ciphertext from AES-GCM authentication failure. The latter
 can mean a wrong key or modified ciphertext; the two are intentionally not reported as distinguishable.
 Logs contain a field name and a failure code, never a key, plaintext credential, or ciphertext.
+
+## Inventory before key changes or plaintext migration
+
+The `DATA_ENCRYPTION_KEY_<keyId>` registry is shared by these application fields:
+
+| Storage | Encrypted value | Recorded key ID |
+| --- | --- | --- |
+| `mail_config` | `smtp_pass`, `imap_pass`, `resend_api_key`, `inbound_secret` when prefixed `era-mail-secret:v1:` | `keyId` inside each JSON envelope |
+| `fpc_subject_input` | `ciphertext` JSONB (birth input) | `key_id` column |
+| `hzn_personal_foundation` | `payload_enc` JSONB (personal foundation input) | `key_id` column |
+| `mp_secrets` | `envelope` JSONB for `purpose = 'dkim-private-key'` | `keyId` inside each JSON envelope |
+
+`crypto_keys` stores key IDs and lifecycle metadata only; it does not store key material and its rows
+do not by themselves prove which IDs are still referenced by data. Before rotation or migration, run
+the following read-only inventory in the Production database. These queries return only field names,
+storage classifications, key IDs, and row counts. Never select or export a secret/ciphertext value.
+
+```sql
+SELECT key_id, purpose, state
+FROM crypto_keys
+ORDER BY key_id;
+
+WITH mail_values AS (
+  SELECT 'smtp_pass' AS field, smtp_pass AS value FROM mail_config WHERE id = 1
+  UNION ALL SELECT 'imap_pass', imap_pass FROM mail_config WHERE id = 1
+  UNION ALL SELECT 'resend_api_key', resend_api_key FROM mail_config WHERE id = 1
+  UNION ALL SELECT 'inbound_secret', inbound_secret FROM mail_config WHERE id = 1
+), mail_inventory AS (
+  SELECT field,
+    CASE
+      WHEN value IS NULL OR btrim(value) = '' THEN 'empty'
+      WHEN value LIKE 'era-mail-secret:v1:%' THEN 'envelope'
+      ELSE 'legacy_plaintext'
+    END AS storage,
+    CASE WHEN value LIKE 'era-mail-secret:v1:%'
+      THEN substring(value FROM '"keyId"[[:space:]]*:[[:space:]]*"([A-Za-z0-9._-]{1,64})"')
+      ELSE NULL
+    END AS key_id
+  FROM mail_values
+)
+SELECT field, storage, key_id, count(*) AS rows
+FROM mail_inventory
+GROUP BY field, storage, key_id
+ORDER BY field;
+
+SELECT key_id, count(*) AS rows
+FROM fpc_subject_input
+GROUP BY key_id
+ORDER BY key_id;
+
+SELECT key_id, count(*) AS rows
+FROM hzn_personal_foundation
+WHERE payload_enc IS NOT NULL
+GROUP BY key_id
+ORDER BY key_id;
+
+SELECT envelope->>'keyId' AS key_id, count(*) AS rows
+FROM mp_secrets
+WHERE purpose = 'dkim-private-key'
+GROUP BY envelope->>'keyId'
+ORDER BY key_id;
+```
+
+Run each statement only where its table exists. A missing optional table is not evidence that it has no
+encrypted rows. Preserve the sanitized output and compare every referenced ID with the configured key
+IDs before changing `ACTIVE_DATA_KEY_ID` or retiring any key.
+
+Other encryption systems in the repository are separate from this registry: `mailint_credentials`
+uses `MAILINT_VAULT_KEY` / `MAILINT_VAULT_KEY_PREVIOUS` and its own `env:v1` / `env:v0` IDs;
+`activity_events` uses `ACTIVITY_ENC_KEY` (falling back to `SESSION_SECRET`) and records no key ID.
+Do not rotate those keys as part of a `DATA_ENCRYPTION_KEY` change. The portal messenger also uses
+client-side WebCrypto keys and is outside this server key registry.
+
+For a plaintext mail-field migration, first pass the no-save SMTP and IMAP verification checks. Then
+use a reviewed server-side migration that reads and encrypts each non-empty plaintext field with its
+field-bound AAD, and updates only that field using compare-and-swap against the exact value read. The
+operation must not return, log, or export plaintext or ciphertext; it should report only per-field
+counts and outcomes. Keep empty fields empty. Stop on a key, encoding, database, or compare-and-swap
+failure and leave that field unchanged. Do not run this migration until the complete key-ID inventory
+has been reviewed and an approved active key is available. This is separate from routine rotation and
+does not restore ciphertext encrypted under a lost key.
 
 ## Generate and escrow a key
 

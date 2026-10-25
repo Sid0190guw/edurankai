@@ -21,84 +21,67 @@ on:
     - cron: '*/10 * * * *'
   workflow_dispatch:  # also allow manual trigger from the Actions tab
 
-# GitHub emails the repo owner on every workflow failure by default. For a
-# cron polling at 10-minute intervals, that's an avalanche. We've already
-# made the workflow tolerant of transient failures (502 / timeout / network),
-# but if the user ever wants to silence ALL notifications from this workflow,
-# turn off "Send notifications for failed workflows" in:
-#   GitHub → Profile → Settings → Notifications → Actions
-# OR add `continue-on-error: true` on the step (would mask real auth failures).
+# Failed polls must remain failed workflow runs so monitoring can detect them.
 
 jobs:
   poll:
     runs-on: ubuntu-latest
     timeout-minutes: 2
-    # No e-mail spam on this job — if you want to see status, watch the
-    # Actions tab. The workflow only emails when CRON_SECRET is misconfigured.
+    # A failed poll is actionable; keep it visible as a failed run.
     permissions:
       contents: read
     steps:
       - name: Hit IMAP poll endpoint
-        # Silences GitHub e-mail notifications for this workflow. The job will
-        # always be marked successful; status of each run is still visible in
-        # the Actions tab logs. Removes the every-10-min red-X email spam.
-        continue-on-error: true
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
           SITE_ORIGIN: ${{ secrets.SITE_ORIGIN }}
         run: |
+          set -euo pipefail
+
           # Sanity check the secrets are even present.
           if [ -z "$CRON_SECRET" ]; then
-            echo "::error::Repository secret CRON_SECRET is not set. Add it at: Settings → Secrets and variables → Actions → New repository secret."
+            echo "::error::Required repository secret CRON_SECRET is missing."
             exit 1
           fi
           if [ -z "$SITE_ORIGIN" ]; then
-            echo "::error::Repository secret SITE_ORIGIN is not set. Should be https://www.edurankai.in (the apex 308-redirects and this curl has no -L)"
+            echo "::error::Required repository secret SITE_ORIGIN is missing."
             exit 1
           fi
 
-          echo "Polling $SITE_ORIGIN/api/mail/imap-poll ..."
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
 
-          # 120s timeout is generous; the endpoint itself caps at 90s.
-          RESPONSE=$(curl -sS -w "\n%{http_code}" \
+          safe_diagnostic_code() {
+            local code
+            code="$(jq -r '.diagnostic.code // empty' "$response_file" 2>/dev/null || true)"
+            case "$code" in
+              IMAP_AUTH_REJECTED|IMAP_MAILBOX_REJECTED|IMAP_COMMAND_REJECTED|IMAP_TLS_FAILURE|IMAP_DNS_FAILURE|IMAP_CONNECTION_TIMEOUT|IMAP_CONNECTION_FAILURE|IMAP_CONFIG_READ_FAILED|IMAP_NOT_CONFIGURED|IMAP_MESSAGE_PARSE_FAILED|IMAP_MESSAGE_PERSISTENCE_FAILED|IMAP_WATERMARK_PERSISTENCE_FAILED|IMAP_POLL_TIMEOUT|IMAP_LOGOUT_FAILED|IMAP_OPERATION_FAILED) printf '%s' "$code" ;;
+              *) printf 'IMAP_POLL_FAILED' ;;
+            esac
+          }
+
+          # The endpoint caps its poll at 90s. Never echo its response body: diagnostics are
+          # intentionally redacted at the API boundary and the body can still contain provider data.
+          if ! http_code="$(curl --silent --output "$response_file" --write-out '%{http_code}' \
             -X GET "${SITE_ORIGIN}/api/mail/imap-poll" \
             -H "Authorization: Bearer ${CRON_SECRET}" \
-            --max-time 120 || echo $'\nCURL_FAILED')
-
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | head -n -1)
-          echo "HTTP_CODE=$HTTP_CODE"
-          echo "BODY=$BODY"
-
-          # Auth misconfig — fail loudly so the user knows to fix CRON_SECRET.
-          if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
-            echo "::error::Auth rejected. The CRON_SECRET in this repo doesn't match the CRON_SECRET on Vercel. Regenerate one, set the SAME value in both Vercel env vars and this repo's Actions secret, then redeploy Vercel."
+            --max-time 120 2>/dev/null)"; then
+            echo "::error::Could not reach the IMAP poll endpoint."
             exit 1
           fi
 
-          # Transient errors (502 cold-start, 504 timeout, 503, network drop)
-          # — log a warning but don't fail. The next 10-min run will pick up
-          # whatever this run missed; IMAP polling is idempotent.
-          if [ "$HTTP_CODE" = "CURL_FAILED" ] || [ "$HTTP_CODE" = "000" ]; then
-            echo "::warning::curl could not reach the endpoint (network / DNS / connection). Will retry on the next schedule."
-            exit 0
-          fi
-          if [ "$HTTP_CODE" -ge 500 ] 2>/dev/null; then
-            echo "::warning::Server returned $HTTP_CODE. This is usually a Vercel cold-start or transient deploy issue. Next run will retry."
-            exit 0
-          fi
-          if [ "$HTTP_CODE" -ne 200 ] 2>/dev/null; then
-            echo "::warning::Unexpected status $HTTP_CODE. Body above. Not failing the workflow."
-            exit 0
+          if [ "$http_code" != "200" ]; then
+            diagnostic_code="$(safe_diagnostic_code)"
+            echo "::error::IMAP poll endpoint returned HTTP $http_code (diagnostic=$diagnostic_code)."
+            exit 1
           fi
 
-          # HTTP 200 — check whether the IMAP poll itself succeeded inside.
-          # The endpoint always returns 200 (we made it crash-safe) but the
-          # JSON body says ok:false when credentials are bad / IMAP not
-          # configured / mail-config table missing values.
-          if echo "$BODY" | grep -q '"ok":false'; then
-            echo "::warning::IMAP poll reported a soft failure. Body above. This is NOT a workflow failure — fix the IMAP credentials at /admin/mail/setup if it persists."
-            exit 0
+          if ! jq -e '.ok == true' "$response_file" >/dev/null 2>&1; then
+            diagnostic_code="$(safe_diagnostic_code)"
+            echo "::error::IMAP poll failed (diagnostic=$diagnostic_code)."
+            exit 1
           fi
 
-          echo "Success."
+          fetched="$(jq -r 'if (.fetched | type) == "number" then .fetched else 0 end' "$response_file")"
+          delivered="$(jq -r 'if (.delivered | type) == "number" then .delivered else 0 end' "$response_file")"
+          echo "IMAP poll succeeded (fetched=$fetched delivered=$delivered)."
