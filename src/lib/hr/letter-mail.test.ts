@@ -22,8 +22,10 @@ const ctx = {
 describe('letter types', () => {
   it('covers every type the three surfaces can produce, and nothing else', () => {
     expect(Object.keys(LETTER_TYPES).sort()).toEqual([
+      'certificate:certificate',
       'offboarding:experience', 'offboarding:noc', 'offboarding:relieving',
       'offer:offer',
+      'promotion:promotion', 'promotion:redesignation',
       'recommendation:completion', 'recommendation:recommendation', 'recommendation:twmic',
     ]);
     // The key is `family:subtype` and the family field must agree with it — a page submits the key
@@ -140,7 +142,30 @@ describe('composeLetterEmail', () => {
       noteHtml: '<p>Congratulations.</p>',
     });
     expect(c.html).toContain('https://www.edurankai.in/portal/offer/abc123');
-    expect(c.html).toContain('Open the signed copy');
+    // NOT "the signed copy": the first offer email goes out before anybody has signed anything.
+    expect(c.html).toContain('Read and sign your offer letter');
+    expect(c.html).not.toContain('Open the signed copy');
+  });
+
+  it('labels the button for what is behind it on every type that links somewhere', () => {
+    const cert = composeLetterEmail({
+      typeKey: 'certificate:certificate',
+      ctx: { ...ctx, letterUrl: 'https://www.edurankai.in/credentials/ERA-IN-2026-ABC123' },
+      letterHtml: '<table><tr><td>certificate</td></tr></table>',
+    });
+    expect(cert.html).toContain('View and verify your certificate');
+    const plain = composeLetterEmail({
+      typeKey: 'offboarding:noc',
+      ctx: { ...ctx, letterUrl: 'https://www.edurankai.in/x' },
+    });
+    expect(plain.html).toContain('Open the letter online');
+  });
+
+  it('does not box a document that brings its own frame', () => {
+    const c = composeLetterEmail({ typeKey: 'promotion:promotion', ctx, letterHtml: '<p>framed</p>' });
+    expect(c.html).not.toContain('padding:18px;background:#fdfcf8');
+    const boxed = composeLetterEmail({ typeKey: 'offboarding:noc', ctx, letterHtml: '<p>plain</p>' });
+    expect(boxed.html).toContain('padding:18px;background:#fdfcf8');
   });
 
   it('carries the positioning sentence on every letter', () => {

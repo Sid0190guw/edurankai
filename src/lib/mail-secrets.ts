@@ -34,8 +34,18 @@ function aadFor(column: string): string {
 export function encodeMailSecret(value: unknown, column: string): string | null {
   const plaintext = String(value ?? '').trim();
   if (!plaintext) return null;
+  return encodeMailSecretVerbatim(plaintext, column);
+}
+
+/** Encrypt an existing value byte-for-byte; migrations must not normalize saved credentials. */
+export function encodeMailSecretVerbatim(plaintext: string, column: string): string | null {
+  if (!plaintext) return null;
   const envelope = encryptField(plaintext, aadFor(column));
   return ENCRYPTED_PREFIX + JSON.stringify(envelope);
+}
+
+export function isMailSecretEnvelope(value: unknown): boolean {
+  return typeof value === 'string' && value.startsWith(ENCRYPTED_PREFIX);
 }
 
 export function decodeMailSecret(value: unknown, column: string): string {

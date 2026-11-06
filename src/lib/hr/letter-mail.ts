@@ -51,8 +51,12 @@ import { sendEmail, brandedEmail } from '@/lib/email';
 import { sanitizeEmailHtml, htmlToPlainText, OUTBOUND } from '@/lib/mailsec/html';
 import { logAudit } from '@/lib/audit';
 
-/** Which desk the letter comes from. Only these three; a fourth needs a decision, not a string. */
-export type LetterFamily = 'offer' | 'offboarding' | 'recommendation';
+/**
+ * Which desk the letter comes from. Each family is a decision, not a string: `promotion` is the
+ * letter that follows an APPLIED designation change, and `certificate` is a recorded, verifiable
+ * certificate from /admin/certificates.
+ */
+export type LetterFamily = 'offer' | 'offboarding' | 'recommendation' | 'promotion' | 'certificate';
 
 export interface LetterType {
   /** `family:subtype`, which is what a form submits and what the audit line records. */
@@ -64,6 +68,13 @@ export interface LetterType {
   heading: string;
   /** The one-line preview mail clients show beside the subject. */
   preheader: string;
+  /** The button under the letter, when there is a canonical copy to link to. */
+  ctaText?: string;
+  /**
+   * False when the document brings its own frame (src/lib/hr/brand-doc.ts). Wrapping a framed
+   * certificate in a second padded box only makes it narrower in a 560px email.
+   */
+  framed?: boolean;
 }
 
 /**
@@ -77,7 +88,10 @@ export const LETTER_TYPES: Readonly<Record<string, LetterType>> = Object.freeze(
   'offer:offer': {
     key: 'offer:offer', family: 'offer',
     label: 'Offer Letter', heading: 'Your offer letter',
-    preheader: 'Your offer letter from EduRankAI.',
+    preheader: 'Your offer letter from EduRankAI is ready to read and sign.',
+    // NOT "the signed copy": the first email goes out before anybody has signed anything.
+    ctaText: 'Read and sign your offer letter',
+    framed: false,
   },
   'recommendation:recommendation': {
     key: 'recommendation:recommendation', family: 'recommendation',
@@ -108,6 +122,25 @@ export const LETTER_TYPES: Readonly<Record<string, LetterType>> = Object.freeze(
     key: 'offboarding:noc', family: 'offboarding',
     label: 'No-Objection Certificate', heading: 'Your no-objection certificate',
     preheader: 'Your no-objection certificate from EduRankAI.',
+  },
+  'promotion:promotion': {
+    key: 'promotion:promotion', family: 'promotion',
+    label: 'Letter of Promotion', heading: 'Congratulations on your promotion',
+    preheader: 'Your letter of promotion from EduRankAI.',
+    framed: false,
+  },
+  'promotion:redesignation': {
+    key: 'promotion:redesignation', family: 'promotion',
+    label: 'Letter of Re-designation', heading: 'Your new designation',
+    preheader: 'Your letter of re-designation from EduRankAI.',
+    framed: false,
+  },
+  'certificate:certificate': {
+    key: 'certificate:certificate', family: 'certificate',
+    label: 'Certificate', heading: 'Your certificate',
+    preheader: 'Your certificate from EduRankAI, with its public verification link.',
+    ctaText: 'View and verify your certificate',
+    framed: false,
   },
 });
 
@@ -234,9 +267,10 @@ export function composeLetterEmail(input: ComposeLetterInput): ComposedLetter {
     // NOT token-substituted. The letter is already rendered — every field on it was filled by the
     // page before the operator read it — so running the substitution over it could only change a
     // document that has already been reviewed, which is the one thing a letter must never do.
-    letterBlock =
-      '<div style="margin-top:22px;padding:18px;background:#fdfcf8;border:1px solid rgba(0,0,0,0.08);border-radius:10px;">'
-      + cleanLetter.html + '</div>';
+    letterBlock = type.framed === false
+      ? '<div style="margin-top:22px;">' + cleanLetter.html + '</div>'
+      : '<div style="margin-top:22px;padding:18px;background:#fdfcf8;border:1px solid rgba(0,0,0,0.08);border-radius:10px;">'
+        + cleanLetter.html + '</div>';
   }
 
   // A DEFAULT NOTE RATHER THAN AN EMPTY ONE. A letter arriving with no sentence in front of it reads
@@ -257,7 +291,7 @@ export function composeLetterEmail(input: ComposeLetterInput): ComposedLetter {
     preheader: type.preheader,
     heading: type.heading,
     body,
-    ctaText: input.ctx.letterUrl ? 'Open the signed copy' : undefined,
+    ctaText: input.ctx.letterUrl ? (type.ctaText || 'Open the letter online') : undefined,
     ctaUrl: input.ctx.letterUrl || undefined,
     // THE POSITIONING SENTENCE, on every letter this company sends. EduRankAI is the technology
     // platform; accredited partners award credentials. A letter is exactly the artefact somebody
