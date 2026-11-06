@@ -142,6 +142,16 @@ export async function getUniversalBySerial(serial: string) {
   return r[0] || null;
 }
 
+/**
+ * One certificate, for the issuing desk. NOT getUniversalBySerial(): that one counts a public
+ * verification, and an admin previewing or emailing a certificate is not somebody checking it.
+ */
+export async function getUniversalForAdmin(serial: string) {
+  await ensureUniversalCertSchema();
+  const r = rows(await (await database()).execute(sql`SELECT * FROM universal_certificates WHERE serial = ${String(serial || '').trim()} LIMIT 1`));
+  return r[0] || null;
+}
+
 export async function listUniversal(opts: { kind?: string; limit?: number; q?: string } = {}) {
   await ensureUniversalCertSchema();
   const limit = Math.min(500, Math.max(10, opts.limit || 100));

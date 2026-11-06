@@ -1,10 +1,79 @@
 ---
+// /admin/certificates - ISSUE A CERTIFICATE, SEE IT, AND PUT IT IN THE PERSON'S INBOX.
+//
+// This console could issue a serial and stop. Getting the certificate to the graduate was a separate,
+// manual act, and what they eventually saw at /credentials/<serial> was a plain card with no mark on
+// it. Now one desk does all three, and the certificate is rendered by ONE function
+// (src/lib/hr/brand-doc.ts certificateHtml) for the preview here, the email, and the public
+// verification page - so the copy an employer checks is the copy the person was sent.
+//
+// FROM AN EMPLOYEE RECORD, NOT RETYPED. ?employee=<id> pre-fills name, email, role and dates from
+// hr_employees, and the key contributions from reviews rated 4 or above - the same rule the
+// completion page uses - so a graduating intern's certificate starts from what was recorded.
 import AdminLayout from '@/layouts/AdminLayout.astro';
-import { ensureUniversalCertSchema, listUniversal, issueUniversalCertificate, revokeUniversal, UCERT_KIND_LABELS } from '@/lib/universal-certificates';
+import {
+  ensureUniversalCertSchema, listUniversal, issueUniversalCertificate, revokeUniversal,
+  getUniversalForAdmin, UCERT_KIND_LABELS,
+} from '@/lib/universal-certificates';
+import { can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { sendLetterEmail, LETTER_TOKENS } from '@/lib/hr/letter-mail';
+import { certificateHtml, certificateFromRecord, CERTIFICATE_WORDING } from '@/lib/hr/brand-doc';
+import { publicUrl } from '@/lib/public-origin';
+import { civilToday } from '@/lib/page-safety';
+import { reviewsForDetailed } from '@/lib/credit-ledger';
+import RichMessageComposer from '@/components/admin/RichMessageComposer.astro';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 if (user.role === 'applicant') return Astro.redirect('/portal');
+
+// EVERYTHING BELOW IS DECLARED BEFORE THE POST HANDLER THAT USES IT. `const` is not hoisted.
+
+// Emailing is an outward-facing act under the company's domain: the same key the HR letter desks
+// gate their send on (super_admin and hr). Issuing is unchanged.
+const mayEmail = can(user, 'employee.manage');
+
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const isUuid = (v: unknown) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || ''));
+const isoDay = (v: any): string => {
+  if (v instanceof Date && !isNaN(v.getTime())) return v.toISOString().slice(0, 10);
+  return String(v || '').slice(0, 10);
+};
+const today = civilToday();
+
+const DEFAULT_NOTE = [
+  '<p>Dear {{name}},</p>',
+  '<p>Congratulations. It gives us real pleasure to send you your certificate for <strong>{{role}}</strong>.</p>',
+  '<p>It is below, and anyone can verify it at the link underneath it &mdash; add it to your professional profile, or share the link with a university or an employer.</p>',
+  '<p>Thank you for everything you built with us. We are proud of you, and we look forward to hearing what you do next.</p>',
+  '<p>{{signatory}}<br/>EduRankAI</p>',
+].join('');
+
+/** Compose and send one certificate. Never throws; answers a sentence for the operator. */
+async function emailCertificate(row: any, to: string, noteHtml: string): Promise<{ ok: boolean; message: string }> {
+  if (!row) return { ok: false, message: 'That certificate could not be found, so nothing was sent.' };
+  if (row.revoked) return { ok: false, message: 'That certificate is revoked, so it was not sent.' };
+  const verifyUrl = publicUrl('/credentials/' + encodeURIComponent(String(row.serial)));
+  const out = await sendLetterEmail({
+    actorUserId: user!.id,
+    typeKey: 'certificate:certificate',
+    noteHtml: noteHtml || DEFAULT_NOTE,
+    letterHtml: certificateHtml(certificateFromRecord(row, verifyUrl)),
+    ctx: {
+      recipientName: String(row.recipient_name || ''),
+      recipientEmail: to,
+      roleTitle: String(row.title || ''),
+      refNumber: String(row.serial || ''),
+      issueDate: isoDay(row.signed_at),
+      signatoryName: String(row.issued_by_name || ''),
+      signatoryTitle: String(row.issued_by_designation || ''),
+      letterUrl: verifyUrl,
+    },
+  });
+  return { ok: out.sent, message: out.message };
+}
 
 await ensureUniversalCertSchema();
 
@@ -18,13 +87,23 @@ if (Astro.request.method === 'POST') {
       const reason = (fd.get('reason') as string || '').trim().slice(0, 1000);
       if (!serial || !reason) errorMsg = 'Serial + reason required.';
       else {
-        // revokeUniversal now answers what actually happened. 'Certificate X revoked.' used to print
-        // for a serial that matched nothing — and a certificate believed revoked but still valid on
-        // the public verification page is the worst outcome this console can produce.
+        // revokeUniversal answers what actually happened. 'Certificate X revoked.' used to print for a
+        // serial that matched nothing, while the public page went on verifying it as valid.
         const res = await revokeUniversal(serial, user.id, reason);
         if (res.revoked) successMsg = 'Certificate ' + serial + ' revoked. It now fails public verification.';
         else if (res.alreadyRevoked) errorMsg = 'Certificate ' + serial + ' was already revoked, so nothing changed — the earlier reason and revoking user are kept.';
         else errorMsg = 'NOTHING WAS REVOKED. No certificate has the serial "' + serial + '". Check it against the printed certificate: it is still valid and still verifies publicly.';
+      }
+    } else if (action === 'email') {
+      if (!mayEmail) {
+        errorMsg = 'Emailing a certificate needs the HR permission. Ask an HR administrator to send it.';
+      } else {
+        const serial = (fd.get('serial') as string || '').trim();
+        const row = await getUniversalForAdmin(serial);
+        const to = String(fd.get('recipient_email') || row?.recipient_email || '').trim();
+        const r = await emailCertificate(row, to, String(fd.get('noteHtml') || ''));
+        if (r.ok) successMsg = r.message; else errorMsg = r.message;
+        issuedSerial = serial;
       }
     } else {
       const kind = (fd.get('kind') as string || 'custom') as any;
@@ -40,159 +119,399 @@ if (Astro.request.method === 'POST') {
       const scorePct = isFinite(scoreRaw) && scoreRaw >= 0 ? scoreRaw : undefined;
       const validFrom = (fd.get('valid_from') as string || '').trim() || undefined;
       const validUntil = (fd.get('valid_until') as string || '').trim() || undefined;
+      const employeeId = String(fd.get('employee_id') || '').trim();
+      const fromDate = String(fd.get('from_date') || '').trim().slice(0, 10);
+      const toDate = String(fd.get('to_date') || '').trim().slice(0, 10);
+      const department = String(fd.get('department') || '').trim().slice(0, 200);
+      const measureLine = String(fd.get('measure_line') || '').trim().slice(0, 300);
+      const achievements = String(fd.get('achievements') || '')
+        .split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 6).map((s) => s.slice(0, 300));
+      const sendNow = fd.get('send_email') === '1';
       if (!recipientName || !title) errorMsg = 'Recipient name + title are required.';
       else {
         const r = await issueUniversalCertificate({
           kind, recipientName, recipientEmail, title, body, achievement,
+          recipientEmployeeId: isUuid(employeeId) ? employeeId : undefined,
           issuedByUserId: user.id, issuedByName, issuedByDesignation, issuerOrg,
           scorePct, validFrom, validUntil,
+          metadata: { fromDate, toDate, department, achievements, measureLine },
         });
         if (r.ok) {
           issuedSerial = r.serial;
-          successMsg = 'Certificate issued: ' + r.serial + (r.existing ? ' (already existed — returning same)' : '');
+          successMsg = 'Certificate issued: ' + r.serial + (r.existing ? ' (already existed — returning same)' : '') + '.';
+          // ISSUED AND SENT ARE TWO FACTS, reported separately: the certificate exists and verifies
+          // whether or not the mail server accepted the message.
+          if (sendNow) {
+            if (!mayEmail) {
+              errorMsg = 'It was not emailed: sending needs the HR permission.';
+            } else if (!recipientEmail) {
+              errorMsg = 'It was not emailed: no recipient email was given. Add one below and press Send.';
+            } else {
+              const row = await getUniversalForAdmin(r.serial);
+              const sent = await emailCertificate(row, recipientEmail, String(fd.get('noteHtml') || ''));
+              if (sent.ok) successMsg += ' ' + sent.message;
+              else errorMsg = sent.message;
+            }
+          }
         } else errorMsg = 'Issue failed.';
       }
     }
   } catch (e: any) {
-    // e.message on a drizzle error is only the failed SQL. The reason lives on e.cause, and nothing
-    // here was logged at all — an issue or a revocation that threw left no trace to investigate.
+    // e.message on a drizzle error is only the failed SQL. The reason lives on e.cause.
     const real = e?.cause?.message || e?.message || 'unknown reason';
     console.error('[admin/certificates] failed -', real);
-    successMsg = ''; issuedSerial = '';
-    errorMsg = 'Nothing was issued or revoked. Reason: ' + real;
+    if (!issuedSerial) successMsg = '';
+    errorMsg = (issuedSerial ? 'The certificate was issued, but the next step failed: ' : 'Nothing was issued or revoked. Reason: ') + real;
   }
 }
 
 const url = new URL(Astro.request.url);
 const filterKind = url.searchParams.get('kind') || '';
 const q = url.searchParams.get('q') || '';
+const previewSerial = issuedSerial || url.searchParams.get('preview') || '';
+const employeeParam = url.searchParams.get('employee') || '';
+
+// THE PEOPLE A CERTIFICATE CAN BE ISSUED FROM. Former staff included: a graduated intern's record
+// is usually already closed by the time the certificate is written.
+let employees: any[] = [];
+try {
+  employees = rowsOf(await db.execute(sql`
+    SELECT id, full_name, email, designation, joining_date, employment_type, is_active
+      FROM hr_employees ORDER BY is_active DESC, full_name ASC LIMIT 600`));
+} catch (e: any) {
+  console.error('[admin/certificates] employees', e?.cause?.message || e?.message);
+}
+
+// Pre-fill from one employee record.
+let prefill: any = null;
+let prefillNote = '';
+if (isUuid(employeeParam)) {
+  const emp = employees.find((e: any) => String(e.id) === employeeParam);
+  if (emp) {
+    const isIntern = /intern|apprentic|trainee/i.test(String(emp.employment_type || '') + ' ' + String(emp.designation || ''));
+    let achievements: string[] = [];
+    try {
+      const rv = await reviewsForDetailed(String(emp.id));
+      if (rv.ok) achievements = rv.reviews.filter((r) => (r.rating || 0) >= 4).map((r) => r.note).filter(Boolean).slice(0, 6);
+      else prefillNote = 'Reviews could not be read, so key contributions were not pre-filled. Type them in, or reload.';
+    } catch (_) {
+      prefillNote = 'Reviews could not be read, so key contributions were not pre-filled.';
+    }
+    prefill = {
+      employeeId: String(emp.id),
+      kind: isIntern ? 'internship' : 'employment',
+      name: String(emp.full_name || ''),
+      email: String(emp.email || ''),
+      title: isIntern
+        ? String(emp.designation || 'Internship').replace(/\bIntern\b/i, 'Internship')
+        : String(emp.designation || ''),
+      fromDate: isoDay(emp.joining_date),
+      toDate: today,
+      achievements: achievements.join('\n'),
+    };
+  } else {
+    prefillNote = 'That employee record was not found, so nothing was pre-filled.';
+  }
+}
+const pf: any = prefill || { employeeId: '', kind: 'internship', name: '', email: '', title: '', fromDate: '', toDate: today, achievements: '' };
+
+// The preview: the certificate exactly as it is emailed and as /credentials/<serial> shows it.
+let previewRow: any = null;
+let previewHtml = '';
+if (previewSerial) {
+  try {
+    previewRow = await getUniversalForAdmin(previewSerial);
+    if (previewRow) {
+      previewHtml = certificateHtml(certificateFromRecord(previewRow, publicUrl('/credentials/' + encodeURIComponent(String(previewRow.serial)))));
+    }
+  } catch (e: any) {
+    console.error('[admin/certificates] preview', e?.cause?.message || e?.message);
+  }
+}
+
 const certs = await listUniversal({ kind: filterKind || undefined, q, limit: 200 });
-
 function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day:'2-digit', month:'short', year:'numeric' }); } catch { return ''; } }
+const kindOptions = Object.entries(UCERT_KIND_LABELS).map(([k, v]) => ({ key: k, label: v.label, accent: v.accent }));
+const headingFor = (k: string) => (CERTIFICATE_WORDING.find((w) => w.kind === k) || { heading: '' }).heading;
+const previewCanEmail = !!previewRow && !previewRow.revoked && mayEmail;
 ---
-<AdminLayout title="Certificate Generator" activeNav="">
-<div style="padding:14px 16px 80px;max-width:1280px;margin:0 auto;">
-  <p style="font-size:10.5px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;font-family:'Geist Mono',monospace;font-weight:700;">Credentials</p>
-  <h1 style="font-size:24px;color:#fff;margin:6px 0 4px;font-weight:700;">Certificate Generator</h1>
-  <p style="font-size:13px;color:#9aa6b6;margin:0 0 18px;">Issue any kind of credential — course completion, test pass, event participation, internship, employment, LOR, or a free-form custom certificate. Each issuance gets a permanent serial + public verify URL.</p>
+<AdminLayout title="Certificates" activeNav="">
+<div class="cw">
+  <p class="eyebrow">Credentials</p>
+  <h1>Certificates</h1>
+  <p class="lede">
+    Issue a certificate, see it exactly as the recipient will, and email it to them in the same step.
+    Every certificate carries a permanent serial and a public verification page. For a graduating
+    intern, start from their employee record so the dates and contributions come from what was recorded.
+  </p>
 
-  {successMsg && <div style="background:rgba(74,222,128,0.12);border:1px solid rgba(74,222,128,0.32);color:#86efac;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;">{successMsg}{issuedSerial && <> · <a href={'/credentials/' + issuedSerial} target="_blank" style="color:#86efac;text-decoration:underline;">View public credential</a></>}</div>}
-  {errorMsg && <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.32);color:#fca5a5;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;">{errorMsg}</div>}
+  {successMsg && <div class="flash ok">{successMsg}{issuedSerial && <> · <a href={'/credentials/' + issuedSerial} target="_blank">View public credential</a></>}</div>}
+  {errorMsg && <div class="flash bad">{errorMsg}</div>}
+  {prefillNote && <div class="flash warn">{prefillNote}</div>}
 
-  <!-- Issue form -->
-  <details open={!issuedSerial} style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px;margin-bottom:18px;">
-    <summary style="cursor:pointer;color:#FF7040;font-size:13px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;font-family:'Geist Mono',monospace;">Issue a new certificate</summary>
-    <form method="POST" style="margin-top:16px;display:grid;gap:10px;">
-      <input type="hidden" name="action" value="issue" />
-
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+  {/* PREVIEW + SEND */}
+  {previewRow && (
+    <section class="panel preview">
+      <div class="pv-head">
         <div>
-          <label style="font-size:10.5px;color:#9aa6b6;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;font-family:'Geist Mono',monospace;">Kind *</label>
-          <select name="kind" required style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;margin-top:4px;">
-            {Object.entries(UCERT_KIND_LABELS).map(([k, v]) => (
-              <option value={k}>{v.label}</option>
+          <p class="pv-k">Preview · {previewRow.serial}{previewRow.revoked ? ' · REVOKED' : ''}</p>
+          <p class="pv-n">{previewRow.recipient_name}</p>
+          <p class="pv-s">This is the certificate exactly as it is emailed and as the public verification page shows it.</p>
+        </div>
+        <a class="btn ghost" href={'/credentials/' + previewRow.serial} target="_blank">Open public page</a>
+      </div>
+      <div class="pv-doc"><Fragment set:html={previewHtml} /></div>
+
+      {previewCanEmail && (
+        <form method="POST" class="sendbox">
+          <input type="hidden" name="action" value="email" />
+          <input type="hidden" name="serial" value={previewRow.serial} />
+          <label>Send to
+            <input type="email" name="recipient_email" required value={previewRow.recipient_email || ''} placeholder="name@example.com" />
+          </label>
+          <RichMessageComposer
+            id="cert-send-note"
+            name="noteHtml"
+            label="Your message"
+            hint="Written above the certificate. The certificate itself and its verification link follow it."
+            tokens={LETTER_TOKENS}
+            value={DEFAULT_NOTE}
+          />
+          <button type="submit" class="btn">Email this certificate</button>
+          <p class="hint">Nothing is attached: the certificate is the message, and the button under it opens the verifiable copy.</p>
+        </form>
+      )}
+      {!previewRow.revoked && !mayEmail && (
+        <p class="hint">Emailing a certificate needs the HR permission. You can still open and print the public page.</p>
+      )}
+
+      {!previewRow.revoked && (
+        <details class="revoke">
+          <summary>Revoke this certificate</summary>
+          {/* No confirm(): admin pages run in a sandboxed side panel where window.confirm() returns
+              false silently. A required reason and a required acknowledgement do the job natively. */}
+          <form method="POST">
+            <input type="hidden" name="action" value="revoke" />
+            <input type="hidden" name="serial" value={previewRow.serial} />
+            <textarea name="reason" required rows="2" maxlength="1000" placeholder="Why is this being revoked? It is shown on the public page."></textarea>
+            <label class="ack"><input type="checkbox" required /> <span>I understand this certificate will fail public verification from now on.</span></label>
+            <button type="submit" class="btn danger">Revoke</button>
+          </form>
+        </details>
+      )}
+    </section>
+  )}
+
+  {/* START FROM A PERSON */}
+  <form method="GET" class="panel picker">
+    <label>Start from an employee record
+      <select name="employee">
+        <option value="">Choose a person (optional)</option>
+        {employees.map((e: any) => (
+          <option value={e.id} selected={String(e.id) === employeeParam}>
+            {e.full_name}{e.designation ? ' — ' + e.designation : ''}{e.is_active === false ? ' (former)' : ''}
+          </option>
+        ))}
+      </select>
+    </label>
+    <button type="submit" class="btn ghost">Pre-fill</button>
+  </form>
+
+  {/* ISSUE */}
+  <details open={!previewRow} class="panel">
+    <summary>Issue a new certificate</summary>
+    <form method="POST" class="grid">
+      <input type="hidden" name="action" value="issue" />
+      <input type="hidden" name="employee_id" value={pf.employeeId} />
+      <div class="two">
+        <label>Kind *
+          <select name="kind" required>
+            {kindOptions.map((k) => (
+              <option value={k.key} selected={k.key === pf.kind}>{k.label}{headingFor(k.key) ? ' — ' + headingFor(k.key) : ''}</option>
             ))}
           </select>
-        </div>
-        <div>
-          <label style="font-size:10.5px;color:#9aa6b6;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;font-family:'Geist Mono',monospace;">Issuer org</label>
-          <input name="issuer_org" type="text" placeholder="EduRankAI" maxlength="200" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;margin-top:4px;" />
-        </div>
+        </label>
+        <label>Issuer
+          <input name="issuer_org" type="text" placeholder="EduRankAI" maxlength="200" />
+        </label>
+      </div>
+      <div class="two">
+        <label>Recipient name *
+          <input name="recipient_name" type="text" required maxlength="200" value={pf.name} placeholder="Full name as it should appear" />
+        </label>
+        <label>Recipient email
+          <input name="recipient_email" type="email" maxlength="200" value={pf.email} placeholder="Where the certificate is sent" />
+        </label>
+      </div>
+      <label>Programme or role *
+        <input name="title" type="text" required maxlength="300" value={pf.title} placeholder="e.g. AI Research Internship" />
+        <span class="hint">Printed large under the name. For an internship, name the programme ("AI Research Internship"), not the job title.</span>
+      </label>
+      <div class="three">
+        <label>Team / department
+          <input name="department" type="text" maxlength="200" placeholder="e.g. Applied AI" />
+        </label>
+        <label>From
+          <input name="from_date" type="date" value={pf.fromDate} />
+        </label>
+        <label>To
+          <input name="to_date" type="date" value={pf.toDate} />
+        </label>
+      </div>
+      <label>Distinction (optional)
+        <input name="achievement" type="text" maxlength="120" placeholder="e.g. With Distinction" />
+        <span class="hint">A short ribbon under the programme. Leave empty unless it was earned.</span>
+      </label>
+      <label>Citation
+        <textarea name="body" rows="4" maxlength="5000" placeholder="Two or three sentences on what they did and the standard they did it to."></textarea>
+      </label>
+      <label>Key contributions (one per line, up to six)
+        <textarea name="achievements" rows="4" maxlength="2000" placeholder="Shipped the evaluation harness used by the ranking pipeline">{pf.achievements}</textarea>
+        <span class="hint">Pre-filled from reviews rated 4 or above when you start from an employee record.</span>
+      </label>
+      <div class="two">
+        <label>Measured line (optional)
+          <input name="measure_line" type="text" maxlength="300" placeholder="e.g. 12 credits earned, one credit per completed week" />
+          <span class="hint">Copy it from the completion page. Never type a figure that was not measured.</span>
+        </label>
+        <label>Score %
+          <input name="score_pct" type="number" min="0" max="100" step="0.01" placeholder="Tests only" />
+        </label>
+      </div>
+      <div class="two">
+        <label>Signed by — name
+          <input name="issued_by_name" type="text" maxlength="200" value={user.name || 'Siddharth Prasad'} />
+        </label>
+        <label>Signed by — designation
+          <input name="issued_by_designation" type="text" maxlength="200" value="Founder & CEO" />
+        </label>
+      </div>
+      <div class="two">
+        <label>Valid from
+          <input name="valid_from" type="date" />
+        </label>
+        <label>Valid until
+          <input name="valid_until" type="date" />
+        </label>
       </div>
 
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-        <div>
-          <label style="font-size:10.5px;color:#9aa6b6;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;font-family:'Geist Mono',monospace;">Recipient name *</label>
-          <input name="recipient_name" type="text" required maxlength="200" placeholder="Full name as it should appear" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;margin-top:4px;" />
+      {mayEmail ? (
+        <div class="sendopt">
+          <label class="ack"><input type="checkbox" name="send_email" value="1" checked /> <span>Email the certificate to the recipient as soon as it is issued</span></label>
+          <details>
+            <summary>The message that goes with it</summary>
+            <RichMessageComposer
+              id="cert-issue-note"
+              name="noteHtml"
+              label="Covering message"
+              hint="Written above the certificate."
+              tokens={LETTER_TOKENS}
+              value={DEFAULT_NOTE}
+            />
+          </details>
         </div>
-        <div>
-          <label style="font-size:10.5px;color:#9aa6b6;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;font-family:'Geist Mono',monospace;">Recipient email</label>
-          <input name="recipient_email" type="email" maxlength="200" placeholder="(optional, for verification look-up)" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;margin-top:4px;" />
-        </div>
-      </div>
+      ) : (
+        <p class="hint">Issuing works for you; emailing needs the HR permission, so the certificate will be issued without being sent.</p>
+      )}
 
-      <div>
-        <label style="font-size:10.5px;color:#9aa6b6;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;font-family:'Geist Mono',monospace;">Title *</label>
-        <input name="title" type="text" required maxlength="300" placeholder="e.g. Certificate of Completion — Quantum Foundations" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;margin-top:4px;" />
-      </div>
-
-      <div>
-        <label style="font-size:10.5px;color:#9aa6b6;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;font-family:'Geist Mono',monospace;">Achievement / summary</label>
-        <input name="achievement" type="text" maxlength="1000" placeholder="e.g. Scored 94% on a 100-question proctored assessment" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;margin-top:4px;" />
-      </div>
-
-      <div>
-        <label style="font-size:10.5px;color:#9aa6b6;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;font-family:'Geist Mono',monospace;">Body (citation / letter text)</label>
-        <textarea name="body" rows="4" maxlength="5000" placeholder="Free-form text rendered on the certificate body. For LOR, write the full letter here." style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;margin-top:4px;font-family:'Inter Tight',sans-serif;resize:vertical;"></textarea>
-      </div>
-
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
-        <div>
-          <label style="font-size:10.5px;color:#9aa6b6;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;font-family:'Geist Mono',monospace;">Score %</label>
-          <input name="score_pct" type="number" min="0" max="100" step="0.01" placeholder="e.g. 94.5" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;margin-top:4px;" />
-        </div>
-        <div>
-          <label style="font-size:10.5px;color:#9aa6b6;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;font-family:'Geist Mono',monospace;">Valid from</label>
-          <input name="valid_from" type="date" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;margin-top:4px;" />
-        </div>
-        <div>
-          <label style="font-size:10.5px;color:#9aa6b6;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;font-family:'Geist Mono',monospace;">Valid until</label>
-          <input name="valid_until" type="date" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;margin-top:4px;" />
-        </div>
-      </div>
-
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-        <div>
-          <label style="font-size:10.5px;color:#9aa6b6;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;font-family:'Geist Mono',monospace;">Signed by — name</label>
-          <input name="issued_by_name" type="text" maxlength="200" placeholder="e.g. Siddharth Prasad" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;margin-top:4px;" />
-        </div>
-        <div>
-          <label style="font-size:10.5px;color:#9aa6b6;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;font-family:'Geist Mono',monospace;">Signed by — designation</label>
-          <input name="issued_by_designation" type="text" maxlength="200" placeholder="e.g. Founder, EduRankAI" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;margin-top:4px;" />
-        </div>
-      </div>
-
-      <button type="submit" style="background:#FF7040;color:#1a0a04;border:none;padding:10px 22px;border-radius:8px;font-size:13px;font-weight:800;cursor:pointer;letter-spacing:0.04em;text-transform:uppercase;font-family:'Geist Mono',monospace;justify-self:start;margin-top:6px;">Issue certificate</button>
+      <button type="submit" class="btn">Issue certificate</button>
     </form>
   </details>
 
-  <!-- Filters + search -->
-  <form method="GET" style="display:flex;gap:8px;margin-bottom:14px;align-items:center;flex-wrap:wrap;">
-    <input name="q" value={q} type="text" placeholder="Search by name, email, serial, or title..." style="flex:1;min-width:240px;background:#0f0f14;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;" />
-    <select name="kind" style="background:#0f0f14;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;">
+  {/* REGISTER */}
+  <form method="GET" class="filters">
+    <input name="q" value={q} type="text" placeholder="Search by name, email, serial, or title..." />
+    <select name="kind">
       <option value="">All kinds</option>
-      {Object.entries(UCERT_KIND_LABELS).map(([k, v]) => (
-        <option value={k} selected={filterKind === k}>{v.label}</option>
+      {kindOptions.map((k) => (
+        <option value={k.key} selected={filterKind === k.key}>{k.label}</option>
       ))}
     </select>
-    <button type="submit" style="background:#15151a;border:1px solid #2a2a2f;color:#FF7040;padding:9px 16px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;">Filter</button>
+    <button type="submit" class="btn ghost">Filter</button>
   </form>
 
-  <!-- List -->
-  <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;overflow:hidden;">
-    <div style="display:grid;grid-template-columns:1.6fr 1.6fr 1fr 110px 100px 90px;gap:10px;padding:10px 14px;background:#15151a;border-bottom:1px solid #1a1a1f;font-size:10px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.08em;font-weight:700;">
-      <div>Recipient</div><div>Title</div><div>Serial</div><div>Kind</div><div>Issued</div><div>Verified</div>
+  <div class="list">
+    <div class="lrow lhead">
+      <div>Recipient</div><div>Title</div><div>Serial</div><div>Kind</div><div>Issued</div><div></div>
     </div>
     {certs.length === 0 ? (
-      <div style="padding:36px;text-align:center;color:#8a8a94;font-size:13px;">
-        No certificates issued yet{q || filterKind ? ' for this filter' : ''}. Issue your first using the form above.
+      <div class="empty">
+        No certificates issued yet{q || filterKind ? ' for this filter' : ''}. Issue the first using the form above.
       </div>
     ) : certs.map((c: any) => {
       const kindMeta = UCERT_KIND_LABELS[c.kind] || UCERT_KIND_LABELS.custom;
       return (
-        <a href={'/credentials/' + c.serial} target="_blank" style="display:grid;grid-template-columns:1.6fr 1.6fr 1fr 110px 100px 90px;gap:10px;padding:11px 14px;border-bottom:1px solid #15151a;text-decoration:none;color:#fff;align-items:center;">
-          <div style="min-width:0;">
-            <p style="font-size:12.5px;font-weight:600;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{c.recipient_name}{c.revoked && <span style="margin-left:6px;background:rgba(239,68,68,0.16);color:#fca5a5;font-size:9px;padding:1px 6px;border-radius:100px;font-family:'Geist Mono',monospace;letter-spacing:0.08em;text-transform:uppercase;font-weight:700;">Revoked</span>}</p>
-            <p style="font-size:10.5px;color:#8a8a94;margin:2px 0 0;font-family:'Geist Mono',monospace;">{c.recipient_email || '—'}</p>
+        <div class="lrow">
+          <div class="cell">
+            <p class="nm">{c.recipient_name}{c.revoked && <span class="rv">Revoked</span>}</p>
+            <p class="sm">{c.recipient_email || '—'}</p>
           </div>
-          <p style="font-size:11.5px;color:#d8d8de;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{c.title}</p>
-          <p style="font-size:10.5px;color:#FF7040;margin:0;font-family:'Geist Mono',monospace;font-weight:700;">{c.serial}</p>
-          <span style={`background:${kindMeta.accent}22;color:${kindMeta.accent};font-size:10px;font-weight:700;padding:3px 8px;border-radius:100px;font-family:'Geist Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;justify-self:start;`}>{c.kind}</span>
-          <p style="font-size:10.5px;color:#a0a0ab;margin:0;font-family:'Geist Mono',monospace;">{fmt(c.signed_at)}</p>
-          <p style="font-size:10.5px;color:#8a8a94;margin:0;font-family:'Geist Mono',monospace;">{c.verify_count} ×</p>
-        </a>
+          <p class="ttl">{c.title}</p>
+          <a class="sr" href={'/credentials/' + c.serial} target="_blank">{c.serial}</a>
+          <span class="kd" style={'background:' + kindMeta.accent + '22;color:' + kindMeta.accent + ';'}>{c.kind}</span>
+          <p class="sm">{fmt(c.signed_at)} · {c.verify_count} checks</p>
+          <a class="btn ghost sm-btn" href={'/admin/certificates?preview=' + encodeURIComponent(c.serial)}>{c.revoked ? 'View' : 'View & send'}</a>
+        </div>
       );
     })}
   </div>
 </div>
+
+<style>
+  .cw { padding: 14px 16px 80px; max-width: 1180px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 24px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 18px; line-height: 1.6; max-width: 75ch; }
+  .flash { border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
+  .flash a { color: inherit; text-decoration: underline; }
+  .flash.ok { background: rgba(74,222,128,0.12); border: 1px solid rgba(74,222,128,0.32); color: #86efac; }
+  .flash.bad { background: rgba(239,68,68,0.10); border: 1px solid rgba(239,68,68,0.32); color: #fca5a5; }
+  .flash.warn { background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.32); color: #fde68a; }
+  .panel { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; padding: 16px 18px; margin-bottom: 16px; }
+  .panel > summary { cursor: pointer; color: #FF7040; font-size: 12.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+  label { display: grid; gap: 5px; font-size: 10.5px; color: #9aa6b6; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
+  input, select, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 10px 11px; border-radius: 8px; font-size: 13px; font-family: inherit; text-transform: none; letter-spacing: normal; font-weight: 400; box-sizing: border-box; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: #FF4F00; }
+  textarea { resize: vertical; }
+  .hint { font-size: 11px; color: #8a8a94; text-transform: none; letter-spacing: normal; font-weight: 400; line-height: 1.5; margin: 0; }
+  .grid { display: grid; gap: 12px; margin-top: 14px; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .three { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px; }
+  @media (max-width: 720px) { .two, .three { grid-template-columns: 1fr; } }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 11px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; justify-self: start; text-decoration: none; display: inline-block; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #d8d8de; }
+  .btn.danger { background: #b91c1c; }
+  .ack { display: flex; align-items: flex-start; gap: 8px; text-transform: none; letter-spacing: normal; font-weight: 500; font-size: 12.5px; color: #d8d8de; }
+  .ack input { width: auto; margin-top: 2px; accent-color: #FF4F00; }
+  .sendopt { display: grid; gap: 10px; padding: 12px; border: 1px dashed #2a2a2f; border-radius: 10px; }
+  .sendopt summary { cursor: pointer; font-size: 12px; color: #9aa6b6; }
+  .picker { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+  .picker label { flex: 1; min-width: 260px; }
+  .preview { border-color: rgba(255,79,0,0.35); }
+  .pv-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 14px; }
+  .pv-k { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; font-weight: 700; margin: 0; }
+  .pv-n { font-size: 18px; color: #fff; font-weight: 700; margin: 4px 0 0; }
+  .pv-s { font-size: 12px; color: #9aa6b6; margin: 4px 0 0; }
+  .pv-doc { max-width: 640px; margin: 0 auto 16px; background: #f5f1e8; padding: 14px; border-radius: 10px; }
+  .sendbox { display: grid; gap: 12px; max-width: 640px; margin: 0 auto; }
+  .revoke { max-width: 640px; margin: 16px auto 0; }
+  .revoke summary { cursor: pointer; font-size: 12px; color: #fca5a5; }
+  .revoke form { display: grid; gap: 8px; margin-top: 8px; }
+  .filters { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .filters input { flex: 1; min-width: 240px; width: auto; }
+  .filters select { width: auto; }
+  .list { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; overflow: hidden; }
+  .lrow { display: grid; grid-template-columns: 1.5fr 1.5fr 1fr 100px 130px 110px; gap: 10px; padding: 11px 14px; border-bottom: 1px solid #15151a; align-items: center; color: #fff; }
+  .lhead { background: #15151a; font-size: 10px; color: #8a8a94; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; }
+  @media (max-width: 860px) { .lrow { grid-template-columns: 1fr 1fr; } .lhead { display: none; } }
+  .cell { min-width: 0; }
+  .nm { font-size: 12.5px; font-weight: 600; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rv { margin-left: 6px; background: rgba(239,68,68,0.16); color: #fca5a5; font-size: 9px; padding: 1px 6px; border-radius: 100px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 700; }
+  .sm { font-size: 10.5px; color: #8a8a94; margin: 2px 0 0; }
+  .ttl { font-size: 11.5px; color: #d8d8de; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sr { font-size: 10.5px; color: #FF7040; font-weight: 700; text-decoration: none; font-family: 'Geist Mono', monospace; }
+  .kd { font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 100px; letter-spacing: 0.06em; text-transform: uppercase; justify-self: start; }
+  .sm-btn { padding: 7px 12px; font-size: 11.5px; }
+  .empty { padding: 36px; text-align: center; color: #8a8a94; font-size: 13px; }
+</style>
 </AdminLayout>

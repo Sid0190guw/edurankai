@@ -1,0 +1,233 @@
+---
+// /admin/hr/promotions/<id>/letter - THE LETTER THAT FOLLOWS AN APPROVED PROMOTION.
+//
+// A promotion here ran through its approval chain, changed the person's designation on the record,
+// and then nobody told them in writing. The register showed "Applied" and that was the end of it.
+// This page writes the letter from the promotion row itself - the previous and new designation, the
+// grade and the effective date that were APPROVED - and emails it in one click.
+//
+// RENDERED ON THE SERVER, FROM THE ROW, BY ONE FUNCTION. The preview and the email are both
+// promotionLetterHtml() over the same fields, so the copy the person receives is the copy that was
+// reviewed here. Nothing is posted back from the browser as markup.
+//
+// ONLY FOR AN APPROVED OR APPLIED PROMOTION OR RE-DESIGNATION. A pending request is not a promotion
+// yet, and a demotion is a conversation, not a letter of congratulations.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection, can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { ensureMoveSchema, designationChangeLabel } from '@/lib/hr-lifecycle';
+import { sendLetterEmail, LETTER_TOKENS } from '@/lib/hr/letter-mail';
+import { promotionLetterHtml, promotionLetterAllowed, promotionLetterTitle } from '@/lib/hr/brand-doc';
+import { civilToday } from '@/lib/page-safety';
+import RichMessageComposer from '@/components/admin/RichMessageComposer.astro';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'hr', 'edit'))) return Astro.redirect('/admin');
+
+// CONSTANTS FIRST. `const` is not hoisted, and this page's POST handler reads all of them.
+const mayEmail = can(user as any, 'employee.manage');
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const isUuid = (v: unknown) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || ''));
+const LETTER_STATES = ['approved', 'applied'];
+const isoDay = (v: any): string => {
+  if (v instanceof Date && !isNaN(v.getTime())) return v.toISOString().slice(0, 10);
+  return String(v || '').slice(0, 10);
+};
+const DEFAULT_NOTE = '<p>Dear {{name}},</p><p>Congratulations on your new role as <strong>{{role}}</strong>. Your letter is below &mdash; it records the change, the date it takes effect, and that it was approved.</p><p>Thank you for the work that earned it.</p><p>{{signatory}}<br/>EduRankAI</p>';
+
+const id = String(Astro.params.id || '');
+if (!isUuid(id)) return Astro.redirect('/admin/hr/promotions');
+
+await ensureMoveSchema();
+
+let p: any = null;
+let readError = '';
+try {
+  p = rowsOf(await db.execute(sql`
+    SELECT p.id, p.kind, p.state, p.from_designation, p.to_designation, p.from_grade, p.to_grade,
+           p.effective_date, e.full_name, e.email
+      FROM hr_promotions p
+      LEFT JOIN hr_employees e ON e.id = p.employee_id
+     WHERE p.id = ${id}::uuid LIMIT 1`))[0] || null;
+} catch (e: any) {
+  readError = e?.cause?.message || e?.message || 'unknown error';
+  console.error('[admin/hr/promotions/letter] read', readError);
+}
+if (!p && !readError) return Astro.redirect('/admin/hr/promotions');
+
+const kind = String(p?.kind || 'promotion');
+const allowedKind = promotionLetterAllowed(kind);
+const allowedState = LETTER_STATES.includes(String(p?.state || ''));
+const typeKey = kind === 'designation_change' ? 'promotion:redesignation' : 'promotion:promotion';
+
+const year = civilToday().slice(0, 4);
+const fields = {
+  recipientEmail: String(p?.email || ''),
+  personalNote: '',
+  signatoryName: user.name || 'Siddharth Prasad',
+  signatoryTitle: 'Founder & CEO',
+  refNumber: 'PRO-' + year + '-' + id.replace(/-/g, '').slice(0, 6).toUpperCase(),
+  issueDate: civilToday(),
+  noteHtml: DEFAULT_NOTE,
+};
+
+let okMsg = '';
+let errMsg = '';
+let removedNames = '';
+
+if (Astro.request.method === 'POST' && p) {
+  const fd = await Astro.request.formData();
+  fields.recipientEmail = String(fd.get('recipientEmail') || '').trim().slice(0, 254);
+  fields.personalNote = String(fd.get('personalNote') || '').trim().slice(0, 3000);
+  fields.signatoryName = String(fd.get('signatoryName') || '').trim().slice(0, 200) || fields.signatoryName;
+  fields.signatoryTitle = String(fd.get('signatoryTitle') || '').trim().slice(0, 200);
+  fields.refNumber = String(fd.get('refNumber') || '').trim().slice(0, 64) || fields.refNumber;
+  const d = String(fd.get('issueDate') || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(d)) fields.issueDate = d;
+  fields.noteHtml = String(fd.get('noteHtml') || '');
+
+  if (fd.get('action') === 'send') {
+    if (!mayEmail) errMsg = 'Emailing a letter needs the HR permission. Ask an HR administrator to send it.';
+    else if (!allowedKind) errMsg = 'A demotion is not sent as a letter from this page.';
+    else if (!allowedState) errMsg = 'This change has not been approved, so no letter was sent.';
+    else {
+      const out = await sendLetterEmail({
+        actorUserId: user.id,
+        typeKey,
+        noteHtml: fields.noteHtml,
+        letterHtml: letterFor(),
+        ctx: {
+          recipientName: String(p.full_name || ''),
+          recipientEmail: fields.recipientEmail,
+          roleTitle: String(p.to_designation || ''),
+          refNumber: fields.refNumber,
+          issueDate: fields.issueDate,
+          signatoryName: fields.signatoryName,
+          signatoryTitle: fields.signatoryTitle,
+        },
+      });
+      if (out.sent) okMsg = out.message; else errMsg = out.message;
+      if (out.removed.length) removedNames = out.removed.map((r) => r.name).join(', ');
+    }
+  } else {
+    okMsg = 'Preview updated. Nothing has been sent.';
+  }
+}
+
+/** The letter, from the row plus the fields on this form. Used for the preview AND the email. */
+function letterFor(): string {
+  return promotionLetterHtml({
+    recipientName: String(p?.full_name || ''),
+    kind,
+    fromDesignation: p?.from_designation || null,
+    toDesignation: String(p?.to_designation || ''),
+    fromGrade: p?.from_grade || null,
+    toGrade: p?.to_grade || null,
+    effectiveDate: isoDay(p?.effective_date),
+    personalNote: fields.personalNote,
+    signatoryName: fields.signatoryName,
+    signatoryTitle: fields.signatoryTitle,
+    refNumber: fields.refNumber,
+    issueDate: fields.issueDate,
+  });
+}
+
+const letterHtml = p && allowedKind ? letterFor() : '';
+const stateWord = String(p?.state || '');
+---
+<AdminLayout title="Promotion letter" activeNav="hr">
+<div class="wrap">
+  <a class="back" href="/admin/hr/promotions">Back to promotions</a>
+  <p class="eyebrow">HR · Lifecycle · Letter</p>
+  <h1>{p ? promotionLetterTitle(kind) + ' for ' + (p.full_name || 'employee') : 'Promotion letter'}</h1>
+
+  {readError && <div class="flash bad">The promotion could not be read: {readError}. Reload the page.</div>}
+  {okMsg && <div class="flash ok" role="status">{okMsg}</div>}
+  {errMsg && <div class="flash bad" role="alert">{errMsg}</div>}
+  {removedNames && <div class="flash warn">Some markup was removed from your message before sending: {removedNames}.</div>}
+
+  {p && !allowedKind && (
+    <div class="flash warn">
+      This is recorded as a {designationChangeLabel(kind).toLowerCase()}. A demotion is communicated in
+      a conversation and recorded on the register; it is not sent as a letter from this page.
+    </div>
+  )}
+  {p && allowedKind && !allowedState && (
+    <div class="flash warn">
+      This change is <strong>{stateWord}</strong>, not approved. The letter can be previewed, but it can
+      only be sent once the approval chain has signed it off.
+    </div>
+  )}
+
+  {p && allowedKind && (
+    <div class="cols">
+      <form method="POST" class="side">
+        <label>Send to
+          <input type="email" name="recipientEmail" value={fields.recipientEmail} placeholder="name@example.com" />
+        </label>
+        <label>A personal paragraph (optional)
+          <textarea name="personalNote" rows="5" maxlength="3000" placeholder="What the new role covers, who they will work with, any revised terms.">{fields.personalNote}</textarea>
+          <span class="hint">Printed in the letter. Revised compensation, if any, belongs here in plain words.</span>
+        </label>
+        <div class="two">
+          <label>Signed by<input type="text" name="signatoryName" value={fields.signatoryName} /></label>
+          <label>Title<input type="text" name="signatoryTitle" value={fields.signatoryTitle} /></label>
+        </div>
+        <div class="two">
+          <label>Reference<input type="text" name="refNumber" value={fields.refNumber} /></label>
+          <label>Date of letter<input type="date" name="issueDate" value={fields.issueDate} /></label>
+        </div>
+        <RichMessageComposer
+          id="promo-note"
+          name="noteHtml"
+          label="Your message"
+          hint="Written above the letter in the email."
+          tokens={LETTER_TOKENS}
+          value={fields.noteHtml}
+        />
+        <div class="btns">
+          <button type="submit" name="action" value="preview" class="btn ghost">Update preview</button>
+          {mayEmail && allowedState && (
+            <button type="submit" name="action" value="send" class="btn">Email the letter</button>
+          )}
+          <button type="button" class="btn ghost" onclick="window.print()">Print / save as PDF</button>
+        </div>
+        {!mayEmail && <p class="hint">Emailing needs the HR permission. You can still print the letter.</p>}
+      </form>
+
+      <div class="doc" id="promoLetter"><Fragment set:html={letterHtml} /></div>
+    </div>
+  )}
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1200px; margin: 0 auto; }
+  .back { font-size: 12px; color: #9aa6b6; text-decoration: none; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 12px 0 0; font-weight: 700; }
+  h1 { font-size: 22px; color: #fff; margin: 6px 0 14px; font-weight: 700; }
+  .flash { border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
+  .flash.ok { background: rgba(74,222,128,0.12); border: 1px solid rgba(74,222,128,0.32); color: #86efac; }
+  .flash.bad { background: rgba(239,68,68,0.10); border: 1px solid rgba(239,68,68,0.32); color: #fca5a5; }
+  .flash.warn { background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.32); color: #fde68a; }
+  .cols { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 20px; align-items: start; }
+  @media (max-width: 960px) { .cols { grid-template-columns: 1fr; } }
+  .side { display: grid; gap: 12px; background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; padding: 16px; }
+  label { display: grid; gap: 5px; font-size: 10.5px; color: #9aa6b6; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
+  input, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 10px 11px; border-radius: 8px; font-size: 13px; font-family: inherit; text-transform: none; letter-spacing: normal; font-weight: 400; box-sizing: border-box; }
+  textarea { resize: vertical; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .hint { font-size: 11px; color: #8a8a94; text-transform: none; letter-spacing: normal; font-weight: 400; line-height: 1.5; margin: 0; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 11px 18px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #d8d8de; }
+  .doc { background: #f5f1e8; border-radius: 12px; padding: 16px; }
+  @media print {
+    body * { visibility: hidden; }
+    #promoLetter, #promoLetter * { visibility: visible; }
+    #promoLetter { position: absolute; left: 0; top: 0; width: 100%; background: #fff; padding: 0; }
+    * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  }
+</style>
+</AdminLayout>
