@@ -1,0 +1,258 @@
+---
+// /verify/id/<token> - WHAT ANYBODY SEES WHEN THEY SCAN AN EDURANKAI ID CARD.
+//
+// The token is checked in this order, and the page says which step failed:
+//   1. Ed25519 signature (src/lib/hr/id-card-crypto.ts). A forgery stops here, before any database
+//      read, and is told only that it is not genuine.
+//   2. The code's own expiry: 90 seconds for a phone card, the card's end date for a printed one.
+//   3. The register (hr_id_cards): revoked, replaced, or past its date.
+//   4. The person: still with EduRankAI.
+//
+// WHAT IS SHOWN IS WHAT IS PRINTED ON THE CARD: photo, name, designation, ID number, validity. No
+// email, phone, address or anything else from the record, because whoever scans a card is a stranger
+// as far as this page knows.
+//
+// STAFF FACE CHECK. A signed-in member of the People desk also gets a "Compare a face" button: their
+// camera's descriptor is compared on the server with the cardholder's enrolment, and they are told
+// match or no match. Advisory only - a human decides at the door.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { verifyToken, type Verdict } from '@/lib/hr/id-card';
+import { can } from '@/lib/auth/permissions';
+
+const token = String(Astro.params.token || '');
+const v = await verifyToken(token, { count: true });
+const viewer = Astro.locals.user;
+const mayFaceCheck = !!viewer && viewer.role !== 'applicant' && can(viewer as any, 'employee.manage');
+
+Astro.response.headers.set('cache-control', 'no-store, private');
+Astro.response.headers.set('x-robots-tag', 'noindex, nofollow');
+if (v.verdict === 'forged' || v.verdict === 'not_found') Astro.response.status = 404;
+
+// Declared before the markup that reads them.
+const HEADLINES: ReadonlyArray<readonly [Verdict, string, string]> = [
+  ['valid', 'Genuine EduRankAI ID', 'This card is genuine, active, and belongs to the person below.'],
+  ['forged', 'Not a genuine EduRankAI ID', 'This code was not issued by EduRankAI, or it has been altered. Do not accept it.'],
+  ['unknown_key', 'This card cannot be checked', 'It was signed with a key this system no longer holds. Ask the holder for a current card.'],
+  ['expired', 'This code has expired', 'Phone codes last 90 seconds and printed cards until their end date. Ask the holder to show a fresh code.'],
+  ['revoked', 'This card has been revoked', 'EduRankAI has cancelled this card. Do not accept it.'],
+  ['replaced', 'This card has been replaced', 'A newer card has been issued to this person. Ask for the current one.'],
+  ['not_found', 'This card is not on record', 'The code is signed but the card is not in the register. Do not accept it.'],
+  ['holder_inactive', 'This person is no longer with EduRankAI', 'The card was genuine, but the holder has left. Do not accept it.'],
+  ['unavailable', 'We could not check this card just now', 'The register could not be read. Try again in a moment; until then, treat the card as unchecked.'],
+];
+const head = HEADLINES.find((h) => h[0] === v.verdict) || HEADLINES[1];
+const good = v.verdict === 'valid';
+const showHolder = !!v.holder && (good || v.verdict === 'revoked' || v.verdict === 'replaced' || v.verdict === 'expired');
+
+const now = Math.floor(Date.now() / 1000);
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+function longDate(iso: string | null | undefined): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ''));
+  return m ? Number(m[3]) + ' ' + MONTHS[Number(m[2]) - 1] + ' ' + m[1] : '';
+}
+function ago(sec: number): string {
+  const d = Math.max(0, now - sec);
+  if (d < 60) return d + ' seconds ago';
+  if (d < 3600) return Math.round(d / 60) + ' minutes ago';
+  return Math.round(d / 3600) + ' hours ago';
+}
+const isLive = v.claims?.presentation === 'live';
+const presentationLine = !v.claims ? ''
+  : isLive ? 'Live phone card. This code was produced ' + ago(v.claims.issuedAt) + ' and works for 90 seconds, so it is not a screenshot from earlier.'
+  : 'Printed card. A printed card can be photocopied: compare the photo with the person, or ask for the live code on their phone.';
+const faceLine = isLive
+  ? (v.claims && v.claims.faceAt ? 'The holder unlocked this card with a face match ' + ago(v.claims.faceAt) + '.' : 'The holder did not unlock this card with a face check.')
+  : '';
+const kind = v.holder ? (/intern/i.test(v.holder.employmentType) ? 'Intern' : /apprentic/i.test(v.holder.employmentType) ? 'Apprentice' : 'Team member') : '';
+---
+<BaseLayout title={head[1] + ' · EduRankAI'} description="EduRankAI ID card verification." noindex={true}>
+<main class="vid">
+  <div class={'vid__banner ' + (good ? 'ok' : 'bad')} role="status">
+    <div class="vid__icon" aria-hidden="true">
+      {good ? (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z" /><path d="M9 12l2 2 4-4" /></svg>
+      ) : (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z" /><path d="M9.5 9.5l5 5M14.5 9.5l-5 5" /></svg>
+      )}
+    </div>
+    <div>
+      <p class="vid__verdict">{good ? 'Verified' : 'Not accepted'}</p>
+      <h1>{head[1]}</h1>
+      <p class="vid__sub">{head[2]}</p>
+    </div>
+  </div>
+
+  {showHolder && v.holder && v.card && (
+    <section class="vid__card">
+      <div class="vid__photo">
+        {v.holder.photoUrl ? <img src={v.holder.photoUrl} alt={'Photograph of ' + v.holder.fullName} /> : <span>No photo on record</span>}
+      </div>
+      <div class="vid__who">
+        <p class="vid__name">{v.holder.fullName}</p>
+        <p class="vid__role">{v.holder.designation || kind}</p>
+        <dl>
+          <div><dt>ID number</dt><dd>{v.holder.employeeCode || '-'}</dd></div>
+          <div><dt>Engagement</dt><dd>{kind}</dd></div>
+          <div><dt>Card</dt><dd class="mono">{v.card.serial}</dd></div>
+          <div><dt>Valid until</dt><dd>{longDate(v.card.validUntil)}</dd></div>
+          {v.card.revokedReason && v.verdict === 'revoked' && <div><dt>Reason</dt><dd>{v.card.revokedReason}</dd></div>}
+        </dl>
+      </div>
+    </section>
+  )}
+
+  {good && (
+    <section class="vid__facts">
+      <p>{presentationLine}</p>
+      {faceLine && <p class={v.claims && v.claims.faceAt ? 'okline' : 'warnline'}>{faceLine}</p>}
+      <p class="vid__fine">The code carries no personal data. It is an Ed25519 signature that only EduRankAI can produce, and the
+        details above are read from the live record at the moment you scanned, so a revoked card stops working everywhere at once.
+        Public keys for offline checking are at <a href="/api/id-card/keys">/api/id-card/keys</a>.</p>
+    </section>
+  )}
+
+  {good && mayFaceCheck && (
+    <section class="vid__desk" id="vidDesk" data-token={token}>
+      <h2>Compare a face</h2>
+      <p>Point your camera at the person holding this card. Their face is compared on the server with the
+        cardholder's enrolment and you are told match or no match. No image is stored or sent; the result
+        is advisory and you decide.</p>
+      <div class="vid__viewer" id="vidViewer" hidden><video id="vidVideo" playsinline muted autoplay></video></div>
+      <button type="button" class="vid__btn" id="vidCheck">Compare a face</button>
+      <p class="vid__result" id="vidResult" role="status" aria-live="polite"></p>
+    </section>
+  )}
+
+  <p class="vid__foot">EduRankAI · Guwahati, Assam, India · Questions about a card: hr@edurankai.in</p>
+</main>
+
+<style>
+  .vid { max-width: 640px; margin: 0 auto; padding: 28px 16px 80px; color: #0E0B08; }
+  .vid__banner { display: flex; gap: 16px; align-items: center; padding: 22px; border-radius: 18px; }
+  .vid__banner.ok { background: linear-gradient(135deg, #EBF5EF, #fff); border: 1px solid #86efac; }
+  .vid__banner.bad { background: linear-gradient(135deg, #FFF1F0, #fff); border: 1px solid #fca5a5; }
+  .vid__icon { width: 58px; height: 58px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #fff; }
+  .ok .vid__icon { background: #1A6B35; }
+  .bad .vid__icon { background: #b91c1c; }
+  .vid__icon svg { width: 30px; height: 30px; }
+  .vid__verdict { margin: 0; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; font-weight: 800; }
+  .ok .vid__verdict { color: #1A6B35; }
+  .bad .vid__verdict { color: #b91c1c; }
+  .vid h1 { margin: 4px 0 0; font-family: Georgia, 'Times New Roman', serif; font-size: 25px; line-height: 1.15; }
+  .vid__sub { margin: 6px 0 0; font-size: 14px; line-height: 1.55; color: #4a4239; }
+  .vid__card { display: flex; gap: 18px; margin-top: 18px; padding: 18px; background: #fff; border: 1px solid rgba(14,11,8,0.1); border-radius: 18px; flex-wrap: wrap; }
+  .vid__photo { width: 140px; height: 168px; border-radius: 14px; overflow: hidden; background: #EDE4D3; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .vid__photo img { width: 100%; height: 100%; object-fit: cover; }
+  .vid__photo span { font-size: 12px; color: #7a7066; text-align: center; padding: 8px; }
+  .vid__who { flex: 1; min-width: 200px; }
+  .vid__name { margin: 0; font-family: Georgia, serif; font-size: 24px; font-weight: 700; }
+  .vid__role { margin: 4px 0 12px; color: #6B635C; font-size: 14px; }
+  .vid dl { margin: 0; display: grid; gap: 8px; }
+  .vid dl div { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px dashed rgba(14,11,8,0.1); padding-bottom: 6px; font-size: 13.5px; }
+  .vid dt { color: #7a7066; margin: 0; }
+  .vid dd { margin: 0; font-weight: 600; text-align: right; }
+  .vid .mono { font-family: Consolas, Menlo, monospace; }
+  .vid__facts { margin-top: 14px; padding: 16px 18px; background: #FFFDF8; border: 1px solid #E7DCC8; border-radius: 16px; }
+  .vid__facts p { margin: 0 0 8px; font-size: 14px; line-height: 1.6; }
+  .vid__facts .okline { color: #1A6B35; font-weight: 600; }
+  .vid__facts .warnline { color: #92400e; font-weight: 600; }
+  .vid__fine { font-size: 12px !important; color: #7a7066; }
+  .vid__fine a { color: #FF4F00; }
+  .vid__desk { margin-top: 14px; padding: 18px; background: #0E0B08; color: #fff; border-radius: 16px; }
+  .vid__desk h2 { margin: 0 0 6px; font-size: 16px; }
+  .vid__desk p { margin: 0 0 12px; font-size: 13.5px; line-height: 1.6; color: rgba(255,255,255,0.75); }
+  .vid__viewer video { width: 220px; aspect-ratio: 3 / 4; object-fit: cover; border-radius: 12px; background: #222; display: block; margin: 0 auto 12px; }
+  .vid__btn { min-height: 46px; padding: 0 20px; border: 0; border-radius: 12px; background: #FF4F00; color: #fff; font-weight: 700; font-size: 14.5px; cursor: pointer; width: 100%; }
+  .vid__result { margin-top: 12px !important; font-weight: 600; color: #fff !important; }
+  .vid__foot { margin-top: 22px; font-size: 12px; color: #9a9188; text-align: center; }
+</style>
+
+<script is:inline>
+  (function () {
+    var desk = document.getElementById('vidDesk');
+    if (!desk) return;
+    var token = desk.getAttribute('data-token') || '';
+    var btn = document.getElementById('vidCheck');
+    var out = document.getElementById('vidResult');
+    var viewer = document.getElementById('vidViewer');
+    var video = document.getElementById('vidVideo');
+    var LIB = '/vendor/face-api/face-api.min.js';
+    var MODELS = '/vendor/face-api/models';
+    var stream = null, libP = null;
+
+    function shut() {
+      try { if (stream) stream.getTracks().forEach(function (t) { try { t.stop(); } catch (_) {} }); } catch (_) {}
+      stream = null; try { video.srcObject = null; } catch (_) {}
+      viewer.hidden = true;
+    }
+    window.addEventListener('pagehide', shut);
+
+    function loadLib() {
+      if (libP) return libP;
+      libP = new Promise(function (res, rej) {
+        if (window.faceapi) { res(); return; }
+        var s = document.createElement('script'); s.src = LIB; s.async = true;
+        s.onload = function () { res(); }; s.onerror = function () { rej(new Error('face-model-script')); };
+        document.head.appendChild(s);
+      }).then(function () {
+        var f = window.faceapi;
+        var back = Promise.resolve();
+        if (f.tf) back = Promise.resolve().then(function () { return f.tf.setBackend('webgl'); })
+          .catch(function () { return f.tf.setBackend('wasm'); }).catch(function () {})
+          .then(function () { return f.tf.ready ? f.tf.ready() : null; }).catch(function () {});
+        return back.then(function () {
+          return Promise.all([
+            f.nets.tinyFaceDetector.loadFromUri(MODELS),
+            f.nets.faceLandmark68TinyNet.loadFromUri(MODELS),
+            f.nets.faceRecognitionNet.loadFromUri(MODELS)
+          ]);
+        });
+      }).catch(function (e) { libP = null; throw e; });
+      return libP;
+    }
+
+    function grab() {
+      var f = window.faceapi;
+      var opts = new f.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+      var deadline = Date.now() + 12000;
+      function step() {
+        return f.detectSingleFace(video, opts).withFaceLandmarks(true).withFaceDescriptor().then(function (d) {
+          if (d && d.descriptor) return Array.prototype.slice.call(d.descriptor);
+          if (Date.now() > deadline) return null;
+          return new Promise(function (r) { setTimeout(r, 250); }).then(step);
+        });
+      }
+      return step();
+    }
+
+    btn.addEventListener('click', function () {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { out.textContent = 'This browser cannot open a camera. Check the photo by eye.'; return; }
+      btn.disabled = true;
+      out.textContent = 'Opening the camera...';
+      navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false }).then(function (s) {
+        stream = s; video.srcObject = s; viewer.hidden = false;
+        out.textContent = 'Loading the face model...';
+        return loadLib();
+      }).then(function () {
+        out.textContent = 'Looking for a face...';
+        return grab();
+      }).then(function (desc) {
+        shut();
+        if (!desc) { btn.disabled = false; out.textContent = 'No face was found. Try again closer, in better light.'; return; }
+        out.textContent = 'Comparing...';
+        return fetch('/api/id-card/face-check', {
+          method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: token, descriptor: desc })
+        }).then(function (r) { return r.json(); }).then(function (j) {
+          btn.disabled = false;
+          out.textContent = (j && (j.message || j.error)) || 'The check did not complete. Check the photo by eye.';
+          out.style.color = j && j.matched ? '#86efac' : '#fde68a';
+        });
+      }).catch(function () {
+        shut(); btn.disabled = false;
+        out.textContent = 'The face check could not run. Check the photo by eye.';
+      });
+    });
+  })();
+</script>
+</BaseLayout>

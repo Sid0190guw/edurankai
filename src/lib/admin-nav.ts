@@ -423,6 +423,8 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // a second link to the same console under a different word would be two doors into one room,
       // and people would come to believe the two behaved differently.
       { id: 'hr-promotions',  label: 'Designation changes', href: '/admin/hr/promotions',        icon: 'users',    section: 'hr' },
+      // Signed ID cards: issue, print, revoke. Verification itself is public at /verify/id/<code>.
+      { id: 'hr-id-cards',    label: 'ID cards',        href: '/admin/hr/id-cards',              icon: 'shield',   section: 'hr' },
       // /admin/hr/separations redirects here — one console over one hr_separations table.
       { id: 'hr-separations', label: 'Separation and exit', href: '/admin/hr/separation',        icon: 'inbox',    section: 'hr' },
       // FULL AND FINAL SETTLEMENT. A surface BESIDE the separation console rather than inside it:

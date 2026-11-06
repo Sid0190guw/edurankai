@@ -1,0 +1,273 @@
+---
+// /admin/hr/id-cards - ISSUE, PRINT AND REVOKE EMPLOYEE ID CARDS.
+//
+// One active card per person (a partial unique index enforces it). Issuing again replaces the old
+// card, and the old one stops verifying the moment the new one exists - printed copies included,
+// because a card is only ever as good as its row in this register.
+//
+// The card itself, the phone code and the verification page are described in src/lib/hr/id-card.ts
+// and src/lib/hr/id-card-crypto.ts. This page decides nothing cryptographic; it writes the register.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import IdCard from '@/components/hr/IdCard.astro';
+import { canAccessSection, can } from '@/lib/auth/permissions';
+import {
+  listCardsForDesk, issueCard, revokeCard, defaultValidUntil, activeSigningKey, activeCardFor, holderFor, printedToken,
+} from '@/lib/hr/id-card';
+import { qrSvg } from '@/lib/qr';
+import { publicUrl } from '@/lib/public-origin';
+import { civilToday } from '@/lib/page-safety';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'hr', 'edit'))) return Astro.redirect('/admin');
+
+// CONSTANTS FIRST. `const` is not hoisted, and the POST handler below reads every one of these.
+const PAGE = '/admin/hr/id-cards';
+const mayWrite = can(user as any, 'employee.manage');
+const today = civilToday();
+// Bulk issue is bounded per press: each card is a transaction and an audit line, and a request that
+// tries to do four hundred of them dies at the platform's time limit having done some of them.
+const BULK_LIMIT = 25;
+const isUuid = (v: unknown) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || ''));
+
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+    if (!mayWrite) {
+      flash = 'Issuing and revoking ID cards needs the employee-records permission.';
+    } else if (action === 'issue') {
+      const r = await issueCard({
+        employeeId: String(fd.get('employee_id') || ''),
+        validUntil: String(fd.get('valid_until') || ''),
+        actorUserId: user.id,
+      });
+      flash = r.ok
+        ? 'Card ' + r.serial + ' issued.' + (r.replaced ? ' The previous card ' + r.replaced + ' no longer verifies.' : '') + ' The holder can show it now at /portal/employee/id-card.'
+        : (r.error || 'The card was not issued.');
+    } else if (action === 'issue_all') {
+      const list = await listCardsForDesk();
+      if (!list.ready) flash = list.error;
+      else {
+        const todo = list.value.filter((x) => x.isActive && !x.card);
+        let done = 0; let failed = 0; let firstError = '';
+        for (const x of todo.slice(0, BULK_LIMIT)) {
+          const r = await issueCard({ employeeId: x.employeeId, validUntil: defaultValidUntil(x.employmentType, today), actorUserId: user.id });
+          if (r.ok) done++; else { failed++; if (!firstError) firstError = x.fullName + ': ' + (r.error || 'not issued'); }
+        }
+        const left = Math.max(0, todo.length - BULK_LIMIT);
+        flash = 'Issued ' + done + ' card(s).' + (failed ? ' ' + failed + ' failed - ' + firstError : '')
+          + (left ? ' ' + left + ' more people still need one: press the button again.' : '');
+      }
+    } else if (action === 'revoke') {
+      const r = await revokeCard({ serial: String(fd.get('serial') || ''), reason: String(fd.get('reason') || ''), actorUserId: user.id });
+      flash = r.ok ? 'Card revoked. Every copy of it now fails verification.' : (r.error || 'The card was not revoked.');
+    } else {
+      flash = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    console.error('[admin/hr/id-cards] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was changed: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 400)));
+}
+
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const printFor = url.searchParams.get('print') || '';
+const q = (url.searchParams.get('q') || '').trim().toLowerCase();
+
+let keyProblem = '';
+try { activeSigningKey(); } catch (e: any) { keyProblem = String(e?.message || 'The signing key is not configured.'); }
+
+const list = await listCardsForDesk();
+const people = list.ready ? list.value : [];
+const shown = q ? people.filter((p) => (p.fullName + ' ' + p.employeeCode + ' ' + p.designation).toLowerCase().includes(q)) : people;
+const activeCount = people.filter((p) => p.isActive).length;
+const withCard = people.filter((p) => p.card).length;
+const needCard = people.filter((p) => p.isActive && !p.card).length;
+const noPhoto = people.filter((p) => p.isActive && !p.hasPhoto).length;
+
+// The print sheet for one person.
+let print: any = null;
+if (isUuid(printFor) && !keyProblem) {
+  try {
+    const c = await activeCardFor(printFor);
+    const h = await holderFor(printFor);
+    if (c.ready && c.value && h) {
+      const qr = await qrSvg(publicUrl('/verify/id/' + printedToken(c.value)), { size: 220, level: 'M', margin: 1 });
+      print = { card: c.value, holder: h, qr };
+    }
+  } catch (e: any) {
+    console.error('[admin/hr/id-cards] print', e?.cause?.message || e?.message);
+  }
+}
+const fmt = (iso: string | null) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ''));
+  return m ? m[3] + '/' + m[2] + '/' + m[1] : '';
+};
+---
+<AdminLayout title="ID cards" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR · People · Identity</p>
+  <h1>Employee ID cards</h1>
+  <p class="lede">
+    Every card carries an Ed25519-signed code that anyone can check at /verify/id, with no personal data
+    inside it. On a phone the code changes every 30 seconds and can be unlocked with the holder's face;
+    on paper it is a long-lived signed code. Revoking a card here stops every copy of it at once.
+  </p>
+
+  {msg && <div class="flash">{msg}</div>}
+  {keyProblem && (
+    <div class="flash warn">
+      <strong>Cards cannot be signed yet.</strong> {keyProblem}. Cards are signed with a key derived from
+      the platform data key, so set that variable in Vercel and redeploy. No card has been issued unsigned.
+    </div>
+  )}
+  {!list.ready && <div class="flash warn">{list.error}</div>}
+
+  {list.ready && (
+    <div class="tiles">
+      <div class="tile"><span class="tv">{activeCount}</span><span class="tl">Active people</span></div>
+      <div class="tile"><span class="tv">{withCard}</span><span class="tl">With a card</span></div>
+      <div class="tile"><span class="tv">{needCard}</span><span class="tl">Still need one</span></div>
+      <div class="tile"><span class="tv">{noPhoto}</span><span class="tl">No photo on record</span></div>
+    </div>
+  )}
+
+  {print && (
+    <section class="panel printpanel">
+      <div class="ph">
+        <div>
+          <p class="eyebrow">Print sheet</p>
+          <p class="pn">{print.holder.fullName} · {print.card.serial}</p>
+        </div>
+        <div class="btnrow">
+          <button type="button" class="btn" onclick="window.print()">Print</button>
+          <a class="btn ghost" href={PAGE}>Close</a>
+        </div>
+      </div>
+      <div class="sheet" id="idSheet">
+        <IdCard side="front" fullName={print.holder.fullName} designation={print.holder.designation} employeeCode={print.holder.employeeCode}
+          employmentType={print.holder.employmentType} photoUrl={print.holder.photoUrl} serial={print.card.serial} validUntil={print.card.validUntil} />
+        <IdCard side="back" fullName={print.holder.fullName} designation={print.holder.designation} employeeCode={print.holder.employeeCode}
+          employmentType={print.holder.employmentType} photoUrl={print.holder.photoUrl} serial={print.card.serial} validUntil={print.card.validUntil}
+          validFrom={print.card.validFrom} qrHtml={print.qr} />
+      </div>
+      <p class="hint">Print at 100% scale. Each face is exactly 54 by 85.6 mm.</p>
+    </section>
+  )}
+
+  {list.ready && mayWrite && !keyProblem && needCard > 0 && (
+    <form method="POST" class="panel bulk">
+      <input type="hidden" name="action" value="issue_all" />
+      <div>
+        <p class="pn">Issue cards to everybody who does not have one</p>
+        <p class="hint">{needCard} active {needCard === 1 ? 'person needs' : 'people need'} a card. Up to {BULK_LIMIT} are issued per press. Validity defaults to six months for interns and apprentices and two years for everybody else; change one person's below.</p>
+      </div>
+      <button type="submit" class="btn">Issue missing cards</button>
+    </form>
+  )}
+
+  {list.ready && (
+    <form method="GET" class="search">
+      <input type="text" name="q" value={url.searchParams.get('q') || ''} placeholder="Search by name, ID number or designation" />
+      <button type="submit" class="btn ghost">Search</button>
+    </form>
+  )}
+
+  {list.ready && (
+    <div class="stack">
+      {shown.length === 0 && <div class="empty">Nobody matches that search.</div>}
+      {shown.map((p) => (
+        <div class={'row' + (p.isActive ? '' : ' former')}>
+          <div class="who">
+            <p class="name">{p.fullName}{!p.isActive && <span class="chip">Former</span>}{p.isActive && !p.hasPhoto && <span class="chip warnchip">No photo</span>}</p>
+            <p class="sub">{p.employeeCode}{p.designation ? ' · ' + p.designation : ''}{p.employmentType ? ' · ' + p.employmentType : ''}</p>
+            {p.card ? (
+              <p class="sub okline">Card {p.card.serial} · valid until {fmt(p.card.validUntil)} · checked {p.card.verifyCount} time(s)</p>
+            ) : (
+              <p class="sub">No card</p>
+            )}
+          </div>
+          <div class="acts">
+            {p.card && <a class="btn ghost" href={PAGE + '?print=' + p.employeeId + '#idSheet'}>Print</a>}
+            {mayWrite && p.isActive && !keyProblem && (
+              <form method="POST" class="inline">
+                <input type="hidden" name="action" value="issue" />
+                <input type="hidden" name="employee_id" value={p.employeeId} />
+                <input type="date" name="valid_until" required value={p.card && p.card.validUntil ? p.card.validUntil : defaultValidUntil(p.employmentType, today)} aria-label="Valid until" />
+                <button type="submit" class="btn">{p.card ? 'Reissue' : 'Issue'}</button>
+              </form>
+            )}
+            {mayWrite && p.card && (
+              <details class="rev">
+                <summary>Revoke</summary>
+                {/* No confirm(): the side panel sandbox makes window.confirm() return false silently.
+                    A required reason and acknowledgement guard it natively. */}
+                <form method="POST">
+                  <input type="hidden" name="action" value="revoke" />
+                  <input type="hidden" name="serial" value={p.card.serial} />
+                  <input type="text" name="reason" required minlength="4" maxlength="500" placeholder="Why (shown when scanned): lost, left, damaged" />
+                  <label class="ack"><input type="checkbox" required /> <span>Every copy of this card stops verifying now.</span></label>
+                  <button type="submit" class="btn danger">Revoke card</button>
+                </form>
+              </details>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  )}
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 75ch; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
+  .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 16px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 22px; color: #fff; font-weight: 700; }
+  .tl { font-size: 11px; color: #9aa6b6; }
+  .panel { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+  .bulk { display: flex; justify-content: space-between; gap: 14px; align-items: center; flex-wrap: wrap; border-color: rgba(255,79,0,0.35); }
+  .pn { font-size: 14px; color: #fff; font-weight: 700; margin: 0; }
+  .hint { font-size: 11.5px; color: #8a8a94; margin: 4px 0 0; line-height: 1.5; }
+  .ph { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .sheet { display: flex; gap: 18px; flex-wrap: wrap; justify-content: center; padding: 18px; background: #f5f1e8; border-radius: 12px; }
+  .sheet :global(.idc) { --idc-w: 250px; }
+  .search { display: flex; gap: 8px; margin-bottom: 12px; }
+  .search input { flex: 1; }
+  input { background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 10px 11px; border-radius: 8px; font-size: 13px; font-family: inherit; min-height: 42px; box-sizing: border-box; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 0 16px; min-height: 42px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #d8d8de; }
+  .btn.danger { background: #b91c1c; }
+  .btnrow { display: flex; gap: 8px; }
+  .stack { display: flex; flex-direction: column; gap: 8px; }
+  .row { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+  .row.former { opacity: 0.6; }
+  .who { min-width: 0; flex: 1 1 280px; }
+  .name { font-size: 14px; color: #fff; font-weight: 700; margin: 0; }
+  .sub { font-size: 11.5px; color: #9aa6b6; margin: 3px 0 0; }
+  .okline { color: #86efac; }
+  .chip { margin-left: 8px; font-size: 9.5px; padding: 2px 7px; border-radius: 100px; border: 1px solid #2a2a2f; color: #9aa6b6; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; }
+  .warnchip { color: #fde68a; border-color: rgba(251,191,36,0.4); }
+  .acts { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
+  .inline { display: flex; gap: 6px; align-items: center; }
+  .rev summary { cursor: pointer; font-size: 12px; color: #fca5a5; min-height: 42px; display: flex; align-items: center; }
+  .rev form { display: grid; gap: 6px; margin-top: 6px; width: 280px; }
+  .ack { display: flex; gap: 6px; font-size: 12px; color: #d8d8de; align-items: flex-start; }
+  .ack input { min-height: 0; width: auto; }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 30px 18px; text-align: center; color: #8a8a94; font-size: 13px; }
+  @media print {
+    :global(body *) { visibility: hidden !important; }
+    :global(#idSheet), :global(#idSheet *) { visibility: visible !important; }
+    #idSheet { position: absolute; left: 10mm; top: 10mm; background: #fff; padding: 0; gap: 8mm; justify-content: flex-start; }
+    .sheet :global(.idc) { --idc-w: 54mm !important; }
+  }
+</style>
+</AdminLayout>

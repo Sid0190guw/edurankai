@@ -457,6 +457,9 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   // The half of PERFORMANCE_DDL that the aborted batch never reached, beyond the two tables
   // db/capability-spine-schema.sql already recovered. db/performance-remainder-schema.sql.
   { module: 'Continuous feedback', table: 'hr_feedback', owner: 'src/lib/performance-schema.ts' },
+  // Employee ID cards: the register a scanned card is checked against. Absent, every scan reads "we
+  // could not check this card", which is the honest answer but not a working ID system.
+  { module: 'Employee ID cards', table: 'hr_id_cards', owner: 'src/lib/hr/id-card.ts' },
 
   // PRESENT, AND LISTED ANYWAY. application_stage_events exists — it carries the funnel history the
   // hiring decision report reads — but it was unmonitored, and /api/health reports four suppressed
