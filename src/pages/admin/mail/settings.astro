@@ -6,6 +6,7 @@ import { sql } from 'drizzle-orm';
 import { getMailConfig, saveMailConfig, ensureMailSchema, clearSmtpSettings } from '@/lib/mail';
 import { getImapConfig, saveImapConfig, ensureImapSchema } from '@/lib/mail-imap';
 import { replaceUnreadableMailSecret } from '@/lib/mail-secret-recovery';
+import { MailSecretMigrationError, migrateLegacyMailSecrets } from '@/lib/mail-secret-migration';
 import type { MailSecretColumn } from '@/lib/mail-secrets';
 import { verifySmtp } from '@/lib/mail-transport';
 import { can } from '@/lib/auth/permissions';
@@ -24,6 +25,7 @@ function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 // only the SQL that failed.
 const dbReason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 let okMsg = '', errMsg = '', generatedInboundSecret = '';
+let migrationOutcomes: Awaited<ReturnType<typeof migrateLegacyMailSecrets>> = [];
 
 function sameOriginRequest(request: Request): boolean {
   const expected = new URL(request.url).origin;
@@ -40,8 +42,25 @@ if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('_action') as string;
   try {
-    await ensureMailSchema();
-    if (action === 'recover_unreadable_secret') {
+    // The migration has stricter preconditions and validates the active key before it opens a DB
+    // transaction. Do not run schema setup ahead of those gates.
+    if (action !== 'migrate_legacy_mail_secrets') await ensureMailSchema();
+    if (action === 'migrate_legacy_mail_secrets') {
+      if (!sameOriginRequest(Astro.request)) throw new MailSecretMigrationError('confirmation_required');
+      if (fd.get('confirm_migration') !== 'ENCRYPT SELECTED MAIL SECRETS') {
+        throw new MailSecretMigrationError('confirmation_required');
+      }
+      const columns = fd.getAll('secret_columns');
+      migrationOutcomes = await migrateLegacyMailSecrets(columns, {
+        keyIdInventoryReviewed: fd.get('inventory_reviewed') === 'yes',
+        smtpAndImapVerified: fd.get('connectivity_verified') === 'yes',
+        explicitlyAuthorized: fd.get('migration_authorized') === 'yes',
+      });
+      const migrated = migrationOutcomes.filter((item) => item.result === 'migrated').length;
+      const unchanged = migrationOutcomes.length - migrated;
+      const outcomes = migrationOutcomes.map((item) => `${item.column}: ${item.result}`).join('; ');
+      okMsg = `Mail-secret migration committed. ${migrated} field(s) encrypted; ${unchanged} selected field(s) were already encrypted or empty. ${outcomes}`;
+    } else if (action === 'recover_unreadable_secret') {
       if (!sameOriginRequest(Astro.request)) throw new Error('Recovery must be submitted from this authenticated settings page.');
       const column = String(fd.get('secret_column') || '') as MailSecretColumn;
       const supported: MailSecretColumn[] = ['smtp_pass', 'imap_pass', 'resend_api_key', 'inbound_secret'];
@@ -138,11 +157,21 @@ if (Astro.request.method === 'POST') {
     }
   } catch (e: any) {
     generatedInboundSecret = '';
-    // e.message on a drizzle/postgres-js error is the failed SQL STATEMENT, table and column names
-    // included, handed to the operator; the database's actual complaint sits unread on e.cause. And
-    // nothing was logged at all, so a save that never happened left no trace for anyone asked later.
-    console.error('[admin/mail/settings] ' + action + ' failed:', dbReason(e));
-    errMsg = 'Nothing was saved: ' + dbReason(e);
+    if (action === 'migrate_legacy_mail_secrets') {
+      const knownCodes = [
+        'confirmation_required', 'invalid_selection', 'mail_config_missing', 'compare_and_swap_failed',
+        'roundtrip_failed', 'invalid_storage_value', 'missing_key_material', 'invalid_key_base64',
+        'invalid_key_length', 'malformed_ciphertext', 'ciphertext_authentication_failed',
+      ];
+      const code = knownCodes.includes(String(e?.code)) ? String(e.code) : 'migration_failed';
+      // Database errors can include generated SQL and values in some drivers; keep this diagnostic
+      // to a fixed code and never log an exception, query, plaintext, or ciphertext.
+      console.error('[admin/mail/settings] legacy mail-secret migration failed:', code);
+      errMsg = `Mail-secret migration stopped (${code}). No migration results were committed; reload the page and review the inventory, key, and mail checks.`;
+    } else {
+      console.error('[admin/mail/settings] ' + action + ' failed:', dbReason(e));
+      errMsg = 'Nothing was saved: ' + dbReason(e);
+    }
   }
 }
 
@@ -154,14 +183,14 @@ const cfg = await getMailConfig();
 // one the forwarding MTA is already using. Stated instead, and the form is withheld while it holds.
 let raw: any = {};
 let rawError = cfg.readError;
+const imap = await getImapConfig();
 try {
-  raw = rows(await db.execute(sql`SELECT smtp_host, smtp_port, smtp_user, smtp_secure, COALESCE(smtp_insecure, false) AS smtp_insecure, from_name, from_address, (inbound_secret IS NOT NULL AND inbound_secret <> '') AS has_inbound_secret, (smtp_pass IS NOT NULL AND smtp_pass <> '') AS has_pass, (resend_api_key IS NOT NULL AND resend_api_key <> '') AS has_resend FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {};
+  raw = rows(await db.execute(sql`SELECT smtp_host, smtp_port, smtp_user, smtp_secure, COALESCE(smtp_insecure, false) AS smtp_insecure, from_name, from_address, (inbound_secret IS NOT NULL AND inbound_secret <> '') AS has_inbound_secret, (smtp_pass IS NOT NULL AND smtp_pass <> '') AS has_pass, (resend_api_key IS NOT NULL AND resend_api_key <> '') AS has_resend, CASE WHEN smtp_pass IS NULL OR smtp_pass = '' THEN 'empty' WHEN smtp_pass LIKE 'era-mail-secret:v1:%' THEN 'encrypted' ELSE 'legacy_plaintext' END AS smtp_pass_storage, CASE WHEN imap_pass IS NULL OR imap_pass = '' THEN 'empty' WHEN imap_pass LIKE 'era-mail-secret:v1:%' THEN 'encrypted' ELSE 'legacy_plaintext' END AS imap_pass_storage, CASE WHEN resend_api_key IS NULL OR resend_api_key = '' THEN 'empty' WHEN resend_api_key LIKE 'era-mail-secret:v1:%' THEN 'encrypted' ELSE 'legacy_plaintext' END AS resend_api_key_storage, CASE WHEN inbound_secret IS NULL OR inbound_secret = '' THEN 'empty' WHEN inbound_secret LIKE 'era-mail-secret:v1:%' THEN 'encrypted' ELSE 'legacy_plaintext' END AS inbound_secret_storage FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {};
 } catch (e: any) {
   rawError = dbReason(e);
   console.error('[admin/mail/settings] mail_config read failed:', rawError);
 }
 
-const imap = await getImapConfig();
 const secretCandidates: Array<{ column: MailSecretColumn; label: string; detail: string; code: string }> = [
   { column: 'smtp_pass', label: 'SMTP password', detail: cfg.secretErrors.smtp_pass || '', code: cfg.secretErrorCodes.smtp_pass || '' },
   { column: 'imap_pass', label: 'IMAP password', detail: imap.secretError || '', code: imap.secretErrorCode || '' },
@@ -170,6 +199,12 @@ const secretCandidates: Array<{ column: MailSecretColumn; label: string; detail:
 ];
 const unreadableSecrets = secretCandidates.filter((item) => !!item.detail);
 const recoverableSecrets = unreadableSecrets.filter((item) => item.code === 'missing_key_material');
+const legacySecretCandidates = ([
+  { column: 'smtp_pass', label: 'SMTP password' },
+  { column: 'imap_pass', label: 'IMAP password' },
+  { column: 'resend_api_key', label: 'Resend API key' },
+  { column: 'inbound_secret', label: 'Inbound webhook secret' },
+] as Array<{ column: MailSecretColumn; label: string }>).filter((item) => raw[`${item.column}_storage`] === 'legacy_plaintext');
 const origin = new URL(Astro.request.url).origin;
 const inboundUrl = origin + '/api/mail/inbound';
 const imapHasPass = !!imap.pass;
@@ -263,6 +298,37 @@ const imapHasPass = !!imap.pass;
     {unreadableSecrets.some((secret) => secret.code !== 'missing_key_material') && (
       <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);color:#fbbf24;font-size:12px;padding:10px 13px;border-radius:8px;margin-bottom:16px;">
         Replacement is disabled for invalid key settings, malformed ciphertext, and authentication failures. Correct the key configuration or investigate the stored value first; an authentication failure can mean either a wrong key or changed ciphertext.
+      </div>
+    )}
+
+    {legacySecretCandidates.length > 0 && (
+      <div class="admin-card" style="margin-bottom:16px;border-color:rgba(251,191,36,0.45);">
+        <div class="admin-card-title" style="margin-bottom:6px;">Encrypt selected legacy mail credentials</div>
+        <p style="font-size:12px;color:var(--o-mid,#8a8a94);margin:0 0 12px;line-height:1.6;">
+          This migration preserves each selected value and changes only its storage format. First restore the original key or complete the approved new-key-ID recovery, rotate any exposed mailbox credential, save the replacement through its password field, pass no-save SMTP and IMAP checks, and review every encrypted-field/key-ID inventory in the encryption recovery runbook. All selected fields update atomically; any key, validation, database, or concurrency error rolls back the transaction.
+        </p>
+        <form method="POST" style="display:flex;flex-direction:column;gap:10px;">
+          <input type="hidden" name="_action" value="migrate_legacy_mail_secrets" />
+          <div style="font-size:11.5px;font-weight:700;">Currently classified as legacy plaintext (no values are displayed):</div>
+          {legacySecretCandidates.map((secret) => (
+            <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--o-hi,#fff);">
+              <input type="checkbox" name="secret_columns" value={secret.column} /> {secret.label}
+            </label>
+          ))}
+          <label style="display:flex;align-items:flex-start;gap:8px;font-size:11.5px;color:var(--o-mid,#8a8a94);line-height:1.5;">
+            <input type="checkbox" name="inventory_reviewed" value="yes" required /> I reviewed the complete encrypted-field and key-ID inventory, including optional tables where present, and every referenced key remains available.
+          </label>
+          <label style="display:flex;align-items:flex-start;gap:8px;font-size:11.5px;color:var(--o-mid,#8a8a94);line-height:1.5;">
+            <input type="checkbox" name="connectivity_verified" value="yes" required /> SMTP and IMAP no-save verification passed using the current saved credentials after any provider-side password rotation.
+          </label>
+          <label style="display:flex;align-items:flex-start;gap:8px;font-size:11.5px;color:var(--o-mid,#8a8a94);line-height:1.5;">
+            <input type="checkbox" name="migration_authorized" value="yes" required /> I explicitly authorize encrypting only the selected legacy plaintext mail fields.
+          </label>
+          <label style="font-size:11.5px;color:var(--o-mid,#8a8a94);">Type <code>ENCRYPT SELECTED MAIL SECRETS</code> to confirm
+            <input name="confirm_migration" type="text" required autocomplete="off" class="rolefield-input" style="display:block;width:100%;margin-top:5px;" />
+          </label>
+          <button type="submit" class="admin-btn" style="align-self:flex-start;padding:7px 12px;border-color:rgba(251,191,36,0.45);color:#fbbf24;">Encrypt selected fields</button>
+        </form>
       </div>
     )}
 

@@ -54,7 +54,7 @@ WITH mail_values AS (
 ), mail_inventory AS (
   SELECT field,
     CASE
-      WHEN value IS NULL OR btrim(value) = '' THEN 'empty'
+      WHEN value IS NULL OR value = '' THEN 'empty'
       WHEN value LIKE 'era-mail-secret:v1:%' THEN 'envelope'
       ELSE 'legacy_plaintext'
     END AS storage,
@@ -85,6 +85,11 @@ FROM mp_secrets
 WHERE purpose = 'dkim-private-key'
 GROUP BY envelope->>'keyId'
 ORDER BY key_id;
+
+SELECT key_id, count(*) AS rows
+FROM mailint_credentials
+GROUP BY key_id
+ORDER BY key_id;
 ```
 
 Run each statement only where its table exists. A missing optional table is not evidence that it has no
@@ -94,17 +99,40 @@ IDs before changing `ACTIVE_DATA_KEY_ID` or retiring any key.
 Other encryption systems in the repository are separate from this registry: `mailint_credentials`
 uses `MAILINT_VAULT_KEY` / `MAILINT_VAULT_KEY_PREVIOUS` and its own `env:v1` / `env:v0` IDs;
 `activity_events` uses `ACTIVITY_ENC_KEY` (falling back to `SESSION_SECRET`) and records no key ID.
-Do not rotate those keys as part of a `DATA_ENCRYPTION_KEY` change. The portal messenger also uses
-client-side WebCrypto keys and is outside this server key registry.
+Do not rotate those keys as part of a `DATA_ENCRYPTION_KEY` change. Run the `mailint_credentials`
+query only where that optional table exists; a missing table does not prove it has no rows. The
+`activity_events` records have no per-row key ID, so preserve the configured key/fallback while any
+such records remain. The portal messenger also uses client-side WebCrypto keys and is outside this
+server key registry.
 
-For a plaintext mail-field migration, first pass the no-save SMTP and IMAP verification checks. Then
-use a reviewed server-side migration that reads and encrypts each non-empty plaintext field with its
-field-bound AAD, and updates only that field using compare-and-swap against the exact value read. The
-operation must not return, log, or export plaintext or ciphertext; it should report only per-field
-counts and outcomes. Keep empty fields empty. Stop on a key, encoding, database, or compare-and-swap
-failure and leave that field unchanged. Do not run this migration until the complete key-ID inventory
-has been reviewed and an approved active key is available. This is separate from routine rotation and
-does not restore ciphertext encrypted under a lost key.
+For a plaintext mail-field migration, first pass the no-save SMTP and IMAP verification checks with
+the current saved credentials, and review the complete inventory above, including every optional
+table that exists. In **Admin -> Mail -> Settings**, the migration panel lists only fields classified
+as legacy plaintext and never displays their values. Select only the reviewed fields, attest that all
+referenced keys are available, that SMTP and IMAP verification passed after any credential update,
+and that the migration is authorized; then type `ENCRYPT SELECTED MAIL SECRETS`. The server validates
+the active key before database access, locks the `mail_config` row in a transaction, verifies already
+encrypted selected values can still be decrypted, encrypts legacy values byte-for-byte with their
+field-bound AAD, and updates each selected column using compare-and-swap. Empty values remain empty.
+The operation is idempotent and all-or-nothing: a key, encoding, database, decryption, or concurrency
+failure aborts the transaction. It returns only field names and outcomes; logs contain only a fixed
+error code, never plaintext or ciphertext. Do not run it until the complete key-ID inventory has been
+reviewed and an approved active key is available. This is separate from routine rotation and does
+not restore ciphertext encrypted under a lost key.
+
+After a successful migration, reload Mail Settings and confirm the selected fields classify as
+encrypted. Use **Verify connection** and **Verify IMAP** with blank password inputs to prove the
+application can decrypt and use the saved values; those checks do not save credentials. For a full
+send/receive check, use an approved test mailbox and recipient, then confirm receipt independently.
+The scheduled poll workflow must finish with a successful run; an HTTP response alone is not proof
+that polling completed.
+
+The migration has no field-level rollback endpoint. Its transaction guarantees that a failed run
+commits nothing. If the deployment needs rollback after a committed run, retain every key ID
+referenced by the newly written envelopes and roll back only to application code that supports the
+`era-mail-secret:v1:` format. Keep the matching Vercel Production variables in place throughout any
+code rollback; never restore a database backup over mail settings without a separate reviewed data
+recovery plan.
 
 ## Generate and escrow a key
 
@@ -147,6 +175,16 @@ the affected secret-field errors must clear before changing credentials. Then ve
 connections without saving new values. Do not paste the value into a terminal command, support ticket,
 or log.
 
+If a mailbox credential was exposed, change it first through the official GoDaddy Email & Office
+Dashboard. For an account owner, GoDaddy's documented path is **Users -> Manage -> Manage -> Password**.
+Do not send the new password in chat. Once an approved encryption key is available, enter the
+replacement directly into the authenticated SMTP/IMAP password field and save; leave the other
+password field blank so it is preserved. Then run the no-save verification controls with blank
+password inputs. GoDaddy documents Professional Email powered by Titan with the full email address as
+the username, `smtpout.secureserver.net` on port 465 using SSL, and `imap.secureserver.net` on port
+993 using SSL. An SMTP authentication rejection alone does not identify the password or auth method
+as the cause; do not force an auth mechanism without provider evidence.
+
 Do not use an already-created older deployment as an automatic rollback after changing this variable:
 Vercel environment changes are applied to deployments created afterward, and an older deployment may
 still run without the restored key. If rollback is needed, redeploy the last known-good source after
@@ -177,6 +215,12 @@ If all approved key backups have been checked and the original is irretrievable:
    approved process.
 5. Keep the old ciphertext and record which fields were re-entered. Never describe those old values
    as recovered.
+
+For the current incident, do not declare loss based only on the current Vercel environment list or
+the repository's statement that no escrow copy is known. The authorized owner must check the
+organization's approved password manager, encrypted offline escrow, and any approved administrator
+backup. If none contains the original `k1` value, record that source audit before approving the `k2`
+procedure. The repository has no documented provider or path for that escrow.
 
 If rollback is needed after any field has been re-entered under `k2`, keep `DATA_ENCRYPTION_KEY_k2`
 and `ACTIVE_DATA_KEY_ID=k2` configured. A previous deployment that lacks `k2` cannot read those
