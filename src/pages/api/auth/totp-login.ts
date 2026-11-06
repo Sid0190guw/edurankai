@@ -10,7 +10,7 @@ import { db } from '@/lib/db';
 import { users } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
 import { findUserByLoginIdentifier } from '@/lib/auth/handle';
-import { verifyLoginCode, isTotpEnabled } from '@/lib/auth/twofactor';
+import { checkLoginCode, isTotpEnabled, SPENT_CODE_MESSAGE } from '@/lib/auth/twofactor';
 import { countAttempt, clearAttempts, gateApiSignIn, type SignInSurface } from '@/lib/auth/two-factor';
 import { generateSessionToken, createSession } from '@/lib/auth/session';
 import { setSessionCookie } from '@/lib/auth/cookie';
@@ -49,9 +49,15 @@ export const POST: APIRoute = async ({ request, cookies, clientAddress }) => {
 
     const u = await findUserByLoginIdentifier(identifier);
     // One generic error — never reveal whether the account exists or has 2FA.
-    if (!u || !u.isActive || !(await isTotpEnabled(u.id)) || !(await verifyLoginCode(u.id, code))) {
+    if (!u || !u.isActive || !(await isTotpEnabled(u.id))) {
       return json({ ok: false, error: GENERIC }, 400);
     }
+    const outcome = await checkLoginCode(u.id, code);
+    // A correct code that was already spent - most often the one just typed to confirm set-up - is
+    // told so. Reaching this branch needs a currently valid code, so it reveals nothing new.
+    if (outcome === 'spent') return json({ ok: false, error: SPENT_CODE_MESSAGE }, 400);
+    if (outcome === 'error') return json({ ok: false, error: 'Your code could not be checked just now. Wait a moment and enter the next code.' }, 503);
+    if (outcome !== 'ok') return json({ ok: false, error: GENERIC }, 400);
 
     // The code was the FIRST factor. If this account opted in to a second step,
     // it still owes one — otherwise this endpoint would be the hole that lets

@@ -106,6 +106,9 @@ export const BOOTSTRAP_MODULE_LIST: BootstrapModule[] = [
   // NO ORDER DEPENDENCY. The only REFERENCES inside this module point at hri_development_plans,
   // which its own DDL creates first; nothing here references another module's table.
   { name: 'hr-intelligence', run: async () => (await import('@/lib/hr-intelligence/schema')).ensureHrIntelSchema() },
+  // EMPLOYEE ID CARDS. One table, no REFERENCES, so no order dependency. Read by /portal/employee/id-card,
+  // /admin/hr/id-cards and the public /verify/id/<token>; created by nothing else in production.
+  { name: 'hr-id-cards', run: async () => (await import('@/lib/hr/id-card')).ensureIdCardSchema() },
   // These two have no exported ensure; a harmless READ triggers the same internal bootstrap.
   { name: 'error-log', run: async () => (await import('@/lib/logger')).recentErrors(1) },
   { name: 'job-queue', run: async () => (await import('@/lib/job-queue')).claimBatch(0) },

@@ -25,7 +25,7 @@ import { sql } from 'drizzle-orm';
 import { ddlPermitted } from '@/lib/schema-bootstrap';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
-  ensureTwoFactorSchema, isTotpEnabled, verifyLoginCode,
+  ensureTwoFactorSchema, isTotpEnabled, verifyLoginCode, checkLoginCode, SPENT_CODE_MESSAGE,
   generateBackupCodes, storeBackupCodes, countUnusedBackupCodes,
 } from '@/lib/auth/twofactor';
 
@@ -550,7 +550,23 @@ export async function verifySecondFactor(
     passed = r.matched;
   } else {
     // Covers a live authenticator code AND a one-time recovery code.
-    passed = await verifyLoginCode(pending.userId, (payload || '').trim());
+    const outcome = await checkLoginCode(pending.userId, (payload || '').trim());
+    passed = outcome === 'ok';
+    // A RIGHT CODE THAT WAS ALREADY USED IS NOT A WRONG GUESS. After an authenticator-code first
+    // factor this is the ordinary case: the challenge asks for a code, the person types the one that
+    // just signed them in, and it is spent. They are told to wait for the next one, and it costs them
+    // no attempt against the challenge.
+    if (outcome === 'spent') {
+      return {
+        ok: false,
+        error: pending.firstFactor === 'totp'
+          ? 'That is the code that started this sign-in, and each code works once. Wait for the next code in your authenticator app (it changes every 30 seconds) and enter that one.'
+          : SPENT_CODE_MESSAGE,
+      };
+    }
+    if (outcome === 'error') {
+      return { ok: false, error: 'Your code could not be checked just now. Wait a moment and enter the next code.' };
+    }
   }
 
   if (!passed) {

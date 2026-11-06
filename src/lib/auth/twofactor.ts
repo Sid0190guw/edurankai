@@ -261,8 +261,23 @@ export async function hasTotpOrBackup(userId: string): Promise<boolean> {
   return isTotpEnabled(userId);
 }
 
-/** Accept a live TOTP code OR an unused backup code. Used on the login challenge. */
-export async function verifyLoginCode(userId: string, code: string): Promise<boolean> {
+/**
+ * What happened to a sign-in code, in words a screen can act on.
+ *
+ *   ok     - accepted (and, for an authenticator code, spent).
+ *   spent  - a CORRECT authenticator code that has already been used. This is the case that made the
+ *            authenticator look broken: confirming set-up spends the code on screen, and a sign-in
+ *            that asks for a second step after an authenticator code asks for one again - so the
+ *            person types the same six digits a second time and was told only "did not match".
+ *            They need to wait for the next code, and now they are told so.
+ *   wrong  - not a valid code or recovery code.
+ *   error  - the spend could not be recorded, so the code was refused (see below). Not "wrong".
+ *
+ * Saying "spent" leaks nothing: only somebody already holding a currently valid code can reach it.
+ */
+export type LoginCodeOutcome = 'ok' | 'spent' | 'wrong' | 'error';
+
+export async function checkLoginCode(userId: string, code: string): Promise<LoginCodeOutcome> {
   const rec = await getTotpRecord(userId);
   if (rec && rec.confirmed) {
     const step = matchTotpStep(rec.secret, code);
@@ -276,13 +291,23 @@ export async function verifyLoginCode(userId: string, code: string): Promise<boo
       } catch (e: any) {
         console.error('[auth/twofactor] could not record the authenticator code as spent; refusing it.',
           e?.cause?.message || e?.message);
-        return false;
+        return 'error';
       }
       // A correctly-formed code that is already spent is a replay, not a backup code — six digits can
       // never match the `xxxxx-xxxxx` shape generateBackupCodes() mints, so there is nothing to fall
       // through to and falling through would only cost a wasted query.
-      return claimed;
+      return claimed ? 'ok' : 'spent';
     }
   }
-  return consumeBackupCode(userId, code);
+  return (await consumeBackupCode(userId, code)) ? 'ok' : 'wrong';
 }
+
+/** Accept a live TOTP code OR an unused backup code. Used on the login challenge. */
+export async function verifyLoginCode(userId: string, code: string): Promise<boolean> {
+  return (await checkLoginCode(userId, code)) === 'ok';
+}
+
+/** The sentence for a code that was right but already used. One wording everywhere. */
+export const SPENT_CODE_MESSAGE =
+  'That code has already been used. Authenticator codes work once: wait for the next code in your app '
+  + '(it changes every 30 seconds) and enter that one.';

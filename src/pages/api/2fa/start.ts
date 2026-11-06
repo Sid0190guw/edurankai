@@ -3,6 +3,12 @@
 // the human-readable key. Nothing is enforced until /api/2fa/confirm succeeds.
 import type { APIRoute } from 'astro';
 import { startTotpEnrollment, otpauthUri, formatSecret, isTotpEnabled } from '@/lib/auth/twofactor';
+// THE QR, RENDERED HERE. Set-up offered only a phone deep link and a 32-character key to type, so
+// anybody setting up from a computer had nothing to scan - the standard way every authenticator app
+// expects to be connected. Rendered on our own server (src/lib/qr.ts), never by a third-party image
+// service: the QR encodes the SECRET, and sending it to somebody else's server to draw would hand
+// them the second factor.
+import { qrSvg } from '@/lib/qr';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -33,7 +39,9 @@ export const POST: APIRoute = async ({ locals }) => {
     }
     const secret = await startTotpEnrollment(user.id);
     const account = user.email || user.internalHandle || user.name || 'account';
-    return json({ ok: true, secret, formatted: formatSecret(secret), otpauth: otpauthUri(secret, account) });
+    const otpauth = otpauthUri(secret, account);
+    const qr = await qrSvg(otpauth, { size: 220, level: 'M', margin: 1 });
+    return json({ ok: true, secret, formatted: formatSecret(secret), otpauth, qrSvg: qr });
   } catch (e: any) {
     // NEVER RETURNED VERBATIM. The real Postgres reason is on e.cause and e.message is only the SQL
     // that failed, so echoing either hands a failed statement — table and column names included — to

@@ -949,6 +949,17 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     gate: 'Page: signed in, then its own hr_employees lookup. Every ticket read is narrowed by requester_employee_id in the WHERE clause, and every write re-checks mayViewTicket/mayWorkTicket on the posted id.',
   },
   {
+    key: 'id-card',
+    label: 'My ID card',
+    href: '/portal/employee/id-card',
+    icon: 'user',
+    group: 'record',
+    bar: 17,
+    // A card is issued against hr_employees.id, so the honest predicate is an employee record.
+    audience: (v) => v.ctx.hasEmployeeRecord,
+    gate: 'Page: signed in, then requireEmployee(). The card, the live code and the face unlock are all resolved from the session employee id; /api/id-card/live re-runs the same gate and never reads an id from the request.',
+  },
+  {
     key: 'assets',
     label: 'My assets',
     href: '/portal/employee/assets',
