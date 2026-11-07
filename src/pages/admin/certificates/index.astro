@@ -13,8 +13,9 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import {
   ensureUniversalCertSchema, listUniversal, issueUniversalCertificate, revokeUniversal,
-  getUniversalForAdmin, UCERT_KIND_LABELS,
+  getUniversalForAdmin, amendUniversalCertificate, UCERT_KIND_LABELS,
 } from '@/lib/universal-certificates';
+import { skillsForEmployee, parseSkills } from '@/lib/hr/role-skills';
 import { can } from '@/lib/auth/permissions';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
@@ -94,6 +95,48 @@ if (Astro.request.method === 'POST') {
         else if (res.alreadyRevoked) errorMsg = 'Certificate ' + serial + ' was already revoked, so nothing changed — the earlier reason and revoking user are kept.';
         else errorMsg = 'NOTHING WAS REVOKED. No certificate has the serial "' + serial + '". Check it against the printed certificate: it is still valid and still verifies publicly.';
       }
+    } else if (action === 'amend') {
+      // CORRECTING A CERTIFICATE THAT HAS ALREADY GONE OUT. Same serial, same link; every change and
+      // the reason for it is kept on the certificate (amendUniversalCertificate) and the public page
+      // says it was amended.
+      if (!mayEmail) {
+        errorMsg = 'Correcting an issued certificate needs the HR permission.';
+      } else {
+        const serial = (fd.get('serial') as string || '').trim();
+        const r = await amendUniversalCertificate(serial, {
+          recipientName: String(fd.get('recipient_name') || ''),
+          recipientEmail: String(fd.get('recipient_email') || '') || null,
+          title: String(fd.get('title') || ''),
+          body: String(fd.get('body') || '') || null,
+          achievement: String(fd.get('achievement') || '') || null,
+          issuedByName: String(fd.get('issued_by_name') || '') || null,
+          issuedByDesignation: String(fd.get('issued_by_designation') || '') || null,
+          validUntil: String(fd.get('valid_until') || '') || null,
+          metadata: {
+            heading: String(fd.get('heading') || ''),
+            department: String(fd.get('department') || ''),
+            fromDate: String(fd.get('from_date') || ''),
+            toDate: String(fd.get('to_date') || ''),
+            measureLine: String(fd.get('measure_line') || ''),
+            achievements: String(fd.get('achievements') || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean).slice(0, 6),
+            skills: parseSkills(fd.get('skills')),
+          },
+        }, String(fd.get('edit_note') || ''), { userId: user.id, name: user.name || user.email || 'People desk' });
+        issuedSerial = serial;
+        if (!r.ok) errorMsg = r.error || 'The certificate was not changed.';
+        else {
+          successMsg = 'Certificate ' + serial + ' corrected (' + (r.changed || []).join(', ') + '). The link and serial are unchanged, and the change is recorded with it.';
+          if (fd.get('resend') === '1') {
+            const row = await getUniversalForAdmin(serial);
+            const to = String(row?.recipient_email || '').trim();
+            if (!to) errorMsg = 'It was not re-sent: the certificate has no email address.';
+            else {
+              const sent = await emailCertificate(row, to, '<p>Dear {{name}},</p><p>We have corrected your certificate for <strong>{{role}}</strong>. The corrected copy is below; the verification link is the same as before.</p><p>{{signatory}}<br/>EduRankAI</p>');
+              if (sent.ok) successMsg += ' ' + sent.message; else errorMsg = sent.message;
+            }
+          }
+        }
+      }
     } else if (action === 'email') {
       if (!mayEmail) {
         errorMsg = 'Emailing a certificate needs the HR permission. Ask an HR administrator to send it.';
@@ -124,6 +167,7 @@ if (Astro.request.method === 'POST') {
       const toDate = String(fd.get('to_date') || '').trim().slice(0, 10);
       const department = String(fd.get('department') || '').trim().slice(0, 200);
       const measureLine = String(fd.get('measure_line') || '').trim().slice(0, 300);
+      const skills = parseSkills(fd.get('skills'));
       const achievements = String(fd.get('achievements') || '')
         .split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 6).map((s) => s.slice(0, 300));
       const sendNow = fd.get('send_email') === '1';
@@ -134,7 +178,7 @@ if (Astro.request.method === 'POST') {
           recipientEmployeeId: isUuid(employeeId) ? employeeId : undefined,
           issuedByUserId: user.id, issuedByName, issuedByDesignation, issuerOrg,
           scorePct, validFrom, validUntil,
-          metadata: { fromDate, toDate, department, achievements, measureLine },
+          metadata: { fromDate, toDate, department, achievements, measureLine, skills },
         });
         if (r.ok) {
           issuedSerial = r.serial;
@@ -208,12 +252,33 @@ if (isUuid(employeeParam)) {
       fromDate: isoDay(emp.joining_date),
       toDate: today,
       achievements: achievements.join('\n'),
+      // FROM THE JOB DESCRIPTION, as a starting point to edit: the JD says what the role needed,
+      // the person issuing decides which were shown.
+      skills: (await skillsForEmployee(String(emp.id))).join(', '),
     };
   } else {
     prefillNote = 'That employee record was not found, so nothing was pre-filled.';
   }
 }
-const pf: any = prefill || { employeeId: '', kind: 'internship', name: '', email: '', title: '', fromDate: '', toDate: today, achievements: '' };
+const pf: any = prefill || { employeeId: '', kind: 'internship', name: '', email: '', title: '', fromDate: '', toDate: today, achievements: '', skills: '' };
+
+// EDIT MODE: ?edit=<serial> opens the issued certificate's own fields for correction.
+const editSerial = url.searchParams.get('edit') || '';
+let editRow: any = null;
+let editMeta: any = {};
+if (editSerial && mayEmail) {
+  try {
+    editRow = await getUniversalForAdmin(editSerial);
+    editMeta = editRow?.metadata;
+    if (typeof editMeta === 'string') { try { editMeta = JSON.parse(editMeta); } catch { editMeta = {}; } }
+    if (!editMeta || typeof editMeta !== 'object') editMeta = {};
+  } catch (e: any) {
+    console.error('[admin/certificates] edit', e?.cause?.message || e?.message);
+  }
+}
+const editAchievements = Array.isArray(editMeta.achievements) ? editMeta.achievements.join('\n') : '';
+const editSkills = Array.isArray(editMeta.skills) ? editMeta.skills.join(', ') : '';
+const editValidUntil = editRow && editRow.valid_until ? isoDay(editRow.valid_until) : '';
 
 // The preview: the certificate exactly as it is emailed and as /credentials/<serial> shows it.
 let previewRow: any = null;
@@ -234,6 +299,14 @@ function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { ti
 const kindOptions = Object.entries(UCERT_KIND_LABELS).map(([k, v]) => ({ key: k, label: v.label, accent: v.accent }));
 const headingFor = (k: string) => (CERTIFICATE_WORDING.find((w) => w.kind === k) || { heading: '' }).heading;
 const previewCanEmail = !!previewRow && !previewRow.revoked && mayEmail;
+// The change history, newest first, for the preview panel.
+let previewRevisions: any[] = [];
+if (previewRow) {
+  let pm: any = previewRow.metadata;
+  if (typeof pm === 'string') { try { pm = JSON.parse(pm); } catch { pm = {}; } }
+  previewRevisions = (pm && Array.isArray(pm.revisions) ? pm.revisions : []).slice().reverse();
+}
+const fmtWhen = (iso: string) => { try { return new Date(iso).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch { return iso; } };
 ---
 <AdminLayout title="Certificates" activeNav="">
 <div class="cw">
@@ -258,9 +331,27 @@ const previewCanEmail = !!previewRow && !previewRow.revoked && mayEmail;
           <p class="pv-n">{previewRow.recipient_name}</p>
           <p class="pv-s">This is the certificate exactly as it is emailed and as the public verification page shows it.</p>
         </div>
-        <a class="btn ghost" href={'/credentials/' + previewRow.serial} target="_blank">Open public page</a>
+        <div class="btnrow">
+          {mayEmail && !previewRow.revoked && <a class="btn ghost" href={'/admin/certificates?edit=' + encodeURIComponent(previewRow.serial) + '#editCert'}>Edit this certificate</a>}
+          <a class="btn ghost" href={'/credentials/' + previewRow.serial} target="_blank">Open public page</a>
+        </div>
       </div>
       <div class="pv-doc"><Fragment set:html={previewHtml} /></div>
+
+      {previewRevisions.length > 0 && (
+        <details class="revs">
+          <summary>Changes since it was issued ({previewRevisions.length})</summary>
+          {previewRevisions.map((r: any) => (
+            <div class="rev">
+              <p class="rev-h">{fmtWhen(r.at)} · {r.byName}</p>
+              <p class="rev-n">{r.note}</p>
+              {Object.keys(r.changed || {}).map((k) => (
+                <p class="rev-c"><strong>{k}:</strong> {(r.changed[k] || [])[0] || '(empty)'} <span class="rev-to">changed to</span> {(r.changed[k] || [])[1] || '(empty)'}</p>
+              ))}
+            </div>
+          ))}
+        </details>
+      )}
 
       {previewCanEmail && (
         <form method="POST" class="sendbox">
@@ -299,6 +390,49 @@ const previewCanEmail = !!previewRow && !previewRow.revoked && mayEmail;
           </form>
         </details>
       )}
+    </section>
+  )}
+
+  {/* EDIT AN ISSUED CERTIFICATE */}
+  {editRow && !editRow.revoked && (
+    <section class="panel editpanel" id="editCert">
+      <p class="pv-k">Edit · {editRow.serial}</p>
+      <p class="hint">The serial and the verification link stay the same. Every change is recorded with who made it, when, what it said before and your reason, and the public page states that the certificate was amended.</p>
+      <form method="POST" class="grid">
+        <input type="hidden" name="action" value="amend" />
+        <input type="hidden" name="serial" value={editRow.serial} />
+        <div class="two">
+          <label>Recipient name<input name="recipient_name" type="text" required maxlength="200" value={editRow.recipient_name || ''} /></label>
+          <label>Recipient email<input name="recipient_email" type="email" maxlength="200" value={editRow.recipient_email || ''} /></label>
+        </div>
+        <div class="two">
+          <label>Heading<input name="heading" type="text" maxlength="120" value={editMeta.heading || ''} placeholder="Leave empty for the standard heading" /></label>
+          <label>Programme or role<input name="title" type="text" required maxlength="300" value={editRow.title || ''} /></label>
+        </div>
+        <div class="three">
+          <label>Team / department<input name="department" type="text" maxlength="200" value={editMeta.department || ''} /></label>
+          <label>From<input name="from_date" type="date" value={editMeta.fromDate || ''} /></label>
+          <label>To<input name="to_date" type="date" value={editMeta.toDate || ''} /></label>
+        </div>
+        <label>Distinction<input name="achievement" type="text" maxlength="120" value={editRow.achievement || ''} /></label>
+        <label>Citation<textarea name="body" rows="4" maxlength="5000">{editRow.body || ''}</textarea></label>
+        <label>Key contributions (one per line)<textarea name="achievements" rows="4" maxlength="2000">{editAchievements}</textarea></label>
+        <label>Skills (comma separated)<input name="skills" type="text" maxlength="800" value={editSkills} /></label>
+        <label>Measured line<input name="measure_line" type="text" maxlength="300" value={editMeta.measureLine || ''} /></label>
+        <div class="three">
+          <label>Signed by<input name="issued_by_name" type="text" maxlength="200" value={editRow.issued_by_name || ''} /></label>
+          <label>Signatory title<input name="issued_by_designation" type="text" maxlength="200" value={editRow.issued_by_designation || ''} /></label>
+          <label>Valid until<input name="valid_until" type="date" value={editValidUntil} /></label>
+        </div>
+        <label>What you changed and why *
+          <textarea name="edit_note" rows="2" required minlength="5" maxlength="1000" placeholder="e.g. Corrected the end date to the last working day."></textarea>
+        </label>
+        <label class="ack"><input type="checkbox" name="resend" value="1" /> <span>Email the corrected certificate to the recipient</span></label>
+        <div class="btnrow">
+          <button type="submit" class="btn">Save the correction</button>
+          <a class="btn ghost" href={'/admin/certificates?preview=' + encodeURIComponent(editRow.serial)}>Cancel</a>
+        </div>
+      </form>
     </section>
   )}
 
@@ -368,6 +502,10 @@ const previewCanEmail = !!previewRow && !previewRow.revoked && mayEmail;
       <label>Key contributions (one per line, up to six)
         <textarea name="achievements" rows="4" maxlength="2000" placeholder="Shipped the evaluation harness used by the ranking pipeline">{pf.achievements}</textarea>
         <span class="hint">Pre-filled from reviews rated 4 or above when you start from an employee record.</span>
+      </label>
+      <label>Skills (comma separated)
+        <input name="skills" type="text" maxlength="800" value={pf.skills} placeholder="e.g. Python, Data analysis, Technical writing" />
+        <span class="hint">Pre-filled from the job description of the role they were hired into. Printed on the certificate and offered to the holder for their LinkedIn profile.</span>
       </label>
       <div class="two">
         <label>Measured line (optional)
@@ -512,6 +650,15 @@ const previewCanEmail = !!previewRow && !previewRow.revoked && mayEmail;
   .sr { font-size: 10.5px; color: #FF7040; font-weight: 700; text-decoration: none; font-family: 'Geist Mono', monospace; }
   .kd { font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 100px; letter-spacing: 0.06em; text-transform: uppercase; justify-self: start; }
   .sm-btn { padding: 7px 12px; font-size: 11.5px; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .editpanel { border-color: rgba(255,79,0,0.45); }
+  .revs { max-width: 640px; margin: 0 auto 16px; }
+  .revs summary { cursor: pointer; font-size: 12.5px; color: #d8d8de; }
+  .rev { border-top: 1px solid #1a1a1f; padding: 8px 0; }
+  .rev-h { font-size: 11px; color: #9aa6b6; margin: 0; }
+  .rev-n { font-size: 13px; color: #fff; margin: 3px 0; }
+  .rev-c { font-size: 12px; color: #c8c8d0; margin: 2px 0; word-break: break-word; }
+  .rev-to { color: #FF7040; }
   .empty { padding: 36px; text-align: center; color: #8a8a94; font-size: 13px; }
 </style>
 </AdminLayout>
