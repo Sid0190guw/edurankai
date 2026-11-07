@@ -15,12 +15,12 @@
 //
 // EMAIL-SAFE BY CONSTRUCTION. Mail clients ignore flexbox, grid, SVG, web fonts and <style> blocks,
 // and src/lib/mailsec/html.ts strips several of them on the way out anyway. So: nested tables, inline
-// styles only, system serif/sans stacks, and the logo as a hosted PNG with alt text (an inline SVG is
-// removed by the outbound sanitiser, and a data: URI is refused by it on purpose).
+// styles only, system serif/sans stacks. THE WORDMARK IS THE LOGO: "EduRankAI" set in type, with no
+// icon tile beside it and no seal under the signature - the name carries the house, as it does on the
+// letters of any firm that does not need to tell you it is official.
 //
 // PURE. No database, no transport. Every value from a form or a row is escaped here, because the
 // output lands in our own origin (/credentials/<serial>) as well as in an inbox.
-import { publicUrl } from '@/lib/public-origin';
 
 export const BRAND = Object.freeze({
   name: 'EduRankAI',
@@ -31,17 +31,14 @@ export const BRAND = Object.freeze({
   gold: '#B8892D',
   muted: '#6B635C',
   rule: '#E7DCC8',
-  tagline: 'AI Research and Technology',
+  // The house line, as the rest of the site writes it. The wordmark IS the logo: no tile, no seal.
+  tagline: 'AI Research & Engineering',
   address: 'Guwahati, Assam, India',
   contact: 'hr@edurankai.in  |  edurankai.in',
   serif: "Georgia, 'Times New Roman', Times, serif",
   sans: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
 });
 
-/** The brand mark as a hosted PNG. Absolute, because a relative src means nothing inside an inbox. */
-export function brandLogoUrl(): string {
-  return publicUrl('/icon-192.png');
-}
 
 export function esc(s: unknown): string {
   return String(s ?? '')
@@ -73,10 +70,6 @@ function wordmark(size: number): string {
     + ';letter-spacing:-0.01em;">Edu<span style="color:' + BRAND.saffron + ';">Rank</span>AI</span>';
 }
 
-function logoImg(px: number): string {
-  return '<img src="' + esc(brandLogoUrl()) + '" width="' + px + '" height="' + px + '" alt="EduRankAI"'
-    + ' style="display:block;width:' + px + 'px;height:' + px + 'px;border:0;border-radius:' + Math.round(px / 5) + 'px;" />';
-}
 
 // -------------------------------------------------------------------------------------------------
 // LETTERHEAD
@@ -87,17 +80,13 @@ export interface LetterheadInput {
   issueDate?: string;
 }
 
-/** The top of every letter: mark, wordmark, address, reference and date. A saffron rule beneath. */
+/** The top of every letter: the wordmark, the line, address, reference and date. A saffron rule beneath. */
 export function letterheadHtml(h: LetterheadInput): string {
   return '<table width="100%" cellpadding="0" cellspacing="0" border="0" style="border-bottom:3px solid ' + BRAND.saffron + ';">'
     + '<tr>'
     + '<td style="vertical-align:top;padding:0 0 18px;">'
-    + '<table cellpadding="0" cellspacing="0" border="0"><tr>'
-    + '<td style="vertical-align:middle;padding:0 12px 0 0;">' + logoImg(46) + '</td>'
-    + '<td style="vertical-align:middle;">'
-    + '<p style="margin:0;line-height:1;">' + wordmark(24) + '</p>'
-    + '<p style="margin:5px 0 0;font-family:' + BRAND.sans + ';font-size:9.5px;letter-spacing:0.18em;text-transform:uppercase;color:' + BRAND.saffron + ';font-weight:700;">' + esc(BRAND.tagline) + '</p>'
-    + '</td></tr></table>'
+    + '<p style="margin:0;line-height:1;">' + wordmark(30) + '</p>'
+    + '<p style="margin:6px 0 0;font-family:' + BRAND.sans + ';font-size:9.5px;letter-spacing:0.2em;text-transform:uppercase;color:' + BRAND.saffron + ';font-weight:700;">' + esc(BRAND.tagline) + '</p>'
     + '<p style="margin:10px 0 0;font-family:' + BRAND.sans + ';font-size:11px;color:' + BRAND.muted + ';line-height:1.5;">'
     + esc(BRAND.address) + '<br />' + esc(BRAND.contact) + '</p>'
     + '</td>'
@@ -111,7 +100,7 @@ export function letterheadHtml(h: LetterheadInput): string {
     + '</tr></table>';
 }
 
-/** Signature block with the seal beside it. Shared by letters so they sign off identically. */
+/** Signature block. Shared by letters so they sign off identically. No seal: the name and the house carry it. */
 function signOff(name: string, title: string): string {
   return '<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:30px;">'
     + '<tr><td style="vertical-align:bottom;font-family:' + BRAND.sans + ';">'
@@ -120,22 +109,6 @@ function signOff(name: string, title: string): string {
     + '<p style="margin:6px 0 0;width:200px;border-top:1px solid ' + BRAND.ink + ';font-size:0;line-height:0;">&nbsp;</p>'
     + (title ? '<p style="margin:6px 0 0;font-size:12px;color:' + BRAND.muted + ';">' + esc(title) + '</p>' : '')
     + '<p style="margin:2px 0 0;font-size:12px;font-weight:700;color:' + BRAND.saffron + ';">EduRankAI</p>'
-    + '</td>'
-    + '<td style="vertical-align:bottom;" align="right" width="96">' + sealHtml(84) + '</td></tr></table>';
-}
-
-/**
- * The seal: the mark inside a double ring. Rounded corners degrade to a square in the clients that
- * ignore border-radius, which still reads as a seal.
- */
-export function sealHtml(px: number): string {
-  const inner = Math.round(px * 0.46);
-  return '<table cellpadding="0" cellspacing="0" border="0" align="center" style="border-collapse:separate;">'
-    + '<tr><td align="center" width="' + px + '" height="' + px + '" style="vertical-align:middle;width:' + px + 'px;height:' + px + 'px;border:2px solid ' + BRAND.gold
-    + ';border-radius:' + px + 'px;background:' + BRAND.cream + ';">'
-    + '<table cellpadding="0" cellspacing="0" border="0" align="center"><tr><td align="center" style="padding:0;">'
-    + logoImg(inner)
-    + '</td></tr><tr><td align="center" style="padding:3px 0 0;font-family:' + BRAND.sans + ';font-size:6.5px;letter-spacing:0.16em;color:' + BRAND.gold + ';font-weight:800;">OFFICIAL</td></tr></table>'
     + '</td></tr></table>';
 }
 
@@ -169,6 +142,11 @@ export interface CertificateInput {
   verifyUrl?: string;
   /** Revoked certificates still render (the public page must show what was revoked), marked as such. */
   revoked?: boolean;
+  /** Skills, from the job description and the issuer. Printed as a row, and offered for LinkedIn. */
+  skills?: string[];
+  /** ISO time of the last correction, when there has been one. Printed, because a certificate that
+   *  changed after it was issued must say so. */
+  amendedAt?: string;
 }
 
 /**
@@ -193,6 +171,10 @@ export function certificateHtml(c: CertificateInput): string {
     + '<td style="padding:0 0 6px;font-family:' + BRAND.sans + ';font-size:13px;line-height:1.6;color:#3a332d;">' + esc(a) + '</td></tr>').join('');
 
   const verifyText = c.verifyUrl ? esc(c.verifyUrl.replace(/^https?:\/\//, '')) : '';
+  const skillCells = (c.skills || []).map((x) => String(x || '').trim()).filter(Boolean).slice(0, 12)
+    .map((x) => '<span style="display:inline-block;margin:0 3px;padding:3px 11px;border:1px solid ' + BRAND.rule
+      + ';border-radius:100px;font-family:' + BRAND.sans + ';font-size:11.5px;color:#3a332d;background:#ffffff;white-space:nowrap;">' + esc(x) + '</span>')
+    .join(' ');
 
   return '<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:' + BRAND.ink + ';border-radius:6px;">'
     + '<tr><td style="padding:9px;">'
@@ -207,8 +189,7 @@ export function certificateHtml(c: CertificateInput): string {
       : '')
 
     // Mark and wordmark
-    + '<table cellpadding="0" cellspacing="0" border="0" align="center"><tr><td align="center">' + logoImg(58) + '</td></tr></table>'
-    + '<p style="margin:12px 0 0;line-height:1;">' + wordmark(26) + '</p>'
+    + '<p style="margin:0;line-height:1;">' + wordmark(36) + '</p>'
     + '<p style="margin:7px 0 0;font-family:' + BRAND.sans + ';font-size:9.5px;letter-spacing:0.24em;text-transform:uppercase;color:' + BRAND.muted + ';font-weight:700;">' + esc(BRAND.tagline) + '</p>'
 
     // Heading
@@ -245,6 +226,13 @@ export function certificateHtml(c: CertificateInput): string {
         + '</td></tr>'
       : '')
 
+    + (skillCells
+      ? '<tr><td align="center" style="padding:6px 34px 6px;text-align:center;">'
+        + '<p style="margin:0 0 8px;font-family:' + BRAND.sans + ';font-size:10px;letter-spacing:0.2em;text-transform:uppercase;color:' + BRAND.gold + ';font-weight:800;">Skills demonstrated</p>'
+        + '<p style="margin:0;line-height:2.1;">' + skillCells + '</p>'
+        + '</td></tr>'
+      : '')
+
     + (c.measureLine
       ? '<tr><td align="center" style="padding:6px 40px 0;font-family:' + BRAND.sans + ';font-size:11.5px;line-height:1.6;color:' + BRAND.muted + ';text-align:center;">' + esc(c.measureLine) + '</td></tr>'
       : '')
@@ -252,14 +240,13 @@ export function certificateHtml(c: CertificateInput): string {
     // Signature / seal / date and serial
     + '<tr><td style="padding:26px 30px 8px;">'
     + '<table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>'
-    + '<td width="38%" style="vertical-align:bottom;font-family:' + BRAND.sans + ';text-align:left;">'
+    + '<td width="55%" style="vertical-align:bottom;font-family:' + BRAND.sans + ';text-align:left;">'
     + '<p style="margin:0;font-family:' + BRAND.serif + ';font-style:italic;font-size:19px;color:' + BRAND.ink + ';">' + esc(c.signatoryName || 'EduRankAI') + '</p>'
     + '<p style="margin:6px 0 0;border-top:1px solid ' + BRAND.ink + ';font-size:0;line-height:0;">&nbsp;</p>'
     + (c.signatoryTitle ? '<p style="margin:6px 0 0;font-size:11px;color:' + BRAND.muted + ';">' + esc(c.signatoryTitle) + '</p>' : '')
     + '<p style="margin:2px 0 0;font-size:11px;font-weight:700;color:' + BRAND.saffron + ';">EduRankAI</p>'
     + '</td>'
-    + '<td style="vertical-align:bottom;" align="center" width="24%">' + sealHtml(86) + '</td>'
-    + '<td width="38%" style="vertical-align:bottom;font-family:' + BRAND.sans + ';text-align:right;">'
+    + '<td width="45%" style="vertical-align:bottom;font-family:' + BRAND.sans + ';text-align:right;">'
     + '<p style="margin:0;font-size:9px;letter-spacing:0.16em;text-transform:uppercase;color:#9a9188;font-weight:700;">Date of issue</p>'
     + '<p style="margin:3px 0 0;font-size:13px;color:' + BRAND.ink + ';font-weight:600;">' + esc(longDate(c.issueDate || '')) + '</p>'
     + (c.serial
@@ -274,6 +261,9 @@ export function certificateHtml(c: CertificateInput): string {
     + '<tr><td align="center" style="padding:16px 30px 22px;text-align:center;font-family:' + BRAND.sans + ';">'
     + (c.verifyUrl
       ? '<p style="margin:0;font-size:11px;color:' + BRAND.muted + ';">Verify this certificate at <a href="' + esc(c.verifyUrl) + '" style="color:' + BRAND.saffron + ';text-decoration:none;font-weight:700;">' + verifyText + '</a></p>'
+      : '')
+    + (c.amendedAt
+      ? '<p style="margin:6px 0 0;font-size:10px;color:' + BRAND.muted + ';">Amended on ' + esc(longDate(c.amendedAt.slice(0, 10))) + '. The record of what changed is kept with this certificate.</p>'
       : '')
     + '<p style="margin:8px 0 0;font-size:9.5px;line-height:1.55;color:#9a9188;">This certificate records a professional engagement with EduRankAI. It is not an academic degree; EduRankAI is the technology platform, and academic credit, where it applies, is awarded by accredited partners.</p>'
     + '</td></tr>'
@@ -310,6 +300,9 @@ export function certificateFromRecord(row: any, verifyUrl?: string): Certificate
   if (!meta || typeof meta !== 'object') meta = {};
   const wording = certificateWording(String(row?.kind || 'custom'));
   const achievements = Array.isArray(meta.achievements) ? meta.achievements.map((a: any) => String(a || '')) : [];
+  const skills = Array.isArray(meta.skills) ? meta.skills.map((a: any) => String(a || '')).filter(Boolean) : [];
+  const revisions = Array.isArray(meta.revisions) ? meta.revisions : [];
+  const amendedAt = revisions.length ? String(revisions[revisions.length - 1]?.at || '') : '';
   const score = row?.score_pct != null && row.score_pct !== '' && Number.isFinite(Number(row.score_pct))
     ? 'Score on record: ' + Number(row.score_pct).toFixed(1) + '%.' : '';
   const measure = [String(meta.measureLine || '').trim(), score].filter(Boolean).join(' ');
@@ -331,6 +324,8 @@ export function certificateFromRecord(row: any, verifyUrl?: string): Certificate
     serial: row?.serial ? String(row.serial) : undefined,
     verifyUrl,
     revoked: !!row?.revoked,
+    skills,
+    amendedAt: amendedAt || undefined,
   };
 }
 
@@ -453,12 +448,8 @@ export function offerSummaryHtml(o: OfferSummaryInput): string {
 
   return '<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:' + BRAND.paper + ';border:1px solid ' + BRAND.rule + ';border-radius:8px;">'
     + '<tr><td style="padding:22px 22px 6px;">'
-    + '<table cellpadding="0" cellspacing="0" border="0"><tr>'
-    + '<td style="vertical-align:middle;padding:0 12px 0 0;">' + logoImg(40) + '</td>'
-    + '<td style="vertical-align:middle;">'
     + '<p style="margin:0;font-family:' + BRAND.sans + ';font-size:9.5px;letter-spacing:0.2em;text-transform:uppercase;color:' + BRAND.saffron + ';font-weight:800;">Offer of engagement</p>'
     + '<p style="margin:4px 0 0;font-family:' + BRAND.serif + ';font-size:20px;color:' + BRAND.ink + ';font-weight:700;">' + esc(o.candidateName || 'Your offer') + '</p>'
-    + '</td></tr></table>'
     + '</td></tr>'
     + '<tr><td style="padding:12px 22px 4px;">'
     + '<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;border:1px solid ' + BRAND.rule + ';border-radius:6px;">' + rows + '</table>'
