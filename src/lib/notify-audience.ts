@@ -102,6 +102,10 @@ export const NOTIFICATION_AUDIENCE: Record<string, AppRole[]> = {
   // nobody else's.
   activity_alert: ['super_admin'],
   activity_digest: ['super_admin'],
+  // An engagement at its end with no lead on record, or a completion the engine held: a named person
+  // and the criterion they did not meet. The People desk decides it, so only the People desk hears.
+  // (A lead who IS on record is told directly with sendPushToUser, not through this broadcast.)
+  completion_review: HR_CORE,
 
   // ── HORIZON signals ──────────────────────────────────────────────────────────
   // An automatically detected change in somebody's working record, addressed to whoever can do

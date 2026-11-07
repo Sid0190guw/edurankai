@@ -5,7 +5,6 @@
 // last-resort default).
 import { sendExternal } from '@/lib/mail-transport';
 import { getMailConfig } from '@/lib/mail';
-import { publicUrl } from '@/lib/public-origin';
 
 export interface EmailParams {
   to: string | string[];
@@ -43,10 +42,6 @@ export function brandedEmail(opts: {
   ctaUrl?: string;
   footerNote?: string;
 }): string {
-  // THE MARK, as a hosted PNG with alt text. An inline SVG is stripped by most mail clients and a
-  // data: URI is refused by our own outbound sanitiser, so an absolute https URL is the only form that
-  // survives. The text wordmark stays beside it for clients that block images by default.
-  const logoUrl = publicUrl('/icon-192.png');
   const cta = opts.ctaText && opts.ctaUrl ? `
     <tr><td style="padding:24px 0;text-align:center;">
       <a href="${opts.ctaUrl}" style="display:inline-block;background:#FF4F00;color:#fff;text-decoration:none;font-size:14px;font-weight:700;padding:13px 28px;border-radius:8px;">${opts.ctaText}</a>
@@ -61,10 +56,8 @@ ${opts.preheader ? `<div style="display:none;font-size:1px;color:#f8f6f1;">${opt
   <tr><td align="center">
     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="560" style="max-width:560px;background:#fff;border-radius:12px;border:1px solid rgba(0,0,0,0.08);overflow:hidden;">
       <tr><td style="background:#0f0f14;padding:22px 24px;text-align:center;">
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center"><tr>
-          <td style="vertical-align:middle;padding:0 10px 0 0;"><img src="${logoUrl}" width="34" height="34" alt="EduRankAI" style="display:block;width:34px;height:34px;border:0;border-radius:7px;" /></td>
-          <td style="vertical-align:middle;"><p style="font-size:22px;font-weight:900;color:#fff;margin:0;letter-spacing:-0.02em;">EduRank<span style="color:#FF4F00;">AI</span></p></td>
-        </tr></table>
+        <p style="font-family:Georgia,'Times New Roman',serif;font-size:24px;font-weight:700;color:#fff;margin:0;letter-spacing:-0.01em;">Edu<span style="color:#FF4F00;">Rank</span>AI</p>
+        <p style="font-size:9.5px;letter-spacing:0.2em;text-transform:uppercase;color:rgba(255,255,255,0.6);margin:6px 0 0;font-weight:700;">AI Research &amp; Engineering</p>
       </td></tr>
       <tr><td style="padding:32px 28px 8px;">
         <h1 style="font-size:20px;font-weight:700;color:#111;margin:0 0 16px;line-height:1.3;">${opts.heading}</h1>

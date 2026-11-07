@@ -2,7 +2,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   certificateHtml, certificateFromRecord, certificateWording, promotionLetterHtml,
-  promotionLetterAllowed, promotionLetterTitle, offerSummaryHtml, letterheadHtml, longDate, brandLogoUrl,
+  promotionLetterAllowed, promotionLetterTitle, offerSummaryHtml, letterheadHtml, longDate,
 } from './brand-doc';
 import { sanitizeEmailHtml, OUTBOUND } from '@/lib/mailsec/html';
 
@@ -38,9 +38,11 @@ describe('certificateHtml', () => {
   const html = certificateHtml(cert);
 
   it('carries the logo, the person, the programme, the dates, the signatory and the serial', () => {
-    expect(html).toContain(brandLogoUrl());
-    expect(brandLogoUrl()).toMatch(/^https?:\/\/.+\/icon-192\.png$/);
-    expect(html).toContain('alt="EduRankAI"');
+    // THE WORDMARK IS THE LOGO: no icon tile, no seal, no "official".
+    expect(html).not.toContain('icon-192');
+    expect(html).not.toMatch(/OFFICIAL/);
+    expect(html).toContain('Rank</span>AI');
+    expect(html).toContain('AI Research &amp; Engineering');
     expect(html).toContain('Anita Sharma');
     expect(html).toContain('AI Research Internship');
     expect(html).toContain('4 May 2026');
@@ -60,7 +62,7 @@ describe('certificateHtml', () => {
   it('survives the outbound sanitiser untouched, so the inbox copy is the reviewed copy', () => {
     const clean = sanitizeEmailHtml(html, OUTBOUND);
     expect(clean.removed).toEqual([]);
-    expect(clean.html).toContain(brandLogoUrl());
+    expect(clean.html).toContain('Rank</span>AI');
   });
 
   it('escapes every field, so a name cannot become markup on the public page', () => {
@@ -75,6 +77,15 @@ describe('certificateHtml', () => {
     expect(hostile).not.toMatch(/<img[^>]*onerror/i);
     expect(hostile).not.toContain('<svg');
     expect(hostile).toContain('&lt;script&gt;');
+  });
+
+  it('prints skills, and says when it was amended', () => {
+    const h = certificateHtml({ ...cert, skills: ['Python', '<b>SQL</b>'], amendedAt: '2026-11-08T10:00:00Z' });
+    expect(h).toContain('Skills demonstrated');
+    expect(h).toContain('Python');
+    expect(h).toContain('&lt;b&gt;SQL');
+    expect(h).toContain('Amended on 8 November 2026');
+    expect(sanitizeEmailHtml(h, OUTBOUND).removed).toEqual([]);
   });
 
   it('marks a revoked certificate on its face', () => {
@@ -144,7 +155,7 @@ describe('promotion letter', () => {
     expect(html).toContain('I1 to E1');
     expect(html).toContain('1 December 2026');
     expect(html).toContain('PRO-2026-ABC123');
-    expect(html).toContain(brandLogoUrl());
+    expect(html).not.toContain('icon-192');
     expect(sanitizeEmailHtml(html, OUTBOUND).removed).toEqual([]);
   });
 
@@ -188,7 +199,7 @@ describe('offer summary', () => {
 describe('letterhead', () => {
   it('passes the sanitiser and carries the mark', () => {
     const html = letterheadHtml({ refNumber: 'X-1', issueDate: '2026-11-06' });
-    expect(html).toContain(brandLogoUrl());
+    expect(html).not.toContain('icon-192');
     expect(sanitizeEmailHtml(html, OUTBOUND).removed).toEqual([]);
   });
 });

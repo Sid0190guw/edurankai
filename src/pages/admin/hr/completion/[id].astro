@@ -36,7 +36,8 @@ import {
 // somebody's engagement, on the document they hand to a university.
 import { civilToday } from '@/lib/page-safety';
 // The letterhead every HR document now carries: the mark, the wordmark and the address.
-import { letterheadHtml } from '@/lib/hr/brand-doc';
+import { letterheadHtml, longDate } from '@/lib/hr/brand-doc';
+import { sanitizeEmailHtml, ORIGIN } from '@/lib/mailsec/html';
 
 const user = Astro.locals.user!;
 // This gate used to read `can(user, 'hr.edit') && can(user, 'employees.edit')`. Neither name exists
@@ -163,6 +164,26 @@ const unmeasurableWeeks = credit.weeks.filter(
 // the credit model at all. A salaried engagement is not measured by an intern's week, and printing
 // "0 credits" for one would be a claim about somebody rather than an absence of a measurement.
 const creditsPrintable = credit.ok && credit.applicable;
+
+// SAVED EDITS. The letter below is computed, and HR can now edit its wording on the screen; each
+// save is an audit entry holding the edited text and the editor's note (POST
+// /api/admin/hr/document-edit). The newest edit opens by default; ?measured=1 shows the computed one.
+let edits: any[] = [];
+try {
+  edits = rows(await db.execute(sql`
+    SELECT a.diff, a.created_at FROM audit_log a
+     WHERE a.entity = 'hr_completion_letter' AND a.entity_id = ${id} AND a.action = 'hr.document.edited'
+     ORDER BY a.created_at DESC LIMIT 20`));
+} catch (e: any) {
+  console.error('[admin/hr/completion] edits', e?.cause?.message || e?.message);
+}
+const showMeasured = new URL(Astro.request.url).searchParams.get('measured') === '1';
+const latestEdit = edits[0] && edits[0].diff && edits[0].diff.html ? edits[0] : null;
+const savedHtml = !showMeasured && latestEdit ? sanitizeEmailHtml(String(latestEdit.diff.html), ORIGIN).html : '';
+const fmtWhen = (d: any) => { try { return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch { return ''; } };
+// ATTENDANCE IS STATED ONLY WHEN IT WAS MARKED. A register nobody filled in read "attendance of 0%"
+// beside measured hours, which says the person never came in. No marked days means no figure.
+const attendanceKnown = summary.daysPresent > 0;
 
 const card = 'border:1px solid #2a2a30;border-radius:12px;background:#0f0f14;padding:14px;';
 const stat = (label: string, value: string, tone = '#e8e8ee') =>
@@ -371,49 +392,50 @@ const stat = (label: string, value: string, tone = '#e8e8ee') =>
         </p>
       </div>
     ) : (
-    <div style="border:1px solid #2a2a30;border-radius:12px;background:#fff;color:#111;padding:26px;" id="letter">
+    <div>
+    {latestEdit && (
+      <div style="padding:10px 14px;border-radius:8px;margin-bottom:10px;border:1px solid rgba(251,191,36,0.35);background:rgba(251,191,36,0.08);color:#fde68a;font-size:12.5px;line-height:1.55;">
+        {showMeasured
+          ? <span>Showing the measured letter. <a href={'/admin/hr/completion/' + id} style="color:#fde68a;">Show the edited version</a> (saved {fmtWhen(latestEdit.created_at)} by {latestEdit.diff.byName}).</span>
+          : <span>This letter was edited on {fmtWhen(latestEdit.created_at)} by {latestEdit.diff.byName}: "{latestEdit.diff.note}". <a href={'/admin/hr/completion/' + id + '?measured=1'} style="color:#fde68a;">Show the measured version</a>.</span>}
+      </div>
+    )}
+    <div style="border:1px solid #2a2a30;border-radius:12px;background:#fff;color:#111;padding:26px;" id="letter" data-employee={id}>
+      {savedHtml ? <Fragment set:html={savedHtml} /> : (
+      <>
       <Fragment set:html={letterheadHtml({ issueDate: letterEndDate })} />
       <p style="font-family:'Geist Mono',monospace;font-size:10px;letter-spacing:0.16em;text-transform:uppercase;color:#a33;margin:18px 0 14px;">Certificate of completion</p>
       <p style="font-size:15px;line-height:1.75;margin:0 0 12px;">
         This is to certify that <strong>{emp.full_name}</strong> served as
         <strong> {emp.designation}</strong> at EduRankAI from
-        <strong> {String(emp.joining_date || '').slice(0, 10) || '—'}</strong> to
-        <strong> {letterEndDate}</strong>.
+        <strong> {longDate(String(emp.joining_date || '').slice(0, 10)) || '-'}</strong> to
+        <strong> {longDate(letterEndDate)}</strong>.
       </p>
-      <p style="font-size:15px;line-height:1.75;margin:0 0 12px;">
-        Over this engagement they recorded <strong>{figures.creditHours} credit-hours</strong> of
-        measured work at an attendance of <strong>{figures.attendancePct}%</strong>
-        {terms.kind === 'part-time' ? ' on an agreed part-time load of ' + contractedWeekly + ' hours per week' : ''}.
-        {figures.reviewCount > 0 && figures.averageRating != null
-          ? ` Across ${figures.reviewCount} recorded reviews their average rating was ${figures.averageRating} out of 5.`
-          : ''}
-      </p>
-
-      {/* CREDITS, WITH THEIR PROVENANCE, AND THE PENDING ONES STATED SEPARATELY. Never one number.
-          A completion letter that overstates credits to an accredited partner is the worst possible
-          place for this to be wrong, so a week nobody has decided is named as undecided rather than
-          rolled into the total or quietly dropped. */}
-      {creditsPrintable ? (
+      {(figures.creditHours > 0 || attendanceKnown || (figures.reviewCount > 0 && figures.averageRating != null)) && (
         <p style="font-size:15px;line-height:1.75;margin:0 0 12px;">
-          They completed <strong>{creditsLabel(creditsTotal)}</strong>, where one credit is one
-          completed week: the hours that week required, measured from recorded check-in and check-out
-          net of breaks, with the daily reports filed and the work due that week done. Approved leave
-          and holidays reduced the hours required for the weeks they fell in.
-          {creditPosition.approvedByPerson > 0
-            ? ' ' + creditPosition.approvedByPerson + ' of those weeks were credited by a named person with a written reason, recorded against the week.'
-            : ''}
-          {creditPosition.pending > 0
-            ? ' A further ' + creditPosition.pending + ' week(s) are waiting on a decision and are NOT included in that figure.'
-            : ''}
-          {unmeasurableWeeks.length > 0
-            ? ' ' + unmeasurableWeeks.length + ' week(s) contain a day that was clocked in and never clocked out, so those hours are unknown rather than zero.'
+          {figures.creditHours > 0 ? 'Over this engagement they recorded ' : ''}
+          {figures.creditHours > 0 && <strong>{figures.creditHours} hours</strong>}
+          {figures.creditHours > 0 ? ' of measured work' : ''}
+          {figures.creditHours > 0 && attendanceKnown ? ', with an attendance of ' : ''}
+          {figures.creditHours > 0 && attendanceKnown && <strong>{figures.attendancePct}%</strong>}
+          {figures.creditHours > 0 && terms.kind === 'part-time' ? ' on an agreed part-time load of ' + contractedWeekly + ' hours per week' : ''}
+          {figures.creditHours > 0 ? '.' : ''}
+          {figures.reviewCount > 0 && figures.averageRating != null
+            ? ' Across ' + figures.reviewCount + ' recorded reviews their average rating was ' + figures.averageRating + ' out of 5.'
             : ''}
         </p>
-      ) : (
+      )}
+
+      {/* CREDITS, WITH THEIR PROVENANCE, AND THE PENDING ONES STATED SEPARATELY. Never one number.
+          Printed only where the engagement is on the weekly credit model: for any other engagement
+          the explanation of why there are no credits is internal and stays in the banner above. */}
+      {creditsPrintable && (
         <p style="font-size:15px;line-height:1.75;margin:0 0 12px;">
-          {credit.applicable
-            ? 'No weekly credit figure is stated: the weekly credit record could not be read for this engagement, and a count that was not measured will not be printed.'
-            : 'No weekly credit figure is stated. ' + (credit.notApplicableReason || '')}
+          They completed <strong>{creditsLabel(creditsTotal)}</strong>, where one credit is one
+          completed week of measured work with the week's reports filed and its work done.
+          {creditPosition.pending > 0
+            ? ' A further ' + creditPosition.pending + ' week(s) are awaiting a decision and are not included.'
+            : ''}
         </p>
       )}
       {figures.achievements.length > 0 && (
@@ -424,31 +446,114 @@ const stat = (label: string, value: string, tone = '#e8e8ee') =>
           </ul>
         </>
       )}
-      <p style="font-size:12.5px;color:#555;line-height:1.6;margin:16px 0 0;border-top:1px solid #eee;padding-top:12px;">
-        {figures.reason} Figures are computed from recorded attendance, approved leave and logged
-        reviews. A day marked present with no hours recorded against it contributes nothing, because
-        an attendance mark is not a measurement of time worked. One credit is one completed week.
+      <p style="font-size:14px;line-height:1.75;margin:18px 0 0;">We thank them for their contribution and wish them every success.</p>
+      <p style="font-family:Georgia,serif;font-style:italic;font-size:19px;margin:26px 0 0;">For EduRankAI</p>
+      <p style="font-size:12px;color:#6B635C;margin:4px 0 0;">People Operations</p>
+      <p style="font-size:11.5px;color:#777;line-height:1.6;margin:22px 0 0;border-top:1px solid #eee;padding-top:10px;">
+        Figures are computed from recorded check-in and check-out, approved leave and logged reviews.
         {' ' + CREDIT_SCOPE_SENTENCE}
       </p>
+      </>
+      )}
+    </div>
     </div>
     )}
 
     {figuresTrustworthy && (
-      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;align-items:center;">
         {/* THE CERTIFICATE THE PERSON KEEPS. This letter is the measured record; the certificate desk
             issues the framed, verifiable certificate with a serial and emails it, pre-filled from
             this employee record and the reviews above. */}
         <a href={'/admin/certificates?employee=' + encodeURIComponent(id)} style="background:#FF4F00;border:0;color:#fff;font-weight:700;font-size:13px;padding:10px 18px;border-radius:8px;cursor:pointer;text-decoration:none;">Issue and email the certificate</a>
-        <button type="button" onclick="window.print()" style="background:#1a1a22;border:1px solid #2a2a30;color:#e8e8ee;font-weight:700;font-size:13px;padding:10px 18px;border-radius:8px;cursor:pointer;">Print / save as PDF</button>
-        <span style={`font-size:12px;padding:10px 0;color:${figures.eligible ? '#4ade80' : '#fbbf24'};`}>
-          {figures.eligible ? 'Requirement met.' : 'Requirement not yet met — issuing is your call.'}
+        {isHrDesk && <button type="button" id="editToggle" style="background:#1a1a22;border:1px solid #2a2a30;color:#e8e8ee;font-weight:700;font-size:13px;padding:10px 18px;border-radius:8px;cursor:pointer;">Edit the wording</button>}
+        <button type="button" onclick="window.print()" style="background:#1a1a22;border:1px solid #2a2a30;color:#e8e8ee;font-weight:700;font-size:13px;padding:10px 18px;border-radius:8px;cursor:pointer;">Print / save as PDF (A4)</button>
+        <span style={'font-size:12px;padding:10px 0;color:' + (figures.eligible ? '#4ade80' : '#fbbf24') + ';'}>
+          {figures.eligible ? 'Requirement met.' : 'Requirement not yet met - issuing is your call.'}
         </span>
       </div>
     )}
+
+    {figuresTrustworthy && isHrDesk && (
+      <div id="editPanel" hidden style={card + 'margin-top:12px;'}>
+        <p style="font-size:13px;font-weight:600;margin:0 0 6px;">Editing the letter</p>
+        <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;line-height:1.55;">Click into the letter above and change any wording. When you save, the edited letter and your note are kept on the record, and the edited version opens by default from then on. The measured original is always one click away.</p>
+        <textarea id="editNote" rows="2" maxlength="1000" placeholder="What you changed and why (required)" style="width:100%;background:#12121a;border:1px solid #2a2a30;color:#e8e8ee;padding:8px;border-radius:6px;font-size:12.5px;box-sizing:border-box;"></textarea>
+        <div style="display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap;">
+          <button type="button" id="editSave" style="background:#FF4F00;border:0;color:#fff;font-weight:700;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;">Save the edited letter</button>
+          <button type="button" id="editCancel" style="background:transparent;border:1px solid #2a2a30;color:#e8e8ee;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;">Discard changes</button>
+          <span id="editMsg" role="status" style="font-size:12.5px;color:#e8e8ee;"></span>
+        </div>
+      </div>
+    )}
+
+    {edits.length > 0 && (
+      <details style={card + 'margin-top:12px;'}>
+        <summary style="cursor:pointer;font-size:13px;font-weight:600;">Edit history ({edits.length})</summary>
+        {edits.map((e: any) => (
+          <div style="border-top:1px solid #1a1a22;padding:8px 0;">
+            <p style="font-size:11px;color:#8a8a94;margin:0;">{fmtWhen(e.created_at)} · {e.diff && e.diff.byName}</p>
+            <p style="font-size:12.5px;color:#e8e8ee;margin:3px 0 0;">{e.diff && e.diff.note}</p>
+          </div>
+        ))}
+      </details>
+    )}
+
     <p style="font-size:11.5px;color:#8a8a94;margin:10px 0 0;">
       {figuresTrustworthy
-        ? days.length + ' attendance day(s) counted. Nothing on the letter is typed by hand.'
+        ? days.length + ' attendance day(s) counted. The figures are measured; any wording edit is recorded above.'
         : 'No attendance day was counted, because the attendance ledger could not be read.'}
     </p>
   </div>
+
+  <style is:global>
+    /* A4, the letter alone. */
+    @media print {
+      @page { size: A4 portrait; margin: 16mm; }
+      body * { visibility: hidden !important; }
+      #letter, #letter * { visibility: visible !important; }
+      #letter { position: absolute; left: 0; top: 0; width: 100%; border: 0 !important; padding: 0 !important; }
+      * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    }
+    #letter[contenteditable="true"] { outline: 2px dashed #FF4F00; outline-offset: 4px; }
+  </style>
+
+  <script is:inline>
+    (function () {
+      var letter = document.getElementById('letter');
+      var toggle = document.getElementById('editToggle');
+      var panel = document.getElementById('editPanel');
+      if (!letter || !toggle || !panel) return;
+      var note = document.getElementById('editNote');
+      var save = document.getElementById('editSave');
+      var cancel = document.getElementById('editCancel');
+      var msg = document.getElementById('editMsg');
+      var original = letter.innerHTML;
+      toggle.addEventListener('click', function () {
+        letter.setAttribute('contenteditable', 'true');
+        panel.hidden = false;
+        letter.focus();
+      });
+      cancel.addEventListener('click', function () {
+        letter.innerHTML = original;
+        letter.removeAttribute('contenteditable');
+        panel.hidden = true;
+        msg.textContent = '';
+      });
+      save.addEventListener('click', function () {
+        var n = (note.value || '').trim();
+        if (n.length < 5) { msg.textContent = 'Write what you changed and why first.'; note.focus(); return; }
+        save.disabled = true; msg.textContent = 'Saving...';
+        fetch('/api/admin/hr/document-edit', {
+          method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ entity: 'hr_completion_letter', entityId: letter.getAttribute('data-employee'), note: n, html: letter.innerHTML })
+        }).then(function (r) { return r.json().catch(function () { return { ok: false, error: 'The answer could not be read.' }; }); })
+          .then(function (j) {
+            save.disabled = false;
+            if (j && j.ok) { msg.textContent = j.message || 'Saved.'; setTimeout(function () { location.href = location.pathname; }, 900); }
+            else msg.textContent = (j && j.error) || 'The edit was not saved.';
+          })
+          .catch(function () { save.disabled = false; msg.textContent = 'Could not reach the server. Nothing was saved; your edits are still on screen.'; });
+      });
+    })();
+  </script>
 </AdminLayout>

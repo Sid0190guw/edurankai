@@ -1,0 +1,302 @@
+---
+// /admin/hr/completions - INTERNSHIPS AND CONTRACTS COMING TO AN END, AND WHAT HAPPENS TO EACH.
+//
+// The completion engine (src/lib/hr/completion-engine.ts) runs daily: a week before the end it asks
+// the lead to review and write a recommendation, and on the end date it measures the engagement and
+// either issues the certificate itself or holds it here with the reason. THIS PAGE IS THE MANUAL
+// SYSTEM OVER THE SAME ACTIONS: set an end date, ask the lead now, evaluate now, issue, hold, reopen,
+// or run the whole engine now. Nothing the engine can do is unavailable by hand.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection, can } from '@/lib/auth/permissions';
+import {
+  listEngagements, evaluateEngagement, notifyLead, issueCompletionCertificate, holdCompletion,
+  reopenCompletion, setEndDate, runEngine, type Engagement, type EvaluationDetail, type RunLine,
+} from '@/lib/hr/completion-engine';
+import { NOTIFY_LEAD_DAYS_BEFORE } from '@/lib/hr/completion-rules';
+import { longDate } from '@/lib/hr/brand-doc';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'hr', 'edit'))) return Astro.redirect('/admin');
+
+// CONSTANTS FIRST. `const` is not hoisted, and the POST handler reads these.
+const PAGE = '/admin/hr/completions';
+const mayWrite = can(user as any, 'employee.manage');
+const isUuid = (v: unknown) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || ''));
+const actorName = user.name || user.email || 'People desk';
+
+let runLines: RunLine[] = [];
+let runWasDry = false;
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const employeeId = String(fd.get('employee_id') || '');
+  let flash = '';
+  try {
+    if (!mayWrite) {
+      flash = 'Acting on a completion needs the employee-records permission.';
+    } else if (action === 'run' || action === 'preview') {
+      runWasDry = action === 'preview';
+      const r = await runEngine({ dryRun: runWasDry, actorUserId: user.id });
+      if (!r.ok) flash = r.error || 'The engine did not run.';
+      else runLines = r.lines;
+      if (!runLines.length && r.ok) flash = 'Nothing is due today: no lead to ask and no engagement at its end.';
+    } else if (!isUuid(employeeId)) {
+      flash = 'Choose a person first.';
+    } else {
+      const list = await listEngagements({ employeeId });
+      const e: Engagement | undefined = list.ready ? list.value[0] : undefined;
+      if (!list.ready) flash = list.error;
+      else if (!e) flash = 'That person is not on a fixed-term engagement the engine watches. Set an end date to add them.';
+      if (action === 'end_date') {
+        const d = String(fd.get('end_date') || '').trim();
+        await setEndDate(employeeId, /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null, user.id);
+        flash = d ? 'End date set to ' + longDate(d) + '.' : 'End date cleared; it is worked out from the offer again.';
+      } else if (e && action === 'notify') {
+        flash = (await notifyLead(e, user.id)).message;
+      } else if (e && action === 'issue') {
+        const detail = await evaluateEngagement(e);
+        const note = String(fd.get('note') || '').trim();
+        if (!detail.evaluation.allPassed && note.length < 5) {
+          flash = 'Not every criterion passed (' + detail.evaluation.blocking.map((b) => b.label).join(', ') + '). Write why you are issuing it anyway; the note is kept with the decision.';
+        } else {
+          const r = await issueCompletionCertificate(e, detail, { userId: user.id, name: actorName, auto: false, note: note || undefined });
+          flash = r.message;
+        }
+      } else if (e && action === 'hold') {
+        const note = String(fd.get('note') || '').trim();
+        if (note.length < 5) flash = 'Write why it is being held. The person and their lead will ask.';
+        else { await holdCompletion(e, null, { userId: user.id, note }); flash = 'Held. Nothing was issued.'; }
+      } else if (e && action === 'reopen') {
+        await reopenCompletion(employeeId, user.id);
+        flash = 'Reopened. The engine will evaluate it again on its next pass, or press Evaluate.';
+      }
+    }
+  } catch (err: any) {
+    console.error('[admin/hr/completions] POST', err?.cause?.message || err?.message);
+    flash = 'Nothing was changed: ' + String(err?.cause?.message || err?.message || 'unknown error');
+  }
+  if (!runLines.length) {
+    return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 400)) + (isUuid(employeeId) ? '&employee=' + employeeId : ''));
+  }
+}
+
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const focusId = url.searchParams.get('employee') || '';
+const list = await listEngagements();
+const engagements: Engagement[] = list.ready ? list.value : [];
+const focus = isUuid(focusId) ? engagements.find((x) => x.employeeId === focusId) || null : null;
+
+// The live evaluation, only for the one person in focus (it reads their whole ledger).
+let detail: EvaluationDetail | null = null;
+let evalError = '';
+if (focus) {
+  try { detail = await evaluateEngagement(focus); } catch (e: any) { evalError = String(e?.cause?.message || e?.message || 'unknown error'); }
+}
+
+const endingSoon = engagements.filter((x) => x.daysLeft != null && x.daysLeft >= 0 && x.daysLeft <= 30 && !x.outcome).length;
+const atEnd = engagements.filter((x) => x.daysLeft != null && x.daysLeft <= 0 && !x.outcome).length;
+const issued = engagements.filter((x) => x.outcome === 'certificate_issued').length;
+const held = engagements.filter((x) => x.outcome === 'held').length;
+
+function daysWords(d: number | null): string {
+  if (d == null) return 'No end date';
+  if (d > 1) return d + ' days left';
+  if (d === 1) return 'Ends tomorrow';
+  if (d === 0) return 'Ends today';
+  return 'Ended ' + Math.abs(d) + ' day(s) ago';
+}
+function outcomeWords(e: Engagement): string {
+  if (e.outcome === 'certificate_issued') return 'Certificate issued';
+  if (e.outcome === 'held') return 'Held for a decision';
+  if (e.leadDecision === 'approved') return 'Lead approved';
+  if (e.leadDecision === 'held') return 'Lead held';
+  if (e.leadNotifiedAt) return 'Lead asked';
+  return 'Waiting';
+}
+function tone(state: string): string {
+  if (state === 'pass') return '#86efac';
+  if (state === 'fail') return '#fca5a5';
+  if (state === 'unknown') return '#fde68a';
+  return '#9aa6b6';
+}
+---
+<AdminLayout title="Completions" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR · Lifecycle · Completions</p>
+  <h1>Internship and contract completions</h1>
+  <p class="lede">
+    Every day the engine looks at fixed-term engagements. {NOTIFY_LEAD_DAYS_BEFORE} days before the end it
+    sends the person's lead a notification to review them, approve or hold, and write their letter of
+    recommendation. On the end date it measures hours, reviews, attendance, leave and weekly credits:
+    if every criterion passes it issues and emails the completion certificate; if not, it holds it here
+    with the reason. Everything below can also be done by hand.
+  </p>
+
+  {msg && <div class="flash">{msg}</div>}
+  {!list.ready && <div class="flash warn">{list.error}</div>}
+
+  {runLines.length > 0 && (
+    <section class="panel">
+      <p class="pn">{runWasDry ? 'Preview: what the engine would do now' : 'The engine ran'}</p>
+      {runLines.map((l) => (
+        <p class="runline"><a href={PAGE + '?employee=' + l.employeeId}>{l.name}</a> · {l.step.replace('_', ' ')} · {l.result}</p>
+      ))}
+    </section>
+  )}
+
+  {list.ready && (
+    <div class="tiles">
+      <div class="tile"><span class="tv">{endingSoon}</span><span class="tl">Ending in 30 days</span></div>
+      <div class="tile"><span class="tv">{atEnd}</span><span class="tl">At or past the end</span></div>
+      <div class="tile"><span class="tv">{issued}</span><span class="tl">Certificates issued</span></div>
+      <div class="tile"><span class="tv">{held}</span><span class="tl">Held for a decision</span></div>
+    </div>
+  )}
+
+  {list.ready && mayWrite && (
+    <div class="runbar">
+      <form method="POST"><input type="hidden" name="action" value="preview" /><button class="btn ghost" type="submit">Preview the engine</button></form>
+      <form method="POST"><input type="hidden" name="action" value="run" /><button class="btn" type="submit">Run the engine now</button></form>
+    </div>
+  )}
+
+  {focus && (
+    <section class="panel focus" id="focus">
+      <div class="fh">
+        <div>
+          <p class="pn">{focus.fullName}</p>
+          <p class="sub">{focus.designation}{focus.employmentType ? ' · ' + focus.employmentType : ''}</p>
+          <p class="sub">{focus.startDate ? longDate(focus.startDate) : 'Start not recorded'} to {focus.endDate ? longDate(focus.endDate) : 'no end date'}{focus.endSource === 'offer' ? ' (from the offer: ' + focus.durationText + ')' : focus.endSource === 'override' ? ' (set by hand)' : ''} · {daysWords(focus.daysLeft)}</p>
+        </div>
+        <a class="btn ghost" href={PAGE}>Close</a>
+      </div>
+
+      {evalError && <div class="flash warn">The engagement could not be evaluated: {evalError}</div>}
+      {detail && (
+        <div class="crit">
+          <p class={'verdict ' + (detail.evaluation.allPassed ? 'ok' : 'hold')}>
+            {detail.evaluation.allPassed ? 'Every criterion passes: the certificate can be issued.' : 'Not every criterion passes: a person decides.'}
+          </p>
+          {detail.evaluation.criteria.map((c) => (
+            <div class="crow">
+              <span class="cdot" style={'background:' + tone(c.state) + ';'}></span>
+              <span class="cl">{c.label}</span>
+              <span class="cd">{c.detail}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {(focus.leadDecision || focus.leadNote || focus.lorSerial) && (
+        <p class="sub">Lead: {focus.leadDecision || 'no decision'}{focus.leadNote ? ' - "' + focus.leadNote + '"' : ''}{focus.lorSerial ? ' · ' : ''}{focus.lorSerial && <a href={'/admin/certificates?preview=' + focus.lorSerial}>Letter of recommendation {focus.lorSerial}</a>}</p>
+      )}
+      {focus.outcome && (
+        <p class="sub">Outcome: {outcomeWords(focus)}{focus.outcomeNote ? ' - ' + focus.outcomeNote : ''}{focus.certificateSerial ? ' · ' : ''}{focus.certificateSerial && <a href={'/admin/certificates?preview=' + focus.certificateSerial}>{focus.certificateSerial}</a>}</p>
+      )}
+
+      {mayWrite && (
+        <div class="acts">
+          <form method="POST" class="inline">
+            <input type="hidden" name="action" value="end_date" /><input type="hidden" name="employee_id" value={focus.employeeId} />
+            <input type="date" name="end_date" value={focus.endDate || ''} aria-label="End date" />
+            <button class="btn ghost" type="submit">Set end date</button>
+          </form>
+          <form method="POST" class="inline">
+            <input type="hidden" name="action" value="notify" /><input type="hidden" name="employee_id" value={focus.employeeId} />
+            <button class="btn ghost" type="submit">{focus.leadNotifiedAt ? 'Ask the lead again' : 'Ask the lead to review now'}</button>
+          </form>
+          {focus.outcome ? (
+            <form method="POST" class="inline">
+              <input type="hidden" name="action" value="reopen" /><input type="hidden" name="employee_id" value={focus.employeeId} />
+              <button class="btn ghost" type="submit">Reopen</button>
+            </form>
+          ) : (
+            <form method="POST" class="decide">
+              <input type="hidden" name="employee_id" value={focus.employeeId} />
+              <input type="text" name="note" maxlength="1000" placeholder={detail && !detail.evaluation.allPassed ? 'Why you are deciding against the criteria (required)' : 'Note (optional for issuing, required for holding)'} />
+              <div class="inline">
+                <button class="btn" type="submit" name="action" value="issue">Issue and email the certificate</button>
+                <button class="btn danger" type="submit" name="action" value="hold">Hold</button>
+              </div>
+            </form>
+          )}
+          <div class="links">
+            <a href={'/admin/hr/completion/' + focus.employeeId}>Completion letter</a>
+            <a href={'/admin/certificates?employee=' + focus.employeeId}>Certificate desk (edit before issuing)</a>
+            <a href="/admin/hr/recommendation">Recommendation letters</a>
+          </div>
+        </div>
+      )}
+    </section>
+  )}
+
+  {list.ready && (
+    <div class="stack">
+      {engagements.length === 0 && (
+        <div class="empty">No fixed-term engagement is being watched. People appear here when their employment type is an internship, apprenticeship or contract, when their offer letter states a duration, or when you set an end date.</div>
+      )}
+      {engagements.map((e) => (
+        <a class={'row' + (focus && focus.employeeId === e.employeeId ? ' on' : '')} href={PAGE + '?employee=' + e.employeeId + '#focus'}>
+          <div class="who">
+            <p class="name">{e.fullName}</p>
+            <p class="sub">{e.designation}{e.employmentType ? ' · ' + e.employmentType : ''}</p>
+          </div>
+          <p class="sub when">{e.endDate ? longDate(e.endDate) : '-'}<br />{daysWords(e.daysLeft)}</p>
+          <span class={'chip ' + (e.outcome === 'certificate_issued' ? 'ok' : e.outcome === 'held' ? 'warn' : '')}>{outcomeWords(e)}</span>
+        </a>
+      ))}
+    </div>
+  )}
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 78ch; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
+  .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 14px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 22px; color: #fff; font-weight: 700; }
+  .tl { font-size: 11px; color: #9aa6b6; }
+  .runbar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .panel { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+  .focus { border-color: rgba(255,79,0,0.4); }
+  .fh { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .pn { font-size: 15px; color: #fff; font-weight: 700; margin: 0 0 4px; }
+  .sub { font-size: 12px; color: #9aa6b6; margin: 3px 0 0; line-height: 1.5; }
+  .sub a, .runline a, .links a { color: #FF9A66; }
+  .runline { font-size: 12.5px; color: #d8d8de; margin: 6px 0 0; line-height: 1.5; }
+  .crit { margin: 14px 0; }
+  .verdict { font-size: 13.5px; font-weight: 700; margin: 0 0 8px; }
+  .verdict.ok { color: #86efac; }
+  .verdict.hold { color: #fde68a; }
+  .crow { display: grid; grid-template-columns: 12px 150px 1fr; gap: 10px; align-items: baseline; padding: 6px 0; border-bottom: 1px dashed #1a1a1f; }
+  .cdot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .cl { font-size: 12.5px; color: #fff; font-weight: 600; }
+  .cd { font-size: 12.5px; color: #c8c8d0; line-height: 1.5; }
+  @media (max-width: 640px) { .crow { grid-template-columns: 12px 1fr; } .cd { grid-column: 2; } }
+  .acts { display: grid; gap: 10px; margin-top: 14px; }
+  .inline { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .decide { display: grid; gap: 8px; }
+  .links { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12.5px; }
+  input { background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 10px 11px; border-radius: 8px; font-size: 13px; font-family: inherit; min-height: 42px; box-sizing: border-box; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 0 16px; min-height: 42px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #d8d8de; }
+  .btn.danger { background: #7f1d1d; }
+  .stack { display: flex; flex-direction: column; gap: 8px; }
+  .row { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: grid; grid-template-columns: 1fr 150px 170px; gap: 12px; align-items: center; text-decoration: none; }
+  .row.on { border-color: rgba(255,79,0,0.5); }
+  @media (max-width: 720px) { .row { grid-template-columns: 1fr; } }
+  .name { font-size: 14px; color: #fff; font-weight: 700; margin: 0; }
+  .when { margin: 0; }
+  .chip { font-size: 10.5px; font-weight: 700; padding: 5px 10px; border-radius: 100px; border: 1px solid #2a2a2f; color: #9aa6b6; text-transform: uppercase; letter-spacing: 0.05em; justify-self: start; }
+  .chip.ok { color: #86efac; border-color: rgba(134,239,172,0.4); }
+  .chip.warn { color: #fde68a; border-color: rgba(253,230,138,0.4); }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 30px 18px; text-align: center; color: #8a8a94; font-size: 13px; line-height: 1.6; }
+</style>
+</AdminLayout>

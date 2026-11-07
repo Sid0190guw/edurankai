@@ -152,6 +152,115 @@ export async function getUniversalForAdmin(serial: string) {
   return r[0] || null;
 }
 
+/** The fields an issued certificate may be corrected in. The serial, kind and issue date never change. */
+export interface CertificateEdit {
+  recipientName?: string;
+  recipientEmail?: string | null;
+  title?: string;
+  body?: string | null;
+  achievement?: string | null;
+  issuedByName?: string | null;
+  issuedByDesignation?: string | null;
+  validUntil?: string | null;
+  metadata?: {
+    heading?: string; department?: string; fromDate?: string; toDate?: string;
+    achievements?: string[]; skills?: string[]; measureLine?: string;
+  };
+}
+
+export interface CertificateRevision {
+  at: string;
+  byUserId: string | null;
+  byName: string;
+  note: string;
+  /** field -> [before, after], as text, for the fields that actually changed. */
+  changed: Record<string, [string, string]>;
+}
+
+const asText = (v: unknown) => (Array.isArray(v) ? v.join(' | ') : String(v ?? ''));
+
+/**
+ * CORRECT A CERTIFICATE THAT HAS ALREADY BEEN ISSUED, AND SAY SO.
+ *
+ * A certificate is a record somebody relies on, so it is corrected rather than reissued: the serial,
+ * the verification link and the issue date stay the same, every field that changes is written into
+ * metadata.revisions with who changed it, when, what it said before and the reason they gave. The
+ * public verification page reads that list and states the certificate was amended and when. Nothing
+ * is overwritten silently, and a correction with no reason is refused.
+ */
+export async function amendUniversalCertificate(
+  serial: string, edit: CertificateEdit, note: string, by: { userId: string | null; name: string },
+): Promise<{ ok: boolean; changed?: string[]; error?: string }> {
+  const reason = String(note || '').trim();
+  if (reason.length < 5) return { ok: false, error: 'Write what you changed and why. It is kept with the certificate.' };
+  const row = await getUniversalForAdmin(serial);
+  if (!row) return { ok: false, error: 'No certificate has that serial.' };
+  if (row.revoked) return { ok: false, error: 'That certificate is revoked. Issue a new one instead of correcting a withdrawn one.' };
+
+  let meta: any = row.metadata;
+  if (typeof meta === 'string') { try { meta = JSON.parse(meta); } catch { meta = {}; } }
+  if (!meta || typeof meta !== 'object') meta = {};
+
+  const changed: Record<string, [string, string]> = {};
+  const next: any = {
+    recipient_name: row.recipient_name, recipient_email: row.recipient_email, title: row.title, body: row.body,
+    achievement: row.achievement, issued_by_name: row.issued_by_name, issued_by_designation: row.issued_by_designation,
+    valid_until: row.valid_until ? String(row.valid_until instanceof Date ? row.valid_until.toISOString() : row.valid_until).slice(0, 10) : null,
+  };
+  const set = (col: string, label: string, v: unknown, max = 5000) => {
+    if (v === undefined) return;
+    const val = v === null ? null : String(v).trim().slice(0, max) || null;
+    if (asText(next[col]) !== asText(val)) { changed[label] = [asText(next[col]), asText(val)]; next[col] = val; }
+  };
+  set('recipient_name', 'Name', edit.recipientName, 200);
+  set('recipient_email', 'Email', edit.recipientEmail, 200);
+  set('title', 'Programme', edit.title, 300);
+  set('body', 'Citation', edit.body);
+  set('achievement', 'Distinction', edit.achievement, 1000);
+  set('issued_by_name', 'Signed by', edit.issuedByName, 200);
+  set('issued_by_designation', 'Signatory title', edit.issuedByDesignation, 200);
+  set('valid_until', 'Valid until', edit.validUntil, 10);
+  if (!next.recipient_name || !next.title) return { ok: false, error: 'A certificate needs a name and a programme.' };
+
+  const m = edit.metadata || {};
+  const metaKeys: Array<[keyof NonNullable<CertificateEdit['metadata']>, string]> = [
+    ['heading', 'Heading'], ['department', 'Team'], ['fromDate', 'From'], ['toDate', 'To'],
+    ['achievements', 'Key contributions'], ['skills', 'Skills'], ['measureLine', 'Measured line'],
+  ];
+  for (const [k, label] of metaKeys) {
+    if (m[k] === undefined) continue;
+    const v = Array.isArray(m[k]) ? (m[k] as string[]).map((x) => String(x).trim()).filter(Boolean).slice(0, 12) : String(m[k] ?? '').trim();
+    if (asText(meta[k]) !== asText(v)) { changed[label] = [asText(meta[k]), asText(v)]; meta[k] = v; }
+  }
+
+  const labels = Object.keys(changed);
+  if (!labels.length) return { ok: false, error: 'Nothing was different from what the certificate already says, so nothing was changed.' };
+
+  const revision: CertificateRevision = {
+    at: new Date().toISOString(), byUserId: by.userId, byName: by.name || 'People desk', note: reason.slice(0, 1000), changed,
+  };
+  meta.revisions = (Array.isArray(meta.revisions) ? meta.revisions : []).concat([revision]).slice(-50);
+
+  await (await database()).execute(sql`
+    UPDATE universal_certificates SET
+      recipient_name = ${next.recipient_name}, recipient_email = ${next.recipient_email}, title = ${next.title},
+      body = ${next.body}, achievement = ${next.achievement}, issued_by_name = ${next.issued_by_name},
+      issued_by_designation = ${next.issued_by_designation}, valid_until = ${next.valid_until}::date,
+      metadata = ${JSON.stringify(meta)}::jsonb, updated_at = NOW()
+    WHERE serial = ${serial}`);
+  return { ok: true, changed: labels };
+}
+
+/** The most recent live certificate of a kind for one employee, if any. */
+export async function universalForEmployee(employeeId: string, kind: string) {
+  await ensureUniversalCertSchema();
+  const r = rows(await (await database()).execute(sql`
+    SELECT * FROM universal_certificates
+     WHERE recipient_employee_id = ${employeeId}::uuid AND kind = ${kind} AND revoked = false
+     ORDER BY created_at DESC LIMIT 1`));
+  return r[0] || null;
+}
+
 export async function listUniversal(opts: { kind?: string; limit?: number; q?: string } = {}) {
   await ensureUniversalCertSchema();
   const limit = Math.min(500, Math.max(10, opts.limit || 100));
