@@ -109,6 +109,9 @@ export const BOOTSTRAP_MODULE_LIST: BootstrapModule[] = [
   // EMPLOYEE ID CARDS. One table, no REFERENCES, so no order dependency. Read by /portal/employee/id-card,
   // /admin/hr/id-cards and the public /verify/id/<token>; created by nothing else in production.
   { name: 'hr-id-cards', run: async () => (await import('@/lib/hr/id-card')).ensureIdCardSchema() },
+  // The completion engine's one state table (no REFERENCES). Read by /admin/hr/completions, the
+  // lead's review page and the daily /api/cron/engagement-completion.
+  { name: 'hr-engagement-completions', run: async () => (await import('@/lib/hr/completion-engine')).ensureCompletionSchema() },
   // These two have no exported ensure; a harmless READ triggers the same internal bootstrap.
   { name: 'error-log', run: async () => (await import('@/lib/logger')).recentErrors(1) },
   { name: 'job-queue', run: async () => (await import('@/lib/job-queue')).claimBatch(0) },

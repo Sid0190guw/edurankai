@@ -425,6 +425,8 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       { id: 'hr-promotions',  label: 'Designation changes', href: '/admin/hr/promotions',        icon: 'users',    section: 'hr' },
       // Signed ID cards: issue, print, revoke. Verification itself is public at /verify/id/<code>.
       { id: 'hr-id-cards',    label: 'ID cards',        href: '/admin/hr/id-cards',              icon: 'shield',   section: 'hr' },
+      // Internships and contracts at their end: lead review, automatic certificate, manual override.
+      { id: 'hr-completions', label: 'Completions',     href: '/admin/hr/completions',           icon: 'shield',   section: 'hr' },
       // /admin/hr/separations redirects here — one console over one hr_separations table.
       { id: 'hr-separations', label: 'Separation and exit', href: '/admin/hr/separation',        icon: 'inbox',    section: 'hr' },
       // FULL AND FINAL SETTLEMENT. A surface BESIDE the separation console rather than inside it:

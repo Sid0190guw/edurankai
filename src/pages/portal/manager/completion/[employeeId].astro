@@ -1,0 +1,179 @@
+---
+// /portal/manager/completion/<employeeId> - THE LEAD'S REVIEW AT THE END OF AN ENGAGEMENT.
+//
+// The completion engine sends the lead here a week before an internship or contract ends. The lead
+// sees what was measured, approves or holds the completion, and writes the letter of
+// recommendation. The recommendation becomes a verifiable credential (kind 'lor', with its own serial
+// and public page) and is emailed to the person; it can be corrected later from /admin/certificates,
+// with the change recorded.
+//
+// WHO MAY OPEN IT: the person's reporting manager (resolved from the org graph, falling back to the
+// legacy column only on an empty graph - userIsReportingManagerCompat), or the People desk. Asked on
+// the server for the render AND again for the POST.
+import EmployeeShell from '@/components/workforce/EmployeeShell.astro';
+import { can } from '@/lib/auth/permissions';
+import { userIsReportingManagerCompat } from '@/lib/org-graph';
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  listEngagements, evaluateEngagement, recordLeadDecision, runEngine, type Engagement, type EvaluationDetail,
+} from '@/lib/hr/completion-engine';
+import { issueUniversalCertificate, getUniversalForAdmin } from '@/lib/universal-certificates';
+import { emailUniversalCertificate } from '@/lib/hr/certificate-mail';
+import { longDate } from '@/lib/hr/brand-doc';
+
+// Declared before the POST handler that reads them.
+const isUuid = (v: unknown) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || ''));
+const LOR_NOTE = '<p>Dear {{name}},</p><p>{{signatory}} has written you a letter of recommendation for your work as <strong>{{role}}</strong>. It is below, and it can be verified at the link underneath it.</p><p>EduRankAI</p>';
+
+const user = Astro.locals.user;
+const employeeId = String(Astro.params.employeeId || '');
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/manager/completion/' + employeeId));
+if (!isUuid(employeeId)) return Astro.redirect('/portal/employee');
+
+const isHr = can(user as any, 'employee.manage');
+let isLead = false;
+try { isLead = (await userIsReportingManagerCompat(String(user.id), employeeId)).value; } catch (e: any) {
+  console.error('[portal/manager/completion] lead check', e?.cause?.message || e?.message);
+}
+const allowed = isHr || isLead;
+
+const list = allowed ? await listEngagements({ employeeId }) : null;
+const eng: Engagement | null = list && list.ready ? list.value[0] || null : null;
+
+let msg = '';
+let msgOk = true;
+if (Astro.request.method === 'POST' && allowed && eng) {
+  const fd = await Astro.request.formData();
+  const decision = String(fd.get('decision') || '') === 'held' ? 'held' : 'approved';
+  const note = String(fd.get('note') || '').trim().slice(0, 1000);
+  const lor = String(fd.get('lor') || '').trim().slice(0, 6000);
+  const signerTitle = String(fd.get('signer_title') || '').trim().slice(0, 200);
+  try {
+    if (decision === 'held' && note.length < 5) {
+      msg = 'Write why you are holding it - the People desk decides next, and needs your reason.'; msgOk = false;
+    } else {
+      let lorSerial: string | null = null;
+      let lorMail = '';
+      if (decision === 'approved' && lor.length >= 40) {
+        const r = await issueUniversalCertificate({
+          kind: 'lor', recipientName: eng.fullName, recipientEmail: eng.email || undefined, recipientEmployeeId: eng.employeeId,
+          title: eng.designation || 'their engagement at EduRankAI', body: lor,
+          issuedByUserId: user.id, issuedByName: user.name || user.email || 'EduRankAI', issuedByDesignation: signerTitle || undefined,
+          metadata: { fromDate: eng.startDate, toDate: eng.endDate || '', heading: 'Letter of Recommendation' },
+        });
+        if (r.ok && r.serial) {
+          lorSerial = String(r.serial);
+          const row = await getUniversalForAdmin(lorSerial);
+          if (eng.email && row) lorMail = ' ' + (await emailUniversalCertificate(row, eng.email, LOR_NOTE, user.id)).message;
+        }
+      }
+      await recordLeadDecision(eng.employeeId, decision, note, user.id, lorSerial);
+      msg = decision === 'approved'
+        ? 'Approved. ' + (lorSerial ? 'Your recommendation is recorded as ' + lorSerial + '.' + lorMail : 'No recommendation was written (it needs at least a few sentences).')
+        : 'Held. The People desk has your reason and decides next.';
+      // At or past the end date, an approval lets the engine finish the job now rather than tomorrow.
+      if (decision === 'approved' && eng.daysLeft != null && eng.daysLeft <= 0 && !eng.outcome) {
+        const run = await runEngine({ onlyEmployeeId: eng.employeeId, actorUserId: user.id });
+        const line = run.lines[0];
+        if (line) msg += ' ' + line.result;
+      }
+    }
+  } catch (e: any) {
+    console.error('[portal/manager/completion] POST', e?.cause?.message || e?.message);
+    msg = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error'); msgOk = false;
+  }
+}
+
+let detail: EvaluationDetail | null = null;
+if (eng) {
+  try { detail = await evaluateEngagement(eng); } catch (e: any) {
+    console.error('[portal/manager/completion] evaluate', e?.cause?.message || e?.message);
+  }
+}
+let signerDefault = '';
+try {
+  const me = await requireEmployee(user, '/portal/manager/completion/' + employeeId);
+  if (me.ok) signerDefault = me.workspace.designation || '';
+} catch (_) { signerDefault = ''; }
+const fresh = list && list.ready && Astro.request.method === 'POST' ? (await listEngagements({ employeeId })) : null;
+const view: Engagement | null = fresh && fresh.ready ? fresh.value[0] || eng : eng;
+function tone(state: string): string {
+  if (state === 'pass') return '#047857';
+  if (state === 'fail') return '#b91c1c';
+  if (state === 'unknown') return '#b45309';
+  return '#6b7280';
+}
+---
+<EmployeeShell title="Completion review" person={user.name} width={640} bottomPad={64} bare>
+<div class="wrap cr">
+  {!allowed && (
+    <div class="card"><h3>This review is not yours to open</h3><p>Only the person's lead, or the People desk, can review a completion.</p></div>
+  )}
+  {allowed && list && !list.ready && (
+    <div class="card"><h3>The completion engine is not set up yet</h3><p>{list.error}</p></div>
+  )}
+  {allowed && list && list.ready && !view && (
+    <div class="card"><h3>Nothing to review</h3><p>This person is not on a fixed-term engagement that is being tracked.</p></div>
+  )}
+
+  {msg && <div class={'msg ' + (msgOk ? 'ok' : 'bad')} role="status">{msg}</div>}
+
+  {view && (
+    <div class="card">
+      <p class="eyebrow">End of engagement</p>
+      <h3>{view.fullName}</h3>
+      <p>{view.designation}{view.employmentType ? ' · ' + view.employmentType : ''}</p>
+      <p class="meta">{view.startDate ? longDate(view.startDate) : 'Start not recorded'} to {view.endDate ? longDate(view.endDate) : 'no end date recorded'}</p>
+      {view.leadDecision && <p class="meta">Your decision on record: <strong>{view.leadDecision}</strong>{view.leadNote ? ' - ' + view.leadNote : ''}{view.lorSerial ? ' · recommendation ' + view.lorSerial : ''}</p>}
+      {view.outcome === 'certificate_issued' && <p class="meta">Their completion certificate has been issued ({view.certificateSerial}).</p>}
+    </div>
+  )}
+
+  {view && detail && (
+    <div class="card">
+      <h3>What was measured</h3>
+      <p class="meta">{detail.evaluation.allPassed ? 'Every criterion passes. With your approval or without, the certificate is issued on the end date.' : 'Not every criterion passes, so the People desk decides. Your view is part of that decision.'}</p>
+      {detail.evaluation.criteria.map((c) => (
+        <div class="crow"><span class="dot" style={'background:' + tone(c.state) + ';'}></span><strong>{c.label}</strong><span>{c.detail}</span></div>
+      ))}
+    </div>
+  )}
+
+  {view && !view.outcome && (
+    <form method="POST" class="card">
+      <h3>Your review</h3>
+      <fieldset class="choice">
+        <label><input type="radio" name="decision" value="approved" checked /> <span>Approve the completion</span></label>
+        <label><input type="radio" name="decision" value="held" /> <span>Hold it for the People desk</span></label>
+      </fieldset>
+      <label class="lab" for="crNote">A note for the People desk (required if you hold it)</label>
+      <textarea id="crNote" name="note" rows="2" maxlength="1000"></textarea>
+      <label class="lab" for="crLor">Letter of recommendation</label>
+      <textarea id="crLor" name="lor" rows="9" maxlength="6000" placeholder={'Describe what ' + view.fullName.split(' ')[0] + ' worked on, the standard of their work, and what you would recommend them for. A few specific examples carry more weight than adjectives.'}></textarea>
+      <p class="meta">It is sent to them as a verifiable letter with its own serial and public page, signed in your name. It can be corrected later, with the change recorded.</p>
+      <label class="lab" for="crTitle">Your title, as it appears under your name</label>
+      <input id="crTitle" name="signer_title" type="text" maxlength="200" value={signerDefault} />
+      <button class="btn" type="submit">Submit my review</button>
+    </form>
+  )}
+</div>
+<style is:global>
+  .cr { padding-top: 12px; }
+  .cr .card { background: #fff; border: 1px solid rgba(14,11,8,0.1); border-radius: 16px; padding: 18px; margin-bottom: 14px; display: block; }
+  .cr .card h3 { margin: 0 0 6px; font-size: 17px; }
+  .cr .card p { margin: 0 0 6px; font-size: 14px; line-height: 1.6; color: #3a332d; }
+  .cr .eyebrow { font-size: 11px !important; letter-spacing: 0.16em; text-transform: uppercase; color: #FF4F00 !important; font-weight: 800; }
+  .cr .meta { font-size: 12.5px !important; color: #6b635c !important; }
+  .cr .msg { border-radius: 12px; padding: 12px 14px; margin-bottom: 14px; font-size: 14px; line-height: 1.55; }
+  .cr .msg.ok { background: rgba(5,150,105,.1); border: 1px solid rgba(5,150,105,.3); color: #065f46; }
+  .cr .msg.bad { background: rgba(220,38,38,.08); border: 1px solid rgba(220,38,38,.3); color: #991b1b; }
+  .cr .crow { display: grid; grid-template-columns: 10px 140px 1fr; gap: 10px; align-items: baseline; padding: 6px 0; border-bottom: 1px dashed rgba(14,11,8,0.08); font-size: 13px; }
+  .cr .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  @media (max-width: 560px) { .cr .crow { grid-template-columns: 10px 1fr; } .cr .crow span:last-child { grid-column: 2; } }
+  .cr .choice { border: 0; padding: 0; margin: 8px 0 12px; display: grid; gap: 8px; }
+  .cr .choice label { display: flex; gap: 10px; align-items: center; font-size: 14.5px; min-height: 44px; border: 1px solid rgba(14,11,8,0.12); border-radius: 12px; padding: 0 12px; }
+  .cr .lab { display: block; font-size: 12px; font-weight: 700; color: #3a332d; margin: 12px 0 6px; }
+  .cr textarea, .cr input[type="text"] { width: 100%; box-sizing: border-box; border: 1px solid rgba(14,11,8,0.18); border-radius: 12px; padding: 12px; font-size: 15px; font-family: inherit; }
+  .cr .btn { margin-top: 14px; width: 100%; min-height: 48px; border: 0; border-radius: 12px; background: #FF4F00; color: #fff; font-weight: 700; font-size: 15px; cursor: pointer; }
+</style>
+</EmployeeShell>

@@ -222,6 +222,8 @@ export const CONFIGURED_CRONS: { path: string; schedule: string }[] = [
   { path: '/api/aquintutor/league-settle', schedule: '0 1 * * 1' },
   { path: '/api/hiring/draft-reminders', schedule: '45 4 * * *' },
   { path: '/api/cron/hr-sweep', schedule: '10 4 * * *' },
+  // Internship / contract completions: lead reviews a week out, certificates on the end date.
+  { path: '/api/cron/engagement-completion', schedule: '30 4 * * *' },
   { path: '/api/cron/hei-refresh', schedule: '0 3 * * *' },
   { path: '/api/cron/activity-digest', schedule: '0 13 * * *' },
   // Deletes facial data whose purpose has ended. The test that pairs this list against
@@ -460,6 +462,7 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   // Employee ID cards: the register a scanned card is checked against. Absent, every scan reads "we
   // could not check this card", which is the honest answer but not a working ID system.
   { module: 'Employee ID cards', table: 'hr_id_cards', owner: 'src/lib/hr/id-card.ts' },
+  { module: 'Engagement completions', table: 'hr_engagement_completions', owner: 'src/lib/hr/completion-engine.ts' },
 
   // PRESENT, AND LISTED ANYWAY. application_stage_events exists — it carries the funnel history the
   // hiring decision report reads — but it was unmonitored, and /api/health reports four suppressed
