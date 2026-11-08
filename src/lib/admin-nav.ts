@@ -624,6 +624,7 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       { id: 'samarth-fees',         label: 'Booking fees',          href: '/admin/samarth/fees',         icon: 'package',  section: 'samarth' },
       { id: 'samarth-partners',     label: 'Partners',              href: '/admin/samarth/partners',     icon: 'users',    section: 'samarth' },
       { id: 'samarth-x',            label: 'SAMARTH X',             href: '/admin/samarth/x',            icon: 'grid',     section: 'samarth_x' },
+      { id: 'samarth-events',       label: 'Events',                href: '/admin/samarth/events',       icon: 'calendar', section: 'samarth' },
     ],
   },
   { id: 'partnerships', label: 'Partnerships', href: '/admin/partnerships', icon: 'package', section: 'settings' },

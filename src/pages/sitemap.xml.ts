@@ -55,6 +55,7 @@ const STATIC_ROUTES: Array<{ path: string; changefreq: string; priority: string 
   { path: '/samarth/partners', changefreq: 'monthly', priority: '0.7' },
   { path: '/samarth/x', changefreq: 'monthly', priority: '0.8' },
   { path: '/samarth/x/apply', changefreq: 'monthly', priority: '0.6' },
+  { path: '/samarth/events', changefreq: 'weekly', priority: '0.7' },
   { path: '/samarth/register', changefreq: 'monthly', priority: '0.7' },
   ...TOPICS.map((t) => ({ path: '/samarth/services/' + t.slug, changefreq: 'monthly', priority: '0.7' })),
 ];

@@ -73,12 +73,12 @@ export const MODULES: readonly SamarthModule[] = [
   },
   {
     id: '08', name: 'SAMARTH X venture-building programme', status: 'built', release: 6, dependsOn: ['01'],
-    built: ['Programme page and public expression of interest, no fee', 'Event nominations and recruitment referrals entered by staff', 'One evaluation pipeline for all three channels', 'Reviewer scoring, advisory ranking, selection guards', 'Best-six incubation cap per cohort, agreement reference required', 'Milestones, resources, demonstrations and showcase records'],
-    pending: [], surfaces: ['/samarth/x', '/samarth/x/apply', '/admin/samarth/x'],
+    built: ['Programme page and public expression of interest, no fee', 'Event nominations and recruitment referrals entered by staff', 'One evaluation pipeline for all three channels', 'Reviewer scoring, advisory ranking, selection guards', 'Best-six incubation cap per cohort, agreement reference required', 'Milestones, resources, demonstrations and showcase records', 'SAMARTH events (hackathons, challenges, competitions) on the platform events system, with one-click nomination of participants into SAMARTH X'],
+    pending: [], surfaces: ['/samarth/x', '/samarth/x/apply', '/samarth/events', '/admin/samarth/x', '/admin/samarth/events'],
   },
   {
     id: '09', name: 'Administration, project management and analytics', status: 'partial', release: 2, dependsOn: ['04', '07', '08'],
-    built: ['Overview with pipeline, revenue, distribution and readiness', 'Search across every SAMARTH record the administrator may see', 'Filters, keyset pagination and CSV export', 'Timeline and audit history on every record'],
+    built: ['Overview with a stage-column pipeline, segmented distribution bars and revenue tiles, on palettes validated for colour-blind readers', 'Readiness panel and one-click setup', 'Search across every SAMARTH record the administrator may see', 'Filters, keyset pagination and CSV export', 'Timeline and audit history on every record'],
     pending: ['Government directory of ministries and departments', 'Consultant scheduling calendar', 'Resource-utilisation analytics'],
     surfaces: ['/admin/samarth', '/admin/samarth/search', '/admin/samarth/applications'],
   },

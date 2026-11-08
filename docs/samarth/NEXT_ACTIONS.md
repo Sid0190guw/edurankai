@@ -3,6 +3,7 @@
 Ordered. The first three are operator steps nobody else can do; the rest is the next build work.
 
 ## Operator (owner) steps to go live
+0. **Regenerate the Razorpay key secret** (the live secret was pasted into a chat on 2026-11-08), then set `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` and `RAZORPAY_WEBHOOK_SECRET` in Vercel (Production and Preview) and redeploy. Point the Razorpay webhook at `https://www.edurankai.in/api/payments/webhook`.
 1. **Merge and deploy** the `feat/samarth-foundation` branch.
 2. **Create the tables in production:** open `/admin/samarth` and press **Set up SAMARTH now** (or "Create module tables" at `/admin/setup`, or paste `db/samarth-schema.sql` into the database SQL editor). The banner disappears once all eight tables exist.
 3. **Approve booking fees** at `/admin/samarth/fees`: for each applicant category (or one all-categories row) and each currency you accept, enter the amount, tax treatment, payment-charge statement and the payment terms (have the terms reviewed), then approve with a note. Until then applicants can register but cannot book.
