@@ -94,6 +94,17 @@ export const ADMIN_SECTION_GROUPS: AdminSectionGroup[] = [
     ],
   },
   {
+    // SAMARTH (src/lib/samarth). Two keys because they are two desks: commercial consultation work
+    // (requests, booking fees, quotations, partners) and the free SAMARTH X venture programme, whose
+    // reviewers have no business reading client fees or contracts. No built-in role below super admin
+    // holds either; grant them through /admin/team/roles.
+    label: 'SAMARTH',
+    sections: [
+      { key: 'samarth', label: 'SAMARTH consultation and engagements', hint: 'Consultation requests, booking fees, quotations, partners, analytics' },
+      { key: 'samarth_x', label: 'SAMARTH X', hint: 'Venture applications, reviews, incubation' },
+    ],
+  },
+  {
     label: 'Access & System',
     sections: [
       { key: 'users', label: 'Users' },

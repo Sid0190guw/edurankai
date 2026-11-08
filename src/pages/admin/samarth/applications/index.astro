@@ -1,0 +1,89 @@
+---
+// /admin/samarth/applications - every consultation request. Filters and search run in SQL across
+// ALL records (keyset pagination), and ?export=csv downloads the filtered set, which needs the
+// `samarth` section at export level.
+import AdminFrame from '@/components/samarth/AdminFrame.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { listApplications } from '@/lib/samarth/applications';
+import { APPLICATION_STATUSES, statusLabel } from '@/lib/samarth/workflow';
+import { APPLICANT_CATEGORIES, categoryLabel } from '@/lib/samarth/categories';
+import { PATHWAYS, pathwayById } from '@/lib/samarth/pathways';
+import { formatMoney } from '@/lib/samarth/currency';
+import { countryName } from '@/lib/samarth/validate';
+import { toCsv } from '@/lib/csv';
+import { logAudit } from '@/lib/audit';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'samarth', 'view'))) return Astro.redirect('/admin?denied=samarth');
+const xDesk = await canAccessSection(user, 'samarth_x', 'view');
+
+const u = Astro.url.searchParams;
+const filter = {
+  q: u.get('q') || '', status: u.get('status') || '', category: u.get('category') || '', country: (u.get('country') || '').toUpperCase(),
+  pathway: u.get('pathway') || '', archived: u.get('archived') === '1', cursor: u.get('cursor') || '',
+};
+
+if (u.get('export') === 'csv') {
+  if (!(await canAccessSection(user, 'samarth', 'export'))) return new Response('Export needs the SAMARTH export permission.', { status: 403 });
+  const all = await listApplications({ ...filter, cursor: '', limit: 5000 });
+  if (!all.ready) return new Response(all.error, { status: 503 });
+  await logAudit({ userId: user.id, action: 'samarth.application.export', entity: 'samarth_application', diff: { rows: all.value.items.length, filter } });
+  const csv = toCsv(all.value.items.map((a) => ({
+    ref: a.ref, status: a.status, created: a.createdAt, category: a.category, country: a.country, organisation: a.orgName, contact: a.contactName,
+    email: a.contactEmail, phone: a.contactPhone, title: a.title, pathway: a.pathway, need: a.need, government_level: a.official?.level || '',
+    department: a.official?.department || '', fee_currency: a.feeCurrency, fee_total_minor: a.feeTotalMinor ?? '', payment_method: a.paymentMethod,
+    paid_at: a.paidAt || '', consultant: a.consultantName, call_at: a.callAt || '',
+  })), ['ref', 'status', 'created', 'category', 'country', 'organisation', 'contact', 'email', 'phone', 'title', 'pathway', 'need', 'government_level', 'department', 'fee_currency', 'fee_total_minor', 'payment_method', 'paid_at', 'consultant', 'call_at']);
+  return new Response(csv, { headers: { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="samarth-consultation-requests.csv"', 'Cache-Control': 'no-store' } });
+}
+
+const list = await listApplications({ ...filter, limit: 50 });
+const items = list.ready ? list.value.items : [];
+const next = list.ready ? list.value.next : null;
+const qs = (extra: Record<string, string>) => {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries({ q: filter.q, status: filter.status, category: filter.category, country: filter.country, pathway: filter.pathway, archived: filter.archived ? '1' : '', ...extra })) if (v) p.set(k, v);
+  return '?' + p.toString();
+};
+const tone = (s: string) => (['BOOKING_REQUESTED', 'FEE_PENDING'].includes(s) ? 'sa-chip hot' : ['CALL_COMPLETED', 'CLOSED'].includes(s) ? 'sa-chip ok' : ['WITHDRAWN', 'DECLINED', 'CANCELLED'].includes(s) ? 'sa-chip bad' : 'sa-chip');
+---
+<AdminFrame title="Consultation requests" active="applications" showX={xDesk} msg={u.get('msg') || ''} err={u.get('err') || ''}>
+  <p class="sa-lede">Registration, details, requirements, booking fee, call booking, consultant, call. Search covers every request, not just this page.</p>
+  <form method="GET" class="sa-panel sa-form">
+    <div class="sa-row">
+      <label>Search<input type="search" name="q" value={filter.q} placeholder="Reference, name, email, organisation, department" /></label>
+      <label>Status<select name="status"><option value="">Any</option>{APPLICATION_STATUSES.map((s) => <option value={s.value} selected={filter.status === s.value}>{s.label}</option>)}</select></label>
+      <label>Category<select name="category"><option value="">Any</option>{APPLICANT_CATEGORIES.map((c) => <option value={c.value} selected={filter.category === c.value}>{c.label}</option>)}</select></label>
+      <label>Kind of project<select name="pathway"><option value="">Any</option>{PATHWAYS.map((p) => <option value={p.id} selected={filter.pathway === p.id}>{p.label}</option>)}</select></label>
+      <label>Country code<input type="text" name="country" value={filter.country} maxlength="2" placeholder="IN, US, DE" /></label>
+    </div>
+    <div class="sa-inline">
+      <label class="sa-check"><input type="checkbox" name="archived" value="1" checked={filter.archived} /> Archived only</label>
+      <button class="sa-btn" type="submit">Apply</button>
+      <a class="sa-btn ghost" href="/admin/samarth/applications">Clear</a>
+      <a class="sa-btn ghost" href={qs({ export: 'csv' })}>Export CSV</a>
+    </div>
+  </form>
+
+  {!list.ready && <div class="sa-flash warn">{list.error}</div>}
+  {list.ready && items.length === 0 && <div class="sa-empty">No consultation requests match. {filter.q || filter.status || filter.category ? 'Try clearing the filters.' : 'Requests appear here as soon as someone registers at /samarth/register.'}</div>}
+  {items.length > 0 && (
+    <div class="sa-scroll"><table class="sa-table">
+      <thead><tr><th>Request</th><th>Applicant</th><th>Status</th><th>Fee</th><th>Consultant</th><th>Received</th></tr></thead>
+      <tbody>
+        {items.map((a) => (
+          <tr>
+            <td><a href={'/admin/samarth/applications/' + a.id}><strong>{a.ref}</strong></a><br /><span style="color:#c8c8d0;">{a.title || 'Untitled'}</span><br /><span class="hint">{pathwayById(a.pathway)?.label || ''}</span></td>
+            <td>{a.orgName || a.contactName}<br /><span class="hint">{categoryLabel(a.category)}, {countryName(a.country)}{a.official?.level ? ' · ' + a.official.level : ''}</span></td>
+            <td><span class={tone(a.status)}>{statusLabel('application', a.status)}</span></td>
+            <td>{a.feeTotalMinor ? formatMoney(a.feeTotalMinor, a.feeCurrency) : '-'}<br /><span class="hint">{a.paidAt ? 'Paid ' + (a.paymentMethod === 'offline' ? '(recorded)' : '(online)') : a.paymentMethod === 'invoice' ? 'Invoice requested' : ''}</span></td>
+            <td>{a.consultantName || '-'}</td>
+            <td><span class="hint">{(a.createdAt || '').slice(0, 10)}</span></td>
+          </tr>
+        ))}
+      </tbody>
+    </table></div>
+  )}
+  {next && <p style="margin-top:12px;"><a class="sa-btn ghost" href={qs({ cursor: next })}>Older requests</a></p>}
+</AdminFrame>

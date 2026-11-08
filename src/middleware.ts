@@ -110,6 +110,9 @@ const PATH_SECTION: [string, string][] = ([
   ['/admin/hr/training', 'training'],
   ['/admin/hr', 'hr'],
   ['/admin/finance', 'finance'],
+  // SAMARTH. The X subtree is its own desk; the longest-prefix sort below makes it win.
+  ['/admin/samarth/x', 'samarth_x'],
+  ['/admin/samarth', 'samarth'],
   ['/admin/interviews/manual', 'interviews_manual'],
   ['/admin/interviews/ai', 'interviews_ai'],
   ['/admin/ai-interview-templates', 'interviews_ai'],
@@ -351,6 +354,9 @@ const PUBLIC_CACHEABLE_EXACT = new Set([
   // indexes, /verify is the credential-check LANDING (the per-certificate /verify/<cert> page is
   // one person's record and is deliberately NOT here), /products/meet is a product page.
   '/labs', '/academy', '/verify', '/products/meet',
+  // SAMARTH content pages: no database read, no form, the same bytes for everyone. The form pages
+  // (/samarth/register, /samarth/partners, /samarth/x/apply) and every private page stay dynamic.
+  '/samarth', '/samarth/industry', '/samarth/government', '/samarth/engineering', '/samarth/consultancy', '/samarth/services', '/samarth/x',
 ]);
 function isPublicCacheable(path: string): boolean {
   if (!path) return false;
@@ -363,6 +369,8 @@ function isPublicCacheable(path: string): boolean {
   // Top-level product pages. One segment only: /products/visvambhara is a public description,
   // /products/visvambhara/access is the gated door to it and must never be served from a cache.
   if (/^\/products\/[^/]+$/.test(path)) return true;
+  // SAMARTH capability pages, rendered from a static catalogue.
+  if (/^\/samarth\/services\/[a-z0-9-]+$/.test(path)) return true;
   return false;
 }
 

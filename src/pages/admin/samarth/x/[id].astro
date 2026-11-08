@@ -1,0 +1,176 @@
+---
+// /admin/samarth/x/<id> - one SAMARTH X candidate: profile, reviewer scores, the advisory aggregate,
+// cohort and agreement, status (with the best-six and agreement guards), and progress records.
+import AdminFrame from '@/components/samarth/AdminFrame.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { getX, reviewsFor, saveReview, setXProgram, transitionX, progressFor, addProgress, setProgressState, xMessage, PROGRESS_KINDS } from '@/lib/samarth/x';
+import { X_CRITERIA, parseScores, MAX_TOTAL } from '@/lib/samarth/x-scoring';
+import { eventsFor, isUuid } from '@/lib/samarth/store-core';
+import { emailUpdate, xUrl } from '@/lib/samarth/notify';
+import { availableTransitions, statusLabel, X_CHANNELS, INCUBATION_PLACES, MIN_REVIEWS_TO_SELECT } from '@/lib/samarth/workflow';
+import { countryName } from '@/lib/samarth/validate';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'samarth_x', 'view'))) return Astro.redirect('/admin?denied=samarth_x');
+const id = String(Astro.params.id || '');
+const PAGE = '/admin/samarth/x/' + id;
+const mayWrite = await canAccessSection(user, 'samarth_x', 'edit');
+const desk = await canAccessSection(user, 'samarth', 'view');
+const who = { userId: user.id, name: user.name || user.email || 'SAMARTH team' };
+const done = (m: string, ok = true) => Astro.redirect(PAGE + '?' + (ok ? 'msg=' : 'err=') + encodeURIComponent(m.slice(0, 500)));
+if (!isUuid(id)) return Astro.redirect('/admin/samarth/x');
+
+if (Astro.request.method === 'POST') {
+  if (!mayWrite) return done('Needs the SAMARTH X edit permission.', false);
+  let fd: FormData;
+  try { fd = await Astro.request.formData(); } catch { fd = new FormData(); }
+  const get = (n: string) => String(fd.get(n) ?? '');
+  const action = get('action');
+  const cur = await getX(id);
+  if (!cur.ready || !cur.value) return done(cur.ready ? 'That candidate no longer exists.' : cur.error, false);
+  const c = cur.value;
+  if (action === 'review') {
+    const s = parseScores((k) => get('score_' + k));
+    if (!s.ok) return done(s.error, false);
+    const r = await saveReview(id, s.scores, get('recommendation'), get('note'), who);
+    return r.ok ? done('Review saved.') : done(r.error, false);
+  }
+  if (action === 'programme') {
+    const r = await setXProgram(id, get('cohort'), get('agreement'), who);
+    return r.ok ? done('Saved.') : done(r.error, false);
+  }
+  if (action === 'transition') {
+    const to = get('to');
+    const r = await transitionX(id, to, 'staff', get('note'), who);
+    if (r.ok) await emailUpdate(c.email, c.ref, 'Your SAMARTH X application: ' + statusLabel('x', to), get('note') || statusLabel('x', to), xUrl(c.ref));
+    return r.ok ? done('Now ' + statusLabel('x', to) + '.') : done(r.error, false);
+  }
+  if (action === 'progress') {
+    const r = await addProgress(id, { kind: get('kind'), title: get('title'), detail: get('detail'), dueDate: get('due'), url: get('url') }, who);
+    return r.ok ? done('Added.') : done(r.error, false);
+  }
+  if (action === 'progress_state') {
+    const r = await setProgressState(get('progress_id'), get('state'), who);
+    return r.ok ? done('Updated.') : done(r.error, false);
+  }
+  if (action === 'message' || action === 'note') {
+    const r = await xMessage(id, get('body'), action === 'message', who);
+    if (r.ok && action === 'message') await emailUpdate(c.email, c.ref, 'A message from SAMARTH X', get('body'), xUrl(c.ref));
+    return r.ok ? done('Saved.') : done(r.error, false);
+  }
+  return done('Unknown action.', false);
+}
+
+const loaded = await getX(id);
+const c = loaded.ready ? loaded.value : null;
+const reviews = c ? await reviewsFor(c.id) : null;
+const progress = c ? await progressFor(c.id) : null;
+const events = c ? await eventsFor('x', c.id, false) : null;
+const transitions = c ? availableTransitions('x', c.status, 'staff') : [];
+const mine = reviews && reviews.ready ? reviews.value.list.find((r) => r.reviewerUserId === user.id) : undefined;
+// A newline for pre-wrapped text, kept out of the template markup.
+const NL = String.fromCharCode(10);
+---
+<AdminFrame title={c ? (c.ventureName || c.name) : 'SAMARTH X candidate'} active="x" showDesk={desk} eyebrow="SAMARTH X" msg={Astro.url.searchParams.get('msg') || ''} err={Astro.url.searchParams.get('err') || (!loaded.ready ? loaded.error : (!c ? 'That candidate does not exist.' : ''))}>
+  {c && (
+    <div>
+      <p class="sa-lede"><span class="sa-chip hot">{statusLabel('x', c.status)}</span> {c.ref} · {X_CHANNELS.find((x) => x.value === c.channel)?.label}{c.sourceEvent ? ': ' + c.sourceEvent : ''}{c.nominatedBy ? ' (nominated by ' + c.nominatedBy + ')' : ''}</p>
+      <div class="sa-grid2">
+        <section class="sa-panel">
+          <h2 class="sa-h2">Candidate</h2>
+          <dl class="sa-kv">
+            <dt>Applicant</dt><dd>{c.name} ({c.applicantKind})<br /><a href={'mailto:' + c.email}>{c.email}</a>{c.phone ? NL + c.phone : ''}<br />{countryName(c.country)}</dd>
+            {c.team.length > 0 && <><dt>Team</dt><dd>{c.team.map((m) => <span style="display:block;">{m.name}{m.role ? ', ' + m.role : ''}{m.link ? <> · <a href={m.link} target="_blank" rel="noopener noreferrer">profile</a></> : ''}</span>)}</dd></>}
+            <dt>Domain</dt><dd>{c.domain || '-'}</dd>
+            <dt>Problem</dt><dd>{c.problem || '-'}</dd>
+            <dt>Proposed system</dt><dd>{c.proposedSystem || '-'}</dd>
+            <dt>Skills</dt><dd>{c.skills || '-'}</dd>
+            <dt>Previous work</dt><dd>{c.previousWork || '-'}</dd>
+            <dt>Links</dt><dd>{[c.githubUrl, c.portfolioUrl, c.prototypeUrl].filter(Boolean).map((l) => <a href={l} target="_blank" rel="noopener noreferrer" style="display:block;">{l}</a>)}{![c.githubUrl, c.portfolioUrl, c.prototypeUrl].some(Boolean) && '-'}</dd>
+            <dt>Vision</dt><dd>{c.vision || '-'}</dd>
+            <dt>Market</dt><dd>{c.market || '-'}</dd>
+            <dt>Resources needed</dt><dd>{c.resourcesNeeded || '-'}</dd>
+            {c.sourceReference && <><dt>Source reference</dt><dd>{c.sourceReference}</dd></>}
+          </dl>
+        </section>
+        <section class="sa-panel">
+          <h2 class="sa-h2">Reviews {reviews && reviews.ready && reviews.value.aggregate.mean != null ? '· mean ' + reviews.value.aggregate.mean + ' of ' + MAX_TOTAL : ''}</h2>
+          {reviews && !reviews.ready && <div class="sa-flash warn">{reviews.error}</div>}
+          {reviews && reviews.ready && reviews.value.list.length === 0 && <p class="hint">No reviews yet. Selection needs at least {MIN_REVIEWS_TO_SELECT}.</p>}
+          {reviews && reviews.ready && reviews.value.list.map((r) => <p style="font-size:12.5px;margin:0 0 6px;"><strong style="color:#fff;">{r.reviewerName}</strong>: {r.total} of {MAX_TOTAL}, recommends {r.recommendation}{r.note ? '. ' + r.note : ''}</p>)}
+          {reviews && reviews.ready && reviews.value.aggregate.spread != null && reviews.value.aggregate.spread > 8 && <div class="sa-flash warn">Reviewers disagree widely (spread {reviews.value.aggregate.spread}). Discuss before deciding.</div>}
+          {mayWrite && (
+            <form method="POST" class="sa-form" style="margin-top:10px;">
+              <input type="hidden" name="action" value="review" />
+              <p class="hint" style="margin:0;">{mine ? 'Your review (submitting again replaces it)' : 'Your review'}: 0 to 5 on each criterion.</p>
+              <div class="sa-row">{X_CRITERIA.map((k) => <label title={k.help}>{k.label}<input type="number" name={'score_' + k.key} min="0" max="5" step="1" required value={mine ? String(mine.scores[k.key] ?? '') : ''} /></label>)}</div>
+              <div class="sa-row">
+                <label>Recommendation<select name="recommendation">{['advance', 'hold', 'decline'].map((v) => <option value={v} selected={mine?.recommendation === v}>{v}</option>)}</select></label>
+                <label>Note<input type="text" name="note" maxlength="4000" value={mine?.note || ''} /></label>
+              </div>
+              <button class="sa-btn ghost" type="submit">Save review</button>
+            </form>
+          )}
+        </section>
+      </div>
+      <div class="sa-grid2">
+        <section class="sa-panel">
+          <h2 class="sa-h2">Programme and decision</h2>
+          <form method="POST" class="sa-form">
+            <input type="hidden" name="action" value="programme" />
+            <div class="sa-row">
+              <label>Cohort<input type="text" name="cohort" maxlength="60" value={c.cohort} disabled={!mayWrite} /></label>
+              <label>Incubation agreement reference<input type="text" name="agreement" maxlength="300" value={c.agreementReference} disabled={!mayWrite} /><span class="hint">The written agreement setting out IP ownership, resources and any equity. Required before incubation; EduRankAI takes no equity automatically.</span></label>
+            </div>
+            {mayWrite && <button class="sa-btn ghost" type="submit">Save</button>}
+          </form>
+          {mayWrite && transitions.length > 0 && (
+            <form method="POST" class="sa-form" style="margin-top:12px;">
+              <input type="hidden" name="action" value="transition" />
+              <div class="sa-row"><label>To<select name="to">{transitions.map((t) => <option value={t.to}>{statusLabel('x', t.to)}{t.needsNote ? ' (note needed)' : ''}</option>)}</select></label><label>Note (shared with the candidate)<input type="text" name="note" maxlength="2000" /></label></div>
+              <p class="hint" style="margin:0;">Incubation needs a cohort, an agreement reference and a free place: {INCUBATION_PLACES} per cohort.</p>
+              <button class="sa-btn" type="submit">Apply and tell the candidate</button>
+            </form>
+          )}
+          {mayWrite && (
+            <form method="POST" class="sa-form" style="margin-top:12px;">
+              <label>Message the candidate (also emailed)<textarea name="body" maxlength="5000" required></textarea></label>
+              <div class="sa-inline"><button class="sa-btn ghost" type="submit" name="action" value="message">Send</button><button class="sa-btn ghost" type="submit" name="action" value="note">Internal note</button></div>
+            </form>
+          )}
+        </section>
+        <section class="sa-panel">
+          <h2 class="sa-h2">Milestones, resources, demonstrations and showcase</h2>
+          {progress && progress.ready && progress.value.length === 0 && <p class="hint">Nothing recorded yet.</p>}
+          {progress && progress.ready && progress.value.map((p) => (
+            <div style="border-bottom:1px solid #1a1a1f;padding:8px 0;font-size:12.5px;">
+              <strong style="color:#fff;">{PROGRESS_KINDS.find((k) => k.value === p.kind)?.label}: {p.title}</strong> <span class="sa-chip">{p.state}</span>
+              {p.dueDate && <span class="hint"> due {p.dueDate}</span>}
+              {p.detail && <p class="hint" style="margin:4px 0 0;white-space:pre-wrap;">{p.detail}</p>}
+              {p.url && <a href={p.url} target="_blank" rel="noopener noreferrer">Link</a>}
+              {mayWrite && p.state === 'open' && <form method="POST" class="sa-inline" style="margin-top:4px;"><input type="hidden" name="action" value="progress_state" /><input type="hidden" name="progress_id" value={p.id} /><button class="sa-btn ghost" type="submit" name="state" value="done">Done</button><button class="sa-btn ghost" type="submit" name="state" value="missed">Missed</button></form>}
+            </div>
+          ))}
+          {mayWrite && (
+            <form method="POST" class="sa-form" style="margin-top:12px;">
+              <input type="hidden" name="action" value="progress" />
+              <div class="sa-row">
+                <label>Kind<select name="kind">{PROGRESS_KINDS.map((k) => <option value={k.value}>{k.label}</option>)}</select></label>
+                <label>Title<input type="text" name="title" required maxlength="300" /></label>
+                <label>Due (optional)<input type="date" name="due" /></label>
+              </div>
+              <label>Detail (optional)<textarea name="detail" maxlength="4000"></textarea></label>
+              <label>Link (optional)<input type="url" name="url" maxlength="800" /></label>
+              <button class="sa-btn ghost" type="submit">Add</button>
+            </form>
+          )}
+        </section>
+      </div>
+      <section class="sa-panel">
+        <h2 class="sa-h2">Timeline</h2>
+        {events && events.ready && <ul class="sa-timeline">{events.value.map((ev) => <li><span class="w">{ev.createdAt.slice(0, 16).replace('T', ' ')} UTC · {ev.actorName}</span>{ev.visibility === 'applicant' && <span class="vis">candidate sees this</span>}<p class="b">{ev.toStatus ? statusLabel('x', ev.toStatus) + (ev.body ? ': ' : '') : ''}{ev.body}</p></li>)}</ul>}
+      </section>
+    </div>
+  )}
+</AdminFrame>

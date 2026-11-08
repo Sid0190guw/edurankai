@@ -463,6 +463,11 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   // could not check this card", which is the honest answer but not a working ID system.
   { module: 'Employee ID cards', table: 'hr_id_cards', owner: 'src/lib/hr/id-card.ts' },
   { module: 'Engagement completions', table: 'hr_engagement_completions', owner: 'src/lib/hr/completion-engine.ts' },
+  // SAMARTH. Absent, /samarth/register cannot save a request and every SAMARTH page says it is not
+  // set up; listing the first and last tables of the batch shows a half-created schema too.
+  { module: 'SAMARTH consultation requests', table: 'samarth_applications', owner: 'src/lib/samarth/schema.ts' },
+  { module: 'SAMARTH booking-fee schedule', table: 'samarth_fee_schedule', owner: 'src/lib/samarth/schema.ts' },
+  { module: 'SAMARTH X progress', table: 'samarth_x_progress', owner: 'src/lib/samarth/schema.ts' },
 
   // PRESENT, AND LISTED ANYWAY. application_stage_events exists — it carries the funnel history the
   // hiring decision report reads — but it was unmonitored, and /api/health reports four suppressed

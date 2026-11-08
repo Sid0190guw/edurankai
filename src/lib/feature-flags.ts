@@ -23,6 +23,12 @@ export interface FlagDef { key: string; env: string; label: string; desc: string
 export const FLAG_CATALOG: FlagDef[] = [
   { key: 'aiTutor',        env: 'AI_TUTOR',        label: 'AI conversation tutor', desc: 'Conversational AI tutor (/aquintutor/converse). Needs the LLM key + a verified flow.', def: false, group: 'AquinTutor' },
   { key: 'dailyChallenge', env: 'DAILY_CHALLENGE', label: 'Daily challenge',        desc: 'Daily challenge surface (/aquintutor/daily).', def: false, group: 'AquinTutor' },
+  // Read by src/lib/samarth/payments.ts (startFeeCheckout / startEngagementCheckout) and by the
+  // applicant workspace /samarth/r/<ref>, which offers online payment only when these are on.
+  // Off: applicants pay against an invoice and staff record the payment. Turn on after a Razorpay
+  // TEST-key payment has gone through end to end (the /admin/samarth readiness panel shows it).
+  { key: 'samarthFeeCheckout', env: 'SAMARTH_FEE_CHECKOUT', label: 'SAMARTH booking-fee checkout', desc: 'Online payment of the SAMARTH consultation booking fee (/samarth/r/<ref>). Off: payment against an invoice only.', def: false, group: 'SAMARTH' },
+  { key: 'samarthEngagementCheckout', env: 'SAMARTH_ENGAGEMENT_CHECKOUT', label: 'SAMARTH engagement checkout', desc: 'Online payment of accepted SAMARTH quotations. Off: engagements are invoiced.', def: false, group: 'SAMARTH' },
 ];
 
 function envOverride(envName: string): boolean | null {

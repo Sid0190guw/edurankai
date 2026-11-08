@@ -1,0 +1,138 @@
+---
+// /admin/samarth/fees - the consultation booking fee, configured per applicant category and
+// currency, revised without code changes. Nothing is preset: a fee exists only once somebody
+// enters it here AND approves it with a note. Approving a revision retires the previous row.
+import AdminFrame from '@/components/samarth/AdminFrame.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { listFees, createFeeDraft, approveFee, retireFee, breakdownFor, feeProblems, waitingForFee } from '@/lib/samarth/fees';
+import { APPLICANT_CATEGORIES, ANY_CATEGORY, categoryLabel } from '@/lib/samarth/categories';
+import { CURRENCIES, TAX_MODES, formatMoney, parseMajorToMinor } from '@/lib/samarth/currency';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'samarth', 'view'))) return Astro.redirect('/admin?denied=samarth');
+const PAGE = '/admin/samarth/fees';
+const mayWrite = await canAccessSection(user, 'samarth', 'edit');
+const xDesk = await canAccessSection(user, 'samarth_x', 'view');
+const who = { userId: user.id, name: user.name || user.email || 'SAMARTH team' };
+const done = (m: string, ok = true) => Astro.redirect(PAGE + '?' + (ok ? 'msg=' : 'err=') + encodeURIComponent(m.slice(0, 600)));
+
+if (Astro.request.method === 'POST') {
+  if (!mayWrite) return done('Setting fees needs the SAMARTH edit permission.', false);
+  let fd: FormData;
+  try { fd = await Astro.request.formData(); } catch { fd = new FormData(); }
+  const get = (n: string) => String(fd.get(n) ?? '');
+  const action = get('action');
+  if (action === 'draft') {
+    const currency = get('currency');
+    const amount = parseMajorToMinor(get('amount'), currency);
+    if (amount == null) return done('Enter the fee as a number in ' + currency + ', for example 5000 or 49.50.', false);
+    const r = await createFeeDraft({
+      category: get('category'), currency, amountMinor: amount, taxMode: get('tax_mode'), taxLabel: get('tax_label'),
+      taxRateBp: get('tax_rate') ? Math.round(Number(get('tax_rate')) * 100) : 0, processingBp: get('processing') ? Math.round(Number(get('processing')) * 100) : 0,
+      chargesNote: get('charges_note'), terms: get('terms'), note: get('note'),
+    }, who);
+    return r.ok ? done('Draft saved. Review it, then approve it with a note to publish it.') : done(r.error, false);
+  }
+  if (action === 'approve') {
+    const r = await approveFee(get('id'), get('approval_note'), who);
+    return r.ok ? done('Approved and published. Any earlier fee for the same category and currency is retired.') : done(r.error, false);
+  }
+  if (action === 'retire') {
+    const r = await retireFee(get('id'), get('reason'), who);
+    return r.ok ? done('Retired. It is no longer quoted to applicants.') : done(r.error, false);
+  }
+  return done('Unknown action.', false);
+}
+
+const fees = await listFees();
+const waiting = await waitingForFee();
+const list = fees.ready ? fees.value : [];
+const approved = list.filter((f) => f.status === 'approved');
+const drafts = list.filter((f) => f.status === 'draft');
+const retired = list.filter((f) => f.status === 'retired').slice(0, 30);
+---
+<AdminFrame title="Consultation booking fees" active="fees" showX={xDesk} msg={Astro.url.searchParams.get('msg') || ''} err={Astro.url.searchParams.get('err') || ''}>
+  <p class="sa-lede">Every applicant, including governments and public bodies, pays the booking fee for their category and currency before a consultation call is booked. Nothing is preset: enter each fee, then approve it with a note saying who decided it. Only approved fees are shown to applicants, on <a href="/samarth/consultation#fees">the consultation page</a> and in their workspace. A row for "All categories" applies wherever a category has no row of its own in that currency.</p>
+  {!fees.ready && <div class="sa-flash warn">{fees.error}</div>}
+  {waiting.ready && waiting.value.length > 0 && <div class="sa-flash warn">Applicants waiting for a fee: {waiting.value.map((w) => categoryLabel(w.category) + ' (' + w.count + ')').join(', ')}.</div>}
+
+  <section class="sa-panel">
+    <h2 class="sa-h2">Published ({approved.length})</h2>
+    {approved.length === 0 && <p class="hint">No fee is published. Applicants can register and describe their project, and are told booking opens once the fee for their category is published.</p>}
+    {approved.length > 0 && (
+      <div class="sa-scroll"><table class="sa-table">
+        <thead><tr><th>Category</th><th>Currency</th><th>Breakdown</th><th>Approved</th><th></th></tr></thead>
+        <tbody>{approved.map((f) => {
+          const b = breakdownFor(f);
+          return (
+            <tr>
+              <td>{f.category === ANY_CATEGORY ? 'All categories' : categoryLabel(f.category)}</td>
+              <td>{f.currency}</td>
+              <td>{b.lines.map((l) => <div>{l.label}: {formatMoney(l.minor, f.currency)}</div>)}<strong>Total {formatMoney(b.total, f.currency)}</strong></td>
+              <td>{f.approvedName}<br /><span class="hint">{(f.approvedAt || '').slice(0, 10)}: {f.approvalNote}</span></td>
+              <td>{mayWrite && <details><summary>Retire</summary><form method="POST" class="sa-form" style="margin-top:8px;"><input type="hidden" name="action" value="retire" /><input type="hidden" name="id" value={f.id} /><input type="text" name="reason" required maxlength="500" placeholder="Why" /><button class="sa-btn danger" type="submit">Retire</button></form></details>}</td>
+            </tr>
+          );
+        })}</tbody>
+      </table></div>
+    )}
+  </section>
+
+  <section class="sa-panel">
+    <h2 class="sa-h2">Drafts awaiting approval ({drafts.length})</h2>
+    {drafts.length === 0 && <p class="hint">None.</p>}
+    {drafts.map((f) => {
+      const b = breakdownFor(f);
+      const problems = feeProblems(f);
+      return (
+        <div style="border:1px solid #1a1a1f;border-radius:12px;padding:12px;margin-bottom:10px;">
+          <p style="margin:0 0 6px;color:#fff;font-weight:700;font-size:13px;">{f.category === ANY_CATEGORY ? 'All categories' : categoryLabel(f.category)} · {f.currency} · total {formatMoney(b.total, f.currency)}</p>
+          <p class="hint" style="margin:0 0 6px;">{b.lines.map((l) => l.label + ' ' + formatMoney(l.minor, f.currency)).join('; ')}. Charges: {f.chargesNote || 'not stated'}. Drafted by {f.createdName}.</p>
+          <details style="margin-bottom:8px;"><summary>Terms</summary><p class="hint" style="white-space:pre-wrap;">{f.terms || 'None written'}</p></details>
+          {problems.length > 0 && <div class="sa-flash warn">Cannot be approved yet: {problems.join(' ')}</div>}
+          {mayWrite && problems.length === 0 && (
+            <form method="POST" class="sa-inline">
+              <input type="hidden" name="action" value="approve" /><input type="hidden" name="id" value={f.id} />
+              <input type="text" name="approval_note" required maxlength="1000" placeholder="Approval note: who decided this fee, and on what basis" style="flex:1;min-width:260px;" />
+              <button class="sa-btn" type="submit">Approve and publish</button>
+            </form>
+          )}
+          {mayWrite && <form method="POST" class="sa-inline" style="margin-top:8px;"><input type="hidden" name="action" value="retire" /><input type="hidden" name="id" value={f.id} /><input type="text" name="reason" required maxlength="500" placeholder="Reason for discarding" /><button class="sa-btn ghost" type="submit">Discard draft</button></form>}
+        </div>
+      );
+    })}
+  </section>
+
+  {mayWrite && (
+    <section class="sa-panel">
+      <h2 class="sa-h2">New fee or revision</h2>
+      <p class="hint" style="margin:0 0 10px;">A revision is a new draft for the same category and currency; approving it retires the current one. Applicants who already accepted the old fee keep what they accepted until they pay; if it is retired before they pay, they are asked to review the new fee.</p>
+      <form method="POST" class="sa-form">
+        <input type="hidden" name="action" value="draft" />
+        <div class="sa-row">
+          <label>Applicant category<select name="category" required><option value={ANY_CATEGORY}>All categories</option>{APPLICANT_CATEGORIES.map((c) => <option value={c.value}>{c.label}</option>)}</select></label>
+          <label>Currency<select name="currency" required>{CURRENCIES.map((c) => <option value={c.code}>{c.code} · {c.name}</option>)}</select></label>
+          <label>Fee amount<input type="text" name="amount" required placeholder="As a number, in that currency" /></label>
+        </div>
+        <div class="sa-row">
+          <label>Tax<select name="tax_mode">{TAX_MODES.map((t) => <option value={t.value}>{t.label}</option>)}</select></label>
+          <label>Tax name<input type="text" name="tax_label" maxlength="60" placeholder="For example GST or VAT" /></label>
+          <label>Tax rate %<input type="number" name="tax_rate" step="0.01" min="0" max="100" /></label>
+          <label>Processing charge passed on %<input type="number" name="processing" step="0.01" min="0" max="10" value="0" /><span class="hint">0 means none is added.</span></label>
+        </div>
+        <label>How payment charges are handled (shown to applicants)<input type="text" name="charges_note" maxlength="300" placeholder="For example: no processing charge is added; your bank may charge for foreign transactions" /></label>
+        <label>Payment terms the applicant must accept<textarea name="terms" maxlength="8000" style="min-height:150px;" placeholder="What the fee covers, when it is refundable and when it is not, what happens if the call cannot take place, how long the booking stays open"></textarea><span class="hint">Have these reviewed before approval. They are shown in full before payment and stored with every acceptance.</span></label>
+        <label>Internal note (optional)<input type="text" name="note" maxlength="500" /></label>
+        <button class="sa-btn" type="submit">Save as draft</button>
+      </form>
+    </section>
+  )}
+
+  {retired.length > 0 && (
+    <section class="sa-panel">
+      <h2 class="sa-h2">History</h2>
+      <div class="sa-scroll"><table class="sa-table"><tbody>{retired.map((f) => <tr><td>{f.category === ANY_CATEGORY ? 'All categories' : categoryLabel(f.category)}</td><td>{f.currency}</td><td>{formatMoney(breakdownFor(f).total, f.currency)}</td><td class="hint">{f.note}</td></tr>)}</tbody></table></div>
+    </section>
+  )}
+</AdminFrame>

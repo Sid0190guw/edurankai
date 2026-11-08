@@ -106,6 +106,13 @@ export const NOTIFICATION_AUDIENCE: Record<string, AppRole[]> = {
   // and the criterion they did not meet. The People desk decides it, so only the People desk hears.
   // (A lead who IS on record is told directly with sendPushToUser, not through this broadcast.)
   completion_review: HR_CORE,
+  // SAMARTH. The desks are gated to the samarth and samarth_x sections, which no built-in role below
+  // super admin holds, and these carry client names, fees and payments: the owner only, until a
+  // SAMARTH desk role exists.
+  samarth_application: ['super_admin'],
+  samarth_payment: ['super_admin'],
+  samarth_partner: ['super_admin'],
+  samarth_x: ['super_admin'],
 
   // ── HORIZON signals ──────────────────────────────────────────────────────────
   // An automatically detected change in somebody's working record, addressed to whoever can do

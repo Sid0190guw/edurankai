@@ -1,0 +1,229 @@
+---
+// /admin/samarth/engagements/<id> - one quotation: edit while DRAFT, submit for approval, approve
+// with a note, send, record acceptance or payment from outside the website, record the contract or
+// award reference, start and complete delivery. Returning to draft clears the approval.
+import AdminFrame from '@/components/samarth/AdminFrame.astro';
+import { canAccessSection, can } from '@/lib/auth/permissions';
+import {
+  getEngagement, updateDraft, transitionEngagement, recordOfflineAcceptance, setAwardReference, recordEngagementPayment, engagementNote,
+  quotationProblems, engagementBreakdown, type DraftInput,
+} from '@/lib/samarth/engagements';
+import { getApplication } from '@/lib/samarth/applications';
+import { approvedPartners } from '@/lib/samarth/partners';
+import { raiseInvoice, paymentStatusOf } from '@/lib/samarth/payments';
+import { eventsFor, isUuid } from '@/lib/samarth/store-core';
+import { emailUpdate, workspaceUrl } from '@/lib/samarth/notify';
+import { availableTransitions, statusLabel, ENGAGEMENT_KINDS, ENGAGEMENT_EDITABLE, isContracted } from '@/lib/samarth/workflow';
+import { PACKAGES, priceLabel } from '@/lib/samarth/pricing';
+import { CURRENCIES, TAX_MODES, formatMoney, parseMajorToMinor, minorToMajorString } from '@/lib/samarth/currency';
+import { DELIVERY_MODELS, ACCOUNTABILITY_NOTICE } from '@/lib/samarth/catalog';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'samarth', 'view'))) return Astro.redirect('/admin?denied=samarth');
+const id = String(Astro.params.id || '');
+const PAGE = '/admin/samarth/engagements/' + id;
+const mayWrite = await canAccessSection(user, 'samarth', 'edit');
+const mayInvoice = can(user as any, 'invoices.manage') || await canAccessSection(user, 'finance', 'edit');
+const xDesk = await canAccessSection(user, 'samarth_x', 'view');
+const who = { userId: user.id, name: user.name || user.email || 'SAMARTH team' };
+const done = (m: string, ok = true) => Astro.redirect(PAGE + '?' + (ok ? 'msg=' : 'err=') + encodeURIComponent(m.slice(0, 600)));
+if (!isUuid(id)) return Astro.redirect('/admin/samarth/engagements');
+
+if (Astro.request.method === 'POST') {
+  if (!mayWrite) return done('Changing an engagement needs the SAMARTH edit permission.', false);
+  let fd: FormData;
+  try { fd = await Astro.request.formData(); } catch { fd = new FormData(); }
+  const get = (n: string) => String(fd.get(n) ?? '');
+  const action = get('action');
+  const cur = await getEngagement(id);
+  if (!cur.ready || !cur.value) return done(cur.ready ? 'That engagement no longer exists.' : cur.error, false);
+  const e = cur.value;
+  const appR = await getApplication(e.applicationId);
+  const app = appR.ready ? appR.value : null;
+  try {
+    if (action === 'save') {
+      const currency = get('currency');
+      const amount = parseMajorToMinor(get('amount'), currency);
+      if (get('amount') && amount == null) return done('The amount is not a valid figure for ' + currency + '.', false);
+      const rate = get('tax_rate') ? Math.round(Number(get('tax_rate')) * 100) : 0;
+      const d: DraftInput = {
+        kind: get('kind'), packageCode: get('package_code'), title: get('title'), scope: get('scope'), deliverables: get('deliverables'),
+        exclusions: get('exclusions'), deliveryModel: get('delivery_model'), responsibility: get('responsibility'), partnerIds: fd.getAll('partners').map(String),
+        currency, amountMinor: amount, taxMode: get('tax_mode'), taxLabel: get('tax_label'), taxRateBp: Number.isFinite(rate) ? rate : 0,
+        terms: get('terms'), validUntil: get('valid_until') || null, paymentMethod: get('payment_method'),
+      };
+      const r = await updateDraft(id, d, who);
+      return r.ok ? done('Draft saved.') : done(r.error, false);
+    }
+    if (action === 'transition') {
+      const to = get('to');
+      const r = await transitionEngagement(id, to, 'staff', who, get('note') || null);
+      if (r.ok && to === 'SENT' && app) await emailUpdate(app.contactEmail, app.ref, 'A quotation from SAMARTH', 'A quotation is waiting for your decision: ' + e.title + ' (' + e.ref + '). Open your request to review its scope, price and terms, and to accept or decline it.', workspaceUrl(app.ref));
+      if (r.ok && app && ['IN_DELIVERY', 'COMPLETED', 'CANCELLED'].includes(to)) await emailUpdate(app.contactEmail, app.ref, 'Update on ' + e.ref, e.title + ' is now: ' + statusLabel('engagement', to) + (get('note') ? '. ' + get('note') : '.'), workspaceUrl(app.ref));
+      return r.ok ? done('Now ' + statusLabel('engagement', to) + '.') : done(r.error, false);
+    }
+    if (action === 'offline_accept') {
+      const r = await recordOfflineAcceptance(id, get('accepted_name'), get('evidence'), who);
+      return r.ok ? done('Acceptance recorded.') : done(r.error, false);
+    }
+    if (action === 'award') {
+      const r = await setAwardReference(id, get('reference'), who);
+      return r.ok ? done('Reference recorded.') : done(r.error, false);
+    }
+    if (action === 'payment') {
+      const r = await recordEngagementPayment(id, get('reference'), who);
+      return r.ok ? done('Payment recorded.') : done(r.error, false);
+    }
+    if (action === 'invoice') {
+      if (!mayInvoice) return done('Raising an invoice needs the finance or invoice permission.', false);
+      if (!app) return done('The consultation request for this engagement could not be read.', false);
+      const r = await raiseInvoice('engagement', app, e, who);
+      return r.ok ? Astro.redirect('/admin/finance/invoices/' + r.invoiceId) : done(r.error, false);
+    }
+    if (action === 'note' || action === 'message') {
+      const r = await engagementNote(id, get('body'), action === 'message', who);
+      if (r.ok && action === 'message' && app) await emailUpdate(app.contactEmail, app.ref, 'A message about ' + e.ref, get('body'), workspaceUrl(app.ref));
+      return r.ok ? done('Saved.') : done(r.error, false);
+    }
+    return done('Unknown action.', false);
+  } catch (err: any) {
+    console.error('[admin/samarth/engagements] action', action, 'failed:', String(err?.cause?.message || err?.message || err));
+    return done('Nothing was changed: ' + String(err?.cause?.message || err?.message || 'unknown error'), false);
+  }
+}
+
+const loaded = await getEngagement(id);
+const e = loaded.ready ? loaded.value : null;
+const appR = e ? await getApplication(e.applicationId) : null;
+const app = appR && appR.ready ? appR.value : null;
+const partners = await approvedPartners();
+const events = e ? await eventsFor('engagement', e.id, false) : null;
+const pay = e?.paymentOrderId ? await paymentStatusOf(e.paymentOrderId) : null;
+const editable = !!e && ENGAGEMENT_EDITABLE.includes(e.status) && mayWrite;
+const problems = e ? quotationProblems(e) : [];
+const transitions = e ? availableTransitions('engagement', e.status, 'staff').filter((t) => t.to !== 'ACCEPTED') : [];
+const b = e ? engagementBreakdown(e) : null;
+const selfApproved = !!e && !!e.approvedBy && e.approvedBy === user.id && e.preparedName === who.name;
+// A newline for pre-wrapped text, kept out of the template markup.
+const NL = String.fromCharCode(10);
+---
+<AdminFrame title={e ? e.ref + ' · ' + e.title : 'Engagement'} active="engagements" showX={xDesk} msg={Astro.url.searchParams.get('msg') || ''} err={Astro.url.searchParams.get('err') || (!loaded.ready ? loaded.error : (!e ? 'That engagement does not exist.' : ''))}>
+  {e && (
+    <div>
+      <p class="sa-lede"><span class="sa-chip hot">{statusLabel('engagement', e.status)}</span>{isContracted(e.status, e.awardReference, e.paymentState === 'paid') && <span class="sa-chip ok" style="margin-left:6px;">Contracted</span>} For {app ? <a href={'/admin/samarth/applications/' + app.id}>{app.ref} · {app.orgName || app.contactName}</a> : 'an unreadable request'}. Prepared by {e.preparedName || 'unknown'}{e.approvedName ? '; approved by ' + e.approvedName + (e.approvedAt ? ' on ' + e.approvedAt.slice(0, 10) : '') : ''}.</p>
+      {selfApproved && <div class="sa-flash warn">This quotation was approved by the same person who prepared it. That is recorded, and allowed, but a second approver is better practice for large amounts.</div>}
+      {problems.length > 0 && e.status === 'DRAFT' && <div class="sa-flash warn">Before it can go for approval: {problems.join(' ')}</div>}
+
+      <div class="sa-grid2">
+        <section class="sa-panel">
+          <h2 class="sa-h2">Quotation</h2>
+          {editable ? (
+            <form method="POST" class="sa-form">
+              <input type="hidden" name="action" value="save" />
+              <div class="sa-row">
+                <label>Kind<select name="kind">{ENGAGEMENT_KINDS.map((k) => <option value={k.value} selected={k.value === e.kind}>{k.label}</option>)}</select></label>
+                <label>Consultancy package<select name="package_code"><option value="">Not a package</option>{PACKAGES.map((p) => <option value={p.code} selected={p.code === e.packageCode}>{p.label} ({priceLabel(p)})</option>)}</select></label>
+              </div>
+              <label>Title<input type="text" name="title" maxlength="200" value={e.title} required /></label>
+              <label>Scope of work<textarea name="scope" maxlength="8000">{e.scope}</textarea></label>
+              <label>Deliverables<textarea name="deliverables" maxlength="8000">{e.deliverables}</textarea></label>
+              <label>Not included<textarea name="exclusions" maxlength="4000">{e.exclusions}</textarea></label>
+              <div class="sa-row">
+                <label>Delivery model<select name="delivery_model"><option value="">Choose</option>{DELIVERY_MODELS.map((m) => <option value={m.value} selected={m.value === e.deliveryModel}>{m.title}</option>)}</select></label>
+                <label>Payment<select name="payment_method"><option value="invoice" selected={e.paymentMethod === 'invoice'}>Against an invoice</option><option value="online" selected={e.paymentMethod === 'online'}>Online after acceptance</option></select></label>
+              </div>
+              <label>Approved partners on this work<select name="partners" multiple size="4">{partners.ready && partners.value.map((p) => <option value={p.id} selected={e.partnerIds.includes(p.id)}>{p.orgName} ({p.country})</option>)}</select><span class="hint">Only approved partners are listed. Hold Ctrl or Cmd to choose several.</span></label>
+              <label>Responsibility and subcontracting<textarea name="responsibility" maxlength="4000" placeholder="Who is responsible for which part, what is subcontracted to whom, and who is accountable for delivery">{e.responsibility}</textarea><span class="hint">{ACCOUNTABILITY_NOTICE}</span></label>
+              <div class="sa-row">
+                <label>Currency<select name="currency">{CURRENCIES.map((c) => <option value={c.code} selected={c.code === e.currency}>{c.code}</option>)}</select></label>
+                <label>Amount before tax<input type="text" name="amount" value={minorToMajorString(e.amountMinor, e.currency)} placeholder="250000" /></label>
+                <label>Tax<select name="tax_mode">{TAX_MODES.map((t) => <option value={t.value} selected={t.value === e.taxMode}>{t.label}</option>)}</select></label>
+                <label>Tax name<input type="text" name="tax_label" maxlength="60" value={e.taxLabel} /></label>
+                <label>Tax rate %<input type="number" name="tax_rate" step="0.01" min="0" max="100" value={e.taxRateBp ? String(e.taxRateBp / 100) : ''} /></label>
+              </div>
+              <div class="sa-row"><label>Valid until<input type="date" name="valid_until" value={e.validUntil || ''} /></label></div>
+              <label>Terms (payment, delivery, acceptance, cancellation, intellectual property)<textarea name="terms" maxlength="12000" style="min-height:160px;">{e.terms}</textarea></label>
+              <button class="sa-btn" type="submit">Save draft</button>
+            </form>
+          ) : (
+            <dl class="sa-kv">
+              <dt>Scope</dt><dd>{e.scope}</dd>
+              <dt>Deliverables</dt><dd>{e.deliverables || '-'}</dd>
+              <dt>Not included</dt><dd>{e.exclusions || '-'}</dd>
+              <dt>Delivery</dt><dd>{DELIVERY_MODELS.find((m) => m.value === e.deliveryModel)?.title || '-'}{e.responsibility ? NL + e.responsibility : ''}</dd>
+              <dt>Valid until</dt><dd>{e.validUntil || '-'}</dd>
+              <dt>Terms</dt><dd>{e.terms}</dd>
+            </dl>
+          )}
+        </section>
+        <section class="sa-panel">
+          <h2 class="sa-h2">Price</h2>
+          {b && b.total > 0 ? (
+            <dl class="sa-kv">{b.lines.map((l) => <><dt>{l.label}</dt><dd>{formatMoney(l.minor, e.currency)}</dd></>)}<dt>Total</dt><dd><strong>{formatMoney(b.total, e.currency)}</strong></dd></dl>
+          ) : <p class="hint">No amount yet.</p>}
+          <h2 class="sa-h2" style="margin-top:14px;">Payment and contract</h2>
+          <dl class="sa-kv">
+            <dt>Payment</dt><dd>{e.paymentState === 'paid' ? 'Paid ' + (e.paidAt || '').slice(0, 10) + ' (' + e.paymentReference + ')' : e.paymentState === 'pending' ? 'Due' : 'Not due yet'}</dd>
+            {e.paymentOrderId && <><dt>Gateway order</dt><dd>{e.paymentOrderId}{pay ? ' · ' + pay.status : ' · payment record unavailable'}</dd></>}
+            <dt>Contract or award</dt><dd>{e.awardReference || 'Not recorded'}</dd>
+            {e.acceptedAt && <><dt>Accepted</dt><dd>{e.acceptedName} on {e.acceptedAt.slice(0, 10)}{e.acceptanceEvidence ? NL + e.acceptanceEvidence : ''}</dd></>}
+            {e.invoiceId && <><dt>Invoice</dt><dd><a href={'/admin/finance/invoices/' + e.invoiceId}>Open invoice</a></dd></>}
+          </dl>
+          {mayWrite && e.status === 'SENT' && (
+            <form method="POST" class="sa-form" style="margin-top:12px;">
+              <input type="hidden" name="action" value="offline_accept" />
+              <div class="sa-row"><label>Accepted by<input type="text" name="accepted_name" maxlength="200" required /></label><label>Evidence<input type="text" name="evidence" maxlength="600" required placeholder="Signed letter, purchase order, document link" /></label></div>
+              <button class="sa-btn ghost" type="submit">Record acceptance received outside the website</button>
+            </form>
+          )}
+          {mayWrite && ['ACCEPTED', 'IN_DELIVERY'].includes(e.status) && (
+            <form method="POST" class="sa-form" style="margin-top:12px;">
+              <input type="hidden" name="action" value="award" />
+              <label>Contract, purchase order or award reference<input type="text" name="reference" maxlength="200" value={e.awardReference} required /></label>
+              <button class="sa-btn ghost" type="submit">Record reference</button>
+            </form>
+          )}
+          {mayWrite && ['ACCEPTED', 'IN_DELIVERY', 'COMPLETED'].includes(e.status) && e.paymentState !== 'paid' && (
+            <form method="POST" class="sa-form" style="margin-top:12px;">
+              <input type="hidden" name="action" value="payment" />
+              <label>Payment received outside the gateway<input type="text" name="reference" maxlength="200" required placeholder="Bank reference or receipt number" /></label>
+              <button class="sa-btn ghost" type="submit">Record payment</button>
+            </form>
+          )}
+          {mayInvoice && !e.invoiceId && ['ACCEPTED', 'IN_DELIVERY', 'COMPLETED'].includes(e.status) && (
+            <form method="POST" style="margin-top:12px;"><input type="hidden" name="action" value="invoice" /><button class="sa-btn ghost" type="submit">Raise invoice</button></form>
+          )}
+        </section>
+      </div>
+
+      <div class="sa-grid2">
+        <section class="sa-panel">
+          <h2 class="sa-h2">Move this engagement</h2>
+          {!mayWrite && <p class="hint">Needs the SAMARTH edit permission.</p>}
+          {mayWrite && transitions.length > 0 && (
+            <form method="POST" class="sa-form">
+              <input type="hidden" name="action" value="transition" />
+              <div class="sa-row">
+                <label>To<select name="to">{transitions.map((t) => <option value={t.to}>{statusLabel('engagement', t.to)}{t.needsNote ? ' (note needed)' : ''}</option>)}</select></label>
+                <label>Note (an approval note is required to approve)<input type="text" name="note" maxlength="2000" /></label>
+              </div>
+              <button class="sa-btn" type="submit">Apply</button>
+            </form>
+          )}
+          {mayWrite && transitions.length === 0 && <p class="hint">No further changes are possible from here{e.status === 'SENT' ? ' except the client\'s decision, or recording an acceptance above' : ''}.</p>}
+          <form method="POST" class="sa-form" style="margin-top:14px;">
+            <input type="hidden" name="action" value="note" />
+            <label>Internal note<textarea name="body" maxlength="5000" required></textarea></label>
+            <button class="sa-btn ghost" type="submit">Save note</button>
+          </form>
+        </section>
+        <section class="sa-panel">
+          <h2 class="sa-h2">Timeline</h2>
+          {events && events.ready && <ul class="sa-timeline">{events.value.map((ev) => <li><span class="w">{ev.createdAt.slice(0, 16).replace('T', ' ')} UTC · {ev.actorName}</span>{ev.visibility === 'applicant' && <span class="vis">client sees this</span>}<p class="b">{ev.toStatus ? statusLabel('engagement', ev.toStatus) + (ev.body ? ': ' : '') : ''}{ev.body}</p></li>)}</ul>}
+          {events && !events.ready && <div class="sa-flash warn">{events.error}</div>}
+        </section>
+      </div>
+    </div>
+  )}
+</AdminFrame>
