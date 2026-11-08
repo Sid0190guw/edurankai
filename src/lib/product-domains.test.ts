@@ -51,7 +51,7 @@ const rolesPerDept = (() => {
  * already removed from Visvambhara on exactly that evidence, and giving the quantum-communications
  * programme its own page is not new evidence for mapping it back.
  */
-const UNSTAFFED = new Set(['sancharan', 'sampark', 'sambandh', 'foundational-models', 'akasha-q']);
+const UNSTAFFED = new Set(['sancharan', 'sampark', 'sambandh', 'foundational-models', 'akasha-q', 'samarth']);
 
 describe('the mapping points at departments that exist', () => {
   it('every department id is a real catalogue department', () => {

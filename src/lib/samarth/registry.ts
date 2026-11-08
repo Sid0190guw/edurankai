@@ -40,8 +40,8 @@ export const MODULES: readonly SamarthModule[] = [
   },
   {
     id: '02', name: 'Branding, navigation and public website', status: 'built', release: 1, dependsOn: ['01'],
-    built: ['/samarth hub and sub-navigation', 'Sector, government, engineering, consultancy and consultation pages', 'Site navigation and sitemap entries', 'Structured data: organisation, services, breadcrumbs, FAQ'],
-    pending: [], surfaces: ['/samarth', '/samarth/consultation', '/samarth/industry', '/samarth/government', '/samarth/engineering'],
+    built: ['/samarth hub and sub-navigation', 'Sector, government, engineering, consultancy and consultation pages', 'Site navigation and sitemap entries', 'Structured data: organisation, services, breadcrumbs, FAQ', 'Listed as a venture on /ecosystem and /ecosystem/samarth, a homepage section, footer, About, FAQ and Contact'],
+    pending: [], surfaces: ['/samarth', '/samarth/consultation', '/samarth/industry', '/samarth/government', '/samarth/engineering', '/ecosystem/samarth'],
   },
   {
     id: '03', name: 'Enterprise, industry, manufacturing and government service architecture', status: 'built', release: 3, dependsOn: ['02'],
