@@ -4,7 +4,7 @@
 // enters it here AND approves it with a note. Approving a revision retires the previous row.
 import AdminFrame from '@/components/samarth/AdminFrame.astro';
 import { canAccessSection } from '@/lib/auth/permissions';
-import { listFees, createFeeDraft, approveFee, retireFee, breakdownFor, feeProblems, waitingForFee } from '@/lib/samarth/fees';
+import { listFees, createFeeDraft, approveFee, retireFee, breakdownFor, feeProblems, waitingForFee, TERMS_TEMPLATE } from '@/lib/samarth/fees';
 import { APPLICANT_CATEGORIES, ANY_CATEGORY, categoryLabel } from '@/lib/samarth/categories';
 import { CURRENCIES, TAX_MODES, formatMoney, parseMajorToMinor } from '@/lib/samarth/currency';
 
@@ -24,15 +24,42 @@ if (Astro.request.method === 'POST') {
   const get = (n: string) => String(fd.get(n) ?? '');
   const action = get('action');
   if (action === 'draft') {
-    const currency = get('currency');
-    const amount = parseMajorToMinor(get('amount'), currency);
-    if (amount == null) return done('Enter the fee as a number in ' + currency + ', for example 5000 or 49.50.', false);
-    const r = await createFeeDraft({
-      category: get('category'), currency, amountMinor: amount, taxMode: get('tax_mode'), taxLabel: get('tax_label'),
+    // Up to four currencies in one submission, sharing the category, tax, charges and terms.
+    const rows: { currency: string; amount: number }[] = [];
+    for (let i = 0; i < 4; i++) {
+      const currency = get('currency_' + i);
+      const raw = get('amount_' + i).trim();
+      if (!currency || !raw) continue;
+      const amount = parseMajorToMinor(raw, currency);
+      if (amount == null || amount <= 0) return done('The amount for ' + currency + ' is not a valid figure (for example 5000 or 49.50). Nothing was saved.', false);
+      rows.push({ currency, amount });
+    }
+    if (!rows.length) return done('Enter at least one currency and amount. Nothing was saved.', false);
+    if (new Set(rows.map((x) => x.currency)).size !== rows.length) return done('Each currency can appear once. Nothing was saved.', false);
+    const approveNow = get('approve_now') === 'yes';
+    const approvalNote = get('approval_note').trim();
+    if (approveNow && approvalNote.length < 5) return done('To publish now, write the approval note: who decided this fee and on what basis. Nothing was saved.', false);
+    const base = {
+      category: get('category'), taxMode: get('tax_mode'), taxLabel: get('tax_label'),
       taxRateBp: get('tax_rate') ? Math.round(Number(get('tax_rate')) * 100) : 0, processingBp: get('processing') ? Math.round(Number(get('processing')) * 100) : 0,
       chargesNote: get('charges_note'), terms: get('terms'), note: get('note'),
-    }, who);
-    return r.ok ? done('Draft saved. Review it, then approve it with a note to publish it.') : done(r.error, false);
+    };
+    if (approveNow) {
+      const problems = feeProblems({ ...base, currency: rows[0].currency, amountMinor: rows[0].amount });
+      if (problems.length) return done('Not published: ' + problems.join(' ') + ' Nothing was saved.', false);
+    }
+    const lines: string[] = [];
+    let failed = false;
+    for (const row of rows) {
+      const r = await createFeeDraft({ ...base, currency: row.currency, amountMinor: row.amount }, who);
+      if (!r.ok) { failed = true; lines.push(row.currency + ': not saved (' + r.error + ')'); continue; }
+      if (approveNow) {
+        const a = await approveFee(r.id, approvalNote, who);
+        if (!a.ok) failed = true;
+        lines.push(row.currency + ': ' + (a.ok ? 'published' : 'saved as a draft, not published (' + a.error + ')'));
+      } else lines.push(row.currency + ': draft saved');
+    }
+    return done(lines.join('. ') + '.', !failed);
   }
   if (action === 'approve') {
     const r = await approveFee(get('id'), get('approval_note'), who);
@@ -112,9 +139,14 @@ const retired = list.filter((f) => f.status === 'retired').slice(0, 30);
         <input type="hidden" name="action" value="draft" />
         <div class="sa-row">
           <label>Applicant category<select name="category" required><option value={ANY_CATEGORY}>All categories</option>{APPLICANT_CATEGORIES.map((c) => <option value={c.value}>{c.label}</option>)}</select></label>
-          <label>Currency<select name="currency" required>{CURRENCIES.map((c) => <option value={c.code}>{c.code} · {c.name}</option>)}</select></label>
-          <label>Fee amount<input type="text" name="amount" required placeholder="As a number, in that currency" /></label>
         </div>
+        <p class="hint" style="margin:0;">Amounts, one per currency (up to four at once). Leave a row empty to skip it.</p>
+        {[0, 1, 2, 3].map((i) => (
+          <div class="sa-row">
+            <label>Currency {i + 1}<select name={'currency_' + i}><option value="">Not used</option>{CURRENCIES.map((c) => <option value={c.code} selected={(i === 0 && c.code === 'INR') || (i === 1 && c.code === 'USD')}>{c.code} · {c.name}</option>)}</select></label>
+            <label>Fee amount<input type="text" name={'amount_' + i} placeholder="As a number, in that currency" /></label>
+          </div>
+        ))}
         <div class="sa-row">
           <label>Tax<select name="tax_mode">{TAX_MODES.map((t) => <option value={t.value}>{t.label}</option>)}</select></label>
           <label>Tax name<input type="text" name="tax_label" maxlength="60" placeholder="For example GST or VAT" /></label>
@@ -122,9 +154,11 @@ const retired = list.filter((f) => f.status === 'retired').slice(0, 30);
           <label>Processing charge passed on %<input type="number" name="processing" step="0.01" min="0" max="10" value="0" /><span class="hint">0 means none is added.</span></label>
         </div>
         <label>How payment charges are handled (shown to applicants)<input type="text" name="charges_note" maxlength="300" placeholder="For example: no processing charge is added; your bank may charge for foreign transactions" /></label>
-        <label>Payment terms the applicant must accept<textarea name="terms" maxlength="8000" style="min-height:150px;" placeholder="What the fee covers, when it is refundable and when it is not, what happens if the call cannot take place, how long the booking stays open"></textarea><span class="hint">Have these reviewed before approval. They are shown in full before payment and stored with every acceptance.</span></label>
+        <label>Payment terms the applicant must accept<textarea name="terms" maxlength="8000" style="min-height:260px;">{TERMS_TEMPLATE}</textarea><span class="hint">A starting draft. Replace every [bracketed] choice with your decision; a fee cannot be published while any bracket remains. Have the terms reviewed. They are shown in full before payment and stored with every acceptance.</span></label>
         <label>Internal note (optional)<input type="text" name="note" maxlength="500" /></label>
-        <button class="sa-btn" type="submit">Save as draft</button>
+        <label class="sa-check"><input type="checkbox" name="approve_now" value="yes" /> Approve and publish now</label>
+        <label>Approval note (required to publish now)<input type="text" name="approval_note" maxlength="1000" placeholder="Who decided this fee, and on what basis" /></label>
+        <button class="sa-btn" type="submit">Save</button>
       </form>
     </section>
   )}

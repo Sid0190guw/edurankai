@@ -267,9 +267,59 @@ export function ensureSamarthSchema(): Promise<void> {
   return ensureBatch('samarth_schema_v1', SAMARTH_DDL);
 }
 
+export interface SamarthSchemaStatus { ready: boolean; missing: string[]; error?: string }
+
+/** Which SAMARTH tables exist right now. Table names are constants, never user input. */
+export async function samarthSchemaStatus(): Promise<SamarthSchemaStatus> {
+  try {
+    const { db } = await import('@/lib/db');
+    const { sql } = await import('drizzle-orm');
+    const cols = SAMARTH_TABLES.map((t, i) => "to_regclass('public." + t + "') IS NOT NULL AS t" + i).join(', ');
+    const r: any = await db.execute(sql.raw('SELECT ' + cols));
+    const row = (Array.isArray(r) ? r : (r?.rows || []))[0] || {};
+    const missing = SAMARTH_TABLES.filter((_, i) => row['t' + i] !== true);
+    return { ready: missing.length === 0, missing };
+  } catch (e: any) {
+    return { ready: false, missing: [...SAMARTH_TABLES], error: dbReason(e) };
+  }
+}
+
+/**
+ * CREATE THE SAMARTH TABLES NOW, ON AN OPERATOR'S EXPLICIT REQUEST.
+ *
+ * Production refuses request-time DDL (src/lib/ensure-once.ts), which is right for page views and
+ * is why /samarth/consultation said "the published fees could not be loaded" on the live site: its
+ * tables had never been created. This is the same operator action as "Create module tables" on
+ * /admin/setup, scoped to SAMARTH and reachable from the SAMARTH desk itself. It runs the DDL inside
+ * allowingDdl(), never through ensureOnce (which would swallow a failure), and then checks every
+ * table, so the answer is what the database says rather than what the DDL call returned.
+ *
+ * Safe on a live database: CREATE TABLE / INDEX IF NOT EXISTS on brand-new tables only, no ALTER, so
+ * no lock is taken on any table other pages read.
+ */
+export async function createSamarthTables(): Promise<SamarthSchemaStatus> {
+  try {
+    const { allowingDdl } = await import('@/lib/schema-bootstrap');
+    const { runGuardedDdl } = await import('@/lib/ensure-once');
+    await allowingDdl(() => runGuardedDdl(SAMARTH_DDL));
+  } catch (e: any) {
+    const after = await samarthSchemaStatus();
+    return { ...after, error: dbReason(e) };
+  }
+  return samarthSchemaStatus();
+}
+
 /** The sentence every reader shows when a SAMARTH table is absent. */
 export const SAMARTH_NOT_SET_UP =
   'SAMARTH is not set up on this deployment yet: its tables do not exist. Run the bootstrap at /admin/setup, or psql -v ON_ERROR_STOP=1 -f db/samarth-schema.sql.';
+
+/** What a PUBLIC visitor is told when SAMARTH is not set up. Never the operator instruction above. */
+export const PUBLIC_NOT_OPEN = 'SAMARTH is not open for this yet. Please try again shortly, or write to connect@edurankai.in and we will reply.';
+
+/** Map an internal error to what a public visitor may read. */
+export function publicMessage(error: string): string {
+  return error === SAMARTH_NOT_SET_UP ? PUBLIC_NOT_OPEN : error;
+}
 
 export function isMissingTable(e: any): boolean {
   return String(e?.cause?.code || e?.code || '') === '42P01';

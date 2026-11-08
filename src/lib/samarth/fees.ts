@@ -51,32 +51,8 @@ export function breakdownFor(f: FeeRow): FeeBreakdown {
   return feeBreakdown({ amountMinor: f.amountMinor, currency: f.currency, taxMode: f.taxMode, taxLabel: f.taxLabel, taxRateBp: f.taxRateBp, processingBp: f.processingBp });
 }
 
-export interface FeeInput {
-  category: string;
-  currency: string;
-  amountMinor: number | null;
-  taxMode: string;
-  taxLabel: string;
-  taxRateBp: number | null;
-  processingBp: number | null;
-  chargesNote: string;
-  terms: string;
-  note: string;
-}
-
-/** Everything a fee row needs before it can be APPROVED. Pure; also used to warn on drafts. */
-export function feeProblems(f: Pick<FeeInput, 'category' | 'currency' | 'amountMinor' | 'taxMode' | 'taxLabel' | 'taxRateBp' | 'processingBp' | 'chargesNote' | 'terms'>): string[] {
-  const p: string[] = [];
-  if (f.category !== ANY_CATEGORY && !isApplicantCategory(f.category)) p.push('Choose an applicant category.');
-  if (!isSupportedCurrency(f.currency)) p.push('Choose a supported currency.');
-  if (!f.amountMinor || f.amountMinor <= 0) p.push('Enter the fee amount.');
-  if (!TAX_MODES.some((t) => t.value === f.taxMode)) p.push('Say how tax applies.');
-  if (f.taxMode !== 'none' && (!f.taxLabel.trim() || !f.taxRateBp || f.taxRateBp <= 0 || f.taxRateBp > 10000)) p.push('A taxed fee needs the tax name and a rate between 0 and 100%.');
-  if (f.processingBp != null && (f.processingBp < 0 || f.processingBp > 1000)) p.push('A payment processing charge must be between 0% and 10%.');
-  if (f.chargesNote.trim().length < 10) p.push('State how payment charges are handled (for example, that none are added, or what is added).');
-  if (f.terms.trim().length < 40) p.push('Write the payment terms the applicant must accept (at least a few sentences: what the fee covers, refunds, and what happens if the call cannot take place).');
-  return p;
-}
+export { feeProblems, TERMS_TEMPLATE, type FeeInput } from '@/lib/samarth/fee-rules';
+import { feeProblems, type FeeInput } from '@/lib/samarth/fee-rules';
 
 export async function listFees(): Promise<Read<FeeRow[]>> {
   return readSafely('the fee schedule', async () =>

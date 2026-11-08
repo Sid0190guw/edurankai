@@ -1,7 +1,7 @@
 # SAMARTH payment architecture
 
 ## What is charged
-1. **Consultation booking fee** (every applicant). Configured at `/admin/samarth/fees` per (applicant category, currency), with tax mode (none, exclusive, inclusive), tax name and rate, an optional processing charge passed on (0 to 10%), a statement of how payment charges are handled, and payment terms. Draft until approved with a note. No amount is preset.
+1. **Consultation booking fee** (every applicant). Configured at `/admin/samarth/fees` per (applicant category, currency), several currencies per submission, with tax mode (none, exclusive, inclusive), tax name and rate, an optional processing charge passed on (0 to 10%), a statement of how payment charges are handled, and payment terms. Draft until approved with a note. No amount is preset.
 2. **Engagements** (later, separate): each quotation carries its own currency, amount, tax and terms, approved internally and accepted by the client before payment.
 SAMARTH X and partner registration are never charged.
 

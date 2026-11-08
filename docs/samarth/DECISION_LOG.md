@@ -41,3 +41,9 @@ Newest last. Each entry: the decision, why, and what would change it.
 **D-019 The AI assistant is not built in this pass (Module 05).** The discovery pathways it would drive are built as a deterministic form so the workflow works with no AI provider at all (sovereignty rule: AI is an optional connector, never a dependency).
 
 **D-020 Hand-run SQL is the production schema path.** Bootstrap DDL is disabled in production. `db/samarth-schema.sql` is kept identical to `SAMARTH_DDL` by a test.
+
+**D-021 (2026-11-08) Online checkout on by default, at the owner's request.** After launch the owner asked to "connect the gateway". Both SAMARTH checkout flags now default on (D-007 superseded). Online payment still needs Razorpay keys on the deployment and an approved fee; either flag can be switched off at `/admin/feature-flags`.
+
+**D-022 One-click setup from the SAMARTH desk.** The live `/samarth/consultation` showed "the published fees could not be loaded" because production never creates tables on a page view and nobody had run the setup. Every SAMARTH admin page now detects missing tables and offers **Set up SAMARTH now** (`/api/admin/samarth/setup`, settings.edit), which runs the DDL inside `allowingDdl()` and verifies each table. Public pages say "not published" or "not open yet" instead of "reload", and an attempted registration alerts the owner.
+
+**D-023 Fee entry: several currencies at once, optional publish in the same step, a terms template.** Approval still needs a written note, and terms containing any `[bracketed]` placeholder are refused, so no refund or cancellation policy is published that a person did not decide. Amounts are never pre-filled.

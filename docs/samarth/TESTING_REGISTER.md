@@ -4,7 +4,7 @@
 
 | Gate | Result |
 |---|---|
-| `npx vitest run src/lib/samarth/samarth.test.ts` | **37 / 37 pass** |
+| `npx vitest run src/lib/samarth/samarth.test.ts` | **41 / 41 pass** (37 at launch; 4 added with the setup and fee-entry change) |
 | `npm test`, Vitest half | **218 files, 5,308 tests pass** (whole repository) |
 | `npm test`, shim half | 80 / 81 suites pass. `src/lib/vod.test.ts` fails 3 assertions. **Pre-existing:** the same 3 fail on clean `origin/main` (checked in a separate worktree). Not touched by SAMARTH. |
 | `node scripts/audit-wiring.mjs` | Pass: every link, form action and fetch resolves; every page reachable |
