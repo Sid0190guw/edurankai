@@ -5,7 +5,7 @@
 import type { APIRoute } from 'astro';
 // putBounded, not put: @vercel/blob retries TEN times with an unbounded backoff
 // (~17 minutes) and no request timeout. See src/lib/blob-upload.ts.
-import { putBounded as put } from '@/lib/blob-upload';
+import { storeImage, sniffImage } from '@/lib/inline-image';
 import { apiFail } from '@/lib/api-fail';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
@@ -33,10 +33,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
   if (!spec) return json({ ok: false, error: 'Allowed: JPG, PNG, WEBP' }, 415);
   const buf = new Uint8Array(await file.arrayBuffer());
   if (!magicMatches(buf, spec.magic)) return json({ ok: false, error: 'That file is not a real image' }, 415);
+  // Object storage when it answers, otherwise kept inline (src/lib/inline-image.ts): a missing or
+  // failing blob store no longer means nobody can set a photo.
+  const real = sniffImage(buf);
+  if (!real) return json({ ok: false, error: 'That file is not a real image' }, 415);
   try {
-    const blob = await put('profile-photos/' + user.id + '-' + Date.now() + '.' + (ext === 'jpeg' ? 'jpg' : ext), file, {
-      access: 'public', contentType: spec.mime, addRandomSuffix: true,
-    });
-    return json({ ok: true, url: blob.url });
-  } catch (e: any) { return apiFail('[profile-photo] upload', e, 'That photo could not be uploaded, so your photo is unchanged. Try again.'); }
+    const stored = await storeImage('profile-photos/' + user.id + '-' + Date.now() + '.' + (ext === 'jpeg' ? 'jpg' : ext), buf, real);
+    return json({ ok: true, url: stored.url, inline: stored.inline });
+  } catch (e: any) { return apiFail('[profile-photo] upload', e, String(e?.message || 'That photo could not be stored, so your photo is unchanged. Try a smaller image.')); }
 };
