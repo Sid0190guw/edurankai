@@ -4,10 +4,10 @@ Ordered. The first three are operator steps nobody else can do; the rest is the 
 
 ## Operator (owner) steps to go live
 1. **Merge and deploy** the `feat/samarth-foundation` branch.
-2. **Create the tables in production:** run the bootstrap at `/admin/setup` (module `samarth`) or `psql -v ON_ERROR_STOP=1 -f db/samarth-schema.sql`. Confirm `/api/health` no longer lists `samarth_*` tables.
+2. **Create the tables in production:** open `/admin/samarth` and press **Set up SAMARTH now** (or "Create module tables" at `/admin/setup`, or paste `db/samarth-schema.sql` into the database SQL editor). The banner disappears once all eight tables exist.
 3. **Approve booking fees** at `/admin/samarth/fees`: for each applicant category (or one all-categories row) and each currency you accept, enter the amount, tax treatment, payment-charge statement and the payment terms (have the terms reviewed), then approve with a note. Until then applicants can register but cannot book.
 4. **Sandbox-test checkout** on a preview deployment with Razorpay **test** keys: register, accept a fee with online payment, pay with a test card, confirm the request moves to "Fee paid" through the webhook and `/api/payments/verify`. `/admin/samarth` then shows "Sandbox-tested: Yes".
-5. **Turn on** `samarthFeeCheckout` at `/admin/feature-flags`. Leave `samarthEngagementCheckout` off until an engagement has also been tested.
+5. Online checkout is **on by default** (D-021). Make one real low-value test payment after approving the first fee, and check `/admin/samarth` shows the payment confirmed. Switch the flags off at `/admin/feature-flags` to fall back to invoices.
 6. **Grant desk access** (optional): give a custom role the `samarth` or `samarth_x` section at `/admin/team/roles`, and decide who else receives SAMARTH alerts (currently super admin only, `src/lib/notify-audience.ts`).
 
 ## Build work, in dependency order

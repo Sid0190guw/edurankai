@@ -1,6 +1,6 @@
 # SAMARTH implementation status
 
-**As of 2026-11-08.** Branch `feat/samarth-foundation`. Not merged, not deployed, production tables not created, no booking fee approved, both checkout flags off. Module-level status: [MODULE_REGISTER.md](MODULE_REGISTER.md). Evidence: [TESTING_REGISTER.md](TESTING_REGISTER.md).
+**As of 2026-11-08.** Branch `feat/samarth-foundation`. Merged and deployed (PRs #7, #8). Production tables not yet created at the time of writing (one-click setup now on /admin/samarth); no booking fee approved yet; online checkout on by default (D-021). Module-level status: [MODULE_REGISTER.md](MODULE_REGISTER.md). Evidence: [TESTING_REGISTER.md](TESTING_REGISTER.md).
 
 ## What works in the code
 - **Public site:** hub, consultation and fees, industry, government, engineering, consultancy packages with estimator, fourteen capability pages, partner ecosystem and registration, SAMARTH X and its expression of interest. Global wording; every country selectable; 31 currencies.

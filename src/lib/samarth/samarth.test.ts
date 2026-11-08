@@ -16,6 +16,7 @@ import * as catalog from '@/lib/samarth/catalog';
 import { newRef, isRef, newToken, hashToken, tokenMatches, zonedLocalToUtc, cleanUrl, cleanEmail, parseDocLinks, isCountryCode } from '@/lib/samarth/validate';
 import { parseScores, reviewTotal, aggregate, rankForIncubation, MAX_TOTAL } from '@/lib/samarth/x-scoring';
 import { MODULES } from '@/lib/samarth/registry';
+import { feeProblems, TERMS_TEMPLATE } from '@/lib/samarth/fee-rules';
 
 describe('consultancy packages (spec Part 6)', () => {
   // A wrong list price here is a wrong price on the public page and on every quotation check.
@@ -319,6 +320,37 @@ describe('copy and governance rules', () => {
       expect(s, f).not.toMatch(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u);
       expect(s, f).not.toMatch(/[←-⇿]/);
     }
+  });
+});
+
+describe('booking-fee approval rules', () => {
+  // A fee published with an undecided refund policy, or with no terms at all, is a promise nobody made.
+  const good = {
+    category: '*', currency: 'INR', amountMinor: 1000_00, taxMode: 'exclusive', taxLabel: 'GST', taxRateBp: 1800, processingBp: 0,
+    chargesNote: 'No processing charge is added.', terms: 'The fee covers one consultation call. It is refunded in full if SAMARTH cancels. It is not refundable after the call.',
+  };
+  it('approves a complete fee', () => {
+    expect(feeProblems(good)).toEqual([]);
+  });
+  it('refuses the terms template until every bracket is decided', () => {
+    expect(TERMS_TEMPLATE).toMatch(/\[[^\]]+\]/);
+    expect(feeProblems({ ...good, terms: TERMS_TEMPLATE }).join(' ')).toMatch(/bracketed placeholder/);
+    expect(feeProblems({ ...good, terms: TERMS_TEMPLATE.replace(/\[([^\]]*)\]/g, '$1') })).toEqual([]);
+  });
+  it('refuses missing tax details, charges statement, amount or currency', () => {
+    expect(feeProblems({ ...good, taxLabel: '' }).length).toBe(1);
+    expect(feeProblems({ ...good, chargesNote: '' }).length).toBe(1);
+    expect(feeProblems({ ...good, amountMinor: 0 }).length).toBe(1);
+    expect(feeProblems({ ...good, currency: 'AED' }).length).toBe(1);
+    expect(feeProblems({ ...good, category: 'astronaut' }).length).toBe(1);
+  });
+  it('never shows the operator setup instruction to the public', () => {
+    const src = readFileSync('src/lib/samarth/schema.ts', 'utf8');
+    expect(src).toMatch(/PUBLIC_NOT_OPEN = 'SAMARTH is not open for this yet/);
+    for (const page of ['src/pages/samarth/register.astro', 'src/pages/samarth/partners/index.astro', 'src/pages/samarth/x/apply.astro']) {
+      expect(readFileSync(page, 'utf8'), page).toMatch(/publicMessage\(r\.error\)/);
+    }
+    expect(readFileSync('src/pages/api/admin/samarth/setup.ts', 'utf8')).toMatch(/settings\.edit/);
   });
 });
 
