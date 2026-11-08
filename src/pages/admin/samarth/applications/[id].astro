@@ -1,0 +1,316 @@
+---
+// /admin/samarth/applications/<id> - one consultation request and everything a consultant does to it:
+// assign, schedule, record the call, record an offline fee payment, raise an invoice, message the
+// applicant, keep internal notes, decline, cancel, archive, and draft a separate engagement.
+import AdminFrame from '@/components/samarth/AdminFrame.astro';
+import { canAccessSection, can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import {
+  getApplication, staffTransition, assignConsultant, scheduleCall, completeCall, recordOfflineFeePayment, staffMessage, setArchived,
+  replaceAccessToken, type Application,
+} from '@/lib/samarth/applications';
+import { createEngagement, engagementsForApplication } from '@/lib/samarth/engagements';
+import { raiseInvoice, paymentStatusOf } from '@/lib/samarth/payments';
+import { eventsFor, isUuid } from '@/lib/samarth/store-core';
+import { emailUpdate, emailNewLink, workspaceUrl } from '@/lib/samarth/notify';
+import { availableTransitions, statusLabel, ENGAGEMENT_KINDS, engagementKindLabel } from '@/lib/samarth/workflow';
+import { categoryLabel, governmentLevelLabel, PROCUREMENT_ROUTES } from '@/lib/samarth/categories';
+import { describeAnswers, pathwayById } from '@/lib/samarth/pathways';
+import { assessEligibility, packageByCode, priceLabel, NEED_TYPES, TURNOVER_BANDS } from '@/lib/samarth/pricing';
+import { formatMoney, suggestCurrency, CURRENCIES } from '@/lib/samarth/currency';
+import { countryName, zonedLocalToUtc, formatInZone, isTimeZone, COMMON_TIME_ZONES, cleanUrl, clean } from '@/lib/samarth/validate';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'samarth', 'view'))) return Astro.redirect('/admin?denied=samarth');
+// Constants first: the POST handler below reads them.
+const id = String(Astro.params.id || '');
+const PAGE = '/admin/samarth/applications/' + id;
+const mayWrite = await canAccessSection(user, 'samarth', 'edit');
+const mayInvoice = can(user as any, 'invoices.manage') || await canAccessSection(user, 'finance', 'edit');
+const xDesk = await canAccessSection(user, 'samarth_x', 'view');
+const who = { userId: user.id, name: user.name || user.email || 'SAMARTH team' };
+const STAFF_TZ = 'Asia/Kolkata';
+const done = (m: string, ok = true) => Astro.redirect(PAGE + '?' + (ok ? 'msg=' : 'err=') + encodeURIComponent(m.slice(0, 500)));
+
+if (!isUuid(id)) return Astro.redirect('/admin/samarth/applications');
+
+if (Astro.request.method === 'POST') {
+  if (!mayWrite) return done('Changing a request needs the SAMARTH edit permission.', false);
+  let fd: FormData;
+  try { fd = await Astro.request.formData(); } catch { fd = new FormData(); }
+  const get = (n: string) => String(fd.get(n) ?? '');
+  const action = get('action');
+  const current = await getApplication(id);
+  if (!current.ready || !current.value) return done(current.ready ? 'That request no longer exists.' : current.error, false);
+  const a: Application = current.value;
+  try {
+    if (action === 'transition') {
+      const r = await staffTransition(id, get('to'), get('note'), who);
+      if (r.ok && get('notify') === 'yes') await emailUpdate(a.contactEmail, a.ref, 'Your request is now: ' + statusLabel('application', get('to')), (get('note') || statusLabel('application', get('to'))), workspaceUrl(a.ref));
+      return r.ok ? done('Status changed to ' + statusLabel('application', get('to')) + '.') : done(r.error, false);
+    }
+    if (action === 'assign') {
+      const pick = get('consultant');
+      let c = { userId: null as string | null, name: clean(get('consultant_name'), 200), email: get('consultant_email') };
+      if (isUuid(pick)) {
+        const r = (await db.execute(sql`SELECT id, name, email FROM users WHERE id = ${pick}::uuid LIMIT 1`)) as any;
+        const row = (Array.isArray(r) ? r : (r?.rows || []))[0];
+        if (row) c = { userId: String(row.id), name: String(row.name || row.email), email: String(row.email || '') };
+      }
+      const r = await assignConsultant(id, c, who);
+      if (r.ok) await emailUpdate(a.contactEmail, a.ref, 'Your consultant has been assigned', c.name + ' will take your SAMARTH consultation and will confirm the call time.', workspaceUrl(a.ref));
+      return r.ok ? done('Consultant assigned and the applicant told.') : done(r.error, false);
+    }
+    if (action === 'schedule') {
+      const tz = isTimeZone(get('tz')) ? get('tz') : STAFF_TZ;
+      const at = zonedLocalToUtc(get('at'), tz);
+      if (!at) return done('Enter the call date and time.', false);
+      const linkRaw = clean(get('link'), 800);
+      const link = linkRaw ? cleanUrl(linkRaw) : null;
+      if (linkRaw && !link) return done('The meeting link must be a full https:// address.', false);
+      const r = await scheduleCall(id, at, link, who);
+      if (r.ok) await emailUpdate(a.contactEmail, a.ref, 'Your consultation call is scheduled', 'Your SAMARTH consultation call is set for ' + formatInZone(at, a.timezone || 'UTC') + '.' + (link ? ' Meeting link: ' + link : ''), workspaceUrl(a.ref));
+      return r.ok ? done('Call scheduled and the applicant told.') : done(r.error, false);
+    }
+    if (action === 'complete') {
+      const r = await completeCall(id, get('outcome'), get('share') === 'yes', who);
+      return r.ok ? done('Call recorded as completed.') : done(r.error, false);
+    }
+    if (action === 'offline_payment') {
+      const r = await recordOfflineFeePayment(id, get('reference'), get('note'), who);
+      if (r.ok) await emailUpdate(a.contactEmail, a.ref, 'Your booking fee payment is recorded', 'We have recorded your booking fee payment. You can now book your consultation call.', workspaceUrl(a.ref));
+      return r.ok ? done('Payment recorded. The applicant can now book the call.') : done(r.error, false);
+    }
+    if (action === 'invoice') {
+      if (!mayInvoice) return done('Raising an invoice needs the finance or invoice permission.', false);
+      const r = await raiseInvoice('application', a, null, who);
+      return r.ok ? Astro.redirect('/admin/finance/invoices/' + r.invoiceId) : done(r.error, false);
+    }
+    if (action === 'message' || action === 'note') {
+      const r = await staffMessage(id, get('body'), action === 'message', who);
+      if (r.ok && action === 'message') await emailUpdate(a.contactEmail, a.ref, 'A message from the SAMARTH team', clean(get('body'), 4000, true), workspaceUrl(a.ref));
+      return r.ok ? done(action === 'message' ? 'Message sent to the applicant.' : 'Note saved.') : done(r.error, false);
+    }
+    if (action === 'archive' || action === 'restore') {
+      const r = await setArchived(id, action === 'archive', who);
+      return r.ok ? done(action === 'archive' ? 'Archived. Nothing was deleted.' : 'Restored.') : done(r.error, false);
+    }
+    if (action === 'resend_link') {
+      const r = await replaceAccessToken(id);
+      if (!r.ok) return done(r.error, false);
+      const sent = await emailNewLink(a.contactEmail, a.ref, r.token, 'application');
+      return done(sent ? 'A new private link was emailed to ' + a.contactEmail + '. The old link no longer works.' : 'A new link was issued but the email could not be sent. Check the mail settings.', sent);
+    }
+    if (action === 'new_engagement') {
+      const r = await createEngagement(id, get('kind'), get('title'), get('currency'), who);
+      return r.ok ? Astro.redirect('/admin/samarth/engagements/' + r.id + '?msg=' + encodeURIComponent('Draft quotation ' + r.ref + ' created.')) : done(r.error, false);
+    }
+    return done('Unknown action.', false);
+  } catch (e: any) {
+    console.error('[admin/samarth/applications] action', action, 'failed:', String(e?.cause?.message || e?.message || e));
+    return done('Nothing was changed: ' + String(e?.cause?.message || e?.message || 'unknown error'), false);
+  }
+}
+
+const loaded = await getApplication(id);
+const a = loaded.ready ? loaded.value : null;
+const events = a ? await eventsFor('application', a.id, false) : null;
+const engs = a ? await engagementsForApplication(a.id, false) : null;
+const pay = a?.paymentOrderId ? await paymentStatusOf(a.paymentOrderId) : null;
+let staff: { id: string; name: string; email: string }[] = [];
+try {
+  const r = (await db.execute(sql`SELECT id, name, email FROM users WHERE is_active = true AND role NOT IN ('applicant', 'partner') ORDER BY name LIMIT 300`)) as any;
+  staff = (Array.isArray(r) ? r : (r?.rows || [])).map((x: any) => ({ id: String(x.id), name: String(x.name || ''), email: String(x.email || '') }));
+} catch (e: any) { console.error('[admin/samarth/applications] staff list failed:', String(e?.cause?.message || e?.message)); }
+const transitions = a ? availableTransitions('application', a.status, 'staff').filter((t) => !['FEE_PAID', 'CONSULTANT_ASSIGNED', 'CALL_SCHEDULED', 'CALL_COMPLETED'].includes(t.to)) : [];
+const assess = a ? assessEligibility({ category: a.category, turnover: a.turnoverBand || 'not_disclosed', need: a.need || 'general' }) : null;
+const pkg = assess ? packageByCode(assess.recommended) : null;
+const answers = a ? describeAnswers(a.pathway, a.requirements) : [];
+const o = a?.official || null;
+const msg = Astro.url.searchParams.get('msg') || '';
+const err = Astro.url.searchParams.get('err') || '';
+// A newline for pre-wrapped text, kept out of the template markup.
+const NL = String.fromCharCode(10);
+---
+<AdminFrame title={a ? a.ref + ' · ' + (a.orgName || a.contactName) : 'Consultation request'} active="applications" showX={xDesk} msg={msg} err={err || (!loaded.ready ? loaded.error : (!a ? 'That request does not exist.' : ''))}>
+  {a && (
+    <div>
+      <p class="sa-lede"><span class="sa-chip hot">{statusLabel('application', a.status)}</span> {a.title} {a.archived && <span class="sa-chip">Archived</span>}</p>
+      <div class="sa-grid2">
+        <section class="sa-panel">
+          <h2 class="sa-h2">Applicant</h2>
+          <dl class="sa-kv">
+            <dt>Category</dt><dd>{categoryLabel(a.category)}</dd>
+            <dt>Country</dt><dd>{countryName(a.country)}{a.region ? ', ' + a.region : ''}{a.city ? ', ' + a.city : ''}</dd>
+            <dt>Contact</dt><dd>{a.contactName}{a.contactRole ? ' (' + a.contactRole + ')' : ''}<br /><a href={'mailto:' + a.contactEmail}>{a.contactEmail}</a>{a.contactPhone ? NL + a.contactPhone : ''}</dd>
+            <dt>Organisation</dt><dd>{a.orgName || '-'}{a.orgWebsite ? NL + a.orgWebsite : ''}{a.orgRegistration ? '\nRegistration: ' + a.orgRegistration : ''}</dd>
+            <dt>Turnover</dt><dd>{TURNOVER_BANDS.find((b) => b.value === a.turnoverBand)?.label || 'Not given'}</dd>
+            <dt>Time zone</dt><dd>{a.timezone || 'Not given'}</dd>
+            <dt>Source</dt><dd>{a.source}{a.aiAssisted ? ' (AI-assisted)' : ''}; marketing contact {a.consentContact ? 'allowed' : 'not allowed'}</dd>
+          </dl>
+          {o && (
+            <div style="margin-top:12px;">
+              <h2 class="sa-h2">Official body</h2>
+              <dl class="sa-kv">
+                <dt>Level</dt><dd>{governmentLevelLabel(o.level)}</dd>
+                <dt>Jurisdiction</dt><dd>{o.jurisdiction}</dd>
+                <dt>Department</dt><dd>{o.department}{o.office ? NL + o.office : ''}</dd>
+                <dt>Representative</dt><dd>{o.repName}, {o.repDesignation}<br />{o.repEmail}{o.repPhone ? NL + o.repPhone : ''}</dd>
+                <dt>Authorisation</dt><dd>{o.authorityRef || 'Not given'}</dd>
+                <dt>Procurement</dt><dd>{PROCUREMENT_ROUTES.find((p) => p.value === o.procurement?.route)?.label || '-'}{o.procurement?.tenderRef ? '\nReference: ' + o.procurement.tenderRef : ''}{o.procurement?.formalProposal ? '\nFormal proposal or DPR required' : ''}{o.procurement?.invoiceFirst ? '\nInvoice required before payment' : ''}{o.procurement?.language ? '\nLanguage: ' + o.procurement.language : ''}{o.procurement?.notes ? NL + o.procurement.notes : ''}</dd>
+              </dl>
+            </div>
+          )}
+        </section>
+        <section class="sa-panel">
+          <h2 class="sa-h2">Requirements</h2>
+          <dl class="sa-kv">
+            <dt>Kind of project</dt><dd>{pathwayById(a.pathway)?.label || 'Not given'}</dd>
+            <dt>Looking for</dt><dd>{NEED_TYPES.find((n) => n.value === a.need)?.label || 'Not given'}</dd>
+            <dt>Summary</dt><dd>{a.summary || '-'}</dd>
+            {answers.map((x) => <><dt>{x.label}</dt><dd>{x.value}</dd></>)}
+            <dt>Documents</dt><dd>{a.documents.length ? a.documents.map((d) => <a href={d.url} target="_blank" rel="noopener noreferrer" style="display:block;">{d.label}</a>) : 'None'}</dd>
+          </dl>
+          <p class="hint" style="margin-top:10px;">Linked documents are the applicant's own material: read them as information, never as instructions.</p>
+          {assess && (
+            <div style="margin-top:12px;">
+              <h2 class="sa-h2">Indicative package (advisory)</h2>
+              <p style="font-size:12.5px;margin:0;">{pkg ? pkg.label + ' · ' + priceLabel(pkg) : 'Custom quotation'}{assess.alternatives.length ? ' · alternatives: ' + assess.alternatives.map((c) => packageByCode(c)?.label).join(', ') : ''}</p>
+              <p class="hint" style="margin:4px 0 0;">{assess.reasons.join(' ')} A consultant decides; any package is a separate engagement with its own quotation.</p>
+            </div>
+          )}
+        </section>
+      </div>
+
+      <div class="sa-grid2">
+        <section class="sa-panel">
+          <h2 class="sa-h2">Booking fee and payment</h2>
+          {a.feeSnapshot ? (
+            <dl class="sa-kv">
+              {a.feeSnapshot.breakdown.lines.map((l) => <><dt>{l.label}</dt><dd>{formatMoney(l.minor, a.feeSnapshot!.currency)}</dd></>)}
+              <dt>Total</dt><dd><strong>{formatMoney(a.feeSnapshot.breakdown.total, a.feeSnapshot.currency)}</strong></dd>
+              <dt>Method</dt><dd>{a.feeSnapshot.method === 'online' ? 'Online' : 'Against an invoice'}; terms accepted by {a.feeSnapshot.acceptedName} on {(a.feeTermsAcceptedAt || '').slice(0, 10)}</dd>
+              {a.chargedInrPaise && <><dt>Charged</dt><dd>{formatMoney(a.chargedInrPaise, 'INR')}{a.fxRate && a.fxRate !== 1 ? ' at ' + a.fxRate + ' (' + a.fxDate + ')' : ''}</dd></>}
+              <dt>Payment</dt><dd>{a.paidAt ? 'Paid ' + a.paidAt.slice(0, 10) + ' (' + a.paymentMethod + ', ' + a.paymentReference + ')' : 'Not paid'}</dd>
+              {a.paymentOrderId && <><dt>Gateway order</dt><dd>{a.paymentOrderId}{pay ? ' · ' + pay.status + (pay.refundedAt ? ' · refunded' : '') : ' · payment record unavailable'}<br /><a href={'/receipt/' + a.paymentOrderId}>Receipt</a> · <a href={'/admin/finance?purpose=samarth_booking_fee'}>Finance</a></dd></>}
+              {a.invoiceId && <><dt>Invoice</dt><dd><a href={'/admin/finance/invoices/' + a.invoiceId}>Open invoice</a></dd></>}
+            </dl>
+          ) : <p class="hint">The applicant has not accepted a booking fee yet.</p>}
+          {mayWrite && a.status === 'FEE_PENDING' && (
+            <form method="POST" class="sa-form" style="margin-top:12px;">
+              <input type="hidden" name="action" value="offline_payment" />
+              <label>Record a payment received outside the gateway<input type="text" name="reference" required maxlength="200" placeholder="Bank reference, receipt or invoice number" /></label>
+              <label>Note (optional)<input type="text" name="note" maxlength="500" /></label>
+              <button class="sa-btn" type="submit">Record payment</button>
+            </form>
+          )}
+          {mayInvoice && a.feeSnapshot && !a.invoiceId && (
+            <form method="POST" style="margin-top:10px;"><input type="hidden" name="action" value="invoice" /><button class="sa-btn ghost" type="submit">Raise invoice for the booking fee</button></form>
+          )}
+        </section>
+        <section class="sa-panel">
+          <h2 class="sa-h2">Consultation call</h2>
+          <dl class="sa-kv">
+            <dt>Requested times</dt><dd>{a.booking?.slots?.length ? a.booking.slots.map((s) => formatInZone(s, a.booking!.timezone) + '  /  ' + formatInZone(s, STAFF_TZ)).join(NL) : 'Not yet'}</dd>
+            {a.booking && <><dt>Mode</dt><dd>{a.booking.mode}{a.booking.note ? NL + a.booking.note : ''}</dd></>}
+            <dt>Consultant</dt><dd>{a.consultantName || 'Not assigned'}</dd>
+            <dt>Call</dt><dd>{a.callAt ? formatInZone(a.callAt, STAFF_TZ) + NL + formatInZone(a.callAt, a.timezone || 'UTC') : 'Not scheduled'}{a.callLink ? NL + a.callLink : ''}</dd>
+            {a.outcomeNote && <><dt>Outcome</dt><dd>{a.outcomeNote}</dd></>}
+          </dl>
+          {mayWrite && ['BOOKING_REQUESTED', 'CONSULTANT_ASSIGNED', 'CALL_SCHEDULED'].includes(a.status) && (
+            <form method="POST" class="sa-form" style="margin-top:12px;">
+              <input type="hidden" name="action" value="assign" />
+              <label>Assign a consultant<select name="consultant"><option value="">Choose a person</option>{staff.map((s) => <option value={s.id} selected={s.id === a.consultantUserId}>{s.name} ({s.email})</option>)}</select></label>
+              <div class="sa-row"><label>Or name<input type="text" name="consultant_name" maxlength="200" /></label><label>Their email<input type="email" name="consultant_email" maxlength="254" /></label></div>
+              <button class="sa-btn" type="submit">{a.consultantName ? 'Reassign' : 'Assign'} and tell the applicant</button>
+            </form>
+          )}
+          {mayWrite && ['CONSULTANT_ASSIGNED', 'CALL_SCHEDULED'].includes(a.status) && (
+            <form method="POST" class="sa-form" style="margin-top:12px;">
+              <input type="hidden" name="action" value="schedule" />
+              <div class="sa-row">
+                <label>Call time<input type="datetime-local" name="at" required /></label>
+                <label>In time zone<select name="tz">{[STAFF_TZ, ...(a.timezone && a.timezone !== STAFF_TZ ? [a.timezone] : []), ...COMMON_TIME_ZONES.filter((z) => z !== STAFF_TZ && z !== a.timezone)].map((z) => <option value={z}>{z}</option>)}</select></label>
+              </div>
+              <label>Meeting link (optional)<input type="url" name="link" maxlength="800" placeholder="https://" value={a.callLink} /></label>
+              <button class="sa-btn" type="submit">{a.callAt ? 'Reschedule' : 'Schedule'} and tell the applicant</button>
+            </form>
+          )}
+          {mayWrite && a.status === 'CALL_SCHEDULED' && (
+            <form method="POST" class="sa-form" style="margin-top:12px;">
+              <input type="hidden" name="action" value="complete" />
+              <label>What was discussed and agreed<textarea name="outcome" maxlength="6000"></textarea></label>
+              <label class="sa-check"><input type="checkbox" name="share" value="yes" /> Show this summary to the applicant</label>
+              <button class="sa-btn" type="submit">Mark the call completed</button>
+            </form>
+          )}
+        </section>
+      </div>
+
+      <section class="sa-panel">
+        <h2 class="sa-h2">Engagements from this consultation</h2>
+        <p class="hint" style="margin:0 0 10px;">Each is separate from the booking fee and from each other, with its own quotation, internal approval and client acceptance.</p>
+        {engs && engs.ready && engs.value.length > 0 && (
+          <div class="sa-scroll"><table class="sa-table"><tbody>{engs.value.map((e) => <tr><td><a href={'/admin/samarth/engagements/' + e.id}>{e.ref}</a></td><td>{e.title}</td><td>{engagementKindLabel(e.kind)}</td><td><span class="sa-chip">{statusLabel('engagement', e.status)}</span></td><td>{e.totalMinor ? formatMoney(e.totalMinor, e.currency) : '-'}</td></tr>)}</tbody></table></div>
+        )}
+        {engs && !engs.ready && <div class="sa-flash warn">{engs.error}</div>}
+        {mayWrite && ['CONSULTANT_ASSIGNED', 'CALL_SCHEDULED', 'CALL_COMPLETED', 'CLOSED'].includes(a.status) && (
+          <form method="POST" class="sa-form" style="margin-top:12px;">
+            <input type="hidden" name="action" value="new_engagement" />
+            <div class="sa-row">
+              <label>Kind<select name="kind">{ENGAGEMENT_KINDS.map((k) => <option value={k.value}>{k.label}</option>)}</select></label>
+              <label>Title<input type="text" name="title" required maxlength="200" /></label>
+              <label>Currency<select name="currency">{CURRENCIES.map((c) => <option value={c.code} selected={c.code === (a.feeCurrency || suggestCurrency(a.country))}>{c.code}</option>)}</select></label>
+            </div>
+            <button class="sa-btn" type="submit">Draft a quotation</button>
+          </form>
+        )}
+      </section>
+
+      <div class="sa-grid2">
+        <section class="sa-panel">
+          <h2 class="sa-h2">Timeline</h2>
+          {events && !events.ready && <div class="sa-flash warn">{events.error}</div>}
+          {events && events.ready && (
+            <ul class="sa-timeline">{events.value.map((ev) => <li><span class="w">{ev.createdAt.slice(0, 16).replace('T', ' ')} UTC · {ev.actorName}{ev.visibility === 'applicant' ? '' : ''}</span>{ev.visibility === 'applicant' && <span class="vis">applicant sees this</span>}<p class="b">{ev.toStatus ? statusLabel('application', ev.toStatus) + (ev.body ? ': ' : '') : ''}{ev.kind === 'reply' ? 'Applicant: ' : ''}{ev.body}</p></li>)}</ul>
+          )}
+        </section>
+        <section class="sa-panel">
+          <h2 class="sa-h2">Act</h2>
+          {!mayWrite && <p class="hint">You can read this request. Acting on it needs the SAMARTH edit permission.</p>}
+          {mayWrite && (
+            <div class="sa-form">
+              <form method="POST" class="sa-form">
+                <input type="hidden" name="action" value="message" />
+                <label>Message the applicant (also emailed)<textarea name="body" maxlength="5000" required placeholder="A clarification request, or an update"></textarea></label>
+                <button class="sa-btn" type="submit">Send</button>
+              </form>
+              <form method="POST" class="sa-form">
+                <input type="hidden" name="action" value="note" />
+                <label>Internal note (never shown to the applicant)<textarea name="body" maxlength="5000" required></textarea></label>
+                <button class="sa-btn ghost" type="submit">Save note</button>
+              </form>
+              {transitions.length > 0 && (
+                <form method="POST" class="sa-form">
+                  <input type="hidden" name="action" value="transition" />
+                  <div class="sa-row">
+                    <label>Change status<select name="to">{transitions.map((t) => <option value={t.to}>{statusLabel('application', t.to)}{t.needsNote ? ' (reason needed)' : ''}</option>)}</select></label>
+                    <label>Reason or note<input type="text" name="note" maxlength="2000" /></label>
+                  </div>
+                  <label class="sa-check"><input type="checkbox" name="notify" value="yes" checked /> Email the applicant</label>
+                  <button class="sa-btn ghost" type="submit">Change status</button>
+                </form>
+              )}
+              <div class="sa-inline">
+                <form method="POST"><input type="hidden" name="action" value="resend_link" /><button class="sa-btn ghost" type="submit">Email the applicant a new private link</button></form>
+                <form method="POST"><input type="hidden" name="action" value={a.archived ? 'restore' : 'archive'} /><button class="sa-btn ghost" type="submit">{a.archived ? 'Restore' : 'Archive'}</button></form>
+              </div>
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  )}
+</AdminFrame>

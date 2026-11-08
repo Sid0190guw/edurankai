@@ -611,6 +611,21 @@ export const ADMIN_NAV: AdminNavEntry[] = [
     ],
   },
   // NEWLY MAPPED. Partnership records are commercial, not covered by any section; operator-only.
+  // SAMARTH (src/lib/samarth). Gated on the two SAMARTH sections, the same keys middleware PATH_SECTION
+  // and each page ask for, so the menu and the lock answer the same question.
+  {
+    groupId: 'samarth-group',
+    label: 'SAMARTH',
+    icon: 'briefcase',
+    children: [
+      { id: 'samarth',              label: 'Overview',              href: '/admin/samarth',              icon: 'chart',    section: 'samarth' },
+      { id: 'samarth-applications', label: 'Consultation requests', href: '/admin/samarth/applications', icon: 'inbox',    section: 'samarth' },
+      { id: 'samarth-engagements',  label: 'Engagements',           href: '/admin/samarth/engagements',  icon: 'document', section: 'samarth' },
+      { id: 'samarth-fees',         label: 'Booking fees',          href: '/admin/samarth/fees',         icon: 'package',  section: 'samarth' },
+      { id: 'samarth-partners',     label: 'Partners',              href: '/admin/samarth/partners',     icon: 'users',    section: 'samarth' },
+      { id: 'samarth-x',            label: 'SAMARTH X',             href: '/admin/samarth/x',            icon: 'grid',     section: 'samarth_x' },
+    ],
+  },
   { id: 'partnerships', label: 'Partnerships', href: '/admin/partnerships', icon: 'package', section: 'settings' },
   // NEWLY MAPPED. Account records — gated with Users, which no built-in role but super admin holds,
   // so this is both honest and unchanged in practice.

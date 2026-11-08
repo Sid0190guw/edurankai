@@ -104,6 +104,10 @@ export const NOTIFICATION_TYPES: { type: string; label: string; desc: string; gr
   { type: 'new_hei_submission', label: 'HEI submissions',           desc: 'When an institution submits scores',           group: 'Institutional' },
   { type: 'activity_alert',     label: 'Platform alerts',           desc: 'Money moved, a permission changed, or data was exported - things needing attention immediately', group: 'People & HR' },
   { type: 'activity_digest',    label: 'Activity digest',           desc: 'A periodic roll-up of routine platform activity', group: 'People & HR' },
+  { type: 'samarth_application', label: 'SAMARTH requests',          desc: 'A new SAMARTH consultation request, a call request, an accepted or declined quotation, or a message from an applicant', group: 'SAMARTH' },
+  { type: 'samarth_payment',     label: 'SAMARTH payments',          desc: 'A SAMARTH booking fee or engagement paid, an invoice requested, or a duplicate payment to refund', group: 'SAMARTH' },
+  { type: 'samarth_partner',     label: 'SAMARTH partners',          desc: 'A new technology partner registration or a message from a partner', group: 'SAMARTH' },
+  { type: 'samarth_x',           label: 'SAMARTH X',                 desc: 'A new SAMARTH X application or a message from a candidate', group: 'SAMARTH' },
   { type: 'completion_review',  label: 'Engagement completions',    desc: 'When an internship or contract you lead is ending and needs your review and recommendation, or a completion needs a decision', group: 'People & HR' },
   { type: 'hei_truth_report',   label: 'HEI truth reports',         desc: 'When an HEI truth report is generated',        group: 'Institutional' },
 ];

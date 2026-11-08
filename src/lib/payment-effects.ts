@@ -533,6 +533,21 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
     return;
   }
 
+  // SAMARTH: the consultation booking fee, or an accepted engagement quotation. The amount was taken
+  // from the stored record when the order was created (src/lib/samarth/payments.ts), and the effect
+  // is idempotent, so verify, webhook and reconcile may all arrive and only the first one changes
+  // anything. It throws on failure, which runEffect() records and alerts on.
+  if (pay.purpose === 'samarth_booking_fee' || pay.purpose === 'samarth_engagement'
+    || pay.reference_type === 'samarth_application' || pay.reference_type === 'samarth_engagement') {
+    await runEffect(orderId, 'apply SAMARTH payment',
+      'A SAMARTH applicant paid and the payment was NOT applied to their request, so they cannot proceed.',
+      async () => {
+        const { applySamarthPaid } = await import('@/lib/samarth/payments');
+        await applySamarthPaid(String(pay.purpose || ''), String(pay.reference_type || ''), String(pay.reference_id || ''), orderId, paymentId);
+      });
+    return;
+  }
+
   // Wallet recharge -> add the paid amount to the user's account credit.
   // Idempotent on the order id so webhook + verify + reconcile never double-credit.
   if (pay.purpose === 'wallet_recharge' || pay.reference_type === 'wallet') {

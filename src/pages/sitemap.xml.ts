@@ -3,6 +3,7 @@ import { SITE } from '@/lib/site';
 import { db } from '@/lib/db';
 import { roles } from '@/lib/db/schema';
 import { eq, desc } from 'drizzle-orm';
+import { TOPICS } from '@/lib/samarth/catalog';
 
 const STATIC_ROUTES: Array<{ path: string; changefreq: string; priority: string }> = [
   { path: '/', changefreq: 'weekly', priority: '1.0' },
@@ -42,6 +43,20 @@ const STATIC_ROUTES: Array<{ path: string; changefreq: string; priority: string 
   { path: '/akasha-q/charter/master-system-architecture', changefreq: 'monthly', priority: '0.7' },
   { path: '/akasha-q/charter/demonstration-and-credibility', changefreq: 'monthly', priority: '0.7' },
   { path: '/akasha-q/demo', changefreq: 'monthly', priority: '0.7' },
+  // SAMARTH. The capability pages are listed one by one from the catalogue below; private pages
+  // (/samarth/r/*, status pages) are noindex and never listed.
+  { path: '/samarth', changefreq: 'weekly', priority: '0.9' },
+  { path: '/samarth/consultation', changefreq: 'weekly', priority: '0.85' },
+  { path: '/samarth/industry', changefreq: 'monthly', priority: '0.8' },
+  { path: '/samarth/government', changefreq: 'monthly', priority: '0.8' },
+  { path: '/samarth/engineering', changefreq: 'monthly', priority: '0.8' },
+  { path: '/samarth/consultancy', changefreq: 'monthly', priority: '0.8' },
+  { path: '/samarth/services', changefreq: 'monthly', priority: '0.75' },
+  { path: '/samarth/partners', changefreq: 'monthly', priority: '0.7' },
+  { path: '/samarth/x', changefreq: 'monthly', priority: '0.8' },
+  { path: '/samarth/x/apply', changefreq: 'monthly', priority: '0.6' },
+  { path: '/samarth/register', changefreq: 'monthly', priority: '0.7' },
+  ...TOPICS.map((t) => ({ path: '/samarth/services/' + t.slug, changefreq: 'monthly', priority: '0.7' })),
 ];
 
 export const GET: APIRoute = async () => {

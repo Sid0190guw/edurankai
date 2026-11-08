@@ -1,0 +1,131 @@
+---
+// /admin/samarth/partners/<id> - one partner: profile, due-diligence checklist, status, performance,
+// messages and notes.
+import AdminFrame from '@/components/samarth/AdminFrame.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { getPartner, saveDueDiligence, savePerformance, transitionPartner, partnerNote, PARTNER_DOMAINS, PARTNER_KINDS } from '@/lib/samarth/partners';
+import { eventsFor, isUuid } from '@/lib/samarth/store-core';
+import { emailUpdate, partnerUrl } from '@/lib/samarth/notify';
+import { availableTransitions, statusLabel, DUE_DILIGENCE_ITEMS, dueDiligenceComplete, type DdState } from '@/lib/samarth/workflow';
+import { countryName } from '@/lib/samarth/validate';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'samarth', 'view'))) return Astro.redirect('/admin?denied=samarth');
+const id = String(Astro.params.id || '');
+const PAGE = '/admin/samarth/partners/' + id;
+const mayWrite = await canAccessSection(user, 'samarth', 'edit');
+const xDesk = await canAccessSection(user, 'samarth_x', 'view');
+const who = { userId: user.id, name: user.name || user.email || 'SAMARTH team' };
+const done = (m: string, ok = true) => Astro.redirect(PAGE + '?' + (ok ? 'msg=' : 'err=') + encodeURIComponent(m.slice(0, 500)));
+if (!isUuid(id)) return Astro.redirect('/admin/samarth/partners');
+
+if (Astro.request.method === 'POST') {
+  if (!mayWrite) return done('Needs the SAMARTH edit permission.', false);
+  let fd: FormData;
+  try { fd = await Astro.request.formData(); } catch { fd = new FormData(); }
+  const get = (n: string) => String(fd.get(n) ?? '');
+  const action = get('action');
+  const cur = await getPartner(id);
+  if (!cur.ready || !cur.value) return done(cur.ready ? 'That partner no longer exists.' : cur.error, false);
+  const p = cur.value;
+  if (action === 'dd') {
+    const list: Record<string, DdState> = {};
+    for (const i of DUE_DILIGENCE_ITEMS) list[i.key] = get('dd_' + i.key) as DdState;
+    const r = await saveDueDiligence(id, list, who);
+    return r.ok ? done('Due diligence saved.') : done(r.error, false);
+  }
+  if (action === 'perf') {
+    const r = await savePerformance(id, get('rating') ? Number(get('rating')) : null, get('note'), who);
+    return r.ok ? done('Saved.') : done(r.error, false);
+  }
+  if (action === 'transition') {
+    const to = get('to');
+    const r = await transitionPartner(id, to, get('note'), who);
+    if (r.ok) await emailUpdate(p.contactEmail, p.ref, 'Your SAMARTH partner registration: ' + statusLabel('partner', to), (get('note') || statusLabel('partner', to)) + (to === 'APPROVED' ? '\n\nApproval makes you eligible to be considered for SAMARTH work. No project is awarded automatically.' : ''), partnerUrl(p.ref));
+    return r.ok ? done('Now ' + statusLabel('partner', to) + '.') : done(r.error, false);
+  }
+  if (action === 'message' || action === 'note') {
+    const r = await partnerNote(id, get('body'), action === 'message', who);
+    if (r.ok && action === 'message') await emailUpdate(p.contactEmail, p.ref, 'A message from SAMARTH', get('body'), partnerUrl(p.ref));
+    return r.ok ? done('Saved.') : done(r.error, false);
+  }
+  return done('Unknown action.', false);
+}
+
+const loaded = await getPartner(id);
+const p = loaded.ready ? loaded.value : null;
+const events = p ? await eventsFor('partner', p.id, false) : null;
+const transitions = p ? availableTransitions('partner', p.status, 'staff') : [];
+// A newline for pre-wrapped text, kept out of the template markup.
+const NL = String.fromCharCode(10);
+---
+<AdminFrame title={p ? p.orgName : 'Partner'} active="partners" showX={xDesk} msg={Astro.url.searchParams.get('msg') || ''} err={Astro.url.searchParams.get('err') || (!loaded.ready ? loaded.error : (!p ? 'That partner does not exist.' : ''))}>
+  {p && (
+    <div>
+      <p class="sa-lede"><span class={p.status === 'APPROVED' ? 'sa-chip ok' : 'sa-chip hot'}>{statusLabel('partner', p.status)}</span> {p.ref} · {PARTNER_KINDS.find((k) => k.value === p.orgKind)?.label} · {countryName(p.country)}</p>
+      <div class="sa-grid2">
+        <section class="sa-panel">
+          <h2 class="sa-h2">Profile (as submitted)</h2>
+          <dl class="sa-kv">
+            <dt>Contact</dt><dd>{p.contactName}<br /><a href={'mailto:' + p.contactEmail}>{p.contactEmail}</a>{p.contactPhone ? NL + p.contactPhone : ''}</dd>
+            <dt>Website</dt><dd>{p.website ? <a href={p.website} target="_blank" rel="noopener noreferrer">{p.website}</a> : '-'}</dd>
+            <dt>Domains</dt><dd>{p.domains.map((d) => PARTNER_DOMAINS.find((x) => x.value === d)?.label || d).join(', ')}</dd>
+            <dt>Capabilities</dt><dd>{p.capabilities}</dd>
+            <dt>Qualifications</dt><dd>{p.qualifications || '-'}</dd>
+            <dt>Certifications (claimed)</dt><dd>{p.certifications || '-'}</dd>
+            <dt>Previous projects</dt><dd>{p.previousProjects || '-'}</dd>
+            <dt>Regulatory</dt><dd>{p.regulatory || '-'}</dd>
+            <dt>Security</dt><dd>{p.security || '-'}</dd>
+            <dt>Commercial</dt><dd>{p.commercial || '-'}</dd>
+            <dt>Documents</dt><dd>{p.documents.length ? p.documents.map((d) => <a href={d.url} target="_blank" rel="noopener noreferrer" style="display:block;">{d.label}</a>) : 'None'}</dd>
+          </dl>
+        </section>
+        <section class="sa-panel">
+          <h2 class="sa-h2">Due diligence {dueDiligenceComplete(p.ddChecklist) ? <span class="sa-chip ok">Complete</span> : <span class="sa-chip warn">Incomplete</span>}</h2>
+          <form method="POST" class="sa-form">
+            <input type="hidden" name="action" value="dd" />
+            {DUE_DILIGENCE_ITEMS.map((i) => (
+              <label>{i.label}{i.required ? '' : ' (optional)'}
+                <select name={'dd_' + i.key} disabled={!mayWrite}>
+                  {['pending', 'pass', 'fail', 'na'].map((v) => <option value={v} selected={(p.ddChecklist[i.key] || 'pending') === v}>{v === 'na' ? 'Not applicable' : v.charAt(0).toUpperCase() + v.slice(1)}</option>)}
+                </select>
+              </label>
+            ))}
+            {mayWrite && <button class="sa-btn ghost" type="submit">Save due diligence</button>}
+          </form>
+          <h2 class="sa-h2" style="margin-top:14px;">Delivery performance</h2>
+          <form method="POST" class="sa-form">
+            <input type="hidden" name="action" value="perf" />
+            <div class="sa-row"><label>Rating<select name="rating" disabled={!mayWrite}><option value="">Not rated</option>{[1, 2, 3, 4, 5].map((n) => <option value={String(n)} selected={p.rating === n}>{n} of 5</option>)}</select></label></div>
+            <label>Notes from delivered work<textarea name="note" maxlength="4000" disabled={!mayWrite}>{p.performanceNote}</textarea></label>
+            {mayWrite && <button class="sa-btn ghost" type="submit">Save</button>}
+          </form>
+        </section>
+      </div>
+      <div class="sa-grid2">
+        <section class="sa-panel">
+          <h2 class="sa-h2">Status and messages</h2>
+          {mayWrite && transitions.length > 0 && (
+            <form method="POST" class="sa-form">
+              <input type="hidden" name="action" value="transition" />
+              <div class="sa-row"><label>To<select name="to">{transitions.map((t) => <option value={t.to}>{statusLabel('partner', t.to)}{t.needsNote ? ' (note needed)' : ''}</option>)}</select></label><label>Note (shared with the partner)<input type="text" name="note" maxlength="2000" /></label></div>
+              <button class="sa-btn" type="submit">Apply and tell the partner</button>
+            </form>
+          )}
+          {mayWrite && (
+            <form method="POST" class="sa-form" style="margin-top:12px;">
+              <label>Message the partner (also emailed)<textarea name="body" maxlength="5000" required></textarea></label>
+              <div class="sa-inline"><button class="sa-btn ghost" type="submit" name="action" value="message">Send message</button><button class="sa-btn ghost" type="submit" name="action" value="note">Save as internal note</button></div>
+            </form>
+          )}
+        </section>
+        <section class="sa-panel">
+          <h2 class="sa-h2">Timeline</h2>
+          {events && events.ready && <ul class="sa-timeline">{events.value.map((ev) => <li><span class="w">{ev.createdAt.slice(0, 16).replace('T', ' ')} UTC · {ev.actorName}</span>{ev.visibility === 'applicant' && <span class="vis">partner sees this</span>}<p class="b">{ev.toStatus ? statusLabel('partner', ev.toStatus) + (ev.body ? ': ' : '') : ''}{ev.body}</p></li>)}</ul>}
+          {events && !events.ready && <div class="sa-flash warn">{events.error}</div>}
+        </section>
+      </div>
+    </div>
+  )}
+</AdminFrame>

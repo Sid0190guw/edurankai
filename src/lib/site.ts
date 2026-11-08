@@ -21,6 +21,7 @@ export const NAV_PRIMARY = [
   { label: 'HEI', href: '/hei' },
   { label: 'AquinTutor', href: '/aquintutor' },
   { label: 'Research', href: '/research' },
+  { label: 'SAMARTH', href: '/samarth' },
   { label: 'Ecosystem', href: '/ecosystem' },
   { label: 'Careers', href: '/careers' },
   { label: 'Events', href: '/events' },

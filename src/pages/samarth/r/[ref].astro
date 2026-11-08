@@ -1,0 +1,594 @@
+---
+// /samarth/r/<ref> - the applicant's private workspace for one consultation request.
+//
+// Reached with the private link (?k=<token>, moved into an HttpOnly cookie on first use) and nothing
+// else: no account, and no way in with the reference alone. Every step of the workflow happens here:
+// details, requirements, the booking fee (with its terms, shown before payment), call booking, the
+// consultant, messages, and any later quotations, which the applicant accepts, declines and pays.
+import SamarthShell from '@/components/samarth/SamarthShell.astro';
+import PathwayFields from '@/components/samarth/PathwayFields.astro';
+import {
+  getApplicationByRef, parseDetails, parseRequirements, saveDetails, saveRequirements, acceptFee, reviseFee, requestBooking,
+  withdrawApplication, applicantMessage, type Application, type FeeSnapshot, type Booking,
+} from '@/lib/samarth/applications';
+import { engagementsForApplication, clientAccept, clientDecline, engagementBreakdown, type Engagement } from '@/lib/samarth/engagements';
+import { partnersByIds } from '@/lib/samarth/partners';
+import { approvedFees, pickFee, currenciesFor, breakdownFor } from '@/lib/samarth/fees';
+import { eventsFor } from '@/lib/samarth/store-core';
+import { checkAccess, isSecureRequest } from '@/lib/samarth/access';
+import { alertAdmins } from '@/lib/samarth/notify';
+import { paymentMayBeCaptured } from '@/lib/samarth/payments';
+import { applicationStepState, statusDef, APPLICANT_EDITABLE, engagementKindLabel, statusLabel } from '@/lib/samarth/workflow';
+import { APPLICANT_CATEGORIES, GOVERNMENT_LEVELS, PROCUREMENT_ROUTES, categoryLabel, isOfficialCategory, governmentLevelLabel } from '@/lib/samarth/categories';
+import { TURNOVER_BANDS, NEED_TYPES } from '@/lib/samarth/pricing';
+import { describeAnswers, defaultPathwayFor } from '@/lib/samarth/pathways';
+import { formatMoney, suggestCurrency, currencyDef, toSettlementPaise } from '@/lib/samarth/currency';
+import { countryOptions, countryName, normaliseRef, isRef, parseDocLinks, zonedLocalToUtc, formatInZone, isTimeZone, COMMON_TIME_ZONES, clean } from '@/lib/samarth/validate';
+import { deliveryModelLabel, AI_ASSISTANCE_NOTICE } from '@/lib/samarth/catalog';
+import { isFeatureEnabled } from '@/lib/feature-flags';
+import { isConfigured } from '@/lib/razorpay';
+import { fxRateToInr } from '@/lib/fx';
+
+// A newline for pre-wrapped text, kept out of the template markup.
+const NL = String.fromCharCode(10);
+// Constants first: `const` is not hoisted and the POST handler reads these.
+const ref = normaliseRef(Astro.params.ref);
+const PAGE = '/samarth/r/' + ref;
+const COUNTRIES = countryOptions();
+const go = (msg: string, ok = true, extra = '') => Astro.redirect(PAGE + '?' + (ok ? 'msg=' : 'err=') + encodeURIComponent(msg.slice(0, 500)) + extra);
+
+if (!isRef(ref, 'A')) return Astro.redirect('/samarth/r');
+const loaded = await getApplicationByRef(ref);
+if (!loaded.ready) {
+  return new Response('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Temporarily unavailable</title><div style="max-width:34rem;margin:12vh auto;padding:0 1.25rem;font:16px/1.7 system-ui,sans-serif"><h1 style="font-size:1.3rem">Your request could not be loaded just now</h1><p>Nothing about it has changed. Please reload in a moment. If this continues, write to connect@edurankai.in quoting ' + ref + '.</p></div>', { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Retry-After': '15' } });
+}
+let app: Application | null = loaded.value;
+const access = app ? checkAccess(Astro.cookies, Astro.url, ref, app.accessHash, isSecureRequest(Astro.url)) : { ok: false as const };
+if (app && access.ok && access.fromLink) {
+  const keep = new URLSearchParams();
+  for (const k of ['welcome', 'nomail', 'msg', 'err']) { const v = Astro.url.searchParams.get(k); if (v) keep.set(k, v); }
+  return Astro.redirect(PAGE + (keep.toString() ? '?' + keep.toString() : ''));
+}
+Astro.response.headers.set('Cache-Control', 'no-store');
+Astro.response.headers.set('Referrer-Policy', 'no-referrer');
+const allowed = !!app && access.ok;
+
+// ---- POST: every applicant action ----
+if (allowed && app && Astro.request.method === 'POST') {
+  const a: Application = app;
+  let fd: FormData;
+  try { fd = await Astro.request.formData(); } catch { fd = new FormData(); }
+  const get = (n: string) => String(fd.get(n) ?? '');
+  const action = get('action');
+  const who = { userId: null, name: a.contactName || 'Applicant' };
+  try {
+    if (action === 'details') {
+      const p = parseDetails(get);
+      if (p.problems.length) return go(p.problems.join(' '), false, '&edit=details');
+      const r = await saveDetails(a, p.value, who);
+      return r.ok ? go('Your details are saved.') : go(r.error, false, '&edit=details');
+    }
+    if (action === 'requirements') {
+      const docs = parseDocLinks(get);
+      const p = parseRequirements(get, docs.links, docs.invalid);
+      if (p.problems.length) return go(p.problems.join(' '), false, '&edit=requirements');
+      const before = a.status;
+      const r = await saveRequirements(a, p.value, who);
+      if (r.ok && before === 'DETAILS_COMPLETE') {
+        await alertAdmins('samarth_application', 'New SAMARTH consultation request', a.ref + ': ' + (a.orgName || a.contactName) + ' (' + categoryLabel(a.category) + ', ' + countryName(a.country) + '). ' + p.value.title, '/admin/samarth/applications/' + a.id, 'samapp-' + a.id);
+      }
+      return r.ok ? go('Your requirements are saved.') : go(r.error, false, '&edit=requirements');
+    }
+    if (action === 'accept_fee') {
+      if (get('terms_ok') !== 'yes') return go('Read and accept the payment terms to continue.', false);
+      const fees = await approvedFees();
+      if (!fees.ready) return go('The fee could not be loaded just now. Nothing was changed. Try again in a moment.', false);
+      const fee = pickFee(fees.value, a.category, get('currency'));
+      if (!fee) return go('There is no published booking fee for your category in that currency.', false);
+      if (fee.id !== get('fee_id')) return go('The fee changed while you were reading it. Review the current fee below and accept again.', false);
+      const method = get('method') === 'online' ? 'online' : 'invoice';
+      const b = breakdownFor(fee);
+      const snap: FeeSnapshot = {
+        feeId: fee.id, category: fee.category, currency: fee.currency, amountMinor: fee.amountMinor, taxMode: fee.taxMode, taxLabel: fee.taxLabel,
+        taxRateBp: fee.taxRateBp, processingBp: fee.processingBp, chargesNote: fee.chargesNote, terms: fee.terms, breakdown: b, method,
+        acceptedName: clean(get('accepted_name'), 200) || a.contactName,
+      };
+      const r = await acceptFee(a, snap, b.total, who);
+      if (r.ok && method === 'invoice') {
+        await alertAdmins('samarth_payment', 'SAMARTH invoice requested', a.ref + ' (' + (a.orgName || a.contactName) + ') accepted the booking fee and asked to pay against an invoice: ' + formatMoney(b.total, fee.currency) + '.', '/admin/samarth/applications/' + a.id, 'saminv-' + a.id);
+      }
+      return r.ok ? go(method === 'invoice' ? 'Accepted. The SAMARTH team will send your invoice; booking opens when the payment is recorded.' : 'Accepted. You can pay now.') : go(r.error, false);
+    }
+    if (action === 'revise_fee') {
+      const maybe = a.paymentOrderId ? await paymentMayBeCaptured(a.paymentOrderId) : false;
+      const r = await reviseFee(a, who, maybe);
+      return r.ok ? go('You can review the fee again.') : go(r.error, false);
+    }
+    if (action === 'booking') {
+      const tz = isTimeZone(get('tz')) ? get('tz') : (a.timezone || 'UTC');
+      const slots: string[] = [];
+      for (const k of ['slot1', 'slot2', 'slot3']) {
+        const at = zonedLocalToUtc(get(k), tz);
+        if (at && at.getTime() > Date.now() + 3600_000) slots.push(at.toISOString());
+      }
+      if (!slots.length) return go('Give at least one preferred time, at least an hour from now.', false);
+      const b: Booking = { timezone: tz, slots, mode: get('mode') === 'phone' ? 'phone' : 'video', note: clean(get('note'), 1000, true) };
+      const r = await requestBooking(a, b, who);
+      if (r.ok) await alertAdmins('samarth_application', 'SAMARTH call requested', a.ref + ' (' + (a.orgName || a.contactName) + ') paid and asked for a call. Assign a consultant.', '/admin/samarth/applications/' + a.id, 'sambook-' + a.id);
+      return r.ok ? go('Thank you. A consultant will be assigned and will confirm the time.') : go(r.error, false);
+    }
+    if (action === 'message') {
+      const r = await applicantMessage(a, get('body'), who);
+      if (r.ok) await alertAdmins('samarth_application', 'Message from a SAMARTH applicant', a.ref + ': ' + clean(get('body'), 140), '/admin/samarth/applications/' + a.id, 'sammsg-' + a.id + '-' + Date.now());
+      return r.ok ? go('Message sent to the SAMARTH team.') : go(r.error, false);
+    }
+    if (action === 'withdraw') {
+      if (get('confirm') !== 'yes') return go('Tick the box to confirm you want to withdraw.', false);
+      const r = await withdrawApplication(a, who);
+      return r.ok ? go('Your request is withdrawn.') : go(r.error, false);
+    }
+    if (action === 'accept_quote') {
+      if (get('agree') !== 'yes') return go('Tick the box to confirm you accept the quotation and its terms.', false);
+      const r = await clientAccept(get('engagement_id'), a.id, get('accepted_name'));
+      if (r.ok) await alertAdmins('samarth_application', 'SAMARTH quotation accepted', r.engagement.ref + ' (' + r.engagement.title + ') was accepted by ' + clean(get('accepted_name'), 100) + '.', '/admin/samarth/engagements/' + r.engagement.id, 'samacc-' + r.engagement.id);
+      return r.ok ? go('Quotation accepted.') : go(r.error, false);
+    }
+    if (action === 'decline_quote') {
+      const r = await clientDecline(get('engagement_id'), a.id, get('reason'), a.contactName);
+      if (r.ok) await alertAdmins('samarth_application', 'SAMARTH quotation declined', r.engagement.ref + ' was declined.', '/admin/samarth/engagements/' + r.engagement.id, 'samdec-' + r.engagement.id);
+      return r.ok ? go('Quotation declined.') : go(r.error, false);
+    }
+    return go('Unknown action.', false);
+  } catch (e: any) {
+    console.error('[samarth/r] action', action, 'failed for', a.ref, '-', String(e?.cause?.message || e?.message || e));
+    return go('Nothing was changed: something went wrong on our side. Please try again.', false);
+  }
+}
+
+// ---- GET: what to show ----
+const msg = Astro.url.searchParams.get('msg') || '';
+const err = Astro.url.searchParams.get('err') || '';
+const welcome = Astro.url.searchParams.get('welcome') === '1';
+const nomail = Astro.url.searchParams.get('nomail') === '1';
+const edit = Astro.url.searchParams.get('edit') || '';
+
+let steps: ReturnType<typeof applicationStepState> = [];
+let showDetailsForm = false, showReqForm = false, showFee = false, showPay = false, showBooking = false;
+let feeList: Awaited<ReturnType<typeof approvedFees>> | null = null;
+let feeCurrencies: string[] = [];
+let feeCurrency = '';
+let fee: ReturnType<typeof pickFee> = null;
+let fxNote = '';
+let onlineAvailable = false;
+let engagements: Engagement[] = [];
+let partnerNames: Record<string, string> = {};
+let events: Awaited<ReturnType<typeof eventsFor>> | null = null;
+let engagementCheckoutOn = false;
+
+if (allowed && app) {
+  const a = app;
+  steps = applicationStepState(a.status);
+  const editable = APPLICANT_EDITABLE.includes(a.status);
+  showDetailsForm = (a.status === 'DRAFT') || (editable && edit === 'details');
+  showReqForm = !showDetailsForm && ((a.status === 'DETAILS_COMPLETE') || (editable && a.status !== 'DRAFT' && edit === 'requirements'));
+  showFee = !showDetailsForm && !showReqForm && a.status === 'REQUIREMENTS_COMPLETE';
+  showPay = a.status === 'FEE_PENDING';
+  showBooking = a.status === 'FEE_PAID';
+  onlineAvailable = isConfigured() && await isFeatureEnabled('samarthFeeCheckout');
+  if (showFee) {
+    feeList = await approvedFees();
+    if (feeList.ready) {
+      feeCurrencies = currenciesFor(feeList.value, a.category);
+      const wanted = (Astro.url.searchParams.get('currency') || a.feeCurrency || suggestCurrency(a.country)).toUpperCase();
+      feeCurrency = feeCurrencies.includes(wanted) ? wanted : (feeCurrencies.includes('USD') ? 'USD' : (feeCurrencies[0] || ''));
+      fee = feeCurrency ? pickFee(feeList.value, a.category, feeCurrency) : null;
+      if (fee && fee.currency !== 'INR' && onlineAvailable) {
+        const fx = await fxRateToInr(fee.currency);
+        const paise = toSettlementPaise(breakdownFor(fee).total, fee.currency, fx.rate);
+        fxNote = fx.live && paise ? 'Paid online, this is charged as about ' + formatMoney(paise, 'INR') + ' at today\'s reference rate of ' + fx.rate.toFixed(4) + ' INR per ' + fee.currency + ' (' + fx.date + '). The exact rate is fixed and shown when you pay.' : 'The live exchange rate is unavailable right now; online payment in ' + fee.currency + ' may be refused until it returns. Payment against an invoice is unaffected.';
+      }
+    }
+  }
+  const eng = await engagementsForApplication(a.id, true);
+  engagements = eng.ready ? eng.value : [];
+  const pids = Array.from(new Set(engagements.flatMap((e) => e.partnerIds)));
+  if (pids.length) { try { for (const p of await partnersByIds(pids)) partnerNames[p.id] = p.orgName; } catch { /* names are a convenience */ } }
+  engagementCheckoutOn = engagements.some((e) => e.status === 'ACCEPTED' && e.paymentMethod === 'online' && e.paymentState !== 'paid') && isConfigured() && await isFeatureEnabled('samarthEngagementCheckout');
+  events = await eventsFor('application', a.id, true);
+}
+
+const statusText = app ? (statusDef('application', app.status)?.public || '') : '';
+const official = app ? isOfficialCategory(app.category) : false;
+const o = app?.official || null;
+const tzList = app && app.timezone && !COMMON_TIME_ZONES.includes(app.timezone) ? [app.timezone, ...COMMON_TIME_ZONES] : COMMON_TIME_ZONES;
+const answered = app ? describeAnswers(app.pathway, app.requirements) : [];
+const callAtText = app?.callAt ? formatInZone(app.callAt, app.timezone || 'UTC') : '';
+const slotsText = app?.booking?.slots?.map((s) => formatInZone(s, app?.booking?.timezone || 'UTC')) || [];
+---
+<SamarthShell title={'Your SAMARTH request ' + ref} description="Your private SAMARTH consultation workspace." noindex={true} active="consultation">
+  <section class="sam-narrow" style="padding:30px 16px 80px;">
+    {!allowed && (
+      <div>
+        <h1 class="sam-h1" style="font-size:2rem;">This link is not valid</h1>
+        <p class="sam-p">The private link for this request is missing, incomplete or has been replaced by a newer one. Ask for a new link with your reference and email address.</p>
+        <a class="sam-btn" href="/samarth/r">Get a new link</a>
+      </div>
+    )}
+
+    {allowed && app && (
+      <div>
+        <p class="sam-eyebrow">Consultation request &middot; {app.ref}</p>
+        <h1 class="sam-h1" style="font-size:clamp(1.8rem,4vw,2.6rem);">{app.title || app.orgName || app.contactName}</h1>
+        <p class="sam-p"><span class="sam-chip">{statusLabel('application', app.status)}</span> {statusText}</p>
+        <ol class="sam-progress" aria-label="Progress">
+          {steps.map((s) => <li class={s.state}>{s.label}</li>)}
+        </ol>
+
+        {welcome && <div class="sam-flash ok">Your reference is <strong>{app.ref}</strong>. {nomail ? 'We could not email your private link just now, so keep this page bookmarked: this browser stays signed in to it for 90 days.' : 'We have emailed you a private link to this page. Keep it private.'}</div>}
+        {msg && <div class="sam-flash ok" role="status">{msg}</div>}
+        {err && <div class="sam-flash err" role="alert">{err}</div>}
+
+        {showDetailsForm && (
+          <form method="POST" class="sam-form" style="margin-bottom:28px;">
+            <input type="hidden" name="action" value="details" />
+            <h2 class="sam-h2">Applicant details</h2>
+            <fieldset>
+              <legend class="sam-legend">Applicant</legend>
+              <div class="sam-form">
+                <div class="sam-row2">
+                  <div class="sam-field"><label for="category">Category</label>
+                    <select id="category" name="category" required>{APPLICANT_CATEGORIES.map((c) => <option value={c.value} selected={c.value === app!.category}>{c.label}</option>)}</select>
+                    <span class="hint">Changing the category can change the booking fee.</span></div>
+                  <div class="sam-field"><label for="country">Country</label>
+                    <select id="country" name="country" required>{COUNTRIES.map((c) => <option value={c.code} selected={c.code === app!.country}>{c.name}</option>)}</select></div>
+                </div>
+                <div class="sam-row2">
+                  <div class="sam-field"><label for="region">State, province or region (optional)</label><input id="region" name="region" type="text" maxlength="120" value={app.region} /></div>
+                  <div class="sam-field"><label for="city">City (optional)</label><input id="city" name="city" type="text" maxlength="120" value={app.city} /></div>
+                </div>
+                <div class="sam-field"><label for="timezone">Time zone</label>
+                  <select id="timezone" name="timezone">{tzList.map((z) => <option value={z} selected={z === (app!.timezone || 'UTC')}>{z}</option>)}</select></div>
+              </div>
+            </fieldset>
+            <fieldset>
+              <legend class="sam-legend">Contact person</legend>
+              <div class="sam-form">
+                <div class="sam-row2">
+                  <div class="sam-field"><label for="contact_name">Name</label><input id="contact_name" name="contact_name" type="text" required maxlength="200" value={app.contactName} /></div>
+                  <div class="sam-field"><label for="contact_role">Role or designation (optional)</label><input id="contact_role" name="contact_role" type="text" maxlength="200" value={app.contactRole} /></div>
+                </div>
+                <div class="sam-row2">
+                  <div class="sam-field"><label for="contact_email">Email</label><input id="contact_email" name="contact_email" type="email" required maxlength="254" value={app.contactEmail} /></div>
+                  <div class="sam-field"><label for="contact_phone">Phone, with country code (optional)</label><input id="contact_phone" name="contact_phone" type="tel" maxlength="32" value={app.contactPhone} /></div>
+                </div>
+              </div>
+            </fieldset>
+            <fieldset>
+              <legend class="sam-legend">Organisation</legend>
+              <div class="sam-form">
+                <div class="sam-row2">
+                  <div class="sam-field"><label for="org_name">Name {app.category === 'individual' ? '(optional)' : ''}</label><input id="org_name" name="org_name" type="text" maxlength="300" value={app.orgName} /></div>
+                  <div class="sam-field"><label for="org_website">Website (optional)</label><input id="org_website" name="org_website" type="url" maxlength="800" value={app.orgWebsite} placeholder="https://" /></div>
+                </div>
+                <div class="sam-row2">
+                  <div class="sam-field"><label for="org_registration">Registration or tax number (optional)</label><input id="org_registration" name="org_registration" type="text" maxlength="120" value={app.orgRegistration} /><span class="hint">Used on invoices where your rules require it.</span></div>
+                  <div class="sam-field"><label for="turnover_band">Annual turnover (optional)</label>
+                    <select id="turnover_band" name="turnover_band"><option value="">Prefer not to say</option>{TURNOVER_BANDS.map((b) => <option value={b.value} selected={b.value === app!.turnoverBand}>{b.label}</option>)}</select></div>
+                </div>
+              </div>
+            </fieldset>
+            <fieldset id="officialBlock">
+              <legend class="sam-legend">Official body details</legend>
+              <p class="hint" style="font-size:0.8rem;color:#7a7266;margin:0 0 10px;">Required for government, intergovernmental and public-sector applicants.</p>
+              <div class="sam-form">
+                <div class="sam-field"><label for="gov_level">Level</label>
+                  <select id="gov_level" name="gov_level"><option value="">Choose one</option>{GOVERNMENT_LEVELS.map((l) => <option value={l.value} selected={o?.level === l.value}>{l.label}</option>)}</select></div>
+                <div class="sam-row2">
+                  <div class="sam-field"><label for="gov_jurisdiction">Jurisdiction</label><input id="gov_jurisdiction" name="gov_jurisdiction" type="text" maxlength="300" value={o?.jurisdiction || ''} placeholder="City, district, state, province or country" /></div>
+                  <div class="sam-field"><label for="gov_department">Ministry, department or agency</label><input id="gov_department" name="gov_department" type="text" maxlength="300" value={o?.department || ''} /></div>
+                </div>
+                <div class="sam-field"><label for="gov_office">Office, division or unit (optional)</label><input id="gov_office" name="gov_office" type="text" maxlength="300" value={o?.office || ''} /></div>
+                <div class="sam-row2">
+                  <div class="sam-field"><label for="rep_name">Authorised representative</label><input id="rep_name" name="rep_name" type="text" maxlength="200" value={o?.repName || ''} /></div>
+                  <div class="sam-field"><label for="rep_designation">Their designation</label><input id="rep_designation" name="rep_designation" type="text" maxlength="200" value={o?.repDesignation || ''} /></div>
+                </div>
+                <div class="sam-row2">
+                  <div class="sam-field"><label for="rep_email">Their official email</label><input id="rep_email" name="rep_email" type="email" maxlength="254" value={o?.repEmail || ''} /></div>
+                  <div class="sam-field"><label for="rep_phone">Their phone (optional)</label><input id="rep_phone" name="rep_phone" type="tel" maxlength="32" value={o?.repPhone || ''} /></div>
+                </div>
+                <div class="sam-field"><label for="rep_authority">Authorisation reference (optional)</label><input id="rep_authority" name="rep_authority" type="text" maxlength="500" value={o?.authorityRef || ''} /><span class="hint">An order or letter number, or a shared-document link, showing the representative may act for the body.</span></div>
+                <div class="sam-row2">
+                  <div class="sam-field"><label for="proc_route">Expected procurement route</label>
+                    <select id="proc_route" name="proc_route"><option value="">Choose one</option>{PROCUREMENT_ROUTES.map((p) => <option value={p.value} selected={o?.procurement?.route === p.value}>{p.label}</option>)}</select></div>
+                  <div class="sam-field"><label for="proc_tender">Tender or reference number (optional)</label><input id="proc_tender" name="proc_tender" type="text" maxlength="200" value={o?.procurement?.tenderRef || ''} /></div>
+                </div>
+                <label class="sam-check"><input type="checkbox" name="proc_formal" value="yes" checked={!!o?.procurement?.formalProposal} /><span>A formal proposal or detailed project report will be required.</span></label>
+                <label class="sam-check"><input type="checkbox" name="proc_invoice" value="yes" checked={!!o?.procurement?.invoiceFirst} /><span>Our rules require an invoice before any payment, including the booking fee.</span></label>
+                <div class="sam-row2">
+                  <div class="sam-field"><label for="proc_language">Language required for documents (optional)</label><input id="proc_language" name="proc_language" type="text" maxlength="80" value={o?.procurement?.language || ''} /></div>
+                  <div class="sam-field"><label for="proc_notes">Other procurement requirements (optional)</label><textarea id="proc_notes" name="proc_notes" maxlength="2000">{o?.procurement?.notes || ''}</textarea></div>
+                </div>
+              </div>
+            </fieldset>
+            <div class="sam-cta"><button class="sam-btn" type="submit">Save details</button>{edit === 'details' && <a class="sam-btn ghost" href={PAGE}>Cancel</a>}</div>
+          </form>
+        )}
+
+        {showReqForm && (
+          <form method="POST" class="sam-form" style="margin-bottom:28px;">
+            <input type="hidden" name="action" value="requirements" />
+            <h2 class="sam-h2">Project requirements</h2>
+            <p class="sam-p">What are you planning to build, improve, transform or achieve through technology? Describe it in your own words; unusual and entirely new kinds of project are welcome.</p>
+            <div class="sam-field"><label for="title">Project title</label><input id="title" name="title" type="text" required maxlength="200" value={app.title} /></div>
+            <div class="sam-field"><label for="summary">The problem and what you want to achieve</label><textarea id="summary" name="summary" required maxlength="6000" style="min-height:150px;">{app.summary}</textarea></div>
+            <div class="sam-field"><label for="need">What are you looking for?</label>
+              <select id="need" name="need" required><option value="">Choose one</option>{NEED_TYPES.map((n) => <option value={n.value} selected={n.value === app!.need}>{n.label}</option>)}</select></div>
+            <PathwayFields pathway={app.pathway || defaultPathwayFor(app.category)} answers={app.requirements} />
+            <fieldset>
+              <legend class="sam-legend">Supporting documents (optional)</legend>
+              <p class="hint" style="font-size:0.8rem;color:#7a7266;margin:0 0 10px;">Share documents as links (for example a cloud-drive link with view access): reports, requests for proposals, tenders, architecture diagrams. Documents are not uploaded here. Content in your documents is treated as information, never as instructions.</p>
+              {[0, 1, 2, 3, 4, 5].map((i) => (
+                <div class="sam-row2" style="margin-bottom:8px;">
+                  <input name={'doc_label_' + i} type="text" maxlength="120" placeholder="What it is" value={app!.documents[i]?.label || ''} aria-label={'Document ' + (i + 1) + ' name'} />
+                  <input name={'doc_url_' + i} type="url" maxlength="800" placeholder="https://" value={app!.documents[i]?.url || ''} aria-label={'Document ' + (i + 1) + ' link'} />
+                </div>
+              ))}
+            </fieldset>
+            <p class="sam-p" style="font-size:0.8rem;">{AI_ASSISTANCE_NOTICE}</p>
+            <div class="sam-cta"><button class="sam-btn" type="submit">Save requirements</button>{edit === 'requirements' && <a class="sam-btn ghost" href={PAGE}>Cancel</a>}</div>
+          </form>
+        )}
+
+        {showFee && (
+          <section class="sam-card" style="margin-bottom:24px;">
+            <h2 class="sam-h2">Consultation booking fee</h2>
+            {feeList && !feeList.ready && <div class="sam-flash err">The fee could not be loaded just now. Please reload in a moment.</div>}
+            {feeList && feeList.ready && !fee && (
+              <div class="sam-note">The booking fee for <strong>{categoryLabel(app.category)}</strong> applicants has not been published yet. Your request is saved. We will email you when booking opens; nothing else is needed from you until then.</div>
+            )}
+            {fee && (
+              <form method="POST" class="sam-form">
+                <input type="hidden" name="action" value="accept_fee" />
+                <input type="hidden" name="fee_id" value={fee.id} />
+                <input type="hidden" name="currency" value={fee.currency} />
+                {feeCurrencies.length > 1 && (
+                  <p class="sam-p" style="font-size:0.86rem;">Currency: {feeCurrencies.map((c) => <a href={PAGE + '?currency=' + c} style={'margin-right:10px;' + (c === fee!.currency ? 'font-weight:700;color:#FF4F00;' : '')}>{c}</a>)}</p>
+                )}
+                <table class="sam-table">
+                  <tbody>
+                    {breakdownFor(fee).lines.map((l) => <tr><td>{l.label}</td><td style="text-align:right;">{formatMoney(l.minor, fee!.currency)}</td></tr>)}
+                    <tr><td><strong>Total</strong></td><td style="text-align:right;"><strong>{formatMoney(breakdownFor(fee).total, fee.currency)}</strong></td></tr>
+                  </tbody>
+                </table>
+                <p class="sam-p" style="font-size:0.84rem;">Currency: {fee.currency} ({currencyDef(fee.currency)?.name}). Payment charges: {fee.chargesNote || 'none added'}.</p>
+                {fxNote && <p class="sam-p" style="font-size:0.84rem;">{fxNote}</p>}
+                <div class="sam-field"><span class="sam-legend">Payment terms</span><div class="sam-card" style="background:#fbf8f4;white-space:pre-wrap;font-size:0.86rem;line-height:1.65;max-height:260px;overflow:auto;">{fee.terms}</div></div>
+                <p class="sam-p" style="font-size:0.84rem;">This fee secures a formal consultation call. It is separate from consultancy packages, engineering, government project proposals, infrastructure and implementation, each of which has its own approved quotation and terms.</p>
+                <fieldset>
+                  <legend class="sam-legend">How will you pay?</legend>
+                  <div class="sam-choice" style="margin-top:8px;">
+                    {onlineAvailable && <label><input type="radio" name="method" value="online" checked={!o?.procurement?.invoiceFirst} /><span><b>Online now</b><small>Card, bank or other methods offered by the payment provider. Confirmed by the provider directly to us.</small></span></label>}
+                    <label><input type="radio" name="method" value="invoice" checked={!onlineAvailable || !!o?.procurement?.invoiceFirst} /><span><b>Against an invoice</b><small>We send an invoice. Booking opens when your payment is recorded.</small></span></label>
+                  </div>
+                  {!onlineAvailable && <p class="hint" style="font-size:0.8rem;color:#7a7266;margin:8px 0 0;">Online payment is not open yet, so the fee is paid against an invoice.</p>}
+                </fieldset>
+                <div class="sam-field"><label for="accepted_name">Your full name</label><input id="accepted_name" name="accepted_name" type="text" required maxlength="200" value={app.contactName} /></div>
+                <label class="sam-check"><input type="checkbox" name="terms_ok" value="yes" required /><span>I have read the fee, the currency, the tax and charges shown, and the payment terms, and I accept them on behalf of {app.orgName || 'myself'}.</span></label>
+                <div class="sam-cta"><button class="sam-btn" type="submit">Accept and continue</button><a class="sam-btn ghost" href={PAGE + '?edit=requirements'}>Edit my requirements</a></div>
+              </form>
+            )}
+          </section>
+        )}
+
+        {showPay && app.feeSnapshot && (
+          <section class="sam-card" style="margin-bottom:24px;">
+            <h2 class="sam-h2">Pay the booking fee</h2>
+            <table class="sam-table"><tbody>
+              {app.feeSnapshot.breakdown.lines.map((l) => <tr><td>{l.label}</td><td style="text-align:right;">{formatMoney(l.minor, app!.feeSnapshot!.currency)}</td></tr>)}
+              <tr><td><strong>Total</strong></td><td style="text-align:right;"><strong>{formatMoney(app.feeSnapshot.breakdown.total, app.feeSnapshot.currency)}</strong></td></tr>
+            </tbody></table>
+            {app.feeSnapshot.method === 'online' ? (
+              onlineAvailable ? (
+                <div style="margin-top:14px;">
+                  <p class="sam-p" style="font-size:0.86rem;">You are charged in Indian rupees{app.feeSnapshot.currency !== 'INR' ? ' at the live reference exchange rate, shown before you confirm' : ''}. Your request moves on only when the payment provider confirms the payment to us.</p>
+                  <button class="sam-btn" type="button" id="payBtn" data-ref={app.ref} data-target="fee">Pay {formatMoney(app.feeSnapshot.breakdown.total, app.feeSnapshot.currency)}</button>
+                  <p class="sam-p" id="payMsg" role="status" style="font-size:0.86rem;margin-top:10px;"></p>
+                </div>
+              ) : (
+                <div class="sam-note">Online payment is not available right now. Switch to payment against an invoice below, or try again later.</div>
+              )
+            ) : (
+              <div class="sam-note" style="margin-top:14px;">You chose to pay against an invoice. The SAMARTH team will send it to {app.official?.repEmail || app.contactEmail}. Booking opens as soon as your payment is recorded; you will be emailed.</div>
+            )}
+            <form method="POST" style="margin-top:12px;"><input type="hidden" name="action" value="revise_fee" /><button class="sam-btn ghost" type="submit">Change currency or payment method</button></form>
+          </section>
+        )}
+
+        {showBooking && (
+          <form method="POST" class="sam-form sam-card" style="margin-bottom:24px;">
+            <input type="hidden" name="action" value="booking" />
+            <h2 class="sam-h2">Book your consultation call</h2>
+            <p class="sam-p">Give up to three times that suit you. The consultant confirms one of them, or proposes another.</p>
+            <div class="sam-field"><label for="tz">Your time zone</label><select id="tz" name="tz">{tzList.map((z) => <option value={z} selected={z === (app!.timezone || 'UTC')}>{z}</option>)}</select></div>
+            <div class="sam-row2">
+              <div class="sam-field"><label for="slot1">First choice</label><input id="slot1" name="slot1" type="datetime-local" required /></div>
+              <div class="sam-field"><label for="slot2">Second choice (optional)</label><input id="slot2" name="slot2" type="datetime-local" /></div>
+            </div>
+            <div class="sam-row2">
+              <div class="sam-field"><label for="slot3">Third choice (optional)</label><input id="slot3" name="slot3" type="datetime-local" /></div>
+              <div class="sam-field"><label for="mode">Call by</label><select id="mode" name="mode"><option value="video">Video</option><option value="phone">Phone</option></select></div>
+            </div>
+            <div class="sam-field"><label for="note">Anything the consultant should know (optional)</label><textarea id="note" name="note" maxlength="1000"></textarea></div>
+            <div class="sam-cta"><button class="sam-btn" type="submit">Request the call</button></div>
+          </form>
+        )}
+
+        {(app.status === 'BOOKING_REQUESTED' || app.status === 'CONSULTANT_ASSIGNED' || app.status === 'CALL_SCHEDULED') && (
+          <section class="sam-card" style="margin-bottom:24px;">
+            <h2 class="sam-h2">Your consultation call</h2>
+            <dl class="sam-kv">
+              {slotsText.length > 0 && <><dt>Times you suggested</dt><dd>{slotsText.join(NL)}</dd></>}
+              <dt>Consultant</dt><dd>{app.consultantName || 'Being assigned'}</dd>
+              <dt>Call time</dt><dd>{callAtText || 'To be confirmed by your consultant'}</dd>
+              {app.callLink && <><dt>Meeting link</dt><dd><a href={app.callLink} target="_blank" rel="noopener noreferrer" style="color:#FF4F00;">Join the call</a></dd></>}
+            </dl>
+          </section>
+        )}
+
+        {engagements.length > 0 && (
+          <section style="margin-bottom:24px;">
+            <h2 class="sam-h2">Quotations and engagements</h2>
+            <p class="sam-p" style="font-size:0.86rem;">Each one is separate from the booking fee and from each other, with its own scope, price and terms.</p>
+            {engagements.map((e) => {
+              const b = engagementBreakdown(e);
+              return (
+                <article class="sam-card" style="margin-bottom:14px;">
+                  <p class="sam-eyebrow" style="margin-bottom:6px;">{e.ref} &middot; {engagementKindLabel(e.kind)}</p>
+                  <h3 class="sam-h3">{e.title}</h3>
+                  <p class="sam-p"><span class="sam-chip">{statusLabel('engagement', e.status)}</span> {statusDef('engagement', e.status)?.public}</p>
+                  <dl class="sam-kv">
+                    <dt>Scope</dt><dd>{e.scope}</dd>
+                    {e.deliverables && <><dt>Deliverables</dt><dd>{e.deliverables}</dd></>}
+                    {e.exclusions && <><dt>Not included</dt><dd>{e.exclusions}</dd></>}
+                    <dt>Delivery</dt><dd>{deliveryModelLabel(e.deliveryModel)}{e.partnerIds.length ? ', with ' + e.partnerIds.map((id) => partnerNames[id] || 'a selected partner').join(', ') : ''}</dd>
+                    {e.responsibility && <><dt>Responsibility</dt><dd>{e.responsibility}</dd></>}
+                    {b.lines.map((l) => <><dt>{l.label}</dt><dd>{formatMoney(l.minor, e.currency)}</dd></>)}
+                    <dt>Total</dt><dd><strong>{formatMoney(b.total, e.currency)}</strong></dd>
+                    {e.validUntil && <><dt>Valid until</dt><dd>{e.validUntil}</dd></>}
+                    <dt>Payment</dt><dd>{e.paymentState === 'paid' ? 'Paid' : e.paymentMethod === 'online' ? 'Online, after acceptance' : 'Against an invoice'}</dd>
+                    {e.awardReference && <><dt>Contract reference</dt><dd>{e.awardReference}</dd></>}
+                  </dl>
+                  <details style="margin-top:10px;"><summary style="cursor:pointer;font-weight:600;font-size:0.88rem;">Terms</summary><p class="sam-p" style="white-space:pre-wrap;font-size:0.86rem;margin-top:8px;">{e.terms}</p></details>
+                  {e.status === 'SENT' && (
+                    <div class="sam-grid two" style="margin-top:14px;">
+                      <form method="POST" class="sam-form">
+                        <input type="hidden" name="action" value="accept_quote" /><input type="hidden" name="engagement_id" value={e.id} />
+                        <div class="sam-field"><label>Your full name</label><input name="accepted_name" type="text" required maxlength="200" value={app!.contactName} /></div>
+                        <label class="sam-check"><input type="checkbox" name="agree" value="yes" required /><span>I accept this quotation, its price and its terms on behalf of {app!.orgName || 'myself'}.</span></label>
+                        <button class="sam-btn" type="submit">Accept quotation</button>
+                      </form>
+                      <form method="POST" class="sam-form">
+                        <input type="hidden" name="action" value="decline_quote" /><input type="hidden" name="engagement_id" value={e.id} />
+                        <div class="sam-field"><label>Reason (optional)</label><textarea name="reason" maxlength="2000"></textarea></div>
+                        <button class="sam-btn ghost" type="submit">Decline</button>
+                      </form>
+                    </div>
+                  )}
+                  {e.status === 'ACCEPTED' && e.paymentState !== 'paid' && e.paymentMethod === 'online' && (
+                    engagementCheckoutOn ? (
+                      <div style="margin-top:12px;"><button class="sam-btn" type="button" id={'payEng-' + e.id} data-ref={app!.ref} data-target="engagement" data-engagement={e.id}>Pay {formatMoney(b.total, e.currency)}</button><p class="sam-p" role="status" id={'payEngMsg-' + e.id} style="font-size:0.86rem;margin-top:8px;"></p></div>
+                    ) : <p class="sam-note" style="margin-top:12px;">The SAMARTH team will send an invoice for this engagement.</p>
+                  )}
+                </article>
+              );
+            })}
+          </section>
+        )}
+
+        <section style="margin-bottom:24px;">
+          <h2 class="sam-h2">Messages and history</h2>
+          {events && !events.ready && <div class="sam-flash err">The history could not be loaded just now.</div>}
+          {events && events.ready && (
+            <ul class="sam-timeline">
+              {events.value.map((ev) => (
+                <li><span class="when">{ev.createdAt.slice(0, 16).replace('T', ' ')} UTC &middot; {ev.kind === 'reply' ? 'You' : ev.actorName || 'SAMARTH'}</span><p class="what">{ev.toStatus ? statusLabel('application', ev.toStatus) + (ev.body ? ': ' : '') : ''}{ev.body}</p></li>
+              ))}
+            </ul>
+          )}
+          {!['WITHDRAWN', 'DECLINED', 'CLOSED'].includes(app.status) && (
+            <form method="POST" class="sam-form" style="margin-top:12px;">
+              <input type="hidden" name="action" value="message" />
+              <div class="sam-field"><label for="body">Message the SAMARTH team</label><textarea id="body" name="body" maxlength="4000" required></textarea></div>
+              <div class="sam-cta"><button class="sam-btn ghost" type="submit">Send message</button></div>
+            </form>
+          )}
+        </section>
+
+        <section class="sam-card" style="margin-bottom:24px;">
+          <h2 class="sam-h3">What you have told us</h2>
+          <dl class="sam-kv">
+            <dt>Applicant</dt><dd>{categoryLabel(app.category)}, {countryName(app.country)}</dd>
+            <dt>Contact</dt><dd>{app.contactName}{app.contactRole ? ', ' + app.contactRole : ''} ({app.contactEmail})</dd>
+            {app.orgName && <><dt>Organisation</dt><dd>{app.orgName}</dd></>}
+            {official && o && <><dt>Official body</dt><dd>{governmentLevelLabel(o.level)}<br />{o.department}{o.jurisdiction ? ', ' + o.jurisdiction : ''}<br />Representative: {o.repName}, {o.repDesignation}</dd></>}
+            {app.summary && <><dt>Project</dt><dd>{app.summary}</dd></>}
+            {answered.map((x) => <><dt>{x.label}</dt><dd>{x.value}</dd></>)}
+            {app.documents.length > 0 && <><dt>Documents</dt><dd>{app.documents.map((d) => <a href={d.url} target="_blank" rel="noopener noreferrer" style="color:#FF4F00;display:block;">{d.label}</a>)}</dd></>}
+          </dl>
+          {APPLICANT_EDITABLE.includes(app.status) && app.status !== 'DRAFT' && (
+            <div class="sam-cta" style="margin-top:12px;"><a class="sam-btn ghost" href={PAGE + '?edit=details'}>Edit details</a><a class="sam-btn ghost" href={PAGE + '?edit=requirements'}>Edit requirements</a></div>
+          )}
+        </section>
+
+        {(APPLICANT_EDITABLE.includes(app.status) || app.status === 'FEE_PENDING') && (
+          <details class="sam-card">
+            <summary style="cursor:pointer;font-weight:600;">Withdraw this request</summary>
+            <form method="POST" class="sam-form" style="margin-top:12px;">
+              <input type="hidden" name="action" value="withdraw" />
+              <label class="sam-check"><input type="checkbox" name="confirm" value="yes" /><span>I want to withdraw this request. This cannot be undone.</span></label>
+              <button class="sam-btn ghost" type="submit">Withdraw</button>
+            </form>
+          </details>
+        )}
+      </div>
+    )}
+  </section>
+
+  <script is:inline>
+    (function () {
+      var official = document.getElementById('officialBlock');
+      var cat = document.getElementById('category');
+      if (official && cat) {
+        var off = ['government', 'intergovernmental', 'public_sector'];
+        var sync = function () { official.style.display = off.indexOf(cat.value) >= 0 ? '' : 'none'; };
+        cat.addEventListener('change', sync); sync();
+      }
+      // The payment provider's script is loaded only when somebody actually pays, so a visitor who
+      // is only reading their request downloads nothing from a third party.
+      function withCheckout(cb) {
+        if (typeof Razorpay !== 'undefined') { cb(true); return; }
+        var s = document.createElement('script'); s.src = 'https://checkout.razorpay.com/v1/checkout.js';
+        s.onload = function () { cb(typeof Razorpay !== 'undefined'); }; s.onerror = function () { cb(false); };
+        document.head.appendChild(s);
+      }
+      function pay(btn, msgEl) {
+        btn.disabled = true; msgEl.textContent = 'Opening secure checkout...';
+        withCheckout(function (loaded) {
+        if (!loaded) { btn.disabled = false; msgEl.textContent = 'The payment window could not load. Check your connection and try again. Nothing was charged.'; return; }
+        var body = { ref: btn.getAttribute('data-ref'), target: btn.getAttribute('data-target'), engagementId: btn.getAttribute('data-engagement') || '' };
+        fetch('/api/samarth/pay', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+          .then(function (r) { return r.json(); })
+          .then(function (j) {
+            if (!j.ok) { btn.disabled = false; msgEl.textContent = j.error || 'Checkout could not be opened. Nothing was charged.'; if (j.alreadyPaid) setTimeout(function () { location.reload(); }, 4000); return; }
+            if (typeof Razorpay === 'undefined') { btn.disabled = false; msgEl.textContent = 'The payment window could not load. Check your connection and try again. Nothing was charged.'; return; }
+            var conv = j.fxRate && j.fxRate !== 1 ? ' (' + j.displayAmount + ' at ' + j.fxRate + ' INR per unit, ' + j.fxDate + ')' : '';
+            msgEl.textContent = 'You will be charged INR ' + (j.amountPaise / 100).toFixed(2) + conv + '.';
+            var rzp = new Razorpay({
+              key: j.keyId, order_id: j.orderId, amount: j.amountPaise, currency: 'INR', name: 'SAMARTH by EduRankAI', description: j.description,
+              prefill: { name: j.name, email: j.email }, theme: { color: '#FF4F00' },
+              handler: function (resp) {
+                msgEl.textContent = 'Confirming with the payment provider...';
+                fetch('/api/payments/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ razorpay_order_id: resp.razorpay_order_id, razorpay_payment_id: resp.razorpay_payment_id, razorpay_signature: resp.razorpay_signature }) })
+                  .then(function (r) { return r.json(); })
+                  .then(function (v) {
+                    if (v && v.ok) { msgEl.textContent = v.status === 'paid' ? 'Payment confirmed. Updating your request...' : 'Payment received and being confirmed. This page will update shortly.'; setTimeout(function () { location.reload(); }, 1500); }
+                    else { msgEl.textContent = (v && v.error) || 'We could not confirm the payment yet. Do not pay again; reload in a minute.'; }
+                  })
+                  .catch(function () { msgEl.textContent = 'Your payment may have gone through but could not be confirmed from this page. Do not pay again. Reload in a minute, or write to connect@edurankai.in quoting payment ' + (resp.razorpay_payment_id || '') + '.'; });
+              },
+              modal: { ondismiss: function () { btn.disabled = false; msgEl.textContent = 'Payment window closed. Nothing was charged.'; } }
+            });
+            rzp.open();
+          })
+          .catch(function () { btn.disabled = false; msgEl.textContent = 'Network error. Nothing was charged. Try again.'; });
+        });
+      }
+      var feeBtn = document.getElementById('payBtn');
+      if (feeBtn) feeBtn.addEventListener('click', function () { pay(feeBtn, document.getElementById('payMsg')); });
+      var engBtns = document.querySelectorAll('[id^="payEng-"]');
+      for (var i = 0; i < engBtns.length; i++) {
+        (function (b) { b.addEventListener('click', function () { pay(b, document.getElementById('payEngMsg-' + b.getAttribute('data-engagement'))); }); })(engBtns[i]);
+      }
+    })();
+  </script>
+</SamarthShell>
