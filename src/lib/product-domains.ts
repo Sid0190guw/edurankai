@@ -158,6 +158,7 @@ export const PRODUCT_DOMAINS: ProductDomain[] = [
   { slug: 'sancharan', aliases: [], departments: [], note: 'Travel. No department is staffed against it; the page correctly shows nothing.' },
   { slug: 'sampark', aliases: [], departments: [], note: 'CRM. No department is staffed against it; the page correctly shows nothing.' },
   { slug: 'sambandh', aliases: [], departments: [], note: 'Identity-verified matchmaking. No department is staffed against it; the page correctly shows nothing.' },
+  { slug: 'samarth', aliases: [], departments: [], note: 'Technology consulting, engineering and venture building. No posting names SAMARTH yet, so no department is mapped; delivery partners are a registry, not hires.' },
 ];
 
 const norm = (s: string | null | undefined): string => String(s || '').trim().toLowerCase();

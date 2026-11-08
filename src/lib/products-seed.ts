@@ -76,6 +76,43 @@ export async function ensureAkashaQProduct(): Promise<void> {
   } catch (_) { /* swallow - listing pages should never 500 because of seed */ }
 }
 
+let samarthSeeded = false;
+
+/** The SAMARTH copy, shared by the seed below and the /ecosystem/samarth fallback. */
+export const SAMARTH_PRODUCT = {
+  slug: 'samarth',
+  name: 'SAMARTH',
+  emphasisWord: 'transformation',
+  short: 'From research to reality. Technology consulting, engineering, technology transfer, intelligent infrastructure and venture building for governments, industry, institutions and individuals in every country.',
+  long: 'SAMARTH is the research, technology consulting, engineering and venture-building initiative of EduRankAI. It works with governments at every level, public bodies, businesses, manufacturers, universities, research institutions and individuals worldwide: from a website or a business application to enterprise platforms, AI and computing infrastructure, intelligent manufacturing and large public digital infrastructure.\n\nEvery engagement begins with registration and a consultation call with a human SAMARTH consultant, booked with a consultation fee that is shown with its currency, tax and terms before payment. Anything proposed after the call is a separate engagement with its own approved quotation. Delivery runs through SAMARTH engineering teams, carefully selected partners, or both, and regulated work only ever goes through appropriately licensed partners.\n\nSAMARTH X, its venture-building programme, selects exceptional builders of AI and intelligent systems. It charges no fee at any stage.',
+  externalUrl: '/samarth',
+  sortOrder: 30,
+} as const;
+
+/**
+ * SAMARTH, the consulting, engineering and venture-building initiative (src/lib/samarth). Its own
+ * site is /samarth, so external_url points there and the generic /ecosystem/samarth detail page
+ * leads to it. The copy is refreshed on every call; status, visibility and order are left to
+ * /admin/products after the first insert.
+ */
+export async function ensureSamarthProduct(): Promise<void> {
+  if (samarthSeeded) return;
+  try {
+    const p = SAMARTH_PRODUCT;
+    await db.execute(sql`
+      INSERT INTO products (slug, name, emphasis_word, status, short_description, long_description, external_url, icon_key, sort_order)
+      VALUES (${p.slug}, ${p.name}, ${p.emphasisWord}, 'live', ${p.short}, ${p.long}, ${p.externalUrl}, 'briefcase', ${p.sortOrder})
+      ON CONFLICT (slug) DO UPDATE SET
+        name = EXCLUDED.name,
+        emphasis_word = EXCLUDED.emphasis_word,
+        short_description = EXCLUDED.short_description,
+        long_description = EXCLUDED.long_description,
+        external_url = EXCLUDED.external_url
+    `);
+    samarthSeeded = true;
+  } catch (_) { /* swallow - listing pages should never 500 because of seed */ }
+}
+
 // Canonical copy for the three consumer ventures. The DB rows previously
 // carried education-flavored placeholder text (Sancharan as "communication
 // infrastructure", Sampark as "bridge between learning and work", Sambandh as
