@@ -3,7 +3,8 @@
 **Status:** partial
 
 ## Built
-- Overview with pipeline, revenue, distribution and readiness
+- Overview with a stage-column pipeline, segmented distribution bars and revenue tiles, on palettes validated for colour-blind readers
+- Readiness panel and one-click setup
 - Search across every SAMARTH record the administrator may see
 - Filters, keyset pagination and CSV export
 - Timeline and audit history on every record
