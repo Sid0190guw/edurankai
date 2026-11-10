@@ -17,6 +17,7 @@
 // It reads through getThreadMessages(), which is already scoped to `mail_box.user_id = <caller>`:
 // a thread id belonging to somebody else's mailbox returns nothing rather than somebody else's mail.
 import type { APIRoute } from 'astro';
+import { publicOrigin as requestPublicOrigin } from '@/lib/public-url';
 import { denyMailApi } from '@/lib/auth/mail-access';
 import { getThreadMessages, markThreadRead, ensureMailSchema } from '@/lib/mail';
 import {
@@ -51,7 +52,7 @@ export const GET: APIRoute = async ({ request, locals }) => {
   const threadId = String(url.searchParams.get('thread') || '');
   if (!UUID_RE.test(threadId)) return json({ ok: false, error: 'thread must be a conversation id' }, 400);
   const markRead = url.searchParams.get('read') !== '0';
-  const selfHost = url.hostname;
+  const selfHost = new URL(requestPublicOrigin(request)).hostname;
 
   try {
     await ensureMailSchema();

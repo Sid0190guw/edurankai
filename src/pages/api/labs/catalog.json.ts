@@ -2,10 +2,11 @@
 // this to discover every licensable virtual lab and its embed URL, then wire
 // them into its own LMS / virtual infrastructure (iframe, SDK, or LTI launch).
 import type { APIRoute } from 'astro';
+import { publicOrigin as requestPublicOrigin } from '@/lib/public-url';
 import { LABS } from '@/data/labs-catalog';
 
-export const GET: APIRoute = async ({ url }) => {
-  const origin = url.origin.includes('localhost') ? 'https://edurankai.in' : url.origin;
+export const GET: APIRoute = async ({ request }) => {
+  const origin = requestPublicOrigin(request);
   const body = {
     provider: 'EduRankAI Virtual Labs',
     version: '1.0',
