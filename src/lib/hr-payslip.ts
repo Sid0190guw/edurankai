@@ -32,6 +32,8 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { payslipLines, describeLine, type PayLine } from '@/lib/payroll';
+import { amountInWords, maskTail } from '@/lib/hr/hr-documents';
+import { longDate } from '@/lib/hr/brand-doc';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
@@ -64,6 +66,17 @@ export async function fetchPayslip(id: string): Promise<any | null> {
   // having to know the component engine exists. An empty array is the ordinary answer for a payslip
   // generated before components, and renderPayslipHtml falls back to the fixed columns for it.
   ps.lines = await payslipLines(String(ps.id));
+  // Particulars a payslip normally carries (date of joining; bank account and PAN, both masked).
+  // Read as to_jsonb(e) so this never names a column a hand-run migration may not have added on the
+  // live database: a column that is absent is simply not printed. Never fatal to the payslip.
+  try {
+    const x = rows(await db.execute(sql`SELECT to_jsonb(e) AS j FROM hr_employees e WHERE e.id = ${ps.employee_id} LIMIT 1`))[0];
+    const j = x?.j && typeof x.j === 'object' ? x.j : (typeof x?.j === 'string' ? JSON.parse(x.j) : {});
+    ps.extra = { joining_date: j?.joining_date || null, bank_name: j?.bank_name || null, bank_account_number: j?.bank_account_number || null, pan_number: j?.pan_number || null };
+  } catch (e: any) {
+    console.error('[hr-payslip] employee particulars unavailable:', e?.cause?.message || e?.message);
+    ps.extra = {};
+  }
   return ps;
 }
 
@@ -80,169 +93,109 @@ function fmt(n: any) {
   return parseFloat(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-/**
- * One component row. `rate` is printed only when it EXPLAINS the amount (a percentage); a fixed
- * component prints its amount alone, because "200 (200)" tells nobody anything.
- */
-function lineRow(line: PayLine, currency: string, deduction: boolean): string {
-  const why = describeLine(line);
-  return `<tr><td>${esc(line.label)}${why ? ` <span style="color:#9ca3af;font-size:10px;">${esc(why)}</span>` : ''}</td>`
-    + `<td${deduction ? ' class="deduction-color"' : ''}>${deduction ? '- ' : ''}${esc(currency)} ${fmt(line.amount)}</td></tr>`;
-}
 
 /** The printable payslip. `autoPrint` opens the browser print dialog (the admin behaviour). */
 export function renderPayslipHtml(ps: any, opts: { autoPrint?: boolean } = {}): string {
-  const month = MONTHS[(ps.month || 1) - 1];
-  const year = ps.year;
+  // A FORMAL PAYSLIP, NOT A DASHBOARD CARD. Letterhead, the period, the employee's particulars, one
+  // earnings-and-deductions table read across, and net pay in figures AND in words, which is what a
+  // bank, a landlord or a visa office reads first. Every value is escaped: names, designations and
+  // component labels are text somebody typed.
+  // Declared here, above the template literal that reads them: `const` is not hoisted.
+  const month = MONTHS[(Number(ps.month) || 1) - 1] || '';
+  const year = esc(ps.year);
   const autoPrint = opts.autoPrint !== false;
-  const currency = ps.currency || 'INR';
+  const currency = String(ps.currency || 'INR');
+  const cur = esc(currency);
+  const extra = ps.extra && typeof ps.extra === 'object' ? ps.extra : {};
 
-  // COMPONENTS WHERE THEY EXIST, FIXED COLUMNS WHERE THEY DO NOT. Declared here, above the template
-  // literal that reads them — `const` is not hoisted, and a declaration below its first use throws on
-  // the first line of whatever reads it.
   const lines: PayLine[] = Array.isArray(ps.lines) ? ps.lines : [];
-  const earningLines = lines.filter((l) => l.kind === 'earning');
-  const deductionLines = lines.filter((l) => l.kind === 'deduction');
-  const employerTotal = lines.reduce((s, l) => s + (Number(l.employerAmount) || 0), 0);
   const hasComponents = lines.length > 0;
+  type Item = { label: string; note: string; amount: number };
+  const legacy = (pairs: [string, any][]): Item[] => pairs.filter(([, v]) => Number(v) > 0).map(([label, v]) => ({ label, note: '', amount: Number(v) }));
+  const earnings: Item[] = hasComponents
+    ? lines.filter((l) => l.kind === 'earning').map((l) => ({ label: String(l.label || ''), note: describeLine(l) || '', amount: Number(l.amount) || 0 }))
+    : legacy([['Basic salary', ps.basic], ['House rent allowance', ps.hra], ['Dearness allowance', ps.da], ['Special allowance', ps.special_allowance],
+        ['Transport allowance', ps.transport_allowance], ['Medical allowance', ps.medical_allowance], ['Other allowances', ps.other_allowances]]);
+  // The component engine prints basic as its own line on the old document; keep it first.
+  if (hasComponents && Number(ps.basic) > 0 && !earnings.some((e) => /basic/i.test(e.label))) earnings.unshift({ label: 'Basic salary', note: '', amount: Number(ps.basic) });
+  // THE TWO RATE CLAIMS STAY GONE: "Provident fund (employee)", not "PF (Employee 12%)". See the header.
+  const lopDays = Number(ps.lop_days) || 0;
+  const deductions: Item[] = hasComponents
+    ? lines.filter((l) => l.kind === 'deduction').map((l) => ({ label: String(l.label || ''), note: describeLine(l) || '', amount: Number(l.amount) || 0 }))
+    : legacy([['Provident fund (employee)', ps.pf_employee], ['State insurance (employee)', ps.esic_employee], ['Professional tax', ps.professional_tax],
+        ['Tax deducted at source', ps.tds], ['Loss of pay (' + lopDays + ' day' + (lopDays === 1 ? '' : 's') + ')', ps.lop_deduction],
+        ['Other deductions', ps.other_deductions]]);
+  const employerTotal = lines.reduce((s, l) => s + (Number(l.employerAmount) || 0), 0);
 
-  const earningsHtml = hasComponents
-    ? earningLines.map((l) => lineRow(l, currency, false)).join('')
-    : `
-          ${ps.hra > 0 ? `<tr><td>House rent allowance</td><td>${currency} ${fmt(ps.hra)}</td></tr>` : ''}
-          ${ps.da > 0 ? `<tr><td>Dearness allowance</td><td>${currency} ${fmt(ps.da)}</td></tr>` : ''}
-          ${ps.special_allowance > 0 ? `<tr><td>Special allowance</td><td>${currency} ${fmt(ps.special_allowance)}</td></tr>` : ''}
-          ${ps.transport_allowance > 0 ? `<tr><td>Transport allowance</td><td>${currency} ${fmt(ps.transport_allowance)}</td></tr>` : ''}
-          ${ps.medical_allowance > 0 ? `<tr><td>Medical allowance</td><td>${currency} ${fmt(ps.medical_allowance)}</td></tr>` : ''}
-          ${ps.other_allowances > 0 ? `<tr><td>Other allowances</td><td>${currency} ${fmt(ps.other_allowances)}</td></tr>` : ''}`;
+  const cell = (it: Item | undefined, emptyText = '') => it
+    ? '<td class="lbl">' + esc(it.label) + (it.note ? '<span class="note">' + esc(it.note) + '</span>' : '') + '</td><td class="amt">' + fmt(it.amount) + '</td>'
+    : '<td class="lbl' + (emptyText ? ' muted' : '') + '">' + esc(emptyText) + '</td><td class="amt"></td>';
+  const rowCount = Math.max(earnings.length, deductions.length, 1);
+  let body = '';
+  for (let k = 0; k < rowCount; k++) body += '<tr>' + cell(earnings[k]) + cell(deductions[k], k === 0 && deductions.length === 0 ? 'No deductions this month' : '') + '</tr>';
 
-  // THE TWO RATE CLAIMS ARE GONE FROM THESE LABELS. They used to read "PF (Employee 12%)" and
-  // "ESIC (0.75%)" — percentages hardcoded in the run, printed on a pay document as though they were
-  // the law. The numbers on already-issued payslips are untouched; only the claim about WHY they are
-  // that number has been removed, because this product cannot stand behind it.
-  const deductionsHtml = hasComponents
-    ? deductionLines.map((l) => lineRow(l, currency, true)).join('')
-    : `
-          ${ps.pf_employee > 0 ? `<tr><td>Provident fund (employee)</td><td class="deduction-color">- ${currency} ${fmt(ps.pf_employee)}</td></tr>` : ''}
-          ${ps.esic_employee > 0 ? `<tr><td>State insurance (employee)</td><td class="deduction-color">- ${currency} ${fmt(ps.esic_employee)}</td></tr>` : ''}
-          ${ps.professional_tax > 0 ? `<tr><td>Professional tax</td><td class="deduction-color">- ${currency} ${fmt(ps.professional_tax)}</td></tr>` : ''}
-          ${ps.tds > 0 ? `<tr><td>Tax deducted at source</td><td class="deduction-color">- ${currency} ${fmt(ps.tds)}</td></tr>` : ''}
-          ${ps.lop_deduction > 0 ? `<tr><td>Loss of pay (${ps.lop_days || 0} day${Number(ps.lop_days) === 1 ? '' : 's'})</td><td class="deduction-color">- ${currency} ${fmt(ps.lop_deduction)}</td></tr>` : ''}
-          ${ps.other_deductions > 0 ? `<tr><td>Other deductions</td><td class="deduction-color">- ${currency} ${fmt(ps.other_deductions)}</td></tr>` : ''}`;
+  const particular = (k: string, v: unknown) => (v === undefined || v === null || String(v).trim() === '' ? '' : '<tr><th>' + esc(k) + '</th><td>' + esc(v) + '</td></tr>');
+  const joined = extra.joining_date ? longDate(String(extra.joining_date).slice(0, 10)) : '';
+  const bank = extra.bank_account_number ? (extra.bank_name ? String(extra.bank_name) + ' ' : '') + maskTail(extra.bank_account_number) : '';
+  const left = particular('Employee name', ps.full_name) + particular('Employee code', ps.employee_code) + particular('Designation', ps.designation)
+    + particular('Department', ps.dept_name) + particular('Date of joining', joined);
+  const right = particular('Pay period', month + ' ' + ps.year) + particular('Days worked', ps.days_worked ?? 0)
+    + particular('Leave days', ps.days_leave ?? 0) + particular('Absent days', ps.days_absent ?? 0)
+    + particular('Bank account', bank) + particular('PAN', extra.pan_number ? maskTail(extra.pan_number) : '')
+    + particular('Payment status', (() => { const t = String(ps.status || 'pending').replace(/_/g, ' '); return t.charAt(0).toUpperCase() + t.slice(1); })());
+  const generated = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'long', year: 'numeric' });
+  const employerHtml = employerTotal > 0 ? '<p class="employer">Employer contributions, not deducted from your pay: <strong>' + cur + ' ' + fmt(employerTotal) + '</strong></p>' : '';
+  const printScript = autoPrint ? '<script>window.onload = function() { window.print(); }<\/script>' : '';
 
-  const employerHtml = employerTotal > 0
-    ? `<div class="total-row" style="margin-top:10px;">
-         <span style="font-weight:600;">Employer contributions (not deducted from you)</span>
-         <span style="font-weight:700;">${currency} ${fmt(employerTotal)}</span>
-       </div>`
-    : '';
-
-  return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Payslip - ${ps.full_name} - ${month} ${year}</title>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: Arial, sans-serif; font-size: 12px; color: #1a1a1a; background: #fff; padding: 20px; }
-  .header { background: #FF4F00; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
-  .header h1 { font-size: 20px; font-weight: 700; }
-  .header p { font-size: 12px; opacity: 0.85; margin-top: 4px; }
-  .badge { background: rgba(255,255,255,0.2); padding: 3px 10px; border-radius: 100px; font-size: 11px; display: inline-block; margin-top: 8px; }
-  .body { border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px; padding: 20px; }
-  .employee-info { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid #e5e7eb; }
-  .info-group label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; display: block; margin-bottom: 2px; }
-  .info-group span { font-size: 13px; font-weight: 600; color: #111; }
-  .section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: #6b7280; margin-bottom: 8px; }
-  .pay-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
-  .pay-table { width: 100%; }
-  .pay-table tr td { padding: 5px 0; border-bottom: 1px solid #f3f4f6; font-size: 12px; }
-  .pay-table tr td:last-child { text-align: right; font-weight: 500; }
-  .pay-table tr:last-child td { border-bottom: none; }
-  .total-row { background: #f9fafb; border-radius: 6px; padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-  .net-pay { background: #FF4F00; color: white; border-radius: 6px; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; margin-top: 12px; }
-  .net-pay .label { font-size: 12px; opacity: 0.9; }
-  .net-pay .amount { font-size: 20px; font-weight: 700; }
-  .attendance { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px; }
-  .att-box { background: #f9fafb; border-radius: 6px; padding: 8px; text-align: center; }
-  .att-box .num { font-size: 18px; font-weight: 700; color: #111; }
-  .att-box .lbl { font-size: 10px; color: #6b7280; margin-top: 2px; }
-  .footer { margin-top: 20px; padding-top: 12px; border-top: 1px solid #e5e7eb; text-align: center; font-size: 10px; color: #9ca3af; }
-  .deduction-color { color: #ef4444; }
-  .printbar { max-width: 780px; margin: 0 auto 12px; text-align: right; }
-  .printbar button { font: inherit; font-weight: 700; background: #111; color: #fff; border: 0; border-radius: 8px; padding: 9px 16px; cursor: pointer; }
-  @media (max-width: 640px) {
-    .employee-info, .pay-grid { grid-template-columns: 1fr; }
-  }
-  @media print { body { padding: 0; } .printbar { display: none; } }
-</style>
-</head>
-<body>
-  <div class="printbar"><button type="button" onclick="window.print()">Print / Save as PDF</button></div>
-  <div class="header">
-    <h1>EduRankAI</h1>
-    <p>Payslip for ${month} ${year}</p>
-    <span class="badge">${ps.status?.toUpperCase() || 'PENDING'}</span>
-  </div>
-  <div class="body">
-    <div class="employee-info">
-      <div class="info-group"><label>Employee Name</label><span>${ps.full_name}</span></div>
-      <div class="info-group"><label>Employee Code</label><span>${ps.employee_code}</span></div>
-      <div class="info-group"><label>Designation</label><span>${ps.designation || '-'}</span></div>
-      <div class="info-group"><label>Department</label><span>${ps.dept_name || '-'}</span></div>
-      <div class="info-group"><label>Pay Period</label><span>${month} ${year}</span></div>
-      <div class="info-group"><label>Currency</label><span>${ps.currency || 'INR'}</span></div>
-    </div>
-
-    <p class="section-title">Attendance</p>
-    <div class="attendance">
-      <div class="att-box"><div class="num">${ps.days_worked || 0}</div><div class="lbl">Days Worked</div></div>
-      <div class="att-box"><div class="num">${ps.days_leave || 0}</div><div class="lbl">Leave Days</div></div>
-      <div class="att-box"><div class="num">${ps.days_absent || 0}</div><div class="lbl">Absent Days</div></div>
-    </div>
-
-    <div class="pay-grid">
-      <div>
-        <p class="section-title">Earnings</p>
-        <table class="pay-table">
-          <tr><td>Basic salary</td><td>${currency} ${fmt(ps.basic)}</td></tr>
-          ${earningsHtml}
-        </table>
-        <div class="total-row" style="margin-top:8px;">
-          <span style="font-weight:600;">Gross salary</span>
-          <span style="font-weight:700;">${currency} ${fmt(ps.gross_salary)}</span>
-        </div>
-      </div>
-      <div>
-        <p class="section-title">Deductions</p>
-        <table class="pay-table">
-          ${deductionsHtml || '<tr><td colspan="2" style="color:#9ca3af;">No deductions this month.</td></tr>'}
-        </table>
-        <div class="total-row" style="margin-top:8px;">
-          <span style="font-weight:600;">Total deductions</span>
-          <span style="font-weight:700;color:#ef4444;">- ${currency} ${fmt(ps.total_deductions)}</span>
-        </div>
-        ${employerHtml}
-      </div>
-    </div>
-
-    <div class="net-pay">
-      <div><div class="label">Net pay</div><div style="font-size:10px;opacity:0.75;">${month} ${year}</div></div>
-      <div class="amount">${currency} ${fmt(ps.net_salary)}</div>
-    </div>
-
-    <div class="footer">
-      <p>This is a computer-generated payslip and does not require a signature.</p>
-      <p>Every component above, including any statutory deduction, is calculated from rates configured
-         by this organisation. It is a record of what was paid, not advice on what any tax or
-         contribution rule requires of you.</p>
-      <p>EduRankAI &bull; hr@edurankai.in &bull; Generated on ${new Date().toLocaleDateString('en-IN')}</p>
-    </div>
-  </div>
-  ${autoPrint ? `<script>window.onload = function() { window.print(); }<\/script>` : ''}
-</body>
-</html>`;
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+    + '<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex,nofollow">'
+    + '<title>Payslip - ' + esc(ps.full_name) + ' - ' + esc(month) + ' ' + year + '</title>'
+    + '<style>'
+    + '@page{size:A4;margin:12mm}*{box-sizing:border-box}'
+    + 'body{margin:0;background:#eceae6;font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#1a1a1a}'
+    + '.sheet{max-width:800px;margin:0 auto 24px;background:#fff;border:1px solid #d9d4cc;padding:26px 30px}'
+    + '.head{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:3px solid #FF4F00;padding-bottom:12px}'
+    + '.wm{font-family:Georgia,"Times New Roman",serif;font-size:26px;font-weight:700;letter-spacing:-0.3px}.wm span{color:#FF4F00}'
+    + '.tag{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:#6b635c;font-weight:700;margin-top:3px}'
+    + '.addr{text-align:right;font-size:10.5px;color:#6b635c;line-height:1.5}'
+    + '.title{display:flex;justify-content:space-between;align-items:baseline;margin:16px 0 12px}'
+    + '.title h1{margin:0;font-size:16px;letter-spacing:3px;text-transform:uppercase}.title p{margin:0;font-size:12.5px;color:#3a332d}'
+    + '.parts{display:grid;grid-template-columns:1fr 1fr;gap:0 18px;border:1px solid #d9d4cc;padding:6px 12px;margin-bottom:14px}'
+    + '.parts table{width:100%;border-collapse:collapse}.parts th{text-align:left;font-weight:400;color:#6b635c;padding:4px 0;width:42%;font-size:11px}'
+    + '.parts td{padding:4px 0;font-weight:700;font-size:12px}'
+    + 'table.pay{width:100%;border-collapse:collapse;border:1px solid #d9d4cc}'
+    + 'table.pay thead th{background:#f4f1ec;text-align:left;padding:7px 10px;font-size:10.5px;letter-spacing:1px;text-transform:uppercase;border-bottom:1px solid #d9d4cc}'
+    + 'table.pay thead th.amt{text-align:right}table.pay td{padding:6px 10px;border-bottom:1px solid #efebe5;vertical-align:top}'
+    + 'table.pay td:nth-child(3){border-left:1px solid #d9d4cc}'
+    + 'table.pay td.amt{text-align:right;white-space:nowrap;width:17%;font-variant-numeric:tabular-nums}'
+    + '.note{display:block;color:#8a837b;font-size:10px}.muted{color:#8a837b}'
+    + 'table.pay tr.tot td{font-weight:700;background:#faf8f4;border-top:1px solid #d9d4cc}'
+    + '.net{display:flex;justify-content:space-between;align-items:center;border:2px solid #1a1a1a;margin-top:12px;padding:10px 14px}'
+    + '.net .k{font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-weight:700}.net .v{font-size:20px;font-weight:800;font-variant-numeric:tabular-nums}'
+    + '.words{margin:6px 0 0;font-size:11.5px;color:#3a332d}.employer{margin-top:8px;font-size:11px;color:#3a332d}'
+    + '.foot{margin-top:18px;padding-top:10px;border-top:1px solid #e5e0d8;font-size:9.5px;color:#8a837b;line-height:1.55}'
+    + '.printbar{max-width:800px;margin:14px auto 10px;text-align:right}'
+    + '.printbar button{font:inherit;font-weight:700;background:#111;color:#fff;border:0;border-radius:8px;padding:9px 16px;cursor:pointer}'
+    + '@media (max-width:640px){.parts{grid-template-columns:1fr}.sheet{padding:18px}.head{flex-direction:column;align-items:flex-start;gap:8px}.addr{text-align:left}}'
+    + '@media print{body{background:#fff}.sheet{border:0;margin:0;max-width:none;padding:0}.printbar{display:none}}'
+    + '</style></head><body>'
+    + '<div class="printbar"><button type="button" onclick="window.print()">Print / Save as PDF</button></div>'
+    + '<div class="sheet">'
+    + '<div class="head"><div><div class="wm">Edu<span>Rank</span>AI</div><div class="tag">AI Research &amp; Engineering</div></div>'
+    + '<div class="addr">Guwahati, Assam, India<br>hr@edurankai.in | edurankai.in</div></div>'
+    + '<div class="title"><h1>Payslip</h1><p>For the month of <strong>' + esc(month) + ' ' + year + '</strong></p></div>'
+    + '<div class="parts"><table>' + left + '</table><table>' + right + '</table></div>'
+    + '<table class="pay"><thead><tr><th>Earnings</th><th class="amt">Amount (' + cur + ')</th><th>Deductions</th><th class="amt">Amount (' + cur + ')</th></tr></thead><tbody>'
+    + body
+    + '<tr class="tot"><td>Gross earnings</td><td class="amt">' + fmt(ps.gross_salary) + '</td><td>Total deductions</td><td class="amt">' + fmt(ps.total_deductions) + '</td></tr>'
+    + '</tbody></table>'
+    + '<div class="net"><span class="k">Net pay for ' + esc(month) + ' ' + year + '</span><span class="v">' + cur + ' ' + fmt(ps.net_salary) + '</span></div>'
+    + '<p class="words">In words: <strong>' + esc(amountInWords(ps.net_salary, currency)) + '</strong></p>'
+    + employerHtml
+    + '<div class="foot">This is a computer-generated payslip and does not require a signature. '
+    + 'Every component above, including any statutory deduction, is calculated from rates configured by this organisation. '
+    + 'It is a record of what was paid, not advice on what any tax or contribution rule requires of you. Generated on ' + esc(generated) + '.</div>'
+    + '</div>' + printScript + '</body></html>';
 }
 
 // =================================================================================================

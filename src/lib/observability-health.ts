@@ -468,6 +468,8 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   { module: 'SAMARTH consultation requests', table: 'samarth_applications', owner: 'src/lib/samarth/schema.ts' },
   { module: 'SAMARTH booking-fee schedule', table: 'samarth_fee_schedule', owner: 'src/lib/samarth/schema.ts' },
   { module: 'SAMARTH X progress', table: 'samarth_x_progress', owner: 'src/lib/samarth/schema.ts' },
+  // Absent, /admin/hr/documents cannot issue a letter and /verify/document/<serial> verifies nothing.
+  { module: 'HR documents register', table: 'hr_issued_documents', owner: 'src/lib/hr/hr-documents-store.ts' },
 
   // PRESENT, AND LISTED ANYWAY. application_stage_events exists — it carries the funnel history the
   // hiring decision report reads — but it was unmonitored, and /api/health reports four suppressed

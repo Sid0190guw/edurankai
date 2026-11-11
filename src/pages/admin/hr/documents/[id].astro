@@ -1,0 +1,147 @@
+---
+// /admin/hr/documents/<id> - one issued document: the document itself, print, email, revoke, and the
+// public verification link. The HTML shown is the stored copy that was issued, never a re-render.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { publicOrigin as configuredOrigin } from '@/lib/public-origin';
+import { hrDocType } from '@/lib/hr/hr-documents';
+import { esc } from '@/lib/hr/brand-doc';
+import { getDocument, revokeDocument, markEmailed } from '@/lib/hr/hr-documents-store';
+import { sendLetterEmail, recipientProblem } from '@/lib/hr/letter-mail';
+import { logAudit } from '@/lib/audit';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user, 'employee.manage')) return Astro.redirect('/admin/hr?denied=documents');
+
+// Declared before the POST handler that reads them.
+const id = String(Astro.params.id || '');
+const origin = configuredOrigin();
+let ok = Astro.url.searchParams.get('issued') === '1' ? 'Issued. Print it, email it, or share the verification link below.' : '';
+let err = '';
+
+let res = await getDocument(id);
+if (Astro.request.method === 'POST' && res.ok && res.value) {
+  let fd: FormData;
+  try { fd = await Astro.request.formData(); } catch { fd = new FormData(); }
+  const action = String(fd.get('action') || '');
+  const doc = res.value;
+  const actor = String(user.name || user.email || 'HR');
+  if (action === 'revoke') {
+    const r = await revokeDocument(doc.id, String(fd.get('reason') || ''), actor);
+    if (r.ok) {
+      ok = 'Revoked. Its verification page now says it was revoked, with your reason.';
+      await logAudit({ userId: user.id ? String(user.id) : null, action: 'hr.document.revoke', entity: 'hr_issued_document', entityId: doc.id, diff: { serial: doc.serial } });
+    } else err = r.error;
+  } else if (action === 'email') {
+    const to = String(fd.get('to') || '').trim();
+    const problem = recipientProblem(to);
+    const def = hrDocType(doc.docType)!;
+    if (doc.status === 'revoked') err = 'A revoked document is not sent.';
+    else if (problem) err = problem;
+    else {
+      const note = String(fd.get('note') || '').trim().slice(0, 4000);
+      const noteHtml = note ? '<p>' + esc(note).replace(/\r?\n/g, '<br>') + '</p>' : '';
+      const f = doc.fields || {};
+      const sent = await sendLetterEmail({
+        typeKey: def.letterKey,
+        ctx: {
+          recipientName: doc.employeeName, recipientEmail: to, roleTitle: String(f.designation || ''), department: String(f.department || ''),
+          refNumber: doc.serial, issueDate: String(f.issueDate || ''), signatoryName: String(f.signatoryName || ''), signatoryTitle: String(f.signatoryTitle || ''),
+          letterUrl: origin + '/verify/document/' + doc.serial,
+        },
+        noteHtml, letterHtml: doc.html, actorUserId: user.id ? String(user.id) : null,
+      });
+      if (sent.sent) {
+        ok = sent.message;
+        try { await markEmailed(doc.id, to); } catch { ok += ' (The email went out, but the "emailed" date could not be recorded.)'; }
+      } else err = sent.message;
+    }
+  }
+  res = await getDocument(id);
+}
+
+if (res.ok && !res.value) return new Response('Not found', { status: 404 });
+const doc = res.ok ? res.value : null;
+const def = doc ? hrDocType(doc.docType) : null;
+const verifyUrl = doc ? origin + '/verify/document/' + doc.serial : '';
+---
+<AdminLayout title={doc ? doc.serial : 'HR document'} activeNav="hr-documents">
+  <div class="hd">
+    <a href="/admin/hr/documents?view=register" class="back">All issued documents</a>
+    {!res.ok && <div class="flash err">{res.error}</div>}
+    {doc && def && (
+      <>
+        <h1>{def.label}: {doc.employeeName}</h1>
+        <p class="meta">
+          <span class="mono">{doc.serial}</span> &middot; issued {doc.issuedAt.slice(0, 10)} by {doc.issuedByName || 'HR'}
+          &middot; <span class={'chip ' + doc.status}>{doc.status === 'revoked' ? 'Revoked' : 'Valid'}</span>
+          {doc.emailedAt && <span> &middot; emailed to {doc.emailedTo} on {doc.emailedAt.slice(0, 10)}</span>}
+        </p>
+        {ok && <div class="flash okk" role="status">{ok}</div>}
+        {err && <div class="flash err" role="alert">{err}</div>}
+        {doc.status === 'revoked' && <div class="flash err">Revoked {doc.revokedAt ? doc.revokedAt.slice(0, 10) : ''}{doc.revokedByName ? ' by ' + doc.revokedByName : ''}: {doc.revokedReason}</div>}
+
+        <div class="cols">
+          <div class="paper"><Fragment set:html={doc.html} /></div>
+          <aside>
+            <div class="card">
+              <h2>Print or save as PDF</h2>
+              <a class="btn" href={'/admin/hr/documents/print/' + doc.id} target="_blank" rel="noopener">Open printable copy</a>
+            </div>
+            <div class="card">
+              <h2>Verification link</h2>
+              <p class="hint">Anyone holding the document can confirm it here. It shows whether the document is valid or revoked.</p>
+              <input readonly value={verifyUrl} onclick="this.select()" aria-label="Verification link" />
+              <a class="link" href={'/verify/document/' + doc.serial} target="_blank" rel="noopener">Open the verification page</a>
+            </div>
+            {doc.status === 'issued' && (
+              <form method="POST" class="card">
+                <h2>Email it</h2>
+                <input type="hidden" name="action" value="email" />
+                <label>To<input type="email" name="to" required value={doc.recipientEmail} /></label>
+                <label>Covering note (optional)<textarea name="note" rows="3"></textarea></label>
+                <button class="btn" type="submit">Send</button>
+                <p class="hint">The email carries the document and its verification link. No attachment.</p>
+              </form>
+            )}
+            {doc.status === 'issued' && (
+              <form method="POST" class="card">
+                <h2>Revoke</h2>
+                <input type="hidden" name="action" value="revoke" />
+                <label>Reason (shown on the verification page)<textarea name="reason" rows="2" required minlength="5"></textarea></label>
+                <button class="btn danger" type="submit">Revoke this document</button>
+                <p class="hint">Use this when a document was issued in error. To correct it, revoke it and issue a new one.</p>
+              </form>
+            )}
+          </aside>
+        </div>
+      </>
+    )}
+  </div>
+
+  <style>
+    .hd { max-width: 1180px; }
+    .back { font-size: 12px; color: rgba(255,255,255,0.5); text-decoration: none; }
+    h1 { font-size: 22px; font-weight: 650; color: #fff; margin: 8px 0 4px; }
+    .meta { color: rgba(255,255,255,0.6); font-size: 13px; margin: 0 0 14px; }
+    .mono { font-family: Consolas, Menlo, monospace; color: #fff; }
+    .cols { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; align-items: start; }
+    .paper { background: #f4efe6; padding: 20px; border-radius: 12px; color: #111; overflow-x: auto; }
+    aside { display: grid; gap: 12px; }
+    .card { border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 14px; background: rgba(255,255,255,0.03); display: grid; gap: 8px; }
+    .card h2 { font-size: 14px; color: #fff; margin: 0; }
+    label { display: grid; gap: 4px; font-size: 12px; color: rgba(255,255,255,0.72); }
+    input, textarea { width: 100%; padding: 8px 10px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.14); border-radius: 8px; color: #fff; font: inherit; font-size: 13px; }
+    .btn { display: inline-block; text-align: center; background: #FF6A2A; color: #0a0a0c; font-weight: 700; border: 0; border-radius: 8px; padding: 9px 14px; cursor: pointer; font-size: 13px; text-decoration: none; }
+    .btn.danger { background: rgba(239,68,68,0.2); color: #fecaca; }
+    .link { font-size: 12px; color: #FF8A55; }
+    .hint { font-size: 12px; color: rgba(255,255,255,0.55); line-height: 1.5; margin: 0; }
+    .flash { border-radius: 10px; padding: 10px 14px; font-size: 13px; margin-bottom: 12px; }
+    .flash.err { background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.35); color: #fecaca; }
+    .flash.okk { background: rgba(34,197,94,0.12); border: 1px solid rgba(34,197,94,0.35); color: #bbf7d0; }
+    .chip { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: rgba(34,197,94,0.15); color: #bbf7d0; }
+    .chip.revoked { background: rgba(239,68,68,0.15); color: #fecaca; }
+    @media (max-width: 980px) { .cols { grid-template-columns: 1fr; } }
+  </style>
+</AdminLayout>
