@@ -1,0 +1,335 @@
+---
+// /admin/hr/documents - one desk for the documents HR puts its name on:
+//   Issue     experience letter, no-objection certificate, relieving letter. Each has its own format
+//             (src/lib/hr/hr-documents.ts), a serial, a public verification page, and is recorded.
+//   Register  every document issued, with its status (issued or revoked).
+//   Payslips  the payslips payroll runs have produced. Read-only here: a payslip comes from a run.
+//
+// Issuing needs `employee.manage`, the permission that already gates sending HR letters. Payslips are
+// listed only to the roles that may open one (/admin/hr/payslip/[id] admits super_admin and hr).
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { civilToday } from '@/lib/page-safety';
+import { publicOrigin as configuredOrigin } from '@/lib/public-origin';
+import {
+  HR_DOC_TYPES, HONORIFICS, NOC_PURPOSES, hrDocType, inputFromForm, documentProblems, renderHrDocument, storedFields, type HrDocType,
+} from '@/lib/hr/hr-documents';
+import { employeesForDocuments, issueDocument, listDocuments, recentPayslips } from '@/lib/hr/hr-documents-store';
+import { logAudit } from '@/lib/audit';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+const mayIssue = can(user, 'employee.manage');
+const mayPayslips = ['super_admin', 'hr'].includes(String(user.role));
+if (!mayIssue && !mayPayslips) return Astro.redirect('/admin/hr?denied=documents');
+
+// Declared before the POST handler that reads them.
+const url = Astro.url;
+const view = (['issue', 'register', 'payslips'].includes(url.searchParams.get('view') || '') ? url.searchParams.get('view') : (mayIssue ? 'issue' : 'payslips')) as 'issue' | 'register' | 'payslips';
+const type: HrDocType = hrDocType(url.searchParams.get('type'))?.value || 'experience';
+const typeDef = hrDocType(type)!;
+const today = civilToday();
+const origin = configuredOrigin();
+let previewHtml = '';
+let problems: string[] = [];
+let error = '';
+let form: Record<string, string> = {
+  issue_date: today, signatory_name: String(user.name || ''), signatory_title: '', purpose: 'employment',
+};
+
+// Prefill from an employee record (GET ?employee=<id>), so HR types as little as possible.
+const employees = mayIssue && view === 'issue' ? await employeesForDocuments() : null;
+const employeeList = employees && employees.ok ? employees.value : [];
+const employeesError = employees && !employees.ok ? employees.error : '';
+const pickedId = url.searchParams.get('employee') || '';
+const picked = employeeList.find((e) => e.id === pickedId) || null;
+if (picked) {
+  form = { ...form, employee_id: picked.id, employee_name: picked.name, employee_code: picked.code, designation: picked.designation,
+    department: picked.department, employment_type: picked.employmentType, joining_date: picked.joiningDate,
+    end_date: picked.lastWorkingDay, recipient_email: picked.email };
+}
+
+if (Astro.request.method === 'POST' && mayIssue && view === 'issue') {
+  let fd: FormData;
+  try { fd = await Astro.request.formData(); } catch { fd = new FormData(); }
+  const get = (n: string) => String(fd.get(n) ?? '');
+  form = {};
+  for (const [k, v] of fd.entries()) if (typeof v === 'string') form[k] = v;
+  const input = inputFromForm(get);
+  problems = documentProblems(type, input);
+  const action = get('action');
+  if (!problems.length && action === 'issue') {
+    const employeeId = /^[0-9a-f-]{36}$/i.test(get('employee_id')) ? get('employee_id') : null;
+    const r = await issueDocument({
+      type, employeeId, employeeName: input.employeeName, employeeCode: input.employeeCode || '',
+      recipientEmail: get('recipient_email').trim(), fields: storedFields(input),
+      render: (serial) => renderHrDocument(type, { ...input, serial, verifyUrl: origin + '/verify/document/' + serial }),
+      issuedBy: { id: user.id ? String(user.id) : null, name: String(user.name || user.email || 'HR') },
+    });
+    if (r.ok) {
+      await logAudit({ userId: user.id ? String(user.id) : null, action: 'hr.document.issue', entity: 'hr_issued_document', entityId: r.id, diff: { serial: r.serial, type } });
+      return Astro.redirect('/admin/hr/documents/' + r.id + '?issued=1');
+    }
+    error = r.error;
+  }
+  if (!problems.length) previewHtml = renderHrDocument(type, { ...input, serial: 'ERA-' + typeDef.prefix + '-' + today.slice(0, 4) + '-PREVIEW', verifyUrl: origin + '/verify/document/ERA-' + typeDef.prefix + '-' + today.slice(0, 4) + '-PREVIEW' });
+}
+
+const q = (url.searchParams.get('q') || '').trim();
+const register = view === 'register' && mayIssue ? await listDocuments({ q, type: url.searchParams.get('type') || '' }) : null;
+const payslips = view === 'payslips' && mayPayslips ? await recentPayslips(q) : null;
+const MONTHS = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const money = (n: number, c: string) => c + ' ' + n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const typeLabel = (v: string) => hrDocType(v)?.label || v;
+const v = (k: string) => form[k] || '';
+const isNoc = type === 'noc';
+const isRel = type === 'relieving';
+const isExp = type === 'experience';
+const endLabel = isRel ? 'Last working day' : 'Last working day (leave empty if still employed)';
+const registerRows = register && register.ok ? register.value : [];
+const payslipRows = payslips && payslips.ok ? payslips.value : [];
+---
+<AdminLayout title="HR documents" activeNav="hr-documents">
+  <div class="hd">
+    <a href="/admin/hr" class="back">HR hub</a>
+    <h1>HR documents</h1>
+    <p class="lede">Experience letters, no-objection certificates and relieving letters, each in its own format, numbered, recorded and verifiable online. Payslips come from payroll runs and are listed here too.</p>
+
+    <nav class="tabs" aria-label="HR documents">
+      {mayIssue && <a href="/admin/hr/documents?view=issue" class={view === 'issue' ? 'on' : ''}>Issue a document</a>}
+      {mayIssue && <a href="/admin/hr/documents?view=register" class={view === 'register' ? 'on' : ''}>Issued documents</a>}
+      {mayPayslips && <a href="/admin/hr/documents?view=payslips" class={view === 'payslips' ? 'on' : ''}>Payslips</a>}
+    </nav>
+
+    {view === 'issue' && mayIssue && (
+      <section>
+        <div class="types">
+          {HR_DOC_TYPES.map((t) => (
+            <a class={'type' + (t.value === type ? ' on' : '')} href={'/admin/hr/documents?view=issue&type=' + t.value + (pickedId ? '&employee=' + pickedId : '')}>
+              <strong>{t.label}</strong><span>{t.forWhom}</span>
+            </a>
+          ))}
+        </div>
+
+        <form method="GET" class="pick">
+          <input type="hidden" name="view" value="issue" />
+          <input type="hidden" name="type" value={type} />
+          <label>Fill from an employee record
+            <select name="employee">
+              <option value="">Choose a person</option>
+              {employeeList.map((e) => <option value={e.id} selected={e.id === pickedId}>{e.name}{e.code ? ' (' + e.code + ')' : ''}{e.active ? '' : ' - former'}</option>)}
+            </select>
+          </label>
+          <button type="submit" class="btn ghost">Fill in</button>
+          {employeesError && <span class="warn">{employeesError}</span>}
+        </form>
+
+        {error && <div class="flash err" role="alert">{error}</div>}
+        {problems.length > 0 && <div class="flash err" role="alert"><strong>Not issued yet.</strong><ul>{problems.map((p) => <li>{p}</li>)}</ul></div>}
+
+        <form method="POST" class="grid" id="docForm">
+          <input type="hidden" name="employee_id" value={v('employee_id')} />
+          <fieldset>
+            <legend>The person</legend>
+            <div class="row">
+              <label class="sm">Honorific
+                <select name="honorific">{HONORIFICS.map((h) => <option value={h} selected={h === v('honorific')}>{h || 'None'}</option>)}</select>
+              </label>
+              <label>Full name<input name="employee_name" required maxlength="200" value={v('employee_name')} /></label>
+            </div>
+            <div class="row">
+              <label>Employee ID<input name="employee_code" maxlength="60" value={v('employee_code')} /></label>
+              <label>Designation<input name="designation" required maxlength="200" value={v('designation')} /></label>
+            </div>
+            <div class="row">
+              <label>Department or team<input name="department" maxlength="200" value={v('department')} /></label>
+              <label>Employment type<input name="employment_type" maxlength="60" value={v('employment_type')} placeholder="Full-time, Intern, Contract" /></label>
+            </div>
+            <div class="row">
+              <label>Date of joining<input type="date" name="joining_date" required value={v('joining_date')} /></label>
+              <label>{endLabel}<input type="date" name="end_date" value={v('end_date')} required={isRel} /></label>
+            </div>
+            {isRel && <label>Resignation dated<input type="date" name="resignation_date" value={v('resignation_date')} /></label>}
+            <label>Email it to (optional, used on the next screen)<input type="email" name="recipient_email" maxlength="200" value={v('recipient_email')} /></label>
+          </fieldset>
+
+          {isExp && (
+            <fieldset>
+              <legend>Experience letter</legend>
+              <label>Responsibilities, one per line<textarea name="responsibilities" rows="5" placeholder="Managed the founder's calendar and correspondence">{v('responsibilities')}</textarea></label>
+              <label>Remarks on performance and conduct (printed only if you write something)<textarea name="remarks" rows="3">{v('remarks')}</textarea></label>
+              <label>Issued for the purpose of (optional)<input name="request_purpose" maxlength="300" value={v('request_purpose')} placeholder="a job application" /></label>
+            </fieldset>
+          )}
+
+          {isNoc && (
+            <fieldset>
+              <legend>No-objection certificate</legend>
+              <label>Addressed to<input name="addressee" maxlength="300" value={v('addressee')} placeholder="To whom it may concern" /></label>
+              <label>Purpose
+                <select name="purpose">{NOC_PURPOSES.map((p) => <option value={p.value} selected={p.value === v('purpose')}>{p.label}</option>)}</select>
+              </label>
+              <label>If "Other", the purpose in a few words<input name="purpose_text" maxlength="300" value={v('purpose_text')} placeholder="attending a conference in Singapore" /></label>
+              <label>Details printed with the particulars (optional)<input name="purpose_detail" maxlength="500" value={v('purpose_detail')} placeholder="New employer, university, country or travel dates" /></label>
+              <div class="row">
+                <label>Valid until (optional)<input type="date" name="valid_until" value={v('valid_until')} /></label>
+              </div>
+              <label>Further conditions, one per line (optional)<textarea name="conditions" rows="3">{v('conditions')}</textarea></label>
+              <label class="check"><input type="checkbox" name="dues_cleared" value="yes" checked={v('dues_cleared') === 'yes'} /> I confirm no dues, liabilities or company assets are pending from this person (printed only when ticked)</label>
+            </fieldset>
+          )}
+
+          {isRel && (
+            <fieldset>
+              <legend>Relieving letter</legend>
+              <label class="check"><input type="checkbox" name="dues_cleared" value="yes" checked={v('dues_cleared') === 'yes'} /> Full and final settlement is complete and nothing is outstanding (printed only when ticked)</label>
+            </fieldset>
+          )}
+
+          <fieldset>
+            <legend>Issue</legend>
+            <div class="row">
+              <label>Date of issue<input type="date" name="issue_date" required value={v('issue_date')} /></label>
+              <label>Signatory<input name="signatory_name" required maxlength="200" value={v('signatory_name')} /></label>
+            </div>
+            <label>Signatory's title<input name="signatory_title" required maxlength="200" value={v('signatory_title')} placeholder="Founder & CEO" /></label>
+            <div class="actions">
+              <button type="submit" name="action" value="preview" class="btn ghost">Preview</button>
+              <button type="submit" name="action" value="issue" class="btn" id="issueBtn">Issue {typeDef.label.toLowerCase()}</button>
+            </div>
+            <p class="hint">Issuing gives it a number, records it and publishes its verification page. Nothing is emailed until you choose to on the next screen.</p>
+          </fieldset>
+        </form>
+
+        {previewHtml && (
+          <section class="preview">
+            <h2>Preview</h2>
+            <p class="hint">This is the document exactly as it will be printed, emailed and verified. The number is assigned when you issue it.</p>
+            <div class="paper"><Fragment set:html={previewHtml} /></div>
+          </section>
+        )}
+      </section>
+    )}
+
+    {view === 'register' && mayIssue && (
+      <section>
+        <form method="GET" class="pick">
+          <input type="hidden" name="view" value="register" />
+          <input type="search" name="q" value={q} placeholder="Name, employee ID or document number" />
+          <select name="type"><option value="">All types</option>{HR_DOC_TYPES.map((t) => <option value={t.value} selected={url.searchParams.get('type') === t.value}>{t.label}</option>)}</select>
+          <button class="btn ghost" type="submit">Search</button>
+        </form>
+        {register && !register.ok && <div class="flash err">{register.error}</div>}
+        {register && register.ok && registerRows.length === 0 && <p class="empty">{q ? 'Nothing matches that search.' : 'No document has been issued from this desk yet.'}</p>}
+        {registerRows.length > 0 && (
+          <div class="scroll"><table class="tbl">
+            <thead><tr><th>Number</th><th>Type</th><th>Person</th><th>Issued</th><th>Status</th><th>Emailed</th></tr></thead>
+            <tbody>{registerRows.map((d) => (
+              <tr>
+                <td><a href={'/admin/hr/documents/' + d.id}>{d.serial}</a></td>
+                <td>{typeLabel(d.docType)}</td>
+                <td>{d.employeeName}{d.employeeCode ? ' (' + d.employeeCode + ')' : ''}</td>
+                <td>{d.issuedAt.slice(0, 10)}</td>
+                <td><span class={'chip ' + d.status}>{d.status === 'revoked' ? 'Revoked' : 'Valid'}</span></td>
+                <td>{d.emailedAt ? d.emailedAt.slice(0, 10) : '-'}</td>
+              </tr>
+            ))}</tbody>
+          </table></div>
+        )}
+      </section>
+    )}
+
+    {view === 'payslips' && mayPayslips && (
+      <section>
+        <p class="hint">A payslip is produced by a payroll run from what was actually paid, so it cannot be typed in here. To produce payslips for a month, run payroll for that month in <a href="/admin/hr/payroll">Payroll</a>. Interns are not paid, so payroll gives them no payslip.</p>
+        <form method="GET" class="pick">
+          <input type="hidden" name="view" value="payslips" />
+          <input type="search" name="q" value={q} placeholder="Name or employee ID" />
+          <button class="btn ghost" type="submit">Search</button>
+        </form>
+        {payslips && !payslips.ok && <div class="flash warn">{payslips.error}</div>}
+        {payslips && payslips.ok && payslipRows.length === 0 && <p class="empty">{q ? 'No payslip matches that search.' : 'No payslips yet.'}</p>}
+        {payslipRows.length > 0 && (
+          <div class="scroll"><table class="tbl">
+            <thead><tr><th>Period</th><th>Person</th><th>Net pay</th><th>Status</th><th></th></tr></thead>
+            <tbody>{payslipRows.map((p) => (
+              <tr>
+                <td>{MONTHS[p.month] || p.month} {p.year}</td>
+                <td>{p.name}{p.code ? ' (' + p.code + ')' : ''}</td>
+                <td>{money(p.net, p.currency)}</td>
+                <td>{p.status || '-'}</td>
+                <td><a href={'/admin/hr/payslip/' + p.id} target="_blank" rel="noopener">Open payslip</a></td>
+              </tr>
+            ))}</tbody>
+          </table></div>
+        )}
+      </section>
+    )}
+  </div>
+
+  <script is:inline>
+    (function () {
+      var f = document.getElementById('docForm');
+      if (!f) return;
+      // One click issues one document: the button disables itself once the issue is submitted.
+      f.addEventListener('submit', function (ev) {
+        var b = ev.submitter;
+        if (b && b.value === 'issue') { setTimeout(function () { b.disabled = true; b.textContent = 'Issuing...'; }, 0); }
+      });
+    })();
+  </script>
+
+  <style>
+    .hd { max-width: 1100px; }
+    .back { font-size: 12px; color: rgba(255,255,255,0.5); text-decoration: none; }
+    .back:hover { color: #fff; }
+    h1 { font-size: 26px; font-weight: 650; color: #fff; margin: 8px 0 4px; }
+    .lede { color: rgba(255,255,255,0.62); font-size: 14px; max-width: 760px; margin: 0 0 16px; line-height: 1.55; }
+    .tabs { display: flex; gap: 6px; flex-wrap: wrap; border-bottom: 1px solid rgba(255,255,255,0.1); margin-bottom: 18px; }
+    .tabs a { padding: 9px 14px; font-size: 13px; color: rgba(255,255,255,0.65); text-decoration: none; border-bottom: 2px solid transparent; }
+    .tabs a.on { color: #fff; border-color: #FF6A2A; }
+    .types { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-bottom: 14px; }
+    .type { display: block; padding: 12px 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; text-decoration: none; color: rgba(255,255,255,0.7); }
+    .type strong { display: block; color: #fff; font-size: 14px; margin-bottom: 3px; }
+    .type span { font-size: 12px; line-height: 1.45; }
+    .type.on { border-color: #FF6A2A; background: rgba(255,106,42,0.08); }
+    .pick { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 14px; }
+    .pick label { display: grid; gap: 4px; font-size: 12px; color: rgba(255,255,255,0.7); min-width: 260px; }
+    .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); align-items: start; }
+    fieldset { border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 14px 16px; margin: 0; display: grid; gap: 10px; background: rgba(255,255,255,0.03); }
+    legend { font-size: 13px; font-weight: 650; color: #fff; padding: 0 6px; }
+    label { display: grid; gap: 4px; font-size: 12px; color: rgba(255,255,255,0.72); }
+    label.check { display: flex; gap: 8px; align-items: flex-start; line-height: 1.45; }
+    label.sm { max-width: 110px; }
+    .row { display: flex; gap: 10px; }
+    .row > label { flex: 1; }
+    input, select, textarea { width: 100%; padding: 8px 10px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.14); border-radius: 8px; color: #fff; font: inherit; font-size: 13px; }
+    input[type=checkbox] { width: auto; margin-top: 2px; }
+    select option { background: #0a0a0c; }
+    input:focus, select:focus, textarea:focus { outline: none; border-color: #FF6A2A; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .btn { background: #FF6A2A; color: #0a0a0c; font-weight: 700; border: 0; border-radius: 8px; padding: 9px 16px; cursor: pointer; font-size: 13px; text-decoration: none; }
+    .btn.ghost { background: rgba(255,255,255,0.08); color: #fff; }
+    .btn:disabled { opacity: 0.6; cursor: wait; }
+    .hint { font-size: 12px; color: rgba(255,255,255,0.55); line-height: 1.5; margin: 0 0 10px; }
+    .hint a { color: #FF8A55; }
+    .flash { border-radius: 10px; padding: 10px 14px; font-size: 13px; margin-bottom: 12px; }
+    .flash.err { background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.35); color: #fecaca; }
+    .flash.warn { background: rgba(234,179,8,0.1); border: 1px solid rgba(234,179,8,0.3); color: #fde68a; }
+    .flash ul { margin: 6px 0 0 18px; }
+    .warn { font-size: 12px; color: #fde68a; }
+    .preview { margin-top: 22px; }
+    .preview h2 { color: #fff; font-size: 16px; margin: 0 0 4px; }
+    .paper { background: #f4efe6; padding: 22px; border-radius: 12px; max-width: 820px; color: #111; }
+    .scroll { overflow-x: auto; }
+    .tbl { width: 100%; border-collapse: collapse; font-size: 13px; color: rgba(255,255,255,0.85); }
+    .tbl th { text-align: left; font-weight: 600; color: rgba(255,255,255,0.55); padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.12); font-size: 12px; }
+    .tbl td { padding: 9px 10px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+    .tbl a { color: #FF8A55; }
+    .chip { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: rgba(34,197,94,0.15); color: #bbf7d0; }
+    .chip.revoked { background: rgba(239,68,68,0.15); color: #fecaca; }
+    .empty { color: rgba(255,255,255,0.55); font-size: 13px; }
+    @media (max-width: 640px) { .row { flex-direction: column; } label.sm { max-width: none; } }
+  </style>
+</AdminLayout>

@@ -155,16 +155,21 @@ describe('composeLetterEmail', () => {
     });
     expect(cert.html).toContain('View and verify your certificate');
     const plain = composeLetterEmail({
-      typeKey: 'offboarding:noc',
+      typeKey: 'recommendation:recommendation',
       ctx: { ...ctx, letterUrl: 'https://www.edurankai.in/x' },
     });
     expect(plain.html).toContain('Open the letter online');
+    // The three offboarding documents link to their public verification page.
+    for (const key of ['offboarding:noc', 'offboarding:experience', 'offboarding:relieving']) {
+      const c = composeLetterEmail({ typeKey: key, ctx: { ...ctx, letterUrl: 'https://www.edurankai.in/verify/document/ERA-NOC-2026-ABCDEF' } });
+      expect(c.html, key).toContain('Verify this document online');
+    }
   });
 
   it('does not box a document that brings its own frame', () => {
     const c = composeLetterEmail({ typeKey: 'promotion:promotion', ctx, letterHtml: '<p>framed</p>' });
     expect(c.html).not.toContain('padding:18px;background:#fdfcf8');
-    const boxed = composeLetterEmail({ typeKey: 'offboarding:noc', ctx, letterHtml: '<p>plain</p>' });
+    const boxed = composeLetterEmail({ typeKey: 'recommendation:recommendation', ctx, letterHtml: '<p>plain</p>' });
     expect(boxed.html).toContain('padding:18px;background:#fdfcf8');
   });
 

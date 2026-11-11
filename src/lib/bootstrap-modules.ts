@@ -115,6 +115,14 @@ export const BOOTSTRAP_MODULE_LIST: BootstrapModule[] = [
   // SAMARTH: eight tables, no REFERENCES and no ALTER, one batch. Read by /samarth/* and /admin/samarth/*.
   // Also in db/samarth-schema.sql for a hand run.
   { name: 'samarth', run: async () => (await import('@/lib/samarth/schema')).ensureSamarthSchema() },
+  // HR documents register: one table, no REFERENCES. Read by /admin/hr/documents and the public
+  // /verify/document/<serial>. Also in db/hr-documents-schema.sql for a hand run.
+  { name: 'hr-documents', run: async () => (await import('@/lib/hr/hr-documents-store')).ensureHrDocumentsSchema() },
+  // HORIZON governance: four tables (hgov_*), CREATE TABLE/INDEX IF NOT EXISTS only, no REFERENCES.
+  // Their ensure always existed in src/lib/horizon/governance/schema.ts but was never registered here,
+  // so /admin/setup listed them as "this button cannot make them" and the only way to create them was
+  // a hand-run psql. db/horizon-governance-schema.sql is the same DDL and still works by hand.
+  { name: 'horizon-governance', run: async () => (await import('@/lib/horizon/governance/schema')).ensureGovernanceSchema() },
   // These two have no exported ensure; a harmless READ triggers the same internal bootstrap.
   { name: 'error-log', run: async () => (await import('@/lib/logger')).recentErrors(1) },
   { name: 'job-queue', run: async () => (await import('@/lib/job-queue')).claimBatch(0) },

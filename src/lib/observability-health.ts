@@ -468,6 +468,8 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   { module: 'SAMARTH consultation requests', table: 'samarth_applications', owner: 'src/lib/samarth/schema.ts' },
   { module: 'SAMARTH booking-fee schedule', table: 'samarth_fee_schedule', owner: 'src/lib/samarth/schema.ts' },
   { module: 'SAMARTH X progress', table: 'samarth_x_progress', owner: 'src/lib/samarth/schema.ts' },
+  // Absent, /admin/hr/documents cannot issue a letter and /verify/document/<serial> verifies nothing.
+  { module: 'HR documents register', table: 'hr_issued_documents', owner: 'src/lib/hr/hr-documents-store.ts' },
 
   // PRESENT, AND LISTED ANYWAY. application_stage_events exists — it carries the funnel history the
   // hiring decision report reads — but it was unmonitored, and /api/health reports four suppressed
@@ -548,15 +550,15 @@ export const BOOTSTRAP_MODULES: { module: string; table: string; owner: string }
   // that honestly, but only after the fact and only to whoever pressed the button. This says it
   // before anybody presses anything.
   //
-  // OWNER IS THE .sql, NOT schema.ts, for the reason recorded against the career-intel and
-  // invitation entries above: /admin/setup splits missing tables on `owner.startsWith('db/')`, so
-  // naming the module puts these in the bucket labelled "still missing after this run" — reported
-  // to an operator as a failure of the Create-module-tables button, for tables that button was never
-  // wired to create. The file below is the one to run, and it carries all four CREATEs.
-  { module: 'Governance decision log', table: 'hgov_decision_log', owner: 'db/horizon-governance-schema.sql' },
-  { module: 'Governance engine versions', table: 'hgov_engine_version', owner: 'db/horizon-governance-schema.sql' },
-  { module: 'Retention policy', table: 'hgov_retention_policy', owner: 'db/horizon-governance-schema.sql' },
-  { module: 'Erasure requests', table: 'hgov_erasure_request', owner: 'db/horizon-governance-schema.sql' },
+  // OWNER IS NOW schema.ts. These four used to name db/horizon-governance-schema.sql, because the
+  // Create-module-tables button was never wired to create them and /admin/setup splits missing tables
+  // on `owner.startsWith('db/')`. ensureGovernanceSchema() is now in BOOTSTRAP_MODULE_LIST, so the
+  // button makes them; if one is still missing after a run, that IS a button failure and is reported
+  // as one. The .sql file is the same DDL and still works by hand.
+  { module: 'Governance decision log', table: 'hgov_decision_log', owner: 'src/lib/horizon/governance/schema.ts' },
+  { module: 'Governance engine versions', table: 'hgov_engine_version', owner: 'src/lib/horizon/governance/schema.ts' },
+  { module: 'Retention policy', table: 'hgov_retention_policy', owner: 'src/lib/horizon/governance/schema.ts' },
+  { module: 'Erasure requests', table: 'hgov_erasure_request', owner: 'src/lib/horizon/governance/schema.ts' },
 ];
 
 /**

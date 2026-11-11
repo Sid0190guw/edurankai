@@ -433,6 +433,10 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // working out the money owed on an exit is a different job from closing the exit, and the two
       // are often done by different people on different days.
       { id: 'hr-settlement',  label: 'Final settlement', href: '/admin/hr/separation/settlement', icon: 'document', section: 'hr' },
+      // HR DOCUMENTS. Experience letters, no-objection certificates and relieving letters, each in its own
+      // format, numbered and verifiable; payslips from payroll listed beside them. The page asks for
+      // employee.manage (or the payslip roles) in its own frontmatter.
+      { id: 'hr-documents',   label: 'HR documents',    href: '/admin/hr/documents',             icon: 'document', section: 'hr' },
       { id: 'hr-leave',       label: 'Leave',           href: '/admin/hr/leave',                 icon: 'calendar', section: 'leave' },
       { id: 'hr-attendance',  label: 'Attendance',      href: '/admin/hr/attendance',            icon: 'calendar', section: 'attendance' },
       // WORKING TIME. Both are /admin/hr/* pages, so middleware's longest-prefix match already gates

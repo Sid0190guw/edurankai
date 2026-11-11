@@ -7,7 +7,7 @@
 // Three letter surfaces existed and none of them could send anything:
 //
 //   /admin/hr/recommendation          LOR, To Whom It May Concern, internship completion
-//   /admin/hr/offboarding             relieving letter, experience letter, NOC
+//   /admin/hr/documents               relieving letter, experience letter, NOC (recorded, verifiable)
 //   /admin/applications/[id]/offer-letter
 //
 // The first two are composed entirely in the browser and end at `ERA.PDF.print()`. The third
@@ -112,16 +112,25 @@ export const LETTER_TYPES: Readonly<Record<string, LetterType>> = Object.freeze(
     key: 'offboarding:relieving', family: 'offboarding',
     label: 'Relieving Letter', heading: 'Your relieving letter',
     preheader: 'Your relieving letter from EduRankAI.',
+    // Issued from /admin/hr/documents with its own letterhead and frame, and a public verification page.
+    ctaText: 'Verify this document online',
+    framed: false,
   },
   'offboarding:experience': {
     key: 'offboarding:experience', family: 'offboarding',
     label: 'Experience Letter', heading: 'Your experience letter',
     preheader: 'Your experience letter from EduRankAI.',
+    // Issued from /admin/hr/documents with its own letterhead and frame, and a public verification page.
+    ctaText: 'Verify this document online',
+    framed: false,
   },
   'offboarding:noc': {
     key: 'offboarding:noc', family: 'offboarding',
     label: 'No-Objection Certificate', heading: 'Your no-objection certificate',
     preheader: 'Your no-objection certificate from EduRankAI.',
+    // Issued from /admin/hr/documents with its own letterhead and frame, and a public verification page.
+    ctaText: 'Verify this document online',
+    framed: false,
   },
   'promotion:promotion': {
     key: 'promotion:promotion', family: 'promotion',

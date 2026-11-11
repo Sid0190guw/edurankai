@@ -61,7 +61,9 @@ export default defineConfig({
   // 2026-07 — src/lib/application-fee.ts returns 0 / exempt for every level). The page is
   // deleted, but it sat in every public footer for months, so send the indexed URL to the
   // policy that now states applications are free rather than serving a 404.
-  redirects: { '/policy/fees': '/policy/candidate-transparency' },
+  // /admin/hr/offboarding produced three letters from one template and recorded none of them; its
+  // replacement is /admin/hr/documents. Redirected here so bookmarks still land somewhere useful.
+  redirects: { '/policy/fees': '/policy/candidate-transparency', '/admin/hr/offboarding': '/admin/hr/documents' },
   security: { checkOrigin: false },
   server: { port: 4321, host: true },
   // NO SHARP. IT WAS 20 MB OF THE 85 MB SERVERLESS FUNCTION AND NOTHING IMPORTED IT.
